@@ -1,0 +1,346 @@
+diff --git a/src/gui/image/qpixmap_blitter.cpp b/src/gui/image/qpixmap_blitter.cpp
+index 53e997e..01fdd8b 100644
+--- a/src/gui/image/qpixmap_blitter.cpp
++++ b/src/gui/image/qpixmap_blitter.cpp
+@@ -130,8 +130,10 @@ int QBlittablePlatformPixmap::metric(QPaintDevice::PaintDeviceMetric metric) con
+ 
+ void QBlittablePlatformPixmap::fill(const QColor &color)
+ {
+-    //jlind: todo: change when blittables can support non opaque fillRects
+-    if (color.alpha() == 255 && blittable()->capabilities() & QBlittable::SolidRectCapability) {
++    if (blittable()->capabilities() & QBlittable::AlphaFillRectCapability) {
++        blittable()->unlock();
++        blittable()->alphaFillRect(QRectF(0,0,w,h),color,QPainter::CompositionMode_Source);
++    } else if (color.alpha() == 255 && blittable()->capabilities() & QBlittable::SolidRectCapability) {
+         blittable()->unlock();
+         blittable()->fillRect(QRectF(0,0,w,h),color);
+     } else {
+diff --git a/src/gui/painting/qblittable_p.h b/src/gui/painting/qblittable_p.h
+index c36de8f..654a0a0 100644
+--- a/src/gui/painting/qblittable_p.h
++++ b/src/gui/painting/qblittable_p.h
+@@ -62,6 +62,7 @@ public:
+         SourcePixmapCapability          = 0x0002,
+         SourceOverPixmapCapability      = 0x0004,
+         SourceOverScaledPixmapCapability = 0x0008,
++        AlphaFillRectCapability         = 0x0010,
+ 
+         // Internal ones
+         OutlineCapability               = 0x0001000
+@@ -76,6 +77,12 @@ public:
+ 
+     virtual void fillRect(const QRectF &rect, const QColor &color) = 0;
+     virtual void drawPixmap(const QRectF &rect, const QPixmap &pixmap, const QRectF &subrect) = 0;
++    virtual void alphaFillRect(const QRectF &rect, const QColor &color, QPainter::CompositionMode cmode) {
++        Q_UNUSED(rect);
++        Q_UNUSED(color);
++        Q_UNUSED(cmode);
++        qWarning("Please implement alphaFillRect function in your platform or remove AlphaFillRectCapability from it");
++    }
+ 
+     QImage *lock();
+     void unlock();
+diff --git a/src/gui/painting/qpaintengine_blitter.cpp b/src/gui/painting/qpaintengine_blitter.cpp
+index d4e0a59..20dd98b 100644
+--- a/src/gui/painting/qpaintengine_blitter.cpp
++++ b/src/gui/painting/qpaintengine_blitter.cpp
+@@ -73,6 +73,7 @@ public:
+         , fillRectMask(0)
+         , drawRectMask(0)
+         , drawPixmapMask(0)
++        , alphaFillRectMask(0)
+         , capabillitiesState(0)
+     {
+         if (capabilities & QBlittable::SolidRectCapability)
+@@ -83,6 +84,8 @@ public:
+            setSourceOverPixmapMask();
+         if (capabilities & QBlittable::SourceOverScaledPixmapCapability)
+             setSourceOverScaledPixmapMask();
++        if (capabilities & QBlittable::AlphaFillRectCapability)
++            setAlphaFillRectMask();
+     }
+ 
+     inline bool canBlitterFillRect() const
+@@ -90,6 +93,11 @@ public:
+         return checkStateAgainstMask(capabillitiesState, fillRectMask);
+     }
+ 
++    inline bool canBlitterAlphaFillRect() const
++    {
++        return checkStateAgainstMask(capabillitiesState, alphaFillRectMask);
++    }
++
+     inline bool canBlitterDrawRectMask() const
+     {
+         return checkStateAgainstMask(capabillitiesState, drawRectMask);
+@@ -147,6 +155,24 @@ private:
+         updateStateBits(&fillRectMask, STATE_CLIP_COMPLEX, false);
+     }
+ 
++    void setAlphaFillRectMask() {
++        updateStateBits(&alphaFillRectMask, STATE_XFORM_SCALE, false);
++        updateStateBits(&alphaFillRectMask, STATE_XFORM_COMPLEX, false);
++
++        updateStateBits(&alphaFillRectMask, STATE_BRUSH_PATTERN, false);
++        updateStateBits(&alphaFillRectMask, STATE_BRUSH_ALPHA, true);
++
++        updateStateBits(&alphaFillRectMask, STATE_PEN_ENABLED, true);
++
++        //Sub-pixel aliasing should not be sent to the blitter
++        updateStateBits(&alphaFillRectMask, STATE_ANTIALIASING, true);
++        updateStateBits(&alphaFillRectMask, STATE_ALPHA, false);
++        updateStateBits(&alphaFillRectMask, STATE_BLENDING_COMPLEX, false);
++
++        updateStateBits(&alphaFillRectMask, STATE_CLIPSYS_COMPLEX, false);
++        updateStateBits(&alphaFillRectMask, STATE_CLIP_COMPLEX, false);
++    }
++
+     void setSourcePixmapMask() {
+         updateStateBits(&drawPixmapMask, STATE_XFORM_SCALE, true);
+         updateStateBits(&drawPixmapMask, STATE_XFORM_COMPLEX, false);
+@@ -177,6 +203,7 @@ private:
+     uint fillRectMask;
+     uint drawRectMask;
+     uint drawPixmapMask;
++    uint alphaFillRectMask;
+     uint capabillitiesState;
+ };
+ 
+@@ -194,7 +221,7 @@ public:
+ 
+     void lock();
+     void unlock();
+-    void fillRect(const QRectF &rect, const QColor &color);
++    void fillRect(const QRectF &rect, const QColor &color, bool alpha);
+     void clipAndDrawPixmap(const QRectF &clip, const QRectF &target, const QPixmap &pm, const QRectF &sr);
+ 
+ 
+@@ -287,7 +314,7 @@ void QBlitterPaintEnginePrivate::updateClipState(QPainterState *)
+     caps.updateState(STATE_CLIP_COMPLEX, complexClip);
+ }
+ 
+-void QBlitterPaintEnginePrivate::fillRect(const QRectF &rect, const QColor &color)
++void QBlitterPaintEnginePrivate::fillRect(const QRectF &rect, const QColor &color, bool alpha)
+ {
+     Q_Q(QBlitterPaintEngine);
+     pmData->unmarkRasterOverlay(rect);
+@@ -298,14 +325,20 @@ void QBlitterPaintEnginePrivate::fillRect(const QRectF &rect, const QColor &colo
+     if (clipData) {
+         if (clipData->hasRectClip) {
+             unlock();
+-            pmData->blittable()->fillRect(targetRect & clipData->clipRect, color);
++            if (alpha)
++                pmData->blittable()->alphaFillRect(targetRect & clipData->clipRect, color, q->state()->compositionMode());
++            else
++                pmData->blittable()->fillRect(targetRect & clipData->clipRect, color);
+         } else if (clipData->hasRegionClip) {
+             QVector<QRect> rects = clipData->clipRegion.rects();
+             for (int i = 0; i < rects.size(); ++i) {
+                 QRect intersectRect = rects.at(i).intersected(targetRect.toRect());
+                 if (!intersectRect.isEmpty()) {
+                     unlock();
+-                    pmData->blittable()->fillRect(intersectRect, color);
++                    if (alpha)
++                        pmData->blittable()->alphaFillRect(intersectRect, color, q->state()->compositionMode());
++                    else
++                        pmData->blittable()->fillRect(intersectRect, color);
+                 }
+             }
+         }
+@@ -314,11 +347,17 @@ void QBlitterPaintEnginePrivate::fillRect(const QRectF &rect, const QColor &colo
+             && targetRect.width() <= q->paintDevice()->width()
+             && targetRect.height() <= q->paintDevice()->height()) {
+             unlock();
+-            pmData->blittable()->fillRect(targetRect, color);
++            if (alpha)
++                pmData->blittable()->alphaFillRect(targetRect, color, q->state()->compositionMode());
++            else
++                pmData->blittable()->fillRect(targetRect, color);
+         } else {
+             QRectF deviceRect(0, 0, q->paintDevice()->width(), q->paintDevice()->height());
+             unlock();
+-            pmData->blittable()->fillRect(deviceRect & targetRect, color);
++            if (alpha)
++                pmData->blittable()->alphaFillRect(deviceRect & targetRect, color, q->state()->compositionMode());
++            else
++                pmData->blittable()->fillRect(deviceRect & targetRect, color);
+         }
+     }
+ }
+@@ -460,8 +499,10 @@ void QBlitterPaintEngine::fill(const QVectorPath &path, const QBrush &brush)
+ void QBlitterPaintEngine::fillRect(const QRectF &rect, const QColor &color)
+ {
+     Q_D(QBlitterPaintEngine);
+-    if (d->caps.canBlitterFillRect() && color.alpha() == 0xff) {
+-        d->fillRect(rect, color);
++    if (d->caps.canBlitterAlphaFillRect()) {
++        d->fillRect(rect, color, true);
++    } else if (d->caps.canBlitterFillRect() && color.alpha() == 0xff) {
++        d->fillRect(rect, color, false);
+     } else {
+         d->lock();
+         d->pmData->markRasterOverlay(rect);
+@@ -477,9 +518,12 @@ void QBlitterPaintEngine::fillRect(const QRectF &rect, const QBrush &brush)
+     Q_D(QBlitterPaintEngine);
+ 
+     if (qbrush_style(brush) == Qt::SolidPattern
++        && d->caps.canBlitterAlphaFillRect()) {
++        d->fillRect(rect, qbrush_color(brush), true);
++    } else if (qbrush_style(brush) == Qt::SolidPattern
+         && qbrush_color(brush).alpha() == 0xff
+         && d->caps.canBlitterFillRect()) {
+-        d->fillRect(rect, qbrush_color(brush));
++        d->fillRect(rect, qbrush_color(brush), false);
+     } else if (brush.style() == Qt::TexturePattern
+               && d->caps.canBlitterDrawPixmap(rect, brush.texture(), rect)) {
+         bool rectIsFilled = false;
+@@ -550,7 +594,7 @@ void QBlitterPaintEngine::drawRects(const QRect *rects, int rectCount)
+     Q_D(QBlitterPaintEngine);
+     if (d->caps.canBlitterDrawRectMask()) {
+         for (int i=0; i<rectCount; ++i)
+-            d->fillRect(rects[i], qbrush_color(state()->brush));
++            d->fillRect(rects[i], qbrush_color(state()->brush), false);
+     } else {
+         d->pmData->markRasterOverlay(rects, rectCount);
+         QRasterPaintEngine::drawRects(rects, rectCount);
+@@ -562,7 +606,7 @@ void QBlitterPaintEngine::drawRects(const QRectF *rects, int rectCount)
+     Q_D(QBlitterPaintEngine);
+     if (d->caps.canBlitterDrawRectMask()) {
+         for (int i = 0; i < rectCount; ++i)
+-            d->fillRect(rects[i], qbrush_color(state()->brush));
++            d->fillRect(rects[i], qbrush_color(state()->brush), false);
+     } else {
+         d->pmData->markRasterOverlay(rects, rectCount);
+         QRasterPaintEngine::drawRects(rects, rectCount);
+diff --git a/src/plugins/platforms/directfb/qdirectfbblitter.cpp b/src/plugins/platforms/directfb/qdirectfbblitter.cpp
+index e2f7a00..889f1cc 100644
+--- a/src/plugins/platforms/directfb/qdirectfbblitter.cpp
++++ b/src/plugins/platforms/directfb/qdirectfbblitter.cpp
+@@ -56,25 +56,34 @@ static QBlittable::Capabilities dfb_blitter_capabilities()
+     return QBlittable::Capabilities(QBlittable::SolidRectCapability
+                                     |QBlittable::SourcePixmapCapability
+                                     |QBlittable::SourceOverPixmapCapability
+-                                    |QBlittable::SourceOverScaledPixmapCapability);
++                                    |QBlittable::SourceOverScaledPixmapCapability
++                                    |QBlittable::AlphaFillRectCapability);
+ }
+ 
+ QDirectFbBlitter::QDirectFbBlitter(const QSize &rect, IDirectFBSurface *surface)
+     : QBlittable(rect, dfb_blitter_capabilities())
+         , m_surface(surface)
+ {
+-        m_surface->AddRef(m_surface.data());
++    m_surface->AddRef(m_surface.data());
++
++    DFBSurfaceCapabilities surfaceCaps;
++    m_surface->GetCapabilities(m_surface.data(), &surfaceCaps);
++    m_premult = (surfaceCaps & DSCAPS_PREMULTIPLIED);
+ }
+ 
+ QDirectFbBlitter::QDirectFbBlitter(const QSize &rect, bool alpha)
+-    : QBlittable(rect, dfb_blitter_capabilities())
++    : QBlittable(rect, dfb_blitter_capabilities()), m_premult(false)
+ {
+     DFBSurfaceDescription surfaceDesc;
+     memset(&surfaceDesc,0,sizeof(DFBSurfaceDescription));
+     surfaceDesc.width = rect.width();
+     surfaceDesc.height = rect.height();
+ 
++    // force alpha format for AlphaFillRectCapability support
++    alpha = true;
++
+     if (alpha) {
++        m_premult = true;
+         surfaceDesc.caps = DSCAPS_PREMULTIPLIED;
+         surfaceDesc.pixelformat = QDirectFbBlitter::alphaPixmapFormat();
+         surfaceDesc.flags = DFBSurfaceDescriptionFlags(DSDESC_WIDTH | DSDESC_HEIGHT | DSDESC_CAPS | DSDESC_PIXELFORMAT);
+@@ -83,7 +92,6 @@ QDirectFbBlitter::QDirectFbBlitter(const QSize &rect, bool alpha)
+         surfaceDesc.pixelformat = QDirectFbBlitter::pixmapFormat();
+     }
+ 
+-
+     IDirectFB *dfb = QDirectFbConvenience::dfbInterface();
+     dfb->CreateSurface(dfb , &surfaceDesc, m_surface.outPtr());
+     m_surface->Clear(m_surface.data(), 0, 0, 0, 0);
+@@ -111,14 +119,7 @@ DFBSurfacePixelFormat QDirectFbBlitter::selectPixmapFormat(bool withAlpha)
+ 
+ void QDirectFbBlitter::fillRect(const QRectF &rect, const QColor &color)
+ {
+-    m_surface->SetColor(m_surface.data(), color.red(), color.green(), color.blue(), color.alpha());
+-//    When the blitter api supports non opaque blits, also remember to change
+-//    qpixmap_blitter.cpp::fill
+-//    DFBSurfaceDrawingFlags drawingFlags = color.alpha() ? DSDRAW_BLEND : DSDRAW_NOFX;
+-//    m_surface->SetDrawingFlags(m_surface, drawingFlags);
+-    m_surface->SetDrawingFlags(m_surface.data(), DSDRAW_NOFX);
+-    m_surface->FillRectangle(m_surface.data(), rect.x(), rect.y(),
+-                              rect.width(), rect.height());
++    alphaFillRect(rect, color, QPainter::CompositionMode_Source);
+ }
+ 
+ void QDirectFbBlitter::drawPixmap(const QRectF &rect, const QPixmap &pixmap, const QRectF &srcRect)
+@@ -156,6 +157,43 @@ void QDirectFbBlitter::drawPixmap(const QRectF &rect, const QPixmap &pixmap, con
+         DirectFBError("QDirectFBBlitter::drawPixmap()", result);
+ }
+ 
++void QDirectFbBlitter::alphaFillRect(const QRectF &rect, const QColor &color, QPainter::CompositionMode cmode)
++{
++    int x, y, w, h;
++    DFBResult result;
++
++    // check paramters
++    rect.toRect().getRect(&x, &y ,&w, &h);
++    if ((w <= 0) || (h <= 0)) return;
++
++    if ((cmode == QPainter::CompositionMode_Source) || (color.alpha() == 255)) {
++        // CompositionMode_Source case or CompositionMode_SourceOver with opaque color
++
++        m_surface->SetDrawingFlags(m_surface.data(),
++            DFBSurfaceDrawingFlags(m_premult ? (DSDRAW_NOFX | DSDRAW_SRC_PREMULTIPLY) : DSDRAW_NOFX));
++        m_surface->SetPorterDuff(m_surface.data(), DSPD_SRC);
++
++    } else {
++        // CompositionMode_SourceOver case
++
++        // check if operation is useless
++        if (color.alpha() == 0)
++            return;
++
++        m_surface->SetDrawingFlags(m_surface.data(),
++            DFBSurfaceDrawingFlags(m_premult ? (DSDRAW_BLEND | DSDRAW_SRC_PREMULTIPLY) : DSDRAW_BLEND));
++        m_surface->SetPorterDuff(m_surface.data(), DSPD_SRC_OVER);
++    }
++
++    // set color
++    m_surface->SetColor(m_surface.data(), color.red(), color.green(), color.blue(), color.alpha());
++
++    // perform fill
++    result = m_surface->FillRectangle(m_surface.data(), x, y, w, h);
++    if (result != DFB_OK)
++        DirectFBError("QDirectFBBlitter::alphaFillRect()", result);
++}
++
+ QImage *QDirectFbBlitter::doLock()
+ {
+     Q_ASSERT(m_surface);
+diff --git a/src/plugins/platforms/directfb/qdirectfbblitter.h b/src/plugins/platforms/directfb/qdirectfbblitter.h
+index bfaa3ba..6da5fcb 100644
+--- a/src/plugins/platforms/directfb/qdirectfbblitter.h
++++ b/src/plugins/platforms/directfb/qdirectfbblitter.h
+@@ -59,6 +59,7 @@ public:
+ 
+     virtual void fillRect(const QRectF &rect, const QColor &color);
+     virtual void drawPixmap(const QRectF &rect, const QPixmap &pixmap, const QRectF &subrect);
++    void alphaFillRect(const QRectF &rect, const QColor &color, QPainter::CompositionMode cmode);
+ 
+     IDirectFBSurface *dfbSurface() const;
+ 
+@@ -74,6 +75,9 @@ protected:
+     QImage m_image;
+ 
+     friend class QDirectFbConvenience;
++
++private:
++    bool m_premult;
+ };
+ 
+ class QDirectFbBlitterPlatformPixmap : public QBlittablePlatformPixmap

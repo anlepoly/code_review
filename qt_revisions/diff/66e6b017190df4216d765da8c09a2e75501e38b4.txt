@@ -1,0 +1,177 @@
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 97d3740..3158f8f 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -592,6 +592,11 @@ inline quint32 QV4Bindings::toUint32(double n)
+     goto exceptionExit; \
+ } 
+ 
++#define THROW_VALUE_EXCEPTION_STR(id, str) { \
++    throwException((id), error, program, context, (str)); \
++    goto exceptionExit; \
++}
++
+ #define THROW_EXCEPTION(id) THROW_EXCEPTION_STR(id, QString())
+ 
+ #define MARK_REGISTER(reg) cleanupRegisterMask |= (1 << (reg))
+@@ -1672,6 +1677,10 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         registers[instr->cleanup.reg].cleanup();
+     QML_V4_END_INSTR(CleanupRegister, cleanup)
+ 
++    QML_V4_BEGIN_INSTR(Throw, throwop)
++        THROW_VALUE_EXCEPTION_STR(instr->throwop.exceptionId, *registers[instr->throwop.message].getstringptr());
++    QML_V4_END_INSTR(Throw, throwop)
++
+ #ifdef QML_THREADED_INTERPRETER
+     // nothing to do
+ #else
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index 08cfed9..e833aed 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -63,6 +63,7 @@ static bool qmlEnableV4 = true;
+ using namespace QQmlJS;
+ QV4CompilerPrivate::QV4CompilerPrivate()
+     : _function(0) , _block(0) , _discarded(false), registerCount(0)
++    , bindingLine(0), bindingColumn(0)
+ {
+ }
+ 
+@@ -73,6 +74,8 @@ void QV4CompilerPrivate::trace(int line, int column)
+ {
+     bytecode.clear();
+ 
++    this->bindingLine = line;
++    this->bindingColumn = column;
+     this->currentReg = _function->tempCount;
+     this->registerCount = qMax(this->registerCount, this->currentReg);
+ 
+@@ -317,7 +320,7 @@ void QV4CompilerPrivate::visitName(IR::Name *e)
+         Instr::LoadAttached attached;
+         attached.output = currentReg;
+         attached.reg = currentReg;
+-        attached.exceptionId = exceptionId(e->line, e->column);
++        attached.exceptionId = exceptionId(bindingLine, bindingColumn);
+         if (e->declarativeType->attachedPropertiesId() == -1)
+             discard();
+         attached.id = e->declarativeType->attachedPropertiesId();
+@@ -966,6 +969,16 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+                 // url-to-xxx conversions.
+                 break;
+             default: {
++                if (s->isMoveForReturn) {
++                    V4Instr instr;
++                    instr.throwop.exceptionId = exceptionId(bindingLine, bindingColumn);
++                    registerLiteralString(dest, _function->newString(QString::fromUtf8("Unable to assign %1 to %2")
++                                                                     .arg(QLatin1String(IR::typeName(sourceTy)))
++                                                                     .arg(QLatin1String(IR::typeName(targetTy)))));
++                    instr.throwop.message = dest;
++                    gen(V4Instr::Throw, instr);
++                    return;
++                }
+                 // generate a UrlToString conversion and fix
+                 // the type of the source expression.
+                 V4Instr conv;
+@@ -1018,6 +1031,17 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+             default: break;
+             } // switch
+         } else if (targetTy == IR::UrlType) {
++            if (s->isMoveForReturn && sourceTy != IR::StringType) {
++                V4Instr instr;
++                instr.throwop.exceptionId = exceptionId(bindingLine, bindingColumn);
++                registerLiteralString(dest, _function->newString(QString::fromUtf8("Unable to assign %1 to %2")
++                                                                 .arg(QLatin1String(IR::typeName(sourceTy)))
++                                                                 .arg(QLatin1String(IR::typeName(targetTy)))));
++                instr.throwop.message = dest;
++                gen(V4Instr::Throw, instr);
++                return;
++            }
++
+             V4Instr convToString;
+             convToString.unaryop.output = dest;
+             convToString.unaryop.src = src;
+diff --git a/src/qml/qml/v4/qv4compiler_p_p.h b/src/qml/qml/v4/qv4compiler_p_p.h
+index 984f20b..782ca59 100644
+--- a/src/qml/qml/v4/qv4compiler_p_p.h
++++ b/src/qml/qml/v4/qv4compiler_p_p.h
+@@ -235,6 +235,8 @@ private:
+ 
+     bool usedSubscriptionIdsChanged;
+     quint32 currentBlockMask;
++    int bindingLine;
++    int bindingColumn;
+ };
+ 
+ 
+diff --git a/src/qml/qml/v4/qv4instruction.cpp b/src/qml/qml/v4/qv4instruction.cpp
+index 2602904..4298be2 100644
+--- a/src/qml/qml/v4/qv4instruction.cpp
++++ b/src/qml/qml/v4/qv4instruction.cpp
+@@ -382,6 +382,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::Block:
+         INSTR_DUMP << "\t" << "Block" << "\t\t\t" << "Mask(" << QByteArray::number(i->blockop.block, 16).constData()  << ")";
+         break;
++    case V4Instr::Throw:
++        INSTR_DUMP << "\t" << "Throw" << "\t\t\t" << "InputReg(" << i->throwop.message  << ")";
++        break;
+     default:
+         INSTR_DUMP << "\t" << "Unknown";
+         break;
+diff --git a/src/qml/qml/v4/qv4instruction_p.h b/src/qml/qml/v4/qv4instruction_p.h
+index 49ac65c..46a03b3 100644
+--- a/src/qml/qml/v4/qv4instruction_p.h
++++ b/src/qml/qml/v4/qv4instruction_p.h
+@@ -160,6 +160,7 @@ QT_BEGIN_NAMESPACE
+     F(BranchFalse, branchop) \
+     F(Branch, branchop) \
+     F(Block, blockop) \
++    F(Throw, throwop) \
+     /* Speculative property resolution */ \
+     F(InitString, initstring)
+ 
+@@ -359,6 +360,12 @@ union Q_AUTOTEST_EXPORT V4Instr {
+         quint32 block;
+     };
+ 
++    struct instr_throwop {
++        QML_V4_INSTR_HEADER
++        quint8 exceptionId;
++        quint32 message;
++    };
++
+     instr_common common;
+     instr_id id;
+     instr_init init;
+@@ -384,6 +391,7 @@ union Q_AUTOTEST_EXPORT V4Instr {
+     instr_initstring initstring;
+     instr_branchop branchop;
+     instr_blockop blockop;
++    instr_throwop throwop;
+ };
+ 
+ template<int N>
+diff --git a/src/qml/qml/v4/qv4ir.cpp b/src/qml/qml/v4/qv4ir.cpp
+index 8fc4719..2bd0720 100644
+--- a/src/qml/qml/v4/qv4ir.cpp
++++ b/src/qml/qml/v4/qv4ir.cpp
+@@ -50,7 +50,7 @@ QT_BEGIN_NAMESPACE
+ namespace QQmlJS {
+ namespace IR {
+ 
+-inline const char *typeName(Type t)
++const char *typeName(Type t)
+ {
+     switch (t) {
+     case InvalidType: return "invalid";
+diff --git a/src/qml/qml/v4/qv4ir_p.h b/src/qml/qml/v4/qv4ir_p.h
+index d670876..26bd43c 100644
+--- a/src/qml/qml/v4/qv4ir_p.h
++++ b/src/qml/qml/v4/qv4ir_p.h
+@@ -155,6 +155,7 @@ enum Type {
+ };
+ Type maxType(IR::Type left, IR::Type right);
+ bool isRealType(IR::Type type);
++const char *typeName(IR::Type t);
+ 
+ struct ExprVisitor {
+     virtual ~ExprVisitor() {}

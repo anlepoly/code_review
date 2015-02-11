@@ -1,0 +1,250 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index fe0cc7a..2b4ede4 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -3503,6 +3503,7 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+         store.value = js.compiledIndex;
+         store.context = js.bindingContext.stack;
+         store.owner = js.bindingContext.owner;
++        store.isAlias = prop->isAlias;
+         if (valueTypeProperty) {
+             store.isRoot = (compileState->root == valueTypeProperty->parent);
+         } else {
+@@ -3523,30 +3524,29 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+     } else if (ref.dataType == BindingReference::QtScript) {
+         const JSBindingReference &js = static_cast<const JSBindingReference &>(ref);
+ 
+-        QQmlInstruction store;
+-        store.assignBinding.value = output->indexForString(js.rewrittenExpression);
+-        store.assignBinding.context = js.bindingContext.stack;
+-        store.assignBinding.owner = js.bindingContext.owner;
+-        store.assignBinding.line = binding->location.start.line;
+-        store.assignBinding.column = binding->location.start.column;
++        Instruction::StoreBinding store;
++        store.value = output->indexForString(js.rewrittenExpression);
++        store.context = js.bindingContext.stack;
++        store.owner = js.bindingContext.owner;
++        store.line = binding->location.start.line;
++        store.column = binding->location.start.column;
++        store.isAlias = prop->isAlias;
+ 
+         if (valueTypeProperty) {
+-            store.assignBinding.isRoot = (compileState->root == valueTypeProperty->parent);
++            store.isRoot = (compileState->root == valueTypeProperty->parent);
+         } else {
+-            store.assignBinding.isRoot = (compileState->root == obj);
++            store.isRoot = (compileState->root == obj);
+         }
+ 
+         Q_ASSERT(js.bindingContext.owner == 0 ||
+                  (js.bindingContext.owner != 0 && valueTypeProperty));
+         if (js.bindingContext.owner) {
+-            store.assignBinding.property = genValueTypeData(prop, valueTypeProperty);
++            store.property = genValueTypeData(prop, valueTypeProperty);
+         } else {
+-            store.assignBinding.property = prop->core;
++            store.property = prop->core;
+         }
+-        output->addInstructionHelper(
+-            !prop->isAlias ? QQmlInstruction::StoreBinding
+-                           : QQmlInstruction::StoreBindingOnAlias
+-            , store);
++
++        output->addInstruction(store);
+     } else {
+         Q_ASSERT(!"Unhandled BindingReference::DataType type");
+     }
+@@ -3623,8 +3623,7 @@ bool QQmlCompiler::completeComponentBuild()
+         bool isSharable = false;
+         binding.rewrittenExpression = rewriteBinding(binding.expression.asAST(), expression, &isSharable);
+ 
+-        if (isSharable && !binding.property->isAlias /* See above re alias */ &&
+-            binding.property->type != qMetaTypeId<QQmlBinding*>()) {
++        if (isSharable && binding.property->type != qMetaTypeId<QQmlBinding*>()) {
+             binding.dataType = BindingReference::V8;
+             sharedBindings.append(b);
+ 
+diff --git a/src/qml/qml/qqmlinstruction.cpp b/src/qml/qml/qqmlinstruction.cpp
+index b37117e..82cf235 100644
+--- a/src/qml/qml/qqmlinstruction.cpp
++++ b/src/qml/qml/qqmlinstruction.cpp
+@@ -210,9 +210,6 @@ void QQmlCompiledData::dump(QQmlInstruction *instr, int idx)
+     case QQmlInstruction::StoreBinding:
+         qWarning().nospace() << idx << "\t\t" << "STORE_BINDING\t" << instr->assignBinding.property.coreIndex << "\t" << instr->assignBinding.value << "\t" << instr->assignBinding.context;
+         break;
+-    case QQmlInstruction::StoreBindingOnAlias:
+-        qWarning().nospace() << idx << "\t\t" << "STORE_BINDING_ALIAS\t" << instr->assignBinding.property.coreIndex << "\t" << instr->assignBinding.value << "\t" << instr->assignBinding.context;
+-        break;
+     case QQmlInstruction::StoreV4Binding:
+         qWarning().nospace() << idx << "\t\t" << "STORE_COMPILED_BINDING\t" << instr->assignV4Binding.property << "\t" << instr->assignV4Binding.value << "\t" << instr->assignV4Binding.context;
+         break;
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index b7533ac..cfc530d 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -114,7 +114,6 @@ QT_BEGIN_NAMESPACE
+     F(BeginObject, begin) \
+     F(InitV8Bindings, initV8Bindings) \
+     F(StoreBinding, assignBinding) \
+-    F(StoreBindingOnAlias, assignBinding) \
+     F(StoreV8Binding, assignBinding) \
+     F(StoreV4Binding, assignV4Binding) \
+     F(StoreValueSource, assignValueSource) \
+@@ -251,6 +250,7 @@ union QQmlInstruction
+         short context;
+         short owner;
+         bool isRoot;
++        bool isAlias;
+         ushort line;
+         ushort column;
+     };
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 5a9fa40..170a628 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -775,36 +775,22 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             bind->m_mePtr = &bindValues.top();
+             bind->setTarget(target, instr.property, CTXT);
+ 
+-            typedef QQmlPropertyPrivate QDPP;
+-            Q_ASSERT(bind->propertyIndex() == QDPP::bindingIndex(instr.property));
+-            Q_ASSERT(bind->object() == target);
++            if (instr.isAlias) {
++                QQmlAbstractBinding *old =
++                    QQmlPropertyPrivate::setBindingNoEnable(target,
++                                                            instr.property.coreIndex,
++                                                            instr.property.getValueTypeCoreIndex(),
++                                                            bind);
++                if (old) { old->destroy(); }
++            } else {
++                typedef QQmlPropertyPrivate QDPP;
++                Q_ASSERT(bind->propertyIndex() == QDPP::bindingIndex(instr.property));
++                Q_ASSERT(bind->object() == target);
+ 
+-            bind->addToObject();
++                bind->addToObject();
++            }
+         QML_END_INSTR(StoreBinding)
+ 
+-        QML_BEGIN_INSTR(StoreBindingOnAlias)
+-            QObject *target = 
+-                objects.at(objects.count() - 1 - instr.owner);
+-            QObject *context = 
+-                objects.at(objects.count() - 1 - instr.context);
+-
+-            if (instr.isRoot && BINDINGSKIPLIST.testBit(instr.property.coreIndex))
+-                QML_NEXT_INSTR(StoreBindingOnAlias);
+-
+-            QQmlBinding *bind = new QQmlBinding(PRIMITIVES.at(instr.value), true,
+-                                                context, CTXT, COMP->name, instr.line,
+-                                                instr.column);
+-            bindValues.push(bind);
+-            bind->m_mePtr = &bindValues.top();
+-            bind->setTarget(target, instr.property, CTXT);
+-
+-            QQmlAbstractBinding *old =
+-                QQmlPropertyPrivate::setBindingNoEnable(target, instr.property.coreIndex,
+-                                                                instr.property.getValueTypeCoreIndex(),
+-                                                                bind);
+-            if (old) { old->destroy(); }
+-        QML_END_INSTR(StoreBindingOnAlias)
+-
+         QML_BEGIN_INSTR(StoreV4Binding)
+             QObject *target = 
+                 objects.at(objects.count() - 1 - instr.owner);
+@@ -842,11 +828,20 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 bindValues.push(binding);
+                 binding->m_mePtr = &bindValues.top();
+ 
+-                typedef QQmlPropertyPrivate QDPP;
+-                Q_ASSERT(binding->propertyIndex() == QDPP::bindingIndex(instr.property));
+-                Q_ASSERT(binding->object() == target);
++                if (instr.isAlias) {
++                    QQmlAbstractBinding *old =
++                        QQmlPropertyPrivate::setBindingNoEnable(target,
++                                                                instr.property.coreIndex,
++                                                                instr.property.getValueTypeCoreIndex(),
++                                                                binding);
++                    if (old) { old->destroy(); }
++                } else {
++                    typedef QQmlPropertyPrivate QDPP;
++                    Q_ASSERT(binding->propertyIndex() == QDPP::bindingIndex(instr.property));
++                    Q_ASSERT(binding->object() == target);
+ 
+-                binding->addToObject();
++                    binding->addToObject();
++                }
+             }
+         QML_END_INSTR(StoreV8Binding)
+ 
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index 487e100..025854f 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -85,12 +85,20 @@ void QV8Bindings::Binding::refresh()
+ 
+ int QV8Bindings::Binding::propertyIndex() const
+ {
+-    return instruction->property.encodedIndex();
++    if (target.hasValue()) return target.constValue()->targetProperty;
++    else return instruction->property.encodedIndex();
+ }
+ 
+ QObject *QV8Bindings::Binding::object() const
+ {
+-    return *target;
++    if (target.hasValue()) return target.constValue()->target;
++    else return *target;
++}
++
++void QV8Bindings::Binding::retargetBinding(QObject *t, int i)
++{
++    target.value().target = t;
++    target.value().targetProperty = i;
+ }
+ 
+ void QV8Bindings::Binding::update(QQmlPropertyPrivate::WriteFlags flags)
+diff --git a/src/qml/qml/v8/qv8bindings_p.h b/src/qml/qml/v8/qv8bindings_p.h
+index 8d27207..7cc1cc9 100644
+--- a/src/qml/qml/v8/qv8bindings_p.h
++++ b/src/qml/qml/v8/qv8bindings_p.h
+@@ -53,12 +53,13 @@
+ // We mean it.
+ //
+ 
++#include <private/qpointervaluepair_p.h>
+ #include <private/qqmlpropertycache_p.h>
+ #include <private/qqmlinstruction_p.h>
+ #include <private/qqmlexpression_p.h>
+ #include <private/qqmlcompiler_p.h>
+-#include <private/qqmlbinding_p.h>
+ #include <private/qflagpointer_p.h>
++#include <private/qqmlbinding_p.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -96,16 +97,22 @@ public:
+         virtual void setEnabled(bool, QQmlPropertyPrivate::WriteFlags flags);
+         virtual void update(QQmlPropertyPrivate::WriteFlags flags);
+         virtual void destroy();
+-        virtual int propertyIndex() const;
+         virtual QObject *object() const;
++        virtual int propertyIndex() const;
++        virtual void retargetBinding(QObject *, int);
+ 
+         QV8Bindings *parent;
+ 
++        struct Retarget {
++            QObject *target;
++            int targetProperty;
++        };
++
+         // To save memory, we store flags inside the instruction pointer.
+         //    target.flag1: destroyed
+         //    instruction.flag1: enabled
+         //    instruction.flag2: updating
+-        QFlagPointer<QObject> target;
++        QPointerValuePair<QObject, Retarget> target;
+         QFlagPointer<const QQmlInstruction::instr_assignBinding> instruction;
+ 
+         inline bool destroyedFlag() const { return target.flag(); }

@@ -1,0 +1,483 @@
+diff --git a/src/quick/items/qquickflickable.cpp b/src/quick/items/qquickflickable.cpp
+index 105989c..0a3dcd8 100644
+--- a/src/quick/items/qquickflickable.cpp
++++ b/src/quick/items/qquickflickable.cpp
+@@ -265,12 +265,12 @@ QQuickFlickablePrivate::QQuickFlickablePrivate()
+     , vData(this, &QQuickFlickablePrivate::setViewportY)
+     , hMoved(false), vMoved(false)
+     , stealMouse(false), pressed(false), interactive(true), calcVelocity(false)
+-    , pixelAligned(false)
++    , pixelAligned(false), replayingPressEvent(false)
+     , lastPosTime(-1)
+     , lastPressTime(0)
+     , deceleration(QML_FLICK_DEFAULTDECELERATION)
+     , maxVelocity(QML_FLICK_DEFAULTMAXVELOCITY), reportedVelocitySmoothing(100)
+-    , delayedPressEvent(0), delayedPressTarget(0), pressDelay(0), fixupDuration(400)
++    , delayedPressEvent(0), pressDelay(0), fixupDuration(400)
+     , flickBoost(1.0), fixupMode(Normal), vTime(0), visibleArea(0)
+     , flickableDirection(QQuickFlickable::AutoFlickDirection)
+     , boundsBehavior(QQuickFlickable::DragAndOvershootBounds)
+@@ -962,6 +962,7 @@ void QQuickFlickablePrivate::handleMousePressEvent(QMouseEvent *event)
+         flickBoost = 1.0;
+     }
+     q->setKeepMouseGrab(stealMouse);
++    clearDelayedPress();
+     pressed = true;
+     if (hData.transitionToBounds)
+         hData.transitionToBounds->stopTransition();
+@@ -1087,8 +1088,10 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+     }
+ 
+     stealMouse = stealX || stealY;
+-    if (stealMouse)
++    if (stealMouse) {
+         q->setKeepMouseGrab(true);
++        clearDelayedPress();
++    }
+ 
+     if (rejectY) {
+         vData.velocityBuffer.clear();
+@@ -1228,6 +1231,15 @@ void QQuickFlickable::mouseMoveEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickFlickable);
+     if (d->interactive) {
++        if (d->delayedPressEvent) {
++            // A move beyond the threshold replays the press to give nested Flickables
++            // the opportunity to grab the gesture.
++            QPointF delta = event->localPos() - d->delayedPressEvent->localPos();
++            if (QQuickWindowPrivate::dragOverThreshold(qAbs(delta.x()), Qt::XAxis, event)
++                || QQuickWindowPrivate::dragOverThreshold(qAbs(delta.y()), Qt::YAxis, event)) {
++                d->replayDelayedPress();
++            }
++        }
+         d->handleMouseMoveEvent(event);
+         event->accept();
+     } else {
+@@ -1239,11 +1251,20 @@ void QQuickFlickable::mouseReleaseEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickFlickable);
+     if (d->interactive) {
+-        d->clearDelayedPress();
++        if (d->delayedPressEvent) {
++            d->replayDelayedPress();
++
++            // Now send the release
++            window()->sendEvent(window()->mouseGrabberItem(), event);
++
++            // And the event has been consumed
++            d->stealMouse = false;
++            d->pressed = false;
++            return;
++        }
++
+         d->handleMouseReleaseEvent(event);
+         event->accept();
+-        if (window() && window()->mouseGrabberItem() == this)
+-            ungrabMouse();
+     } else {
+         QQuickItem::mouseReleaseEvent(event);
+     }
+@@ -1304,28 +1325,32 @@ void QQuickFlickable::wheelEvent(QWheelEvent *event)
+         QQuickItem::wheelEvent(event);
+ }
+ 
+-bool QQuickFlickablePrivate::isOutermostPressDelay() const
++bool QQuickFlickablePrivate::isInnermostPressDelay(QQuickItem *i) const
+ {
+     Q_Q(const QQuickFlickable);
+-    QQuickItem *item = q->parentItem();
++    QQuickItem *item = i;
+     while (item) {
+         QQuickFlickable *flick = qobject_cast<QQuickFlickable*>(item);
+-        if (flick && flick->pressDelay() > 0 && flick->isInteractive())
+-            return false;
++        if (flick && flick->pressDelay() > 0 && flick->isInteractive()) {
++            // Found the innermost flickable with press delay - is it me?
++            return (flick == q);
++        }
+         item = item->parentItem();
+     }
+-
+-    return true;
++    return false;
+ }
+ 
+-void QQuickFlickablePrivate::captureDelayedPress(QMouseEvent *event)
++void QQuickFlickablePrivate::captureDelayedPress(QQuickItem *item, QMouseEvent *event)
+ {
+     Q_Q(QQuickFlickable);
+     if (!q->window() || pressDelay <= 0)
+         return;
+-    if (!isOutermostPressDelay())
++
++    // Only the innermost flickable should handle the delayed press; this allows
++    // flickables up the parent chain to all see the events in their filter functions
++    if (!isInnermostPressDelay(item))
+         return;
+-    delayedPressTarget = q->window()->mouseGrabberItem();
++
+     delayedPressEvent = QQuickWindowPrivate::cloneMouseEvent(event);
+     delayedPressEvent->setAccepted(false);
+     delayedPressTimer.start(pressDelay, q);
+@@ -1340,6 +1365,28 @@ void QQuickFlickablePrivate::clearDelayedPress()
+     }
+ }
+ 
++void QQuickFlickablePrivate::replayDelayedPress()
++{
++    Q_Q(QQuickFlickable);
++    if (delayedPressEvent) {
++        // Losing the grab will clear the delayed press event; take control of it here
++        QScopedPointer<QMouseEvent> mouseEvent(delayedPressEvent);
++        delayedPressEvent = 0;
++        delayedPressTimer.stop();
++
++        // If we have the grab, release before delivering the event
++        QQuickWindow *w = q->window();
++        if (w && (w->mouseGrabberItem() == q)) {
++            q->ungrabMouse();
++        }
++
++        // Use the event handler that will take care of finding the proper item to propagate the event
++        replayingPressEvent = true;
++        QQuickWindowPrivate::get(w)->deliverMouseEvent(mouseEvent.data());
++        replayingPressEvent = false;
++    }
++}
++
+ //XXX pixelAligned ignores the global position of the Flickable, i.e. assumes Flickable itself is pixel aligned.
+ void QQuickFlickablePrivate::setViewportX(qreal x)
+ {
+@@ -1357,17 +1404,7 @@ void QQuickFlickable::timerEvent(QTimerEvent *event)
+     if (event->timerId() == d->delayedPressTimer.timerId()) {
+         d->delayedPressTimer.stop();
+         if (d->delayedPressEvent) {
+-            QQuickItem *grabber = window() ? window()->mouseGrabberItem() : 0;
+-            if (!grabber || grabber != this) {
+-                // We replay the mouse press but the grabber we had might not be interessted by the event (e.g. overlay)
+-                // so we reset the grabber
+-                if (window()->mouseGrabberItem() == d->delayedPressTarget)
+-                    d->delayedPressTarget->ungrabMouse();
+-                // Use the event handler that will take care of finding the proper item to propagate the event
+-                QQuickWindowPrivate::get(window())->deliverMouseEvent(d->delayedPressEvent);
+-            }
+-            delete d->delayedPressEvent;
+-            d->delayedPressEvent = 0;
++            d->replayDelayedPress();
+         }
+     }
+ }
+@@ -1992,7 +2029,7 @@ void QQuickFlickable::mouseUngrabEvent()
+     }
+ }
+ 
+-bool QQuickFlickable::sendMouseEvent(QMouseEvent *event)
++bool QQuickFlickable::sendMouseEvent(QQuickItem *item, QMouseEvent *event)
+ {
+     Q_D(QQuickFlickable);
+     QPointF localPos = mapFromScene(event->windowPos());
+@@ -2007,48 +2044,18 @@ bool QQuickFlickable::sendMouseEvent(QMouseEvent *event)
+ 
+         switch (mouseEvent->type()) {
+         case QEvent::MouseMove:
+-            if (d->delayedPressEvent) {
+-                // A move beyond the threshold replays the press to give nested Flickables
+-                // the opportunity to grab the gesture.
+-                QPointF delta = event->localPos() - d->delayedPressEvent->localPos();
+-                if (QQuickWindowPrivate::dragOverThreshold(qAbs(delta.x()), Qt::XAxis, event)
+-                    || QQuickWindowPrivate::dragOverThreshold(qAbs(delta.y()), Qt::YAxis, event)) {
+-                    // We replay the mouse press but the grabber we had might not be interested in the event (e.g. overlay)
+-                    // so we reset the grabber
+-                    if (c->mouseGrabberItem() == d->delayedPressTarget)
+-                        d->delayedPressTarget->ungrabMouse();
+-                    // Use the event handler that will take care of finding the proper item to propagate the event
+-                    QQuickWindowPrivate::get(window())->deliverMouseEvent(d->delayedPressEvent);
+-                    d->clearDelayedPress();
+-                    // continue on to handle mouse move event
+-                }
+-            }
+             d->handleMouseMoveEvent(mouseEvent.data());
+             break;
+         case QEvent::MouseButtonPress:
+-            if (d->pressed) // we are already pressed - this is a delayed replay
++            // Don't process a replayed event during replay
++            if (d->replayingPressEvent)
+                 return false;
+ 
+             d->handleMousePressEvent(mouseEvent.data());
+-            d->captureDelayedPress(event);
++            d->captureDelayedPress(item, event);
+             stealThisEvent = d->stealMouse;   // Update stealThisEvent in case changed by function call above
+             break;
+         case QEvent::MouseButtonRelease:
+-            if (d->delayedPressEvent) {
+-                // We replay the mouse press but the grabber we had might not be interested in the event (e.g. overlay)
+-                // so we reset the grabber
+-                if (c->mouseGrabberItem() == d->delayedPressTarget)
+-                    d->delayedPressTarget->ungrabMouse();
+-                // Use the event handler that will take care of finding the proper item to propagate the event
+-                QQuickWindowPrivate::get(window())->deliverMouseEvent(d->delayedPressEvent);
+-                d->clearDelayedPress();
+-                // We send the release
+-                window()->sendEvent(c->mouseGrabberItem(), event);
+-                // And the event has been consumed
+-                d->stealMouse = false;
+-                d->pressed = false;
+-                return true;
+-            }
+             d->handleMouseReleaseEvent(mouseEvent.data());
+             break;
+         default:
+@@ -2060,7 +2067,12 @@ bool QQuickFlickable::sendMouseEvent(QMouseEvent *event)
+             grabMouse();
+         }
+ 
+-        return stealThisEvent || d->delayedPressEvent || grabberDisabled;
++        // Do not accept this event when filtering, as this would force the mouse grab to the child
++        const bool filtered = stealThisEvent || d->delayedPressEvent || grabberDisabled;
++        if (filtered) {
++            event->setAccepted(false);
++        }
++        return filtered;
+     } else if (d->lastPosTime != -1) {
+         d->lastPosTime = -1;
+         returnToBounds();
+@@ -2084,7 +2096,7 @@ bool QQuickFlickable::childMouseEventFilter(QQuickItem *i, QEvent *e)
+     case QEvent::MouseButtonPress:
+     case QEvent::MouseMove:
+     case QEvent::MouseButtonRelease:
+-        return sendMouseEvent(static_cast<QMouseEvent *>(e));
++        return sendMouseEvent(i, static_cast<QMouseEvent *>(e));
+     case QEvent::UngrabMouse:
+         if (d->window && d->window->mouseGrabberItem() && d->window->mouseGrabberItem() != this) {
+             // The grab has been taken away from a child and given to some other item.
+@@ -2250,7 +2262,7 @@ bool QQuickFlickablePrivate::isViewMoving() const
+     within the timeout, both the press and release will be delivered.
+ 
+     Note that for nested Flickables with pressDelay set, the pressDelay of
+-    inner Flickables is overridden by the outermost Flickable.
++    outer Flickables is overridden by the innermost Flickable.
+ */
+ int QQuickFlickable::pressDelay() const
+ {
+diff --git a/src/quick/items/qquickflickable_p.h b/src/quick/items/qquickflickable_p.h
+index a97af9c..d5f97ad 100644
+--- a/src/quick/items/qquickflickable_p.h
++++ b/src/quick/items/qquickflickable_p.h
+@@ -257,7 +257,7 @@ protected:
+     virtual void geometryChanged(const QRectF &newGeometry,
+                                  const QRectF &oldGeometry);
+     void mouseUngrabEvent();
+-    bool sendMouseEvent(QMouseEvent *event);
++    bool sendMouseEvent(QQuickItem *item, QMouseEvent *event);
+ 
+     bool xflick() const;
+     bool yflick() const;
+diff --git a/src/quick/items/qquickflickable_p_p.h b/src/quick/items/qquickflickable_p_p.h
+index ac1ecdb..1aa4c4a 100644
+--- a/src/quick/items/qquickflickable_p_p.h
++++ b/src/quick/items/qquickflickable_p_p.h
+@@ -183,9 +183,10 @@ public:
+ 
+     void updateBeginningEnd();
+ 
+-    bool isOutermostPressDelay() const;
+-    void captureDelayedPress(QMouseEvent *event);
++    bool isInnermostPressDelay(QQuickItem *item) const;
++    void captureDelayedPress(QQuickItem *item, QMouseEvent *event);
+     void clearDelayedPress();
++    void replayDelayedPress();
+ 
+     void setViewportX(qreal x);
+     void setViewportY(qreal y);
+@@ -213,6 +214,7 @@ public:
+     bool interactive : 1;
+     bool calcVelocity : 1;
+     bool pixelAligned : 1;
++    bool replayingPressEvent : 1;
+     QElapsedTimer timer;
+     qint64 lastPosTime;
+     qint64 lastPressTime;
+@@ -222,7 +224,6 @@ public:
+     qreal maxVelocity;
+     qreal reportedVelocitySmoothing;
+     QMouseEvent *delayedPressEvent;
+-    QQuickItem *delayedPressTarget;
+     QBasicTimer delayedPressTimer;
+     int pressDelay;
+     int fixupDuration;
+diff --git a/tests/auto/quick/qquickflickable/data/nestedPressDelay.qml b/tests/auto/quick/qquickflickable/data/nestedPressDelay.qml
+index 557b7c4..7426566 100644
+--- a/tests/auto/quick/qquickflickable/data/nestedPressDelay.qml
++++ b/tests/auto/quick/qquickflickable/data/nestedPressDelay.qml
+@@ -7,7 +7,7 @@ Flickable {
+     contentWidth: 480
+     contentHeight: 320
+     flickableDirection: Flickable.HorizontalFlick
+-    pressDelay: 50
++    pressDelay: 10000
+     Rectangle {
+         x: 20
+         y: 20
+@@ -20,7 +20,7 @@ Flickable {
+             flickableDirection: Flickable.HorizontalFlick
+             contentWidth: 1480
+             contentHeight: 400
+-            pressDelay: 10000
++            pressDelay: 50
+             Rectangle {
+                 y: 100
+                 x: 80
+diff --git a/tests/auto/quick/qquickflickable/data/pressDelay.qml b/tests/auto/quick/qquickflickable/data/pressDelay.qml
+new file mode 100644
+index 0000000..18a5840
+--- /dev/null
++++ b/tests/auto/quick/qquickflickable/data/pressDelay.qml
+@@ -0,0 +1,32 @@
++import QtQuick 2.0
++
++Flickable {
++    flickableDirection: Flickable.VerticalFlick
++    width: 480
++    height: 320
++    contentWidth: 480
++    contentHeight: 400
++    pressDelay: 100
++
++    MouseArea {
++        id: ma
++        objectName: "mouseArea"
++        y: 100
++        anchors.horizontalCenter: parent.horizontalCenter
++        width: 240
++        height: 100
++
++        Rectangle {
++            anchors.fill: parent
++            color: parent.pressed ? 'blue' : 'green'
++
++            Text {
++                anchors.fill: parent
++                verticalAlignment: Text.AlignVCenter
++                horizontalAlignment: Text.AlignHCenter
++                text: 'Hello'
++            }
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp b/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
+index ceed276..66071e6 100644
+--- a/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
++++ b/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
+@@ -346,9 +346,13 @@ void tst_qquickflickable::flickDeceleration()
+ 
+ void tst_qquickflickable::pressDelay()
+ {
+-    QQmlComponent component(&engine);
+-    component.setData("import QtQuick 2.0; Flickable { pressDelay: 100; }", QUrl::fromLocalFile(""));
+-    QQuickFlickable *flickable = qobject_cast<QQuickFlickable*>(component.create());
++    QScopedPointer<QQuickView> window(new QQuickView);
++    window->setSource(testFileUrl("pressDelay.qml"));
++    window->show();
++    window->requestActivate();
++    QVERIFY(window->rootObject() != 0);
++
++    QQuickFlickable *flickable = qobject_cast<QQuickFlickable*>(window->rootObject());
+     QSignalSpy spy(flickable, SIGNAL(pressDelayChanged()));
+ 
+     QVERIFY(flickable);
+@@ -360,13 +364,28 @@ void tst_qquickflickable::pressDelay()
+     flickable->setPressDelay(200);
+     QCOMPARE(spy.count(),1);
+ 
+-    delete flickable;
++    QQuickItem *mouseArea = window->rootObject()->findChild<QQuickItem*>("mouseArea");
++    QSignalSpy clickedSpy(mouseArea, SIGNAL(clicked(QQuickMouseEvent*)));
++
++    QTest::mousePress(window.data(), Qt::LeftButton, 0, QPoint(150, 150));
++
++    // The press should not occur immediately
++    QVERIFY(mouseArea->property("pressed").toBool() == false);
++
++    // But, it should occur eventually
++    QTRY_VERIFY(mouseArea->property("pressed").toBool() == true);
++
++    QCOMPARE(clickedSpy.count(),0);
++
++    // On release the clicked signal should be emitted
++    QTest::mouseRelease(window.data(), Qt::LeftButton, 0, QPoint(150, 150));
++    QCOMPARE(clickedSpy.count(),1);
+ }
+ 
+ // QTBUG-17361
+ void tst_qquickflickable::nestedPressDelay()
+ {
+-    QQuickView *window = new QQuickView;
++    QScopedPointer<QQuickView> window(new QQuickView);
+     window->setSource(testFileUrl("nestedPressDelay.qml"));
+     window->show();
+     window->requestActivate();
+@@ -378,46 +397,46 @@ void tst_qquickflickable::nestedPressDelay()
+     QQuickFlickable *inner = window->rootObject()->findChild<QQuickFlickable*>("innerFlickable");
+     QVERIFY(inner != 0);
+ 
+-    QTest::mousePress(window, Qt::LeftButton, 0, QPoint(150, 150));
++    QTest::mousePress(window.data(), Qt::LeftButton, 0, QPoint(150, 150));
+     // the MouseArea is not pressed immediately
+     QVERIFY(outer->property("pressed").toBool() == false);
++    QVERIFY(inner->property("pressed").toBool() == false);
+ 
+-    // The outer pressDelay will prevail (50ms, vs. 10sec)
++    // The inner pressDelay will prevail (50ms, vs. 10sec)
+     // QTRY_VERIFY() has 5sec timeout, so will timeout well within 10sec.
+     QTRY_VERIFY(outer->property("pressed").toBool() == true);
+ 
+-    QTest::mouseRelease(window, Qt::LeftButton, 0, QPoint(150, 150));
++    QTest::mouseRelease(window.data(), Qt::LeftButton, 0, QPoint(150, 150));
+ 
+     // Dragging inner Flickable should work
+-    QTest::mousePress(window, Qt::LeftButton, 0, QPoint(80, 150));
++    QTest::mousePress(window.data(), Qt::LeftButton, 0, QPoint(80, 150));
+     // the MouseArea is not pressed immediately
+     QVERIFY(outer->property("pressed").toBool() == false);
++    QVERIFY(inner->property("pressed").toBool() == false);
+ 
+-    QTest::mouseMove(window, QPoint(60, 150));
+-    QTest::mouseMove(window, QPoint(40, 150));
+-    QTest::mouseMove(window, QPoint(20, 150));
++    QTest::mouseMove(window.data(), QPoint(60, 150));
++    QTest::mouseMove(window.data(), QPoint(40, 150));
++    QTest::mouseMove(window.data(), QPoint(20, 150));
+ 
+-    QVERIFY(outer->property("moving").toBool() == false);
+     QVERIFY(inner->property("moving").toBool() == true);
++    QVERIFY(outer->property("moving").toBool() == false);
+ 
+-    QTest::mouseRelease(window, Qt::LeftButton, 0, QPoint(20, 150));
++    QTest::mouseRelease(window.data(), Qt::LeftButton, 0, QPoint(20, 150));
+ 
+     // Dragging the MouseArea in the inner Flickable should move the inner Flickable
+-    QTest::mousePress(window, Qt::LeftButton, 0, QPoint(150, 150));
++    QTest::mousePress(window.data(), Qt::LeftButton, 0, QPoint(150, 150));
+     // the MouseArea is not pressed immediately
+     QVERIFY(outer->property("pressed").toBool() == false);
+ 
+-    QTest::mouseMove(window, QPoint(130, 150));
+-    QTest::mouseMove(window, QPoint(110, 150));
+-    QTest::mouseMove(window, QPoint(90, 150));
++    QTest::mouseMove(window.data(), QPoint(130, 150));
++    QTest::mouseMove(window.data(), QPoint(110, 150));
++    QTest::mouseMove(window.data(), QPoint(90, 150));
+ 
+ 
+     QVERIFY(outer->property("moving").toBool() == false);
+     QVERIFY(inner->property("moving").toBool() == true);
+ 
+-    QTest::mouseRelease(window, Qt::LeftButton, 0, QPoint(90, 150));
+-
+-    delete window;
++    QTest::mouseRelease(window.data(), Qt::LeftButton, 0, QPoint(90, 150));
+ }
+ 
+ void tst_qquickflickable::flickableDirection()

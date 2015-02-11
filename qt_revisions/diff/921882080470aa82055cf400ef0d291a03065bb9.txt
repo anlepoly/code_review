@@ -1,0 +1,173 @@
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index 0759551..045a14f 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -62,7 +62,8 @@ static bool qmlEnableV4 = true;
+ 
+ using namespace QQmlJS;
+ QV4CompilerPrivate::QV4CompilerPrivate()
+-    : _function(0) , _block(0) , _discarded(false), registerCount(0)
++    : subscriptionOffset(0)
++    , _function(0) , _block(0) , _discarded(false), registerCount(0)
+     , bindingLine(0), bindingColumn(0)
+ {
+ }
+@@ -1190,7 +1191,8 @@ void QV4CompilerPrivate::resetInstanceState()
+     data = committed.data;
+     exceptions = committed.exceptions;
+     usedSubscriptionIds.clear();
+-    subscriptionIds = committed.subscriptionIds;
++    subscriptionIds.clear();
++    subscriptionOffset = committed.subscriptionCount;
+     bytecode.clear();
+     patches.clear();
+     pool.clear();
+@@ -1211,7 +1213,9 @@ int QV4CompilerPrivate::commitCompile()
+     committed.bytecode.append(bytecode.constData(), bytecode.size());
+     committed.data = data;
+     committed.exceptions = exceptions;
+-    committed.subscriptionIds = subscriptionIds;
++    committed.subscriptionCount = subscriptionOffset + subscriptionIds.count();
++    if (bindingsDump())
++        committed.subscriptions.append(subscriptionIds);
+     return rv;
+ }
+ 
+@@ -1310,7 +1314,7 @@ int QV4CompilerPrivate::subscriptionIndex(const QStringList &sub)
+     QString str = sub.join(QLatin1String("."));
+     int *iter = subscriptionIds.value(str);
+     if (!iter) {
+-        int count = subscriptionIds.count();
++        int count = subscriptionOffset + subscriptionIds.count();
+         iter = &subscriptionIds[str];
+         *iter = count;
+     }
+@@ -1409,8 +1413,8 @@ QByteArray QV4CompilerPrivate::buildSignalTable() const
+ 
+     QVector<quint32> header;
+     QVector<quint32> data;
+-    for (int ii = 0; ii < committed.subscriptionIds.count(); ++ii) {
+-        header.append(committed.subscriptionIds.count() + data.count());
++    for (int ii = 0; ii < committed.subscriptionCount; ++ii) {
++        header.append(committed.subscriptionCount + data.count());
+         const QList<QPair<int, quint32> > &bindings = table[ii];
+         data.append(bindings.count());
+         for (int jj = 0; jj < bindings.count(); ++jj) {
+@@ -1468,7 +1472,7 @@ QByteArray QV4Compiler::program() const
+         data += d->buildExceptionData();
+ 
+         prog.dataLength = 4 * ((data.size() + 3) / 4);
+-        prog.subscriptions = d->committed.subscriptionIds.count();
++        prog.subscriptions = d->committed.subscriptionCount;
+         prog.instructionCount = bytecode.count();
+         int size = sizeof(QV4Program) + bytecode.count();
+         size += prog.dataLength;
+@@ -1485,12 +1489,13 @@ QByteArray QV4Compiler::program() const
+     if (bindingsDump()) {
+         qWarning().nospace() << "Subscription slots:";
+ 
+-        for (QQmlAssociationList<QString, int>::ConstIterator iter = d->committed.subscriptionIds.begin();
+-                iter != d->committed.subscriptionIds.end();
+-                ++iter) {
+-            qWarning().nospace() << "    " << iter->first << "\t-> " << iter->second;
++        QQmlAssociationList<QString, int> subscriptionIds;
++        foreach (subscriptionIds, d->committed.subscriptions) {
++            for (QQmlAssociationList<QString, int>::ConstIterator iter = subscriptionIds.begin();
++                 iter != subscriptionIds.end(); ++iter) {
++                qWarning().nospace() << "    " << iter->first << "\t-> " << iter->second;
++            }
+         }
+-
+         QV4Compiler::dump(programData);
+     }
+ 
+diff --git a/src/qml/qml/v4/qv4compiler_p_p.h b/src/qml/qml/v4/qv4compiler_p_p.h
+index c4a81db..0c06ade 100644
+--- a/src/qml/qml/v4/qv4compiler_p_p.h
++++ b/src/qml/qml/v4/qv4compiler_p_p.h
+@@ -139,7 +139,7 @@ public:
+     QVector<quint64> exceptions;
+ 
+     QQmlAssociationList<int, quint32> usedSubscriptionIds;
+-
++    int subscriptionOffset;
+     QQmlAssociationList<QString, int> subscriptionIds;
+     QQmlJS::Bytecode bytecode;
+ 
+@@ -154,15 +154,17 @@ public:
+     QQmlPool pool;
+ 
+     // Committed binding data
+-    struct {
++    struct Committed {
++        Committed(): subscriptionCount(0) {}
+         QList<int> offsets;
+         QList<QQmlAssociationList<int, quint32> > dependencies;
+ 
+         //QQmlJS::Bytecode bytecode;
+         QByteArray bytecode;
+         QByteArray data;
+-        QQmlAssociationList<QString, int> subscriptionIds;
+         QVector<quint64> exceptions;
++        int subscriptionCount;
++        QList<QQmlAssociationList<QString, int> > subscriptions;
+ 
+         int count() const { return offsets.count(); }
+     } committed;
+diff --git a/tests/auto/qml/v4/data/subscriptions.1.qml b/tests/auto/qml/v4/data/subscriptions.1.qml
+new file mode 100644
+index 0000000..6072338
+--- /dev/null
++++ b/tests/auto/qml/v4/data/subscriptions.1.qml
+@@ -0,0 +1,16 @@
++import QtQuick 2.0
++
++Rectangle {
++    id: root
++    width: 400
++    height: 400
++
++    property real targetHeight: menuItems.height + 1
++    property real heightValue: if (1) menuItems.height      //this must be v8?
++    property bool boolProp: menuItems.height > heightValue  //this must be v4?
++
++    Column {
++        id: menuItems
++        Item { height: 200; width: 10 }
++    }
++}
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index 03c5ba6..dfb7cc4 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -86,6 +86,7 @@ private slots:
+ 
+     void conversions_data();
+     void conversions();
++    void subscriptions();
+ 
+     void debuggingDumpInstructions(); // this test should be last.
+ 
+@@ -795,6 +796,22 @@ void tst_v4::conversions()
+     delete o;
+ }
+ 
++void tst_v4::subscriptions()
++{
++    {
++        QQmlComponent component(&engine, testFileUrl("subscriptions.1.qml"));
++
++        QObject *o = component.create();
++        QVERIFY(o != 0);
++
++        QObject *ro = qobject_cast<QObject *>(o);
++        QVERIFY(ro != 0);
++
++        QCOMPARE(ro->property("targetHeight"), QVariant::fromValue<qreal>(201));
++
++        delete o;
++    }
++}
+ 
+ static QStringList messages;
+ static void msgHandler(QtMsgType, const char *msg)

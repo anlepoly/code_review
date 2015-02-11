@@ -1,0 +1,268 @@
+diff --git a/src/corelib/io/qurl.cpp b/src/corelib/io/qurl.cpp
+index 215ce32..9d16910 100644
+--- a/src/corelib/io/qurl.cpp
++++ b/src/corelib/io/qurl.cpp
+@@ -805,11 +805,6 @@ inline void QUrlPrivate::setPath(const QString &value, int from, int end)
+     // sectionIsPresent |= Path; // not used, save some cycles
+     sectionHasError &= ~Path;
+     path = recodeFromUser(value, decodedPathInIsolationActions, from, end);
+-
+-    // ### FIXME?
+-    // check for the "path-noscheme" case
+-    // if the path contains a ":" before the first "/", it could be misinterpreted
+-    // as a scheme
+ }
+ 
+ inline void QUrlPrivate::setFragment(const QString &value, int from, int end)
+@@ -1310,6 +1305,44 @@ static void removeDotsFromPath(QString *path)
+     path->truncate(out - path->constData());
+ }
+ 
++QUrlPrivate::ErrorCode QUrlPrivate::validityError() const
++{
++    if (sectionHasError)
++        return ErrorCode(errorCode);
++
++    // There are two more cases of invalid URLs that QUrl recognizes and they
++    // are only possible with constructed URLs (setXXX methods), not with
++    // parsing. Therefore, they are tested here.
++    //
++    // The two cases are a non-empty path that doesn't start with a slash and:
++    //  - with an authority
++    //  - without an authority, without scheme but the path with a colon before
++    //    the first slash
++    // Those cases are considered invalid because toString() would produce a URL
++    // that wouldn't be parsed back to the same QUrl.
++
++    if (path.isEmpty() || path.at(0) == QLatin1Char('/'))
++        return NoError;
++    if (sectionIsPresent & QUrlPrivate::Host)
++        return AuthorityPresentAndPathIsRelative;
++    if (sectionIsPresent & QUrlPrivate::Scheme)
++        return NoError;
++
++    // check for a path of "text:text/"
++    for (int i = 0; i < path.length(); ++i) {
++        register ushort c = path.at(i).unicode();
++        if (c == '/') {
++            // found the slash before the colon
++            return NoError;
++        }
++        if (c == ':') {
++            // found the colon before the slash, it's invalid
++            return RelativeUrlPathContainsColonBeforeSlash;
++        }
++    }
++    return NoError;
++}
++
+ #if 0
+ void QUrlPrivate::validate() const
+ {
+@@ -1519,8 +1552,11 @@ QUrl::~QUrl()
+ */
+ bool QUrl::isValid() const
+ {
+-    if (isEmpty()) return false;
+-    return d->sectionHasError == 0;
++    if (isEmpty()) {
++        // also catches d == 0
++        return false;
++    }
++    return d->validityError() == QUrlPrivate::NoError;
+ }
+ 
+ /*!
+@@ -3379,15 +3415,17 @@ QString QUrl::errorString() const
+     if (!d)
+         return QString();
+ 
+-    if (d->sectionHasError == 0)
++    QUrlPrivate::ErrorCode errorCode = d->validityError();
++    if (errorCode == QUrlPrivate::NoError)
+         return QString();
+ 
+     // check if the error code matches a section with error
+-    if ((d->sectionHasError & (d->errorCode >> 8)) == 0)
++    // unless it's a compound error (0x10000)
++    if ((d->sectionHasError & (errorCode >> 8)) == 0 && (errorCode & 0x10000) == 0)
+         return QString();
+ 
+     QChar c = d->errorSupplement;
+-    switch (QUrlPrivate::ErrorCode(d->errorCode)) {
++    switch (errorCode) {
+     case QUrlPrivate::NoError:
+         return QString();
+ 
+@@ -3428,8 +3466,6 @@ QString QUrl::errorString() const
+     case QUrlPrivate::InvalidPathError:
+         return QString(QStringLiteral("Invalid path (character '%1' not permitted)"))
+                 .arg(c);
+-    case QUrlPrivate::PathContainsColonBeforeSlash:
+-        return QStringLiteral("Path component contains ':' before any '/'");
+ 
+     case QUrlPrivate::InvalidQueryError:
+         return QString(QStringLiteral("Invalid query (character '%1' not permitted)"))
+@@ -3438,6 +3474,11 @@ QString QUrl::errorString() const
+     case QUrlPrivate::InvalidFragmentError:
+         return QString(QStringLiteral("Invalid fragment (character '%1' not permitted)"))
+                 .arg(c);
++
++    case QUrlPrivate::AuthorityPresentAndPathIsRelative:
++        return QStringLiteral("Path component is relative and authority is present");
++    case QUrlPrivate::RelativeUrlPathContainsColonBeforeSlash:
++        return QStringLiteral("Relative URL's path component contains ':' before any '/'");
+     }
+     return QStringLiteral("<unknown error>");
+ }
+diff --git a/src/corelib/io/qurl_p.h b/src/corelib/io/qurl_p.h
+index c696709..8c1e307 100644
+--- a/src/corelib/io/qurl_p.h
++++ b/src/corelib/io/qurl_p.h
+@@ -95,12 +95,16 @@ public:
+         PortEmptyError,
+ 
+         InvalidPathError = Path << 8,
+-        PathContainsColonBeforeSlash,
+ 
+         InvalidQueryError = Query << 8,
+ 
+         InvalidFragmentError = Fragment << 8,
+ 
++        // the following two cases are only possible in combination
++        // with presence/absence of the authority and scheme. See validityError().
++        AuthorityPresentAndPathIsRelative = Authority << 8 | Path << 8 | 0x10000,
++        RelativeUrlPathContainsColonBeforeSlash = Scheme << 8 | Authority << 8 | Path << 8 | 0x10000,
++
+         NoError = 0
+     };
+ 
+@@ -110,6 +114,7 @@ public:
+     void parse(const QString &url, QUrl::ParsingMode parsingMode);
+     bool isEmpty() const
+     { return sectionIsPresent == 0 && port == -1 && path.isEmpty(); }
++    ErrorCode validityError() const;
+ 
+     // no QString scheme() const;
+     void appendAuthority(QString &appendTo, QUrl::FormattingOptions options, Section appendingTo) const;
+diff --git a/tests/auto/corelib/io/qurl/tst_qurl.cpp b/tests/auto/corelib/io/qurl/tst_qurl.cpp
+index 06d2301..55bbaa9 100644
+--- a/tests/auto/corelib/io/qurl/tst_qurl.cpp
++++ b/tests/auto/corelib/io/qurl/tst_qurl.cpp
+@@ -976,7 +976,7 @@ void tst_QUrl::toString_constructed_data()
+ 
+     QString n("");
+ 
+-    QTest::newRow("data1") << n << n << n << QString::fromLatin1("qt.nokia.com") << -1 << QString::fromLatin1("index.html")
++    QTest::newRow("data1") << n << n << n << QString::fromLatin1("qt.nokia.com") << -1 << QString::fromLatin1("/index.html")
+                         << QByteArray() << n << QString::fromLatin1("//qt.nokia.com/index.html")
+                         << QByteArray("//qt.nokia.com/index.html") << 0u;
+     QTest::newRow("data2") << QString::fromLatin1("file") << n << n << n << -1 << QString::fromLatin1("/root") << QByteArray()
+@@ -1313,9 +1313,9 @@ void tst_QUrl::compat_isValid_02_data()
+     QTest::newRow( "ok_02" ) << QString("ftp") << n     << n     << QString("ftp.qt.nokia.com") << -1 << n      << (bool)true;
+     QTest::newRow( "ok_03" ) << QString("ftp") << QString("foo") << n     << QString("ftp.qt.nokia.com") << -1 << n      << (bool)true;
+     QTest::newRow( "ok_04" ) << QString("ftp") << QString("foo") << QString("bar") << QString("ftp.qt.nokia.com") << -1 << n      << (bool)true;
+-    QTest::newRow( "ok_05" ) << QString("ftp") << n     << n     << QString("ftp.qt.nokia.com") << -1 << QString("path")<< (bool)true;
+-    QTest::newRow( "ok_06" ) << QString("ftp") << QString("foo") << n     << QString("ftp.qt.nokia.com") << -1 << QString("path") << (bool)true;
+-    QTest::newRow( "ok_07" ) << QString("ftp") << QString("foo") << QString("bar") << QString("ftp.qt.nokia.com") << -1 << QString("path")<< (bool)true;
++    QTest::newRow( "ok_05" ) << QString("ftp") << n     << n     << QString("ftp.qt.nokia.com") << -1 << QString("/path")<< (bool)true;
++    QTest::newRow( "ok_06" ) << QString("ftp") << QString("foo") << n     << QString("ftp.qt.nokia.com") << -1 << QString("/path") << (bool)true;
++    QTest::newRow( "ok_07" ) << QString("ftp") << QString("foo") << QString("bar") << QString("ftp.qt.nokia.com") << -1 << QString("/path")<< (bool)true;
+ 
+     QTest::newRow( "err_01" ) << n     << n     << n     << n                   << -1 << n << (bool)false;
+     QTest::newRow( "err_02" ) << QString("ftp") << n     << n     << n                   << -1 << n << (bool)true;
+@@ -1766,6 +1766,20 @@ void tst_QUrl::isValid()
+                  qPrintable(url.errorString()));
+     }
+ 
++    {
++        QUrl url("http://example.com");
++        QVERIFY(url.isValid());
++        url.setPath("relative");
++        QVERIFY(!url.isValid());
++        QVERIFY(url.errorString().contains("Path component is relative and authority is present"));
++    }
++
++    {
++        QUrl url;
++        url.setPath("http://example.com");
++        QVERIFY(!url.isValid());
++        QVERIFY(url.errorString().contains("':' before any '/'"));
++    }
+ }
+ 
+ void tst_QUrl::schemeValidator_data()
+@@ -1849,8 +1863,10 @@ void tst_QUrl::strictParser_data()
+     QTest::addColumn<QString>("input");
+     QTest::addColumn<QString>("needle");
+ 
+-    QTest::newRow("invalid-scheme") << "ht%://example.com" << "Invalid scheme";
+-    QTest::newRow("empty-scheme") << ":/" << "Empty scheme";
++    // QUrl doesn't detect an error in the scheme when parsing because
++    // it falls back to parsing as a path. So, these errors are path errors
++    QTest::newRow("invalid-scheme") << "ht%://example.com" << "character '%' not permitted";
++    QTest::newRow("empty-scheme") << ":/" << "':' before any '/'";
+ 
+     QTest::newRow("invalid-user1") << "http://bad<user_name>@ok-hostname" << "Invalid user name";
+     QTest::newRow("invalid-user2") << "http://bad%@ok-hostname" << "Invalid user name";
+@@ -1872,8 +1888,6 @@ void tst_QUrl::strictParser_data()
+     QTest::newRow("port-range") << "http://example.com:65536" << "out of range";
+ 
+     QTest::newRow("invalid-path") << "foo:/path%\x1F" << "Invalid path";
+-    // not yet checked:
+-    //QTest::newRow("path-colon-before-slash") << "foo::/" << "':' before any '/'";
+ 
+     QTest::newRow("invalid-query") << "foo:?\\#" << "Invalid query";
+ 
+@@ -1886,7 +1900,6 @@ void tst_QUrl::strictParser()
+     QFETCH(QString, needle);
+ 
+     QUrl url(input, QUrl::StrictMode);
+-    QEXPECT_FAIL("empty-scheme", "QUrl does not forbid paths with a colon before the first slash yet", Abort);
+     QVERIFY(!url.isValid());
+     QVERIFY(!url.errorString().isEmpty());
+     if (!url.errorString().contains(needle))
+@@ -2605,7 +2618,7 @@ void tst_QUrl::isEmptyForEncodedUrl()
+ void tst_QUrl::toEncodedNotUsingUninitializedPath()
+ {
+     QUrl url;
+-    url.setEncodedPath("test.txt");
++    url.setEncodedPath("/test.txt");
+     url.setHost("example.com");
+ 
+     QCOMPARE(url.toEncoded().constData(), "//example.com/test.txt");
+@@ -3091,9 +3104,15 @@ void tst_QUrl::setComponents_data()
+     QTest::newRow("invalid-authority-2") << QUrl("http://example.com")
+                                          << int(Authority) << "%31%30.%30.%30.%31" << Strict << false
+                                          << PrettyDecoded << "" << "";
++
++    // these test cases are "compound invalid":
++    // they produces isValid == false, but the original is still available
+     QTest::newRow("invalid-path-1") << QUrl("/relative")
+                                     << int(Path) << "c:/" << Strict << false
+-                                    << PrettyDecoded << "" << "";
++                                    << PrettyDecoded << "c:/" << "c:/";
++    QTest::newRow("invalid-path-2") << QUrl("http://example.com")
++                                    << int(Path) << "relative" << Strict << false
++                                    << PrettyDecoded << "relative" << "";
+ 
+     // -- test decoded behaviour --
+     // '%' characters are not permitted in the scheme, this tests that it fails to set anything
+@@ -3117,8 +3136,8 @@ void tst_QUrl::setComponents_data()
+                                               << int(Authority) << "ex%61mple.com" << Decoded << false
+                                               << PrettyDecoded << "" << "";
+     QTest::newRow("path-encode") << QUrl("http://example.com/foo")
+-                                 << int(Path) << "bar%23" << Decoded << true
+-                                 << PrettyDecoded << "bar%2523" << "http://example.com/bar%2523";
++                                 << int(Path) << "/bar%23" << Decoded << true
++                                 << PrettyDecoded << "/bar%2523" << "http://example.com/bar%2523";
+     QTest::newRow("query-encode") << QUrl("http://example.com/foo?q")
+                                   << int(Query) << "bar%23" << Decoded << true
+                                   << PrettyDecoded << "bar%2523" << "http://example.com/foo?bar%2523";
+@@ -3167,7 +3186,6 @@ void tst_QUrl::setComponents()
+ 
+     case Path:
+         copy.setPath(newValue, QUrl::ParsingMode(parsingMode));
+-        QEXPECT_FAIL("invalid-path-1", "QUrl does not forbid paths with a colon before the first slash yet", Abort);
+         QCOMPARE(copy.path(QUrl::ComponentFormattingOptions(encoding)), output);
+         break;

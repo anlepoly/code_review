@@ -1,0 +1,227 @@
+diff --git a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
+index 0e18625..9e581d8 100644
+--- a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
++++ b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
+@@ -72,14 +72,7 @@ QGstreamerPlayerControl::QGstreamerPlayerControl(QGstreamerPlayerSession *sessio
+     , m_pendingSeekPosition(-1)
+     , m_setMediaPending(false)
+     , m_stream(0)
+-    , m_fifoNotifier(0)
+-    , m_fifoCanWrite(false)
+-    , m_bufferSize(0)
+-    , m_bufferOffset(0)
+ {
+-    m_fifoFd[0] = -1;
+-    m_fifoFd[1] = -1;
+-
+     m_resources = QMediaResourcePolicy::createResourceSet<QMediaPlayerResourceSetInterface>();
+     Q_ASSERT(m_resources);
+ 
+@@ -123,13 +116,6 @@ QGstreamerPlayerControl::QGstreamerPlayerControl(QGstreamerPlayerSession *sessio
+ QGstreamerPlayerControl::~QGstreamerPlayerControl()
+ {
+     QMediaResourcePolicy::destroyResourceSet(m_resources);
+-
+-    if (m_fifoFd[0] >= 0) {
+-        ::close(m_fifoFd[0]);
+-        ::close(m_fifoFd[1]);
+-        m_fifoFd[0] = -1;
+-        m_fifoFd[1] = -1;
+-    }
+ }
+ 
+ QMediaPlayerResourceSetInterface* QGstreamerPlayerControl::resources() const
+@@ -386,12 +372,6 @@ void QGstreamerPlayerControl::setMedia(const QMediaContent &content, QIODevice *
+     }
+ 
+     if (m_stream) {
+-#if !defined(HAVE_GST_APPSRC)
+-        closeFifo();
+-
+-        disconnect(m_stream, SIGNAL(readyRead()), this, SLOT(writeFifo()));
+-#endif
+-
+         if (m_ownStream)
+             delete m_stream;
+         m_stream = 0;
+@@ -423,14 +403,8 @@ void QGstreamerPlayerControl::setMedia(const QMediaContent &content, QIODevice *
+     QNetworkRequest request;
+ 
+     if (m_stream) {
+-#if !defined(HAVE_GST_APPSRC)
+-        if (m_stream->isReadable() && openFifo()) {
+-            request = QNetworkRequest(QUrl(QString(QLatin1String("fd://%1")).arg(m_fifoFd[0])));
+-        }
+-#else
+         userStreamValid = stream->isOpen() && m_stream->isReadable();
+         request = content.canonicalRequest();
+-#endif
+     } else if (!content.isNull()) {
+         request = content.canonicalRequest();
+     }
+@@ -453,13 +427,6 @@ void QGstreamerPlayerControl::setMedia(const QMediaContent &content, QIODevice *
+         m_session->loadFromUri(request);
+ #endif
+ 
+-#if !defined(HAVE_GST_APPSRC)
+-    if (m_fifoFd[1] >= 0) {
+-        m_fifoCanWrite = true;
+-
+-        writeFifo();
+-    }
+-#endif
+ 
+ #if defined(HAVE_GST_APPSRC)
+     if (!request.url().isEmpty() || userStreamValid) {
+@@ -590,98 +557,6 @@ void QGstreamerPlayerControl::setBufferProgress(int progress)
+     emit bufferStatusChanged(m_bufferProgress);
+ }
+ 
+-void QGstreamerPlayerControl::writeFifo()
+-{
+-    if (m_fifoCanWrite) {
+-        qint64 bytesToRead = qMin<qint64>(
+-                m_stream->bytesAvailable(), PIPE_BUF - m_bufferSize);
+-
+-        if (bytesToRead > 0) {
+-            int bytesRead = m_stream->read(&m_buffer[m_bufferOffset + m_bufferSize], bytesToRead);
+-
+-            if (bytesRead > 0)
+-                m_bufferSize += bytesRead;
+-        }
+-
+-        if (m_bufferSize > 0) {
+-            int bytesWritten = ::write(m_fifoFd[1], &m_buffer[m_bufferOffset], size_t(m_bufferSize));
+-
+-            if (bytesWritten > 0) {
+-                m_bufferOffset += bytesWritten;
+-                m_bufferSize -= bytesWritten;
+-
+-                if (m_bufferSize == 0)
+-                    m_bufferOffset = 0;
+-            } else if (errno == EAGAIN) {
+-                m_fifoCanWrite = false;
+-            } else {
+-                closeFifo();
+-            }
+-        }
+-    }
+-
+-    m_fifoNotifier->setEnabled(m_stream->bytesAvailable() > 0);
+-}
+-
+-void QGstreamerPlayerControl::fifoReadyWrite(int socket)
+-{
+-    if (socket == m_fifoFd[1]) {
+-        m_fifoCanWrite = true;
+-
+-        writeFifo();
+-    }
+-}
+-
+-bool QGstreamerPlayerControl::openFifo()
+-{
+-    Q_ASSERT(m_fifoFd[0] < 0);
+-    Q_ASSERT(m_fifoFd[1] < 0);
+-
+-    if (::pipe(m_fifoFd) == 0) {
+-        int flags = ::fcntl(m_fifoFd[1], F_GETFD);
+-
+-        if (::fcntl(m_fifoFd[1], F_SETFD, flags | O_NONBLOCK) >= 0) {
+-            m_fifoNotifier = new QSocketNotifier(m_fifoFd[1], QSocketNotifier::Write);
+-
+-            connect(m_fifoNotifier, SIGNAL(activated(int)), this, SLOT(fifoReadyWrite(int)));
+-
+-            return true;
+-        } else {
+-            qWarning("Failed to make pipe non blocking %d", errno);
+-
+-            ::close(m_fifoFd[0]);
+-            ::close(m_fifoFd[1]);
+-
+-            m_fifoFd[0] = -1;
+-            m_fifoFd[1] = -1;
+-
+-            return false;
+-        }
+-    } else {
+-        qWarning("Failed to create pipe %d", errno);
+-
+-        return false;
+-    }
+-}
+-
+-void QGstreamerPlayerControl::closeFifo()
+-{
+-    if (m_fifoFd[0] >= 0) {
+-        delete m_fifoNotifier;
+-        m_fifoNotifier = 0;
+-
+-        ::close(m_fifoFd[0]);
+-        ::close(m_fifoFd[1]);
+-        m_fifoFd[0] = -1;
+-        m_fifoFd[1] = -1;
+-
+-        m_fifoCanWrite = false;
+-
+-        m_bufferSize = 0;
+-        m_bufferOffset = 0;
+-    }
+-}
+-
+ void QGstreamerPlayerControl::applyPendingSeek(bool isSeekable)
+ {
+     if (isSeekable && m_pendingSeekPosition != -1)
+diff --git a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.h b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.h
+index c09d577..8fefae0 100644
+--- a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.h
++++ b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.h
+@@ -111,9 +111,6 @@ public Q_SLOTS:
+     void setMuted(bool muted);
+ 
+ private Q_SLOTS:
+-    void writeFifo();
+-    void fifoReadyWrite(int socket);
+-
+     void updateSessionState(QMediaPlayer::State state);
+     void updateMediaStatus();
+     void processEOS();
+@@ -128,8 +125,6 @@ private Q_SLOTS:
+     void handleResourcesDenied();
+ 
+ private:
+-    bool openFifo();
+-    void closeFifo();
+     void playOrPause(QMediaPlayer::State state);
+ 
+     void pushState();
+@@ -149,12 +144,6 @@ private:
+     bool m_setMediaPending;
+     QMediaContent m_currentResource;
+     QIODevice *m_stream;
+-    QSocketNotifier *m_fifoNotifier;
+-    int m_fifoFd[2];
+-    bool m_fifoCanWrite;
+-    int m_bufferSize;
+-    int m_bufferOffset;
+-    char m_buffer[PIPE_BUF];
+ 
+     QMediaPlayerResourceSetInterface *m_resources;
+ };
+diff --git a/src/plugins/gstreamer/mediaplayer/qgstreamerplayerserviceplugin.cpp b/src/plugins/gstreamer/mediaplayer/qgstreamerplayerserviceplugin.cpp
+index 59a039f..da2878a 100644
+--- a/src/plugins/gstreamer/mediaplayer/qgstreamerplayerserviceplugin.cpp
++++ b/src/plugins/gstreamer/mediaplayer/qgstreamerplayerserviceplugin.cpp
+@@ -85,7 +85,11 @@ QMediaServiceProviderHint::Features QGstreamerPlayerServicePlugin::supportedFeat
+         const QByteArray &service) const
+ {
+     if (service == Q_MEDIASERVICE_MEDIAPLAYER)
+-        return QMediaServiceProviderHint::StreamPlayback | QMediaServiceProviderHint::VideoSurface;
++        return
++#ifdef HAVE_GST_APPSRC
++                QMediaServiceProviderHint::StreamPlayback |
++#endif
++                QMediaServiceProviderHint::VideoSurface;
+     else
+         return QMediaServiceProviderHint::Features();
+ }

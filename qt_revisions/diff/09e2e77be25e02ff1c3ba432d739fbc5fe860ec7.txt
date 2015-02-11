@@ -1,0 +1,407 @@
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index d41c906..b17cf58 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -184,7 +184,8 @@ QGuiApplication::~QGuiApplication()
+ QGuiApplicationPrivate::QGuiApplicationPrivate(int &argc, char **argv, int flags)
+     : QCoreApplicationPrivate(argc, argv, flags),
+       styleHints(0),
+-      inputMethod(0)
++      inputMethod(0),
++      lastTouchType(QEvent::TouchEnd)
+ {
+     self = this;
+     application_type = QCoreApplication::GuiClient;
+@@ -950,8 +951,53 @@ Q_GUI_EXPORT bool operator==(const QGuiApplicationPrivate::ActiveTouchPointsKey
+ 
+ void QGuiApplicationPrivate::processTouchEvent(QWindowSystemInterfacePrivate::TouchEvent *e)
+ {
+-    QWindow *window = e->window.data();
+     QGuiApplicationPrivate *d = self;
++
++    if (e->touchType == QEvent::TouchCancel) {
++        // The touch sequence has been canceled (e.g. by the compositor).
++        // Send the TouchCancel to all windows with active touches and clean up.
++        QTouchEvent touchEvent(QEvent::TouchCancel, e->device, e->modifiers);
++        touchEvent.setTimestamp(e->timestamp);
++        QHash<ActiveTouchPointsKey, ActiveTouchPointsValue>::const_iterator it
++                = self->activeTouchPoints.constBegin(), ite = self->activeTouchPoints.constEnd();
++        QSet<QWindow *> windowsNeedingCancel;
++        while (it != ite) {
++            QWindow *w = it->window.data();
++            if (w)
++                windowsNeedingCancel.insert(w);
++            ++it;
++        }
++        for (QSet<QWindow *>::const_iterator winIt = windowsNeedingCancel.constBegin(),
++             winItEnd = windowsNeedingCancel.constEnd(); winIt != winItEnd; ++winIt) {
++            touchEvent.setWindow(*winIt);
++            QGuiApplication::sendSpontaneousEvent(*winIt, &touchEvent);
++        }
++        if (!self->synthesizedMousePoints.isEmpty() && !e->synthetic) {
++            for (QHash<QWindow *, SynthesizedMouseData>::const_iterator synthIt = self->synthesizedMousePoints.constBegin(),
++                 synthItEnd = self->synthesizedMousePoints.constEnd(); synthIt != synthItEnd; ++synthIt) {
++                QWindowSystemInterfacePrivate::MouseEvent fake(synthIt.key(),
++                                                               e->timestamp,
++                                                               synthIt->pos,
++                                                               synthIt->screenPos,
++                                                               Qt::NoButton,
++                                                               e->modifiers);
++                fake.synthetic = true;
++                processMouseEvent(&fake);
++            }
++            self->synthesizedMousePoints.clear();
++        }
++        self->activeTouchPoints.clear();
++        self->lastTouchType = e->touchType;
++        return;
++    }
++
++    // Prevent sending ill-formed event sequences: Cancel can only be followed by a Begin.
++    if (self->lastTouchType == QEvent::TouchCancel && e->touchType != QEvent::TouchBegin)
++        return;
++
++    self->lastTouchType = e->touchType;
++
++    QWindow *window = e->window.data();
+     typedef QPair<Qt::TouchPointStates, QList<QTouchEvent::TouchPoint> > StatesAndTouchPoints;
+     QHash<QWindow *, StatesAndTouchPoints> windowsNeedingEvents;
+ 
+@@ -1101,6 +1147,8 @@ void QGuiApplicationPrivate::processTouchEvent(QWindowSystemInterfacePrivate::To
+             // exclude touchpads as those generate their own mouse events
+             if (touchEvent.device()->type() != QTouchDevice::TouchPad) {
+                 Qt::MouseButtons b = eventType == QEvent::TouchEnd ? Qt::NoButton : Qt::LeftButton;
++                if (b == Qt::NoButton)
++                    self->synthesizedMousePoints.clear();
+ 
+                 QList<QTouchEvent::TouchPoint> touchPoints = touchEvent.touchPoints();
+                 if (eventType == QEvent::TouchBegin)
+@@ -1109,6 +1157,9 @@ void QGuiApplicationPrivate::processTouchEvent(QWindowSystemInterfacePrivate::To
+                 for (int i = 0; i < touchPoints.count(); ++i) {
+                     const QTouchEvent::TouchPoint &touchPoint = touchPoints.at(i);
+                     if (touchPoint.id() == m_fakeMouseSourcePointId) {
++                        if (b != Qt::NoButton)
++                            self->synthesizedMousePoints.insert(w, SynthesizedMouseData(
++                                                                    touchPoint.pos(), touchPoint.screenPos()));
+                         QWindowSystemInterfacePrivate::MouseEvent fake(w, e->timestamp,
+                                                                        touchPoint.pos(),
+                                                                        touchPoint.screenPos(),
+diff --git a/src/gui/kernel/qguiapplication_p.h b/src/gui/kernel/qguiapplication_p.h
+index d9444eb..3ca007f 100644
+--- a/src/gui/kernel/qguiapplication_p.h
++++ b/src/gui/kernel/qguiapplication_p.h
+@@ -199,6 +199,13 @@ public:
+         QTouchEvent::TouchPoint touchPoint;
+     };
+     QHash<ActiveTouchPointsKey, ActiveTouchPointsValue> activeTouchPoints;
++    QEvent::Type lastTouchType;
++    struct SynthesizedMouseData {
++        SynthesizedMouseData(const QPointF &p, const QPointF &sp) : pos(p), screenPos(sp) { }
++        QPointF pos;
++        QPointF screenPos;
++    };
++    QHash<QWindow *, SynthesizedMouseData> synthesizedMousePoints;
+ 
+ private:
+     void init();
+diff --git a/src/gui/kernel/qwindow.cpp b/src/gui/kernel/qwindow.cpp
+index b451a6e..43b7e39 100644
+--- a/src/gui/kernel/qwindow.cpp
++++ b/src/gui/kernel/qwindow.cpp
+@@ -943,6 +943,7 @@ bool QWindow::event(QEvent *ev)
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+     case QEvent::TouchEnd:
++    case QEvent::TouchCancel:
+         touchEvent(static_cast<QTouchEvent *>(ev));
+         break;
+ 
+diff --git a/src/gui/kernel/qwindowsysteminterface_qpa.cpp b/src/gui/kernel/qwindowsysteminterface_qpa.cpp
+index ae94b75..f4f7551 100644
+--- a/src/gui/kernel/qwindowsysteminterface_qpa.cpp
++++ b/src/gui/kernel/qwindowsysteminterface_qpa.cpp
+@@ -296,6 +296,22 @@ void QWindowSystemInterface::handleTouchEvent(QWindow *tlw, ulong timestamp, QTo
+     QWindowSystemInterfacePrivate::queueWindowSystemEvent(e);
+ }
+ 
++void QWindowSystemInterface::handleTouchCancelEvent(QWindow *w, QTouchDevice *device,
++                                                    Qt::KeyboardModifiers mods)
++{
++    unsigned long time = QWindowSystemInterfacePrivate::eventTime.elapsed();
++    handleTouchCancelEvent(w, time, device, mods);
++}
++
++void QWindowSystemInterface::handleTouchCancelEvent(QWindow *w, ulong timestamp, QTouchDevice *device,
++                                                    Qt::KeyboardModifiers mods)
++{
++    QWindowSystemInterfacePrivate::TouchEvent *e =
++            new QWindowSystemInterfacePrivate::TouchEvent(w, timestamp, QEvent::TouchCancel, device,
++                                                         QList<QTouchEvent::TouchPoint>(), mods);
++    QWindowSystemInterfacePrivate::queueWindowSystemEvent(e);
++}
++
+ void QWindowSystemInterface::handleScreenOrientationChange(QScreen *screen, Qt::ScreenOrientation orientation)
+ {
+     QWindowSystemInterfacePrivate::ScreenOrientationEvent *e =
+diff --git a/src/gui/kernel/qwindowsysteminterface_qpa.h b/src/gui/kernel/qwindowsysteminterface_qpa.h
+index b99363e..28ec68e 100644
+--- a/src/gui/kernel/qwindowsysteminterface_qpa.h
++++ b/src/gui/kernel/qwindowsysteminterface_qpa.h
+@@ -101,6 +101,8 @@ public:
+                                  const QList<struct TouchPoint> &points, Qt::KeyboardModifiers mods = Qt::NoModifier);
+     static void handleTouchEvent(QWindow *w, ulong timestamp, QTouchDevice *device,
+                                  const QList<struct TouchPoint> &points, Qt::KeyboardModifiers mods = Qt::NoModifier);
++    static void handleTouchCancelEvent(QWindow *w, QTouchDevice *device, Qt::KeyboardModifiers mods = Qt::NoModifier);
++    static void handleTouchCancelEvent(QWindow *w, ulong timestamp, QTouchDevice *device, Qt::KeyboardModifiers mods = Qt::NoModifier);
+ 
+     static void handleGeometryChange(QWindow *w, const QRect &newRect);
+     static void handleSynchronousGeometryChange(QWindow *w, const QRect &newRect);
+diff --git a/src/widgets/kernel/qapplication.cpp b/src/widgets/kernel/qapplication.cpp
+index d2b4e01..8d776e2 100644
+--- a/src/widgets/kernel/qapplication.cpp
++++ b/src/widgets/kernel/qapplication.cpp
+@@ -5200,6 +5200,28 @@ void QApplicationPrivate::translateRawTouchEvent(QWidget *window,
+     }
+ }
+ 
++void QApplicationPrivate::translateTouchCancel(QTouchDevice *device, ulong timestamp)
++{
++    QTouchEvent touchEvent(QEvent::TouchCancel, device, QApplication::keyboardModifiers());
++    touchEvent.setTimestamp(timestamp);
++    QHash<ActiveTouchPointsKey, ActiveTouchPointsValue>::const_iterator it
++            = self->activeTouchPoints.constBegin(), ite = self->activeTouchPoints.constEnd();
++    QSet<QWidget *> widgetsNeedingCancel;
++    while (it != ite) {
++        QWidget *widget = static_cast<QWidget *>(it->target.data());
++        if (widget)
++            widgetsNeedingCancel.insert(widget);
++        ++it;
++    }
++    for (QSet<QWidget *>::const_iterator widIt = widgetsNeedingCancel.constBegin(),
++         widItEnd = widgetsNeedingCancel.constEnd(); widIt != widItEnd; ++widIt) {
++        QWidget *widget = *widIt;
++        touchEvent.setWindow(widget->windowHandle());
++        touchEvent.setTarget(widget);
++        QApplication::sendSpontaneousEvent(widget, &touchEvent);
++    }
++}
++
+ #ifndef QT_NO_GESTURES
+ QGestureManager* QGestureManager::instance()
+ {
+diff --git a/src/widgets/kernel/qapplication_p.h b/src/widgets/kernel/qapplication_p.h
+index d9d184d..b4cd22d 100644
+--- a/src/widgets/kernel/qapplication_p.h
++++ b/src/widgets/kernel/qapplication_p.h
+@@ -386,6 +386,7 @@ public:
+                                        QTouchDevice *device,
+                                        const QList<QTouchEvent::TouchPoint> &touchPoints,
+                                        ulong timestamp);
++    static void translateTouchCancel(QTouchDevice *device, ulong timestamp);
+ 
+ private:
+ #ifdef Q_WS_QWS
+diff --git a/src/widgets/kernel/qwidget.cpp b/src/widgets/kernel/qwidget.cpp
+index 008f039..cd36697 100644
+--- a/src/widgets/kernel/qwidget.cpp
++++ b/src/widgets/kernel/qwidget.cpp
+@@ -7776,6 +7776,7 @@ bool QWidget::event(QEvent *event)
+         case QEvent::TouchBegin:
+         case QEvent::TouchUpdate:
+         case QEvent::TouchEnd:
++        case QEvent::TouchCancel:
+         case QEvent::ContextMenu:
+ #ifndef QT_NO_WHEELEVENT
+         case QEvent::Wheel:
+@@ -8178,6 +8179,7 @@ bool QWidget::event(QEvent *event)
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+     case QEvent::TouchEnd:
++    case QEvent::TouchCancel:
+     {
+         event->ignore();
+         break;
+diff --git a/src/widgets/kernel/qwidgetwindow_qpa.cpp b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+index e7ba485..c252456 100644
+--- a/src/widgets/kernel/qwidgetwindow_qpa.cpp
++++ b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+@@ -110,6 +110,7 @@ bool QWidgetWindow::event(QEvent *event)
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+     case QEvent::TouchEnd:
++    case QEvent::TouchCancel:
+         handleTouchEvent(static_cast<QTouchEvent *>(event));
+         return true;
+ 
+@@ -289,7 +290,10 @@ void QWidgetWindow::handleMouseEvent(QMouseEvent *event)
+ 
+ void QWidgetWindow::handleTouchEvent(QTouchEvent *event)
+ {
+-    QApplicationPrivate::translateRawTouchEvent(m_widget, event->device(), event->touchPoints(), event->timestamp());
++    if (event->type() == QEvent::TouchCancel)
++        QApplicationPrivate::translateTouchCancel(event->device(), event->timestamp());
++    else
++        QApplicationPrivate::translateRawTouchEvent(m_widget, event->device(), event->touchPoints(), event->timestamp());
+ }
+ 
+ void QWidgetWindow::handleKeyEvent(QKeyEvent *event)
+diff --git a/tests/auto/gui/kernel/qwindow/tst_qwindow.cpp b/tests/auto/gui/kernel/qwindow/tst_qwindow.cpp
+index d7c153d..8c4c53c 100644
+--- a/tests/auto/gui/kernel/qwindow/tst_qwindow.cpp
++++ b/tests/auto/gui/kernel/qwindow/tst_qwindow.cpp
+@@ -57,6 +57,8 @@ private slots:
+     void touchToMouseTranslation();
+     void mouseToTouchTranslation();
+     void mouseToTouchLoop();
++    void touchCancel();
++    void touchCancelWithTouchToMouse();
+     void orientation();
+     void close();
+     void initTestCase()
+@@ -274,6 +276,7 @@ public:
+             event->ignore();
+             return;
+         }
++        touchEventType = event->type();
+         QList<QTouchEvent::TouchPoint> points = event->touchPoints();
+         for (int i = 0; i < points.count(); ++i) {
+             switch (points.at(i).state()) {
+@@ -283,6 +286,9 @@ public:
+             case Qt::TouchPointReleased:
+                 ++touchReleasedCount;
+                 break;
++            case Qt::TouchPointMoved:
++                ++touchMovedCount;
++                break;
+             default:
+                 break;
+             }
+@@ -292,14 +298,15 @@ public:
+     InputTestWindow() {
+         keyPressCode = keyReleaseCode = 0;
+         mousePressButton = mouseReleaseButton = 0;
+-        touchPressedCount = touchReleasedCount = 0;
+-        ignoreMouse = ignoreTouch = 0;
++        touchPressedCount = touchReleasedCount = touchMovedCount = 0;
++        ignoreMouse = ignoreTouch = false;
+     }
+ 
+     int keyPressCode, keyReleaseCode;
+     int mousePressButton, mouseReleaseButton, mouseMoveButton;
+     QPointF mousePressScreenPos, mouseMoveScreenPos;
+-    int touchPressedCount, touchReleasedCount;
++    int touchPressedCount, touchReleasedCount, touchMovedCount;
++    QEvent::Type touchEventType;
+ 
+     bool ignoreMouse, ignoreTouch;
+ };
+@@ -480,7 +487,108 @@ void tst_QWindow::mouseToTouchLoop()
+     QCoreApplication::processEvents();
+ 
+     qApp->setAttribute(Qt::AA_SynthesizeTouchForUnhandledMouseEvents, false);
+-    qApp->setAttribute(Qt::AA_SynthesizeMouseForUnhandledTouchEvents, false);
++    qApp->setAttribute(Qt::AA_SynthesizeMouseForUnhandledTouchEvents, true);
++}
++
++void tst_QWindow::touchCancel()
++{
++    InputTestWindow window;
++    window.setGeometry(80, 80, 40, 40);
++    window.show();
++    QTest::qWaitForWindowShown(&window);
++
++    QList<QWindowSystemInterface::TouchPoint> points;
++    QWindowSystemInterface::TouchPoint tp1;
++    tp1.id = 1;
++
++    // Start a touch.
++    tp1.state = Qt::TouchPointPressed;
++    tp1.area = QRect(10, 10, 4, 4);
++    points << tp1;
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchEventType, QEvent::TouchBegin);
++    QTRY_COMPARE(window.touchPressedCount, 1);
++
++    // Cancel the active touch sequence.
++    QWindowSystemInterface::handleTouchCancelEvent(&window, touchDevice);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchEventType, QEvent::TouchCancel);
++
++    // Send a move -> will not be delivered due to the cancellation.
++    QTRY_COMPARE(window.touchMovedCount, 0);
++    points[0].state = Qt::TouchPointMoved;
++    tp1.area.adjust(2, 2, 2, 2);
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchMovedCount, 0);
++
++    // Likewise. The only allowed transition is TouchCancel -> TouchBegin.
++    QTRY_COMPARE(window.touchReleasedCount, 0);
++    points[0].state = Qt::TouchPointReleased;
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchReleasedCount, 0);
++
++    // Start a new sequence -> from this point on everything should go through normally.
++    points[0].state = Qt::TouchPointPressed;
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchEventType, QEvent::TouchBegin);
++    QTRY_COMPARE(window.touchPressedCount, 2);
++
++    points[0].state = Qt::TouchPointMoved;
++    tp1.area.adjust(2, 2, 2, 2);
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchMovedCount, 1);
++
++    points[0].state = Qt::TouchPointReleased;
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.touchReleasedCount, 1);
++}
++
++void tst_QWindow::touchCancelWithTouchToMouse()
++{
++    InputTestWindow window;
++    window.ignoreTouch = true;
++    window.setGeometry(80, 80, 40, 40);
++    window.show();
++    QTest::qWaitForWindowShown(&window);
++
++    QList<QWindowSystemInterface::TouchPoint> points;
++    QWindowSystemInterface::TouchPoint tp1;
++    tp1.id = 1;
++
++    tp1.state = Qt::TouchPointPressed;
++    tp1.area = QRect(100, 100, 4, 4);
++    points << tp1;
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.mousePressButton, int(Qt::LeftButton));
++    QTRY_COMPARE(window.mousePressScreenPos, points[0].area.center());
++
++    // Cancel the touch. Should result in a mouse release for windows that have
++    // have an active touch-to-mouse sequence.
++    QWindowSystemInterface::handleTouchCancelEvent(0, touchDevice);
++    QCoreApplication::processEvents();
++
++    QTRY_COMPARE(window.mouseReleaseButton, int(Qt::LeftButton));
++
++    // Now change the window to accept touches.
++    window.mousePressButton = window.mouseReleaseButton = 0;
++    window.ignoreTouch = false;
++
++    // Send a touch, there will be no mouse event generated.
++    QWindowSystemInterface::handleTouchEvent(&window, touchDevice, points);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.mousePressButton, 0);
++
++    // Cancel the touch. It should not result in a mouse release with this window.
++    QWindowSystemInterface::handleTouchCancelEvent(0, touchDevice);
++    QCoreApplication::processEvents();
++    QTRY_COMPARE(window.mouseReleaseButton, 0);
+ }
+ 
+ void tst_QWindow::orientation()

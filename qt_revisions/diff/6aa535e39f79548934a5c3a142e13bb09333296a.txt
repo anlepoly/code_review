@@ -1,0 +1,197 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index eab6292..cdf6b6d 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -1415,8 +1415,10 @@ void QQuickCanvasPrivate::cleanupNodesOnShutdown(QQuickItem *item)
+ void QQuickCanvasPrivate::cleanupNodesOnShutdown()
+ {
+     cleanupNodes();
+-
+     cleanupNodesOnShutdown(rootItem);
++    QSet<QQuickItem *>::const_iterator it = parentlessItems.begin();
++    for (; it != parentlessItems.end(); ++it)
++        cleanupNodesOnShutdown(*it);
+ }
+ 
+ void QQuickCanvasPrivate::updateDirtyNodes()
+diff --git a/src/quick/items/qquickcanvas_p.h b/src/quick/items/qquickcanvas_p.h
+index 6bb16ed..d192105 100644
+--- a/src/quick/items/qquickcanvas_p.h
++++ b/src/quick/items/qquickcanvas_p.h
+@@ -107,6 +107,7 @@ public:
+     void initRootItem();//Currently only used if items added in QML
+ 
+     QQuickRootItem *rootItem;
++    QSet<QQuickItem *> parentlessItems;
+     QDeclarativeListProperty<QObject> data();
+ 
+     QQuickItem *activeFocusItem;
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index e9dc737..54ce316 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -1892,6 +1892,8 @@ void QQuickItem::setParentItem(QQuickItem *parentItem)
+                                                                 QQuickCanvasPrivate::DontChangeFocusProperty);
+ 
+         op->removeChild(this);
++    } else if (d->canvas) {
++        QQuickCanvasPrivate::get(d->canvas)->parentlessItems.remove(this);
+     }
+ 
+     d->parentItem = parentItem;
+@@ -2119,6 +2121,8 @@ void QQuickItemPrivate::initCanvas(InitializationState *state, QQuickCanvas *c)
+             c->hoverItems.removeAll(q);
+         if (itemNodeInstance)
+             c->cleanup(itemNodeInstance);
++        if (!parentItem)
++            c->parentlessItems.remove(q);
+     }
+ 
+     canvas = c;
+@@ -2142,6 +2146,9 @@ void QQuickItemPrivate::initCanvas(InitializationState *state, QQuickCanvas *c)
+         childState = &_dummy;
+     }
+ 
++    if (!parentItem && canvas)
++        QQuickCanvasPrivate::get(canvas)->parentlessItems.insert(q);
++
+     for (int ii = 0; ii < childItems.count(); ++ii) {
+         QQuickItem *child = childItems.at(ii);
+         QQuickItemPrivate::get(child)->initCanvas(childState, c);
+diff --git a/src/quick/items/qquickshadereffect.cpp b/src/quick/items/qquickshadereffect.cpp
+index 7572a0c..f90c538 100644
+--- a/src/quick/items/qquickshadereffect.cpp
++++ b/src/quick/items/qquickshadereffect.cpp
+@@ -388,14 +388,17 @@ void QQuickShaderEffect::setSource(const QVariant &var, int index)
+ 
+     source.sourceObject = item;
+ 
+-
+-    // TODO: Find better solution.
+-    // 'item' needs a canvas to get a scenegraph node.
+-    // The easiest way to make sure it gets a canvas is to
+-    // make it a part of the same item tree as 'this'.
+-    if (item && item->parentItem() == 0) {
+-        item->setParentItem(this);
+-        item->setVisible(false);
++    if (item) {
++        QQuickItemPrivate *d = QQuickItemPrivate::get(item);
++        // 'item' needs a canvas to get a scene graph node. It usually gets one through its
++        // parent, but if the source item is "inline" rather than a reference -- i.e.
++        // "property variant source: Image { }" instead of "property variant source: foo" -- it
++        // will not get a parent. In those cases, 'item' should get the canvas from 'this'.
++        if (!d->parentItem && canvas() && !d->canvas) {
++            QQuickItemPrivate::InitializationState initState;
++            initState.clear();
++            d->initCanvas(&initState, canvas());
++        }
+     }
+ }
+ 
+@@ -454,9 +457,6 @@ void QQuickShaderEffect::reset()
+     for (int i = 0; i < m_sources.size(); ++i) {
+         const SourceData &source = m_sources.at(i);
+         delete source.mapper;
+-        QQuickItem *item = qobject_cast<QQuickItem *>(source.sourceObject);
+-        if (item && item->parentItem() == this)
+-            item->setParentItem(0);
+     }
+     m_sources.clear();
+ 
+@@ -760,4 +760,21 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+     return node;
+ }
+ 
++void QQuickShaderEffect::itemChange(ItemChange change, const ItemChangeData &value)
++{
++    if (change == QQuickItem::ItemSceneChange) {
++        // See comment in QQuickShaderEffect::setSource().
++        for (int i = 0; i < m_sources.size(); ++i) {
++            QQuickItemPrivate *d = QQuickItemPrivate::get(m_sources.at(i).sourceObject);
++            if (!d->parentItem && value.canvas != d->canvas) {
++                QQuickItemPrivate::InitializationState initState;
++                initState.clear();
++                d->initCanvas(&initState, value.canvas);
++            }
++        }
++    }
++    QQuickItem::itemChange(change, value);
++}
++
++
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffect_p.h b/src/quick/items/qquickshadereffect_p.h
+index 97444fb..ca67a6a 100644
+--- a/src/quick/items/qquickshadereffect_p.h
++++ b/src/quick/items/qquickshadereffect_p.h
+@@ -110,6 +110,7 @@ Q_SIGNALS:
+ protected:
+     virtual void geometryChanged(const QRectF &newGeometry, const QRectF &oldGeometry);
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
++    virtual void itemChange(ItemChange change, const ItemChangeData &value);
+ 
+ private Q_SLOTS:
+     void changeSource(int index);
+diff --git a/src/quick/items/qquickshadereffectsource.cpp b/src/quick/items/qquickshadereffectsource.cpp
+index e8be7bd..c57d749 100644
+--- a/src/quick/items/qquickshadereffectsource.cpp
++++ b/src/quick/items/qquickshadereffectsource.cpp
+@@ -601,16 +601,18 @@ void QQuickShaderEffectSource::setSourceItem(QQuickItem *item)
+         d->removeItemChangeListener(this, QQuickItemPrivate::Geometry);
+     }
+     m_sourceItem = item;
+-    if (m_sourceItem) {
+-        // TODO: Find better solution.
+-        // 'm_sourceItem' needs a canvas to get a scenegraph node.
+-        // The easiest way to make sure it gets a canvas is to
+-        // make it a part of the same item tree as 'this'.
+-        if (m_sourceItem->parentItem() == 0) {
+-            m_sourceItem->setParentItem(this);
+-            m_sourceItem->setVisible(false);
++
++    if (item) {
++        QQuickItemPrivate *d = QQuickItemPrivate::get(item);
++        // 'item' needs a canvas to get a scene graph node. It usually gets one through its
++        // parent, but if the source item is "inline" rather than a reference -- i.e.
++        // "sourceItem: Item { }" instead of "sourceItem: foo" -- it will not get a parent.
++        // In those cases, 'item' should get the canvas from 'this'.
++        if (!d->parentItem && canvas() && !d->canvas) {
++            QQuickItemPrivate::InitializationState initState;
++            initState.clear();
++            d->initCanvas(&initState, canvas());
+         }
+-        QQuickItemPrivate *d = QQuickItemPrivate::get(m_sourceItem);
+         d->refFromEffectItem(m_hideSource);
+         d->addItemChangeListener(this, QQuickItemPrivate::Geometry);
+     }
+@@ -918,4 +920,18 @@ QSGNode *QQuickShaderEffectSource::updatePaintNode(QSGNode *oldNode, UpdatePaint
+     return node;
+ }
+ 
++void QQuickShaderEffectSource::itemChange(ItemChange change, const ItemChangeData &value)
++{
++    if (change == QQuickItem::ItemSceneChange && m_sourceItem) {
++        // See comment in QQuickShaderEffectSource::setSourceItem().
++        QQuickItemPrivate *d = QQuickItemPrivate::get(m_sourceItem);
++        if (!d->parentItem && value.canvas != d->canvas) {
++            QQuickItemPrivate::InitializationState initState;
++            initState.clear();
++            d->initCanvas(&initState, value.canvas);
++        }
++    }
++    QQuickItem::itemChange(change, value);
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffectsource_p.h b/src/quick/items/qquickshadereffectsource_p.h
+index b648cb5..bf5a7d1 100644
+--- a/src/quick/items/qquickshadereffectsource_p.h
++++ b/src/quick/items/qquickshadereffectsource_p.h
+@@ -232,6 +232,7 @@ protected:
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
+ 
+     virtual void itemGeometryChanged(QQuickItem *item, const QRectF &newRect, const QRectF &oldRect);
++    virtual void itemChange(ItemChange change, const ItemChangeData &value);
+ 
+ private:
+     void ensureTexture();

@@ -1,0 +1,243 @@
+diff --git a/src/plugins/platforms/qnx/qqnxglcontext.cpp b/src/plugins/platforms/qnx/qqnxglcontext.cpp
+index 0b030bd..44935f7 100644
+--- a/src/plugins/platforms/qnx/qqnxglcontext.cpp
++++ b/src/plugins/platforms/qnx/qqnxglcontext.cpp
+@@ -88,7 +88,8 @@ static EGLenum checkEGLError(const char *msg)
+ QQnxGLContext::QQnxGLContext(QOpenGLContext *glContext)
+     : QPlatformOpenGLContext(),
+       m_glContext(glContext),
+-      m_eglSurface(EGL_NO_SURFACE)
++      m_eglSurface(EGL_NO_SURFACE),
++      m_newSurfaceRequested(true)   // Create a surface the first time makeCurrent() is called
+ {
+     qGLContextDebug() << Q_FUNC_INFO;
+     QSurfaceFormat format = m_glContext->format();
+@@ -201,6 +202,12 @@ void QQnxGLContext::shutdown()
+     eglTerminate(ms_eglDisplay);
+ }
+ 
++void QQnxGLContext::requestSurfaceChange()
++{
++    qGLContextDebug() << Q_FUNC_INFO;
++    m_newSurfaceRequested.testAndSetRelease(false, true);
++}
++
+ bool QQnxGLContext::makeCurrent(QPlatformSurface *surface)
+ {
+     qGLContextDebug() << Q_FUNC_INFO;
+@@ -213,8 +220,12 @@ bool QQnxGLContext::makeCurrent(QPlatformSurface *surface)
+         qFatal("QQNXQBBWindow: failed to set EGL API, err=%d", eglGetError());
+     }
+ 
+-    if (m_eglSurface == EGL_NO_SURFACE)
++    if (m_newSurfaceRequested.testAndSetOrdered(true, false)) {
++        qGLContextDebug() << "New EGL surface requested";
++        doneCurrent();
++        destroySurface();
+         createSurface(surface);
++    }
+ 
+     eglResult = eglMakeCurrent(ms_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext);
+     if (eglResult != EGL_TRUE) {
+@@ -302,14 +313,13 @@ void QQnxGLContext::createSurface(QPlatformSurface *surface)
+         qFatal("QQNX: unable to create EGLSurface without a QQnxWindow");
+     }
+ 
+-    // If the platform window does not yet have any buffers, we create
+-    // a temporary set of buffers with a size of 1x1 pixels. This will
+-    // suffice until such time as the platform window has obtained
+-    // buffers of the proper size
+-    if (!platformWindow->hasBuffers()) {
+-        platformWindow->setPlatformOpenGLContext(this);
+-        platformWindow->setBufferSize(platformWindow->geometry().size());
+-    }
++    // Link the window and context
++    platformWindow->setPlatformOpenGLContext(this);
++
++    // Fetch the surface size from the window and update
++    // the window's buffers before we create the EGL surface
++    const QSize surfaceSize = platformWindow->requestedBufferSize();
++    platformWindow->setBufferSize(surfaceSize);
+ 
+     // Obtain the native handle for our window
+     screen_window_t handle = platformWindow->nativeHandle();
+diff --git a/src/plugins/platforms/qnx/qqnxglcontext.h b/src/plugins/platforms/qnx/qqnxglcontext.h
+index 219c48f..de03f3e 100644
+--- a/src/plugins/platforms/qnx/qqnxglcontext.h
++++ b/src/plugins/platforms/qnx/qqnxglcontext.h
+@@ -44,6 +44,7 @@
+ 
+ #include <qpa/qplatformopenglcontext.h>
+ #include <QtGui/QSurfaceFormat>
++#include <QtCore/QAtomicInt>
+ #include <QtCore/QSize>
+ 
+ #include <EGL/egl.h>
+@@ -61,6 +62,8 @@ public:
+     static void initialize();
+     static void shutdown();
+ 
++    void requestSurfaceChange();
++
+     bool makeCurrent(QPlatformSurface *surface);
+     void doneCurrent();
+     void swapBuffers(QPlatformSurface *surface);
+@@ -84,6 +87,8 @@ private:
+     EGLContext m_eglContext;
+     EGLSurface m_eglSurface;
+ 
++    QAtomicInt m_newSurfaceRequested;
++
+     static EGLint *contextAttrs();
+ };
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.cpp b/src/plugins/platforms/qnx/qqnxintegration.cpp
+index f20fb60..a63c217 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.cpp
++++ b/src/plugins/platforms/qnx/qqnxintegration.cpp
+@@ -279,12 +279,16 @@ bool QQnxIntegration::hasCapability(QPlatformIntegration::Capability cap) const
+ {
+     qIntegrationDebug() << Q_FUNC_INFO;
+     switch (cap) {
+-    case ThreadedPixmaps: return true;
++    case ThreadedPixmaps:
++        return true;
+ #if defined(QT_OPENGL_ES)
+     case OpenGL:
++    case ThreadedOpenGL:
++    case BufferQueueingOpenGL:
+         return true;
+ #endif
+-    default: return QPlatformIntegration::hasCapability(cap);
++    default:
++        return QPlatformIntegration::hasCapability(cap);
+     }
+ }
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxwindow.cpp b/src/plugins/platforms/qnx/qqnxwindow.cpp
+index 1dfb45d..d951e7c 100644
+--- a/src/plugins/platforms/qnx/qqnxwindow.cpp
++++ b/src/plugins/platforms/qnx/qqnxwindow.cpp
+@@ -165,9 +165,8 @@ void QQnxWindow::setGeometry(const QRect &rect)
+                    << ", (" << rect.x() << "," << rect.y()
+                    << "," << rect.width() << "," << rect.height() << ")";
+ 
+-    QRect oldGeometry = geometry();
+-
+     // Call base class method
++    QRect oldGeometry = QPlatformWindow::geometry();
+     QPlatformWindow::setGeometry(rect);
+ 
+     // Set window geometry equal to widget geometry
+@@ -195,20 +194,17 @@ void QQnxWindow::setGeometry(const QRect &rect)
+         qFatal("QQnxWindow: failed to set window source size, errno=%d", errno);
+     }
+ 
+-    if (m_platformOpenGLContext != 0 && bufferSize() != rect.size()) {
+-        bool restoreCurrent = false;
+-
+-        if (m_platformOpenGLContext->isCurrent()) {
+-            m_platformOpenGLContext->doneCurrent();
+-            restoreCurrent = true;
+-        }
+-
+-        m_platformOpenGLContext->destroySurface();
+-        setBufferSize(rect.size());
+-        m_platformOpenGLContext->createSurface(this);
+-
+-        if (restoreCurrent)
+-            m_platformOpenGLContext->makeCurrent(this);
++    // If this is an OpenGL window we need to request that the GL context updates
++    // the EGLsurface on which it is rendering. The surface will be recreated the
++    // next time QQnxGLContext::makeCurrent() is called.
++    {
++        // We want the setting of the atomic bool in the GL context to be atomic with
++        // setting m_requestedBufferSize and therefore extended the scope to include
++        // that test.
++        const QMutexLocker locker(&m_mutex);
++        m_requestedBufferSize = rect.size();
++        if (m_platformOpenGLContext != 0 && bufferSize() != rect.size())
++            m_platformOpenGLContext->requestSurfaceChange();
+     }
+ 
+     QWindowSystemInterface::handleSynchronousGeometryChange(window(), rect);
+@@ -298,9 +294,16 @@ bool QQnxWindow::isExposed() const
+     return m_visible;
+ }
+ 
++QSize QQnxWindow::requestedBufferSize() const
++{
++    const QMutexLocker locker(&m_mutex);
++    return m_requestedBufferSize;
++}
++
+ void QQnxWindow::setBufferSize(const QSize &size)
+ {
+     qWindowDebug() << Q_FUNC_INFO << "window =" << window() << "size =" << size;
++
+     // Set window buffer size
+     errno = 0;
+     int val[2] = { size.width(), size.height() };
+@@ -310,7 +313,7 @@ void QQnxWindow::setBufferSize(const QSize &size)
+     }
+ 
+     // Create window buffers if they do not exist
+-    if (!hasBuffers()) {
++    if (m_bufferSize.isEmpty()) {
+ #ifndef QT_NO_OPENGL
+         // Get pixel format from EGL config if using OpenGL;
+         // otherwise inherit pixel format of window's screen
+@@ -341,11 +344,15 @@ void QQnxWindow::setBufferSize(const QSize &size)
+     m_currentBufferIndex = -1;
+     m_previousDirty = QRegion();
+     m_scrolled = QRegion();
++
++    const QMutexLocker locker(&m_mutex);
++    m_requestedBufferSize = QSize();
+ }
+ 
+ QQnxBuffer &QQnxWindow::renderBuffer()
+ {
+     qWindowDebug() << Q_FUNC_INFO << "window =" << window();
++
+     // Check if render buffer is invalid
+     if (m_currentBufferIndex == -1) {
+         // Get all buffers available for rendering
+diff --git a/src/plugins/platforms/qnx/qqnxwindow.h b/src/plugins/platforms/qnx/qqnxwindow.h
+index 4a461d0..26afe71 100644
+--- a/src/plugins/platforms/qnx/qqnxwindow.h
++++ b/src/plugins/platforms/qnx/qqnxwindow.h
+@@ -47,6 +47,7 @@
+ #include "qqnxbuffer.h"
+ 
+ #include <QtGui/QImage>
++#include <QtCore/QMutex>
+ 
+ #ifndef QT_NO_OPENGL
+ #include <EGL/egl.h>
+@@ -82,6 +83,9 @@ public:
+     WId winId() const { return (WId)m_window; }
+     screen_window_t nativeHandle() const { return m_window; }
+ 
++    // Called by QQnxGLContext::createSurface()
++    QSize requestedBufferSize() const;
++
+     void setBufferSize(const QSize &size);
+     QSize bufferSize() const { return m_bufferSize; }
+     bool hasBuffers() const { return !m_bufferSize.isEmpty(); }
+@@ -140,6 +144,15 @@ private:
+     bool m_visible;
+     QRect m_unmaximizedGeometry;
+     Qt::WindowState m_windowState;
++
++    // This mutex is used to protect access to the m_requestedBufferSize
++    // member. This member is used in conjunction with QQnxGLContext::requestNewSurface()
++    // to coordinate recreating the EGL surface which involves destroying any
++    // existing EGL surface; resizing the native window buffers; and creating a new
++    // EGL surface. All of this has to be done from the thread that is calling
++    // QQnxGLContext::makeCurrent()
++    mutable QMutex m_mutex;
++    QSize m_requestedBufferSize;
+ };
+ 
+ QT_END_NAMESPACE

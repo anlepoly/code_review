@@ -1,0 +1,384 @@
+diff --git a/src/gui/gui.pro b/src/gui/gui.pro
+index 2d21a7d..3940705 100644
+--- a/src/gui/gui.pro
++++ b/src/gui/gui.pro
+@@ -84,6 +84,18 @@ win32:!contains(QT_CONFIG, directwrite) {
+             silent:ssse3_compiler.commands = @echo compiling[ssse3] ${QMAKE_FILE_IN} && $$ssse3_compiler.commands
+             QMAKE_EXTRA_COMPILERS += ssse3_compiler
+         }
++        avx {
++            avx_compiler.commands = $$QMAKE_CXX -c -Winline
++            avx_compiler.commands += -mavx
++            avx_compiler.commands += $(CXXFLAGS) $(INCPATH) ${QMAKE_FILE_IN} -o ${QMAKE_FILE_OUT}
++            avx_compiler.dependency_type = TYPE_C
++            avx_compiler.output = ${QMAKE_VAR_OBJECTS_DIR}${QMAKE_FILE_BASE}$${first(QMAKE_EXT_OBJ)}
++            avx_compiler.input = AVX_SOURCES
++            avx_compiler.variable_out = OBJECTS
++            avx_compiler.name = compiling[avx] ${QMAKE_FILE_IN}
++            silent:avx_compiler.commands = @echo compiling[avx] ${QMAKE_FILE_IN} && $$avx_compiler.commands
++            QMAKE_EXTRA_COMPILERS += avx_compiler
++        }
+         iwmmxt {
+             iwmmxt_compiler.commands = $$QMAKE_CXX -c -Winline
+             iwmmxt_compiler.commands += -mcpu=iwmmxt
+diff --git a/src/gui/image/image.pri b/src/gui/image/image.pri
+index 6b306dd..f29385d 100644
+--- a/src/gui/image/image.pri
++++ b/src/gui/image/image.pri
+@@ -77,3 +77,4 @@ contains(QT_CONFIG, gif):include($$PWD/qgifhandler.pri)
+ NEON_SOURCES += image/qimage_neon.cpp
+ SSE2_SOURCES += image/qimage_sse2.cpp
+ SSSE3_SOURCES += image/qimage_ssse3.cpp
++AVX_SOURCES += image/qimage_avx.cpp
+diff --git a/src/gui/image/qimage.cpp b/src/gui/image/qimage.cpp
+index 89060cf..2d70b28 100644
+--- a/src/gui/image/qimage.cpp
++++ b/src/gui/image/qimage.cpp
+@@ -3273,19 +3273,32 @@ void qInitImageConversions()
+     Q_UNUSED(features);
+ 
+ #ifdef QT_HAVE_SSE2
+-    if (features & SSE2) {
+-        extern bool convert_ARGB_to_ARGB_PM_inplace_sse2(QImageData *data, Qt::ImageConversionFlags);
+-        inplace_converter_map[QImage::Format_ARGB32][QImage::Format_ARGB32_Premultiplied] = convert_ARGB_to_ARGB_PM_inplace_sse2;
+-    }
++#ifdef QT_HAVE_AVX
++    if (features & AVX) {
++        extern bool convert_ARGB_to_ARGB_PM_inplace_avx(QImageData *data, Qt::ImageConversionFlags);
++        inplace_converter_map[QImage::Format_ARGB32][QImage::Format_ARGB32_Premultiplied] = convert_ARGB_to_ARGB_PM_inplace_avx;
++
++        extern void convert_RGB888_to_RGB32_avx(QImageData *dest, const QImageData *src, Qt::ImageConversionFlags);
++        converter_map[QImage::Format_RGB888][QImage::Format_RGB32] = convert_RGB888_to_RGB32_avx;
++        converter_map[QImage::Format_RGB888][QImage::Format_ARGB32] = convert_RGB888_to_RGB32_avx;
++        converter_map[QImage::Format_RGB888][QImage::Format_ARGB32_Premultiplied] = convert_RGB888_to_RGB32_avx;
++    } else
+ #endif
++
++        if (features & SSE2) {
++            extern bool convert_ARGB_to_ARGB_PM_inplace_sse2(QImageData *data, Qt::ImageConversionFlags);
++            inplace_converter_map[QImage::Format_ARGB32][QImage::Format_ARGB32_Premultiplied] = convert_ARGB_to_ARGB_PM_inplace_sse2;
+ #ifdef QT_HAVE_SSSE3
+-    if (features & SSSE3) {
+-        extern void convert_RGB888_to_RGB32_ssse3(QImageData *dest, const QImageData *src, Qt::ImageConversionFlags);
+-        converter_map[QImage::Format_RGB888][QImage::Format_RGB32] = convert_RGB888_to_RGB32_ssse3;
+-        converter_map[QImage::Format_RGB888][QImage::Format_ARGB32] = convert_RGB888_to_RGB32_ssse3;
+-        converter_map[QImage::Format_RGB888][QImage::Format_ARGB32_Premultiplied] = convert_RGB888_to_RGB32_ssse3;
+-    }
++            if (features & SSSE3) {
++                extern void convert_RGB888_to_RGB32_ssse3(QImageData *dest, const QImageData *src, Qt::ImageConversionFlags);
++                converter_map[QImage::Format_RGB888][QImage::Format_RGB32] = convert_RGB888_to_RGB32_ssse3;
++                converter_map[QImage::Format_RGB888][QImage::Format_ARGB32] = convert_RGB888_to_RGB32_ssse3;
++                converter_map[QImage::Format_RGB888][QImage::Format_ARGB32_Premultiplied] = convert_RGB888_to_RGB32_ssse3;
++            }
+ #endif
++        }
++#endif // SSE2
++
+ #ifdef QT_HAVE_NEON
+     if (features & NEON) {
+         extern void convert_RGB888_to_RGB32_neon(QImageData *dest, const QImageData *src, Qt::ImageConversionFlags);
+diff --git a/src/gui/image/qimage_avx.cpp b/src/gui/image/qimage_avx.cpp
+new file mode 100644
+index 0000000..f112a46
+--- /dev/null
++++ b/src/gui/image/qimage_avx.cpp
+@@ -0,0 +1,57 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Intel Corporation
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtGui module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <private/qsimd_p.h>
++
++#ifdef QT_HAVE_AVX
++
++#ifndef __AVX__
++#error "AVX not enabled in this file, cannot proceed"
++#endif
++
++#define convert_ARGB_to_ARGB_PM_inplace_sse2 convert_ARGB_to_ARGB_PM_inplace_avx
++#include "qimage_sse2.cpp"
++
++#define qt_convert_rgb888_to_rgb32_ssse3 qt_convert_rgb888_to_rgb32_avx
++#define convert_RGB888_to_RGB32_ssse3 convert_RGB888_to_RGB32_avx
++#include "qimage_ssse3.cpp"
++
++#endif
+diff --git a/src/gui/painting/painting.pri b/src/gui/painting/painting.pri
+index 7a20f35..e4b3f5e 100644
+--- a/src/gui/painting/painting.pri
++++ b/src/gui/painting/painting.pri
+@@ -91,12 +91,13 @@ SOURCES += \
+ 
+ 
+ 
+-if(mmx|3dnow|sse|sse2|iwmmxt) {
++if(mmx|3dnow|sse|sse2|iwmmxt|avx) {
+     HEADERS += painting/qdrawhelper_x86_p.h \
+                painting/qdrawingprimitive_sse2_p.h
+     SSE2_SOURCES += painting/qdrawhelper_sse2.cpp
+     SSSE3_SOURCES += painting/qdrawhelper_ssse3.cpp
+     IWMMXT_SOURCES += painting/qdrawhelper_iwmmxt.cpp
++    AVX_SOURCES += painting/qdrawhelper_avx.cpp
+ }
+ 
+ NEON_SOURCES += painting/qdrawhelper_neon.cpp
+diff --git a/src/gui/painting/qdrawhelper.cpp b/src/gui/painting/qdrawhelper.cpp
+index c21cc61..23a1853 100644
+--- a/src/gui/painting/qdrawhelper.cpp
++++ b/src/gui/painting/qdrawhelper.cpp
+@@ -5805,6 +5805,24 @@ void qInitDrawhelperAsm()
+ 
+     const uint features = qDetectCPUFeatures();
+     if (false) {
++#ifdef QT_HAVE_AVX
++    } else if (features & AVX) {
++        qt_memfill32 = qt_memfill32_avx;
++        qt_memfill16 = qt_memfill16_avx;
++        qDrawHelper[QImage::Format_RGB32].bitmapBlit = qt_bitmapblit32_avx;
++        qDrawHelper[QImage::Format_ARGB32].bitmapBlit = qt_bitmapblit32_avx;
++        qDrawHelper[QImage::Format_ARGB32_Premultiplied].bitmapBlit = qt_bitmapblit32_avx;
++        qDrawHelper[QImage::Format_RGB16].bitmapBlit = qt_bitmapblit16_avx;
++
++        extern void qt_scale_image_argb32_on_argb32_avx(uchar *destPixels, int dbpl,
++                                                         const uchar *srcPixels, int sbpl,
++                                                         const QRectF &targetRect,
++                                                         const QRectF &sourceRect,
++                                                         const QRect &clip,
++                                                         int const_alpha);
++        qScaleFunctions[QImage::Format_ARGB32_Premultiplied][QImage::Format_ARGB32_Premultiplied] = qt_scale_image_argb32_on_argb32_avx;
++        qScaleFunctions[QImage::Format_RGB32][QImage::Format_ARGB32_Premultiplied] = qt_scale_image_argb32_on_argb32_avx;
++#endif
+ #ifdef QT_HAVE_SSE2
+     } else if (features & SSE2) {
+         qt_memfill32 = qt_memfill32_sse2;
+@@ -5859,12 +5877,51 @@ void qInitDrawhelperAsm()
+     }
+ #endif // SSSE3
+ 
++#ifdef QT_HAVE_AVX
++    if (features & AVX) {
++        extern void qt_blend_rgb32_on_rgb32_avx(uchar *destPixels, int dbpl,
++                                                const uchar *srcPixels, int sbpl,
++                                                int w, int h,
++                                                int const_alpha);
++        extern void qt_blend_argb32_on_argb32_avx(uchar *destPixels, int dbpl,
++                                                  const uchar *srcPixels, int sbpl,
++                                                  int w, int h,
++                                                  int const_alpha);
++
++        qBlendFunctions[QImage::Format_RGB32][QImage::Format_RGB32] = qt_blend_rgb32_on_rgb32_avx;
++        qBlendFunctions[QImage::Format_ARGB32_Premultiplied][QImage::Format_RGB32] = qt_blend_rgb32_on_rgb32_avx;
++        qBlendFunctions[QImage::Format_RGB32][QImage::Format_ARGB32_Premultiplied] = qt_blend_argb32_on_argb32_avx;
++        qBlendFunctions[QImage::Format_ARGB32_Premultiplied][QImage::Format_ARGB32_Premultiplied] = qt_blend_argb32_on_argb32_avx;
++
++        extern const uint * QT_FASTCALL qt_fetch_radial_gradient_avx(uint *buffer, const Operator *op, const QSpanData *data,
++                                                                     int y, int x, int length);
++
++        qt_fetch_radial_gradient = qt_fetch_radial_gradient_avx;
++    }
++#endif // AVX
++
+ #endif // SSE2
+ 
+ #ifdef QT_HAVE_SSE2
+     if (features & SSE2) {
+         functionForModeAsm = qt_functionForMode_SSE2;
+         functionForModeSolidAsm = qt_functionForModeSolid_SSE2;
++        }
++#endif
++#ifdef QT_HAVE_AVX
++        if (features & AVX) {
++            extern void QT_FASTCALL comp_func_SourceOver_avx(uint *destPixels,
++                                                             const uint *srcPixels,
++                                                             int length,
++                                                             uint const_alpha);
++            extern void QT_FASTCALL comp_func_solid_SourceOver_avx(uint *destPixels, int length, uint color, uint const_alpha);
++            extern void QT_FASTCALL comp_func_Plus_avx(uint *dst, const uint *src, int length, uint const_alpha);
++            extern void QT_FASTCALL comp_func_Source_avx(uint *dst, const uint *src, int length, uint const_alpha);
++
++            functionForModeAsm[0] = comp_func_SourceOver_avx;
++            functionForModeAsm[QPainter::CompositionMode_Source] = comp_func_Source_avx;
++            functionForModeAsm[QPainter::CompositionMode_Plus] = comp_func_Plus_avx;
++            functionForModeSolidAsm[0] = comp_func_solid_SourceOver_avx;
+     }
+ #endif // SSE2
+ 
+diff --git a/src/gui/painting/qdrawhelper_avx.cpp b/src/gui/painting/qdrawhelper_avx.cpp
+new file mode 100644
+index 0000000..28ba5f8
+--- /dev/null
++++ b/src/gui/painting/qdrawhelper_avx.cpp
+@@ -0,0 +1,70 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Intel Corporation
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtGui module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <private/qsimd_p.h>
++
++#ifdef QT_HAVE_AVX
++#define QDRAWHELPER_AVX
++
++#ifndef __AVX__
++#error "AVX not enabled in this file, cannot proceed"
++#endif
++
++#define qt_blend_argb32_on_argb32_ssse3 qt_blend_argb32_on_argb32_avx
++#include "qdrawhelper_ssse3.cpp"
++
++//#define qt_blend_argb32_on_argb32_sse2 qt_blend_argb32_on_argb32_avx
++#define qt_blend_rgb32_on_rgb32_sse2 qt_blend_rgb32_on_rgb32_avx
++#define comp_func_SourceOver_sse2 comp_func_SourceOver_avx
++#define comp_func_Plus_sse2 comp_func_Plus_avx
++#define comp_func_Source_sse2 comp_func_Source_avx
++#define comp_func_solid_SourceOver_sse2 comp_func_solid_SourceOver_avx
++#define qt_memfill32_sse2 qt_memfill32_avx
++#define qt_memfill16_sse2 qt_memfill16_avx
++#define qt_bitmapblit32_sse2 qt_bitmapblit32_avx
++#define qt_bitmapblit16_sse2 qt_bitmapblit16_avx
++#define QSimdSse2 QSimdAvx
++#define qt_fetch_radial_gradient_sse2 qt_fetch_radial_gradient_avx
++#define qt_scale_image_argb32_on_argb32_sse2 qt_scale_image_argb32_on_argb32_avx
++
++#include "qdrawhelper_sse2.cpp"
++
++#endif
+diff --git a/src/gui/painting/qdrawhelper_sse2.cpp b/src/gui/painting/qdrawhelper_sse2.cpp
+index 2c87aab..e441165 100644
+--- a/src/gui/painting/qdrawhelper_sse2.cpp
++++ b/src/gui/painting/qdrawhelper_sse2.cpp
+@@ -48,6 +48,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++#ifndef QDRAWHELPER_AVX
++// in AVX mode, we'll use the SSSE3 code
+ void qt_blend_argb32_on_argb32_sse2(uchar *destPixels, int dbpl,
+                                     const uchar *srcPixels, int sbpl,
+                                     int w, int h,
+@@ -83,6 +85,7 @@ void qt_blend_argb32_on_argb32_sse2(uchar *destPixels, int dbpl,
+         }
+     }
+ }
++#endif
+ 
+ // qblendfunctions.cpp
+ void qt_blend_rgb32_on_rgb32(uchar *destPixels, int dbpl,
+@@ -310,6 +313,7 @@ void QT_FASTCALL comp_func_solid_SourceOver_sse2(uint *destPixels, int length, u
+     }
+ }
+ 
++#ifndef QDRAWHELPER_AVX
+ CompositionFunctionSolid qt_functionForModeSolid_SSE2[numCompositionFunctions] = {
+     comp_func_solid_SourceOver_sse2,
+     comp_func_solid_DestinationOver,
+@@ -381,6 +385,7 @@ CompositionFunction qt_functionForMode_SSE2[numCompositionFunctions] = {
+     rasterop_NotSourceAndDestination,
+     rasterop_SourceAndNotDestination
+ };
++#endif
+ 
+ void qt_memfill16_sse2(quint16 *dest, quint16 value, int count)
+ {
+diff --git a/src/gui/painting/qdrawhelper_x86_p.h b/src/gui/painting/qdrawhelper_x86_p.h
+index 93abaf4..eb434e5 100644
+--- a/src/gui/painting/qdrawhelper_x86_p.h
++++ b/src/gui/painting/qdrawhelper_x86_p.h
+@@ -79,6 +79,25 @@ extern CompositionFunction qt_functionForMode_SSE2[];
+ extern CompositionFunctionSolid qt_functionForModeSolid_SSE2[];
+ #endif // QT_HAVE_SSE2
+ 
++#ifdef QT_HAVE_AVX
++void qt_memfill32_avx(quint32 *dest, quint32 value, int count);
++void qt_memfill16_avx(quint16 *dest, quint16 value, int count);
++void qt_bitmapblit32_avx(QRasterBuffer *rasterBuffer, int x, int y,
++                         quint32 color,
++                         const uchar *src, int width, int height, int stride);
++void qt_bitmapblit16_avx(QRasterBuffer *rasterBuffer, int x, int y,
++                         quint32 color,
++                         const uchar *src, int width, int height, int stride);
++void qt_blend_argb32_on_argb32_avx(uchar *destPixels, int dbpl,
++                                   const uchar *srcPixels, int sbpl,
++                                   int w, int h,
++                                   int const_alpha);
++void qt_blend_rgb32_on_rgb32_avx(uchar *destPixels, int dbpl,
++                                 const uchar *srcPixels, int sbpl,
++                                 int w, int h,
++                                 int const_alpha);
++#endif // QT_HAVE_AVX
++
+ #ifdef QT_HAVE_IWMMXT
+ void qt_blend_color_argb_iwmmxt(int count, const QSpan *spans, void *userData);

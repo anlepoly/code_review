@@ -1,0 +1,2085 @@
+diff --git a/src/plugins/wmf/mfstream.cpp b/src/plugins/wmf/mfstream.cpp
+new file mode 100644
+index 0000000..99033b0
+--- /dev/null
++++ b/src/plugins/wmf/mfstream.cpp
+@@ -0,0 +1,361 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Mobility Components.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "mfstream.h"
++#include <QtCore/qcoreapplication.h>
++
++//MFStream is added for supporting QIODevice type of media source.
++//It is used to delegate invocations from media foundation(through IMFByteStream) to QIODevice.
++
++MFStream::MFStream(QIODevice *stream, bool ownStream)
++    : m_cRef(1)
++    , m_stream(stream)
++    , m_ownStream(ownStream)
++    , m_currentReadResult(0)
++{
++    //Move to the thread of the stream object
++    //to make sure invocations on stream
++    //are happened in the same thread of stream object
++    this->moveToThread(stream->thread());
++    connect(stream, SIGNAL(readyRead()), this, SLOT(handleReadyRead()));
++}
++
++MFStream::~MFStream()
++{
++    if (m_currentReadResult)
++        m_currentReadResult->Release();
++    if (m_ownStream)
++        m_stream->deleteLater();
++}
++
++//from IUnknown
++STDMETHODIMP MFStream::QueryInterface(REFIID riid, LPVOID *ppvObject)
++{
++    if (!ppvObject)
++        return E_POINTER;
++    if (riid == IID_IMFByteStream) {
++        *ppvObject = static_cast<IMFByteStream*>(this);
++    } else if (riid == IID_IUnknown) {
++        *ppvObject = static_cast<IUnknown*>(this);
++    } else {
++        *ppvObject =  NULL;
++        return E_NOINTERFACE;
++    }
++    AddRef();
++    return S_OK;
++}
++
++STDMETHODIMP_(ULONG) MFStream::AddRef(void)
++{
++    return InterlockedIncrement(&m_cRef);
++}
++
++STDMETHODIMP_(ULONG) MFStream::Release(void)
++{
++    LONG cRef = InterlockedDecrement(&m_cRef);
++    if (cRef == 0) {
++        this->deleteLater();
++    }
++    return cRef;
++}
++
++
++//from IMFByteStream
++STDMETHODIMP MFStream::GetCapabilities(DWORD *pdwCapabilities)
++{
++    if (!pdwCapabilities)
++        return E_INVALIDARG;
++    *pdwCapabilities = MFBYTESTREAM_IS_READABLE;
++    if (!m_stream->isSequential())
++        *pdwCapabilities |= MFBYTESTREAM_IS_SEEKABLE;
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::GetLength(QWORD *pqwLength)
++{
++    if (!pqwLength)
++        return E_INVALIDARG;
++    QMutexLocker locker(&m_mutex);
++    *pqwLength = QWORD(m_stream->size());
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::SetLength(QWORD)
++{
++    return E_NOTIMPL;
++}
++
++STDMETHODIMP MFStream::GetCurrentPosition(QWORD *pqwPosition)
++{
++    if (!pqwPosition)
++        return E_INVALIDARG;
++    QMutexLocker locker(&m_mutex);
++    *pqwPosition = m_stream->pos();
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::SetCurrentPosition(QWORD qwPosition)
++{
++    QMutexLocker locker(&m_mutex);
++    //SetCurrentPosition may happend during the BeginRead/EndRead pair,
++    //refusing to execute SetCurrentPosition during that time seems to be
++    //the simplest workable solution
++    if (m_currentReadResult)
++        return S_FALSE;
++
++    bool seekOK = m_stream->seek(qint64(qwPosition));
++    if (seekOK)
++        return S_OK;
++    else
++        return S_FALSE;
++}
++
++STDMETHODIMP MFStream::IsEndOfStream(BOOL *pfEndOfStream)
++{
++    if (!pfEndOfStream)
++        return E_INVALIDARG;
++    QMutexLocker locker(&m_mutex);
++    *pfEndOfStream = m_stream->atEnd() ? TRUE : FALSE;
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::Read(BYTE *pb, ULONG cb, ULONG *pcbRead)
++{
++    QMutexLocker locker(&m_mutex);
++    qint64 read = m_stream->read((char*)(pb), qint64(cb));
++    if (pcbRead)
++        *pcbRead = ULONG(read);
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::BeginRead(BYTE *pb, ULONG cb, IMFAsyncCallback *pCallback,
++                       IUnknown *punkState)
++{
++    if (!pCallback || !pb)
++        return E_INVALIDARG;
++
++    Q_ASSERT(m_currentReadResult == NULL);
++
++    AsyncReadState *state = new (std::nothrow) AsyncReadState(pb, cb);
++    if (state == NULL)
++        return E_OUTOFMEMORY;
++
++    HRESULT hr = MFCreateAsyncResult(state, pCallback, punkState, &m_currentReadResult);
++    state->Release();
++    if (FAILED(hr))
++        return hr;
++
++    QCoreApplication::postEvent(this, new QEvent(QEvent::User));
++    return hr;
++}
++
++STDMETHODIMP MFStream::EndRead(IMFAsyncResult* pResult, ULONG *pcbRead)
++{
++    if (!pcbRead)
++        return E_INVALIDARG;
++    IUnknown *pUnk;
++    pResult->GetObject(&pUnk);
++    AsyncReadState *state = static_cast<AsyncReadState*>(pUnk);
++    *pcbRead = state->bytesRead();
++    pUnk->Release();
++
++    m_currentReadResult->Release();
++    m_currentReadResult = NULL;
++
++    return S_OK;
++}
++
++STDMETHODIMP MFStream::Write(const BYTE *, ULONG, ULONG *)
++{
++    return E_NOTIMPL;
++}
++
++STDMETHODIMP MFStream::BeginWrite(const BYTE *, ULONG ,
++                        IMFAsyncCallback *,
++                        IUnknown *)
++{
++    return E_NOTIMPL;
++}
++
++STDMETHODIMP MFStream::EndWrite(IMFAsyncResult *,
++                      ULONG *)
++{
++    return E_NOTIMPL;
++}
++
++STDMETHODIMP MFStream::Seek(
++    MFBYTESTREAM_SEEK_ORIGIN SeekOrigin,
++    LONGLONG llSeekOffset,
++    DWORD,
++    QWORD *pqwCurrentPosition)
++{
++    QMutexLocker locker(&m_mutex);
++    if (m_currentReadResult)
++        return S_FALSE;
++
++    qint64 pos = qint64(llSeekOffset);
++    switch (SeekOrigin) {
++    case msoCurrent:
++        pos += m_stream->pos();
++        break;
++    }
++    bool seekOK = m_stream->seek(pos);
++    if (*pqwCurrentPosition)
++        *pqwCurrentPosition = pos;
++    if (seekOK)
++        return S_OK;
++    else
++        return S_FALSE;
++}
++
++STDMETHODIMP MFStream::Flush()
++{
++    return E_NOTIMPL;
++}
++
++STDMETHODIMP MFStream::Close()
++{
++    QMutexLocker locker(&m_mutex);
++    if (m_ownStream)
++        m_stream->close();
++    return S_OK;
++}
++
++void MFStream::doRead()
++{
++    bool readDone = true;
++    IUnknown *pUnk = NULL;
++    HRESULT    hr = m_currentReadResult->GetObject(&pUnk);
++    if (SUCCEEDED(hr)) {
++        //do actual read
++        AsyncReadState *state =  static_cast<AsyncReadState*>(pUnk);
++        ULONG cbRead;
++        Read(state->pb(), state->cb() - state->bytesRead(), &cbRead);
++        pUnk->Release();
++
++        state->setBytesRead(cbRead + state->bytesRead());
++        if (state->cb() > state->bytesRead() && !m_stream->atEnd()) {
++            readDone = false;
++        }
++    }
++
++    if (readDone) {
++        //now inform the original caller
++        m_currentReadResult->SetStatus(hr);
++        MFInvokeCallback(m_currentReadResult);
++    }
++}
++
++
++void MFStream::handleReadyRead()
++{
++    doRead();
++}
++
++void MFStream::customEvent(QEvent *event)
++{
++    if (event->type() != QEvent::User) {
++        QObject::customEvent(event);
++        return;
++    }
++    doRead();
++}
++
++//AsyncReadState is a helper class used in BeginRead for asynchronous operation
++//to record some BeginRead parameters, so these parameters could be
++//used later when actually executing the read operation in another thread.
++MFStream::AsyncReadState::AsyncReadState(BYTE *pb, ULONG cb)
++    : m_cRef(1)
++    , m_pb(pb)
++    , m_cb(cb)
++    , m_cbRead(0)
++{
++}
++
++//from IUnknown
++STDMETHODIMP MFStream::AsyncReadState::QueryInterface(REFIID riid, LPVOID *ppvObject)
++{
++    if (!ppvObject)
++        return E_POINTER;
++
++    if (riid == IID_IUnknown) {
++        *ppvObject = static_cast<IUnknown*>(this);
++    } else {
++        *ppvObject =  NULL;
++        return E_NOINTERFACE;
++    }
++    AddRef();
++    return S_OK;
++}
++
++STDMETHODIMP_(ULONG) MFStream::AsyncReadState::AddRef(void)
++{
++    return InterlockedIncrement(&m_cRef);
++}
++
++STDMETHODIMP_(ULONG) MFStream::AsyncReadState::Release(void)
++{
++    LONG cRef = InterlockedDecrement(&m_cRef);
++    if (cRef == 0)
++        delete this;
++    // For thread safety, return a temporary variable.
++    return cRef;
++}
++
++BYTE* MFStream::AsyncReadState::pb() const
++{
++    return m_pb;
++}
++
++ULONG MFStream::AsyncReadState::cb() const
++{
++    return m_cb;
++}
++
++ULONG MFStream::AsyncReadState::bytesRead() const
++{
++    return m_cbRead;
++}
++
++void MFStream::AsyncReadState::setBytesRead(ULONG cbRead)
++{
++    m_cbRead = cbRead;
++}
+diff --git a/src/plugins/wmf/mfstream.h b/src/plugins/wmf/mfstream.h
+new file mode 100644
+index 0000000..ef854b5
+--- /dev/null
++++ b/src/plugins/wmf/mfstream.h
+@@ -0,0 +1,150 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Mobility Components.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef MFSTREAM_H
++#define MFSTREAM_H
++
++#include <mfapi.h>
++#include <mfidl.h>
++#include <QtCore/qmutex.h>
++#include <QtCore/qiodevice.h>
++#include <QtCore/qcoreevent.h>
++
++QT_USE_NAMESPACE
++
++class MFStream : public QObject, public IMFByteStream
++{
++    Q_OBJECT
++public:
++    MFStream(QIODevice *stream, bool ownStream);
++
++    ~MFStream();
++
++    //from IUnknown
++    STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
++
++    STDMETHODIMP_(ULONG) AddRef(void);
++
++    STDMETHODIMP_(ULONG) Release(void);
++
++
++    //from IMFByteStream
++    STDMETHODIMP GetCapabilities(DWORD *pdwCapabilities);
++
++    STDMETHODIMP GetLength(QWORD *pqwLength);
++
++    STDMETHODIMP SetLength(QWORD);
++
++    STDMETHODIMP GetCurrentPosition(QWORD *pqwPosition);
++
++    STDMETHODIMP SetCurrentPosition(QWORD qwPosition);
++
++    STDMETHODIMP IsEndOfStream(BOOL *pfEndOfStream);
++
++    STDMETHODIMP Read(BYTE *pb, ULONG cb, ULONG *pcbRead);
++
++    STDMETHODIMP BeginRead(BYTE *pb, ULONG cb, IMFAsyncCallback *pCallback,
++                           IUnknown *punkState);
++
++    STDMETHODIMP EndRead(IMFAsyncResult* pResult, ULONG *pcbRead);
++
++    STDMETHODIMP Write(const BYTE *, ULONG, ULONG *);
++
++    STDMETHODIMP BeginWrite(const BYTE *, ULONG ,
++                            IMFAsyncCallback *,
++                            IUnknown *);
++
++    STDMETHODIMP EndWrite(IMFAsyncResult *,
++                          ULONG *);
++
++    STDMETHODIMP Seek(
++        MFBYTESTREAM_SEEK_ORIGIN SeekOrigin,
++        LONGLONG llSeekOffset,
++        DWORD,
++        QWORD *pqwCurrentPosition);
++
++    STDMETHODIMP Flush();
++
++    STDMETHODIMP Close();
++
++private:
++    class AsyncReadState : public IUnknown
++    {
++    public:
++        AsyncReadState(BYTE *pb, ULONG cb);
++
++        //from IUnknown
++        STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
++
++        STDMETHODIMP_(ULONG) AddRef(void);
++
++        STDMETHODIMP_(ULONG) Release(void);
++
++        BYTE* pb() const;
++        ULONG cb() const;
++        ULONG bytesRead() const;
++
++        void setBytesRead(ULONG cbRead);
++
++    private:
++        long m_cRef;
++        BYTE *m_pb;
++        ULONG m_cb;
++        ULONG m_cbRead;
++    };
++
++    long m_cRef;
++    QIODevice *m_stream;
++    bool m_ownStream;
++    DWORD m_workQueueId;
++    QMutex m_mutex;
++
++    void doRead();
++
++private Q_SLOTS:
++    void handleReadyRead();
++
++protected:
++    void customEvent(QEvent *event);
++    IMFAsyncResult *m_currentReadResult;
++};
++
++#endif
+diff --git a/src/plugins/wmf/player/mfplayerservice.cpp b/src/plugins/wmf/player/mfplayerservice.cpp
+index 20e0561..3372055 100644
+--- a/src/plugins/wmf/player/mfplayerservice.cpp
++++ b/src/plugins/wmf/player/mfplayerservice.cpp
+@@ -52,7 +52,6 @@
+ #include "mfplayerservice.h"
+ #include "mfplayersession.h"
+ #include "mfmetadatacontrol.h"
+-int MFPlayerService::s_refCount = 0;
+ 
+ MFPlayerService::MFPlayerService(QObject *parent)
+     : QMediaService(parent)
+@@ -62,11 +61,6 @@ MFPlayerService::MFPlayerService(QObject *parent)
+ #endif
+     , m_videoRendererControl(0)
+ {
+-    s_refCount++;
+-    if (s_refCount == 1) {
+-        CoInitialize(NULL);
+-        MFStartup(MF_VERSION);
+-    }
+     m_audioEndpointControl = new MFAudioEndpointControl(this);
+     m_session = new MFPlayerSession(this);
+     m_player = new MFPlayerControl(m_session);
+@@ -85,12 +79,6 @@ MFPlayerService::~MFPlayerService()
+ 
+     m_session->close();
+     m_session->Release();
+-
+-    s_refCount--;
+-    if (s_refCount == 0) {
+-        MFShutdown();
+-        CoUninitialize();
+-    }
+ }
+ 
+ QMediaControl* MFPlayerService::requestControl(const char *name)
+diff --git a/src/plugins/wmf/player/mfplayerservice.h b/src/plugins/wmf/player/mfplayerservice.h
+index 65f3b34..587e592 100644
+--- a/src/plugins/wmf/player/mfplayerservice.h
++++ b/src/plugins/wmf/player/mfplayerservice.h
+@@ -91,7 +91,6 @@ private:
+ #endif
+     MFPlayerControl        *m_player;
+     MFMetaDataControl      *m_metaDataControl;
+-    static int                s_refCount;
+ };
+ 
+ #endif
+diff --git a/src/plugins/wmf/player/mfplayersession.cpp b/src/plugins/wmf/player/mfplayersession.cpp
+index c8c99e2..ef359b5 100644
+--- a/src/plugins/wmf/player/mfplayersession.cpp
++++ b/src/plugins/wmf/player/mfplayersession.cpp
+@@ -62,7 +62,7 @@
+ #include "mfmetadatacontrol.h"
+ #include <Mferror.h>
+ #include <nserror.h>
+-#include <sourceresolver.h>
++#include "sourceresolver.h"
+ 
+ //#define DEBUG_MEDIAFOUNDATION
+ //#define TEST_STREAMING
+diff --git a/src/plugins/wmf/player/mfstream.cpp b/src/plugins/wmf/player/mfstream.cpp
+deleted file mode 100644
+index 99033b0..0000000
+--- a/src/plugins/wmf/player/mfstream.cpp
++++ /dev/null
+@@ -1,361 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the Qt Mobility Components.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "mfstream.h"
+-#include <QtCore/qcoreapplication.h>
+-
+-//MFStream is added for supporting QIODevice type of media source.
+-//It is used to delegate invocations from media foundation(through IMFByteStream) to QIODevice.
+-
+-MFStream::MFStream(QIODevice *stream, bool ownStream)
+-    : m_cRef(1)
+-    , m_stream(stream)
+-    , m_ownStream(ownStream)
+-    , m_currentReadResult(0)
+-{
+-    //Move to the thread of the stream object
+-    //to make sure invocations on stream
+-    //are happened in the same thread of stream object
+-    this->moveToThread(stream->thread());
+-    connect(stream, SIGNAL(readyRead()), this, SLOT(handleReadyRead()));
+-}
+-
+-MFStream::~MFStream()
+-{
+-    if (m_currentReadResult)
+-        m_currentReadResult->Release();
+-    if (m_ownStream)
+-        m_stream->deleteLater();
+-}
+-
+-//from IUnknown
+-STDMETHODIMP MFStream::QueryInterface(REFIID riid, LPVOID *ppvObject)
+-{
+-    if (!ppvObject)
+-        return E_POINTER;
+-    if (riid == IID_IMFByteStream) {
+-        *ppvObject = static_cast<IMFByteStream*>(this);
+-    } else if (riid == IID_IUnknown) {
+-        *ppvObject = static_cast<IUnknown*>(this);
+-    } else {
+-        *ppvObject =  NULL;
+-        return E_NOINTERFACE;
+-    }
+-    AddRef();
+-    return S_OK;
+-}
+-
+-STDMETHODIMP_(ULONG) MFStream::AddRef(void)
+-{
+-    return InterlockedIncrement(&m_cRef);
+-}
+-
+-STDMETHODIMP_(ULONG) MFStream::Release(void)
+-{
+-    LONG cRef = InterlockedDecrement(&m_cRef);
+-    if (cRef == 0) {
+-        this->deleteLater();
+-    }
+-    return cRef;
+-}
+-
+-
+-//from IMFByteStream
+-STDMETHODIMP MFStream::GetCapabilities(DWORD *pdwCapabilities)
+-{
+-    if (!pdwCapabilities)
+-        return E_INVALIDARG;
+-    *pdwCapabilities = MFBYTESTREAM_IS_READABLE;
+-    if (!m_stream->isSequential())
+-        *pdwCapabilities |= MFBYTESTREAM_IS_SEEKABLE;
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::GetLength(QWORD *pqwLength)
+-{
+-    if (!pqwLength)
+-        return E_INVALIDARG;
+-    QMutexLocker locker(&m_mutex);
+-    *pqwLength = QWORD(m_stream->size());
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::SetLength(QWORD)
+-{
+-    return E_NOTIMPL;
+-}
+-
+-STDMETHODIMP MFStream::GetCurrentPosition(QWORD *pqwPosition)
+-{
+-    if (!pqwPosition)
+-        return E_INVALIDARG;
+-    QMutexLocker locker(&m_mutex);
+-    *pqwPosition = m_stream->pos();
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::SetCurrentPosition(QWORD qwPosition)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    //SetCurrentPosition may happend during the BeginRead/EndRead pair,
+-    //refusing to execute SetCurrentPosition during that time seems to be
+-    //the simplest workable solution
+-    if (m_currentReadResult)
+-        return S_FALSE;
+-
+-    bool seekOK = m_stream->seek(qint64(qwPosition));
+-    if (seekOK)
+-        return S_OK;
+-    else
+-        return S_FALSE;
+-}
+-
+-STDMETHODIMP MFStream::IsEndOfStream(BOOL *pfEndOfStream)
+-{
+-    if (!pfEndOfStream)
+-        return E_INVALIDARG;
+-    QMutexLocker locker(&m_mutex);
+-    *pfEndOfStream = m_stream->atEnd() ? TRUE : FALSE;
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::Read(BYTE *pb, ULONG cb, ULONG *pcbRead)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    qint64 read = m_stream->read((char*)(pb), qint64(cb));
+-    if (pcbRead)
+-        *pcbRead = ULONG(read);
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::BeginRead(BYTE *pb, ULONG cb, IMFAsyncCallback *pCallback,
+-                       IUnknown *punkState)
+-{
+-    if (!pCallback || !pb)
+-        return E_INVALIDARG;
+-
+-    Q_ASSERT(m_currentReadResult == NULL);
+-
+-    AsyncReadState *state = new (std::nothrow) AsyncReadState(pb, cb);
+-    if (state == NULL)
+-        return E_OUTOFMEMORY;
+-
+-    HRESULT hr = MFCreateAsyncResult(state, pCallback, punkState, &m_currentReadResult);
+-    state->Release();
+-    if (FAILED(hr))
+-        return hr;
+-
+-    QCoreApplication::postEvent(this, new QEvent(QEvent::User));
+-    return hr;
+-}
+-
+-STDMETHODIMP MFStream::EndRead(IMFAsyncResult* pResult, ULONG *pcbRead)
+-{
+-    if (!pcbRead)
+-        return E_INVALIDARG;
+-    IUnknown *pUnk;
+-    pResult->GetObject(&pUnk);
+-    AsyncReadState *state = static_cast<AsyncReadState*>(pUnk);
+-    *pcbRead = state->bytesRead();
+-    pUnk->Release();
+-
+-    m_currentReadResult->Release();
+-    m_currentReadResult = NULL;
+-
+-    return S_OK;
+-}
+-
+-STDMETHODIMP MFStream::Write(const BYTE *, ULONG, ULONG *)
+-{
+-    return E_NOTIMPL;
+-}
+-
+-STDMETHODIMP MFStream::BeginWrite(const BYTE *, ULONG ,
+-                        IMFAsyncCallback *,
+-                        IUnknown *)
+-{
+-    return E_NOTIMPL;
+-}
+-
+-STDMETHODIMP MFStream::EndWrite(IMFAsyncResult *,
+-                      ULONG *)
+-{
+-    return E_NOTIMPL;
+-}
+-
+-STDMETHODIMP MFStream::Seek(
+-    MFBYTESTREAM_SEEK_ORIGIN SeekOrigin,
+-    LONGLONG llSeekOffset,
+-    DWORD,
+-    QWORD *pqwCurrentPosition)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    if (m_currentReadResult)
+-        return S_FALSE;
+-
+-    qint64 pos = qint64(llSeekOffset);
+-    switch (SeekOrigin) {
+-    case msoCurrent:
+-        pos += m_stream->pos();
+-        break;
+-    }
+-    bool seekOK = m_stream->seek(pos);
+-    if (*pqwCurrentPosition)
+-        *pqwCurrentPosition = pos;
+-    if (seekOK)
+-        return S_OK;
+-    else
+-        return S_FALSE;
+-}
+-
+-STDMETHODIMP MFStream::Flush()
+-{
+-    return E_NOTIMPL;
+-}
+-
+-STDMETHODIMP MFStream::Close()
+-{
+-    QMutexLocker locker(&m_mutex);
+-    if (m_ownStream)
+-        m_stream->close();
+-    return S_OK;
+-}
+-
+-void MFStream::doRead()
+-{
+-    bool readDone = true;
+-    IUnknown *pUnk = NULL;
+-    HRESULT    hr = m_currentReadResult->GetObject(&pUnk);
+-    if (SUCCEEDED(hr)) {
+-        //do actual read
+-        AsyncReadState *state =  static_cast<AsyncReadState*>(pUnk);
+-        ULONG cbRead;
+-        Read(state->pb(), state->cb() - state->bytesRead(), &cbRead);
+-        pUnk->Release();
+-
+-        state->setBytesRead(cbRead + state->bytesRead());
+-        if (state->cb() > state->bytesRead() && !m_stream->atEnd()) {
+-            readDone = false;
+-        }
+-    }
+-
+-    if (readDone) {
+-        //now inform the original caller
+-        m_currentReadResult->SetStatus(hr);
+-        MFInvokeCallback(m_currentReadResult);
+-    }
+-}
+-
+-
+-void MFStream::handleReadyRead()
+-{
+-    doRead();
+-}
+-
+-void MFStream::customEvent(QEvent *event)
+-{
+-    if (event->type() != QEvent::User) {
+-        QObject::customEvent(event);
+-        return;
+-    }
+-    doRead();
+-}
+-
+-//AsyncReadState is a helper class used in BeginRead for asynchronous operation
+-//to record some BeginRead parameters, so these parameters could be
+-//used later when actually executing the read operation in another thread.
+-MFStream::AsyncReadState::AsyncReadState(BYTE *pb, ULONG cb)
+-    : m_cRef(1)
+-    , m_pb(pb)
+-    , m_cb(cb)
+-    , m_cbRead(0)
+-{
+-}
+-
+-//from IUnknown
+-STDMETHODIMP MFStream::AsyncReadState::QueryInterface(REFIID riid, LPVOID *ppvObject)
+-{
+-    if (!ppvObject)
+-        return E_POINTER;
+-
+-    if (riid == IID_IUnknown) {
+-        *ppvObject = static_cast<IUnknown*>(this);
+-    } else {
+-        *ppvObject =  NULL;
+-        return E_NOINTERFACE;
+-    }
+-    AddRef();
+-    return S_OK;
+-}
+-
+-STDMETHODIMP_(ULONG) MFStream::AsyncReadState::AddRef(void)
+-{
+-    return InterlockedIncrement(&m_cRef);
+-}
+-
+-STDMETHODIMP_(ULONG) MFStream::AsyncReadState::Release(void)
+-{
+-    LONG cRef = InterlockedDecrement(&m_cRef);
+-    if (cRef == 0)
+-        delete this;
+-    // For thread safety, return a temporary variable.
+-    return cRef;
+-}
+-
+-BYTE* MFStream::AsyncReadState::pb() const
+-{
+-    return m_pb;
+-}
+-
+-ULONG MFStream::AsyncReadState::cb() const
+-{
+-    return m_cb;
+-}
+-
+-ULONG MFStream::AsyncReadState::bytesRead() const
+-{
+-    return m_cbRead;
+-}
+-
+-void MFStream::AsyncReadState::setBytesRead(ULONG cbRead)
+-{
+-    m_cbRead = cbRead;
+-}
+diff --git a/src/plugins/wmf/player/mfstream.h b/src/plugins/wmf/player/mfstream.h
+deleted file mode 100644
+index ef854b5..0000000
+--- a/src/plugins/wmf/player/mfstream.h
++++ /dev/null
+@@ -1,150 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the Qt Mobility Components.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef MFSTREAM_H
+-#define MFSTREAM_H
+-
+-#include <mfapi.h>
+-#include <mfidl.h>
+-#include <QtCore/qmutex.h>
+-#include <QtCore/qiodevice.h>
+-#include <QtCore/qcoreevent.h>
+-
+-QT_USE_NAMESPACE
+-
+-class MFStream : public QObject, public IMFByteStream
+-{
+-    Q_OBJECT
+-public:
+-    MFStream(QIODevice *stream, bool ownStream);
+-
+-    ~MFStream();
+-
+-    //from IUnknown
+-    STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
+-
+-    STDMETHODIMP_(ULONG) AddRef(void);
+-
+-    STDMETHODIMP_(ULONG) Release(void);
+-
+-
+-    //from IMFByteStream
+-    STDMETHODIMP GetCapabilities(DWORD *pdwCapabilities);
+-
+-    STDMETHODIMP GetLength(QWORD *pqwLength);
+-
+-    STDMETHODIMP SetLength(QWORD);
+-
+-    STDMETHODIMP GetCurrentPosition(QWORD *pqwPosition);
+-
+-    STDMETHODIMP SetCurrentPosition(QWORD qwPosition);
+-
+-    STDMETHODIMP IsEndOfStream(BOOL *pfEndOfStream);
+-
+-    STDMETHODIMP Read(BYTE *pb, ULONG cb, ULONG *pcbRead);
+-
+-    STDMETHODIMP BeginRead(BYTE *pb, ULONG cb, IMFAsyncCallback *pCallback,
+-                           IUnknown *punkState);
+-
+-    STDMETHODIMP EndRead(IMFAsyncResult* pResult, ULONG *pcbRead);
+-
+-    STDMETHODIMP Write(const BYTE *, ULONG, ULONG *);
+-
+-    STDMETHODIMP BeginWrite(const BYTE *, ULONG ,
+-                            IMFAsyncCallback *,
+-                            IUnknown *);
+-
+-    STDMETHODIMP EndWrite(IMFAsyncResult *,
+-                          ULONG *);
+-
+-    STDMETHODIMP Seek(
+-        MFBYTESTREAM_SEEK_ORIGIN SeekOrigin,
+-        LONGLONG llSeekOffset,
+-        DWORD,
+-        QWORD *pqwCurrentPosition);
+-
+-    STDMETHODIMP Flush();
+-
+-    STDMETHODIMP Close();
+-
+-private:
+-    class AsyncReadState : public IUnknown
+-    {
+-    public:
+-        AsyncReadState(BYTE *pb, ULONG cb);
+-
+-        //from IUnknown
+-        STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
+-
+-        STDMETHODIMP_(ULONG) AddRef(void);
+-
+-        STDMETHODIMP_(ULONG) Release(void);
+-
+-        BYTE* pb() const;
+-        ULONG cb() const;
+-        ULONG bytesRead() const;
+-
+-        void setBytesRead(ULONG cbRead);
+-
+-    private:
+-        long m_cRef;
+-        BYTE *m_pb;
+-        ULONG m_cb;
+-        ULONG m_cbRead;
+-    };
+-
+-    long m_cRef;
+-    QIODevice *m_stream;
+-    bool m_ownStream;
+-    DWORD m_workQueueId;
+-    QMutex m_mutex;
+-
+-    void doRead();
+-
+-private Q_SLOTS:
+-    void handleReadyRead();
+-
+-protected:
+-    void customEvent(QEvent *event);
+-    IMFAsyncResult *m_currentReadResult;
+-};
+-
+-#endif
+diff --git a/src/plugins/wmf/player/player.pri b/src/plugins/wmf/player/player.pri
+index 57cca77..733c790 100644
+--- a/src/plugins/wmf/player/player.pri
++++ b/src/plugins/wmf/player/player.pri
+@@ -7,8 +7,6 @@ DEFINES += QMEDIA_MEDIAFOUNDATION_PLAYER
+ HEADERS += \
+     $$PWD/mfplayerservice.h \
+     $$PWD/mfplayersession.h \
+-    $$PWD/mfstream.h \
+-    $$PWD/sourceresolver.h \
+     $$PWD/mfplayercontrol.h \
+     $$PWD/mfvideorenderercontrol.h \
+     $$PWD/mfaudioendpointcontrol.h \
+@@ -17,8 +15,6 @@ HEADERS += \
+ SOURCES += \
+     $$PWD/mfplayerservice.cpp \
+     $$PWD/mfplayersession.cpp \
+-    $$PWD/mfstream.cpp \
+-    $$PWD/sourceresolver.cpp \
+     $$PWD/mfplayercontrol.cpp \
+     $$PWD/mfvideorenderercontrol.cpp \
+     $$PWD/mfaudioendpointcontrol.cpp \
+diff --git a/src/plugins/wmf/player/sourceresolver.cpp b/src/plugins/wmf/player/sourceresolver.cpp
+deleted file mode 100644
+index 8db973a..0000000
+--- a/src/plugins/wmf/player/sourceresolver.cpp
++++ /dev/null
+@@ -1,321 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the Qt Mobility Components.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "mfplayersession.h"
+-#include "mfstream.h"
+-#include "sourceresolver.h"
+-#include <Mferror.h>
+-#include <nserror.h>
+-#include <QtCore/qfile.h>
+-
+-/*
+-    SourceResolver is separated from MFPlayerSession to handle the work of resolving a media source
+-    asynchronously. You call SourceResolver::load to request resolving a media source asynchronously,
+-    and it will emit mediaSourceReady() when resolving is done. You can call SourceResolver::cancel to
+-    stop the previous load operation if there is any.
+-*/
+-
+-SourceResolver::SourceResolver(QObject *parent)
+-    : QObject(parent)
+-    , m_cRef(1)
+-    , m_cancelCookie(0)
+-    , m_sourceResolver(0)
+-    , m_mediaSource(0)
+-    , m_stream(0)
+-{
+-}
+-
+-SourceResolver::~SourceResolver()
+-{
+-    shutdown();
+-    if (m_mediaSource) {
+-        m_mediaSource->Release();
+-        m_mediaSource = NULL;
+-    }
+-
+-    if (m_cancelCookie)
+-        m_cancelCookie->Release();
+-    if (m_sourceResolver)
+-        m_sourceResolver->Release();
+-}
+-
+-STDMETHODIMP SourceResolver::QueryInterface(REFIID riid, LPVOID *ppvObject)
+-{
+-    if (!ppvObject)
+-        return E_POINTER;
+-    if (riid == IID_IUnknown) {
+-        *ppvObject = static_cast<IUnknown*>(this);
+-    } else if (riid == IID_IMFAsyncCallback) {
+-        *ppvObject = static_cast<IMFAsyncCallback*>(this);
+-    } else {
+-        *ppvObject =  NULL;
+-        return E_NOINTERFACE;
+-    }
+-    AddRef();
+-    return S_OK;
+-}
+-
+-STDMETHODIMP_(ULONG) SourceResolver::AddRef(void)
+-{
+-    return InterlockedIncrement(&m_cRef);
+-}
+-
+-STDMETHODIMP_(ULONG) SourceResolver::Release(void)
+-{
+-    LONG cRef = InterlockedDecrement(&m_cRef);
+-    if (cRef == 0)
+-        this->deleteLater();
+-    return cRef;
+-}
+-
+-HRESULT STDMETHODCALLTYPE SourceResolver::Invoke(IMFAsyncResult *pAsyncResult)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    MF_OBJECT_TYPE ObjectType = MF_OBJECT_INVALID;
+-    IUnknown* pSource = NULL;
+-    State *state = static_cast<State*>(pAsyncResult->GetStateNoAddRef());
+-
+-    HRESULT hr = S_OK;
+-    if (state->fromStream())
+-        hr = m_sourceResolver->EndCreateObjectFromByteStream(pAsyncResult, &ObjectType, &pSource);
+-    else
+-        hr = m_sourceResolver->EndCreateObjectFromURL(pAsyncResult, &ObjectType, &pSource);
+-
+-    if (state->sourceResolver() != m_sourceResolver) {
+-        //This is a cancelled one
+-        return S_OK;
+-    }
+-
+-    if (m_cancelCookie) {
+-        m_cancelCookie->Release();
+-        m_cancelCookie = NULL;
+-    }
+-
+-    if (FAILED(hr)) {
+-        emit error(hr);
+-        return S_OK;
+-    }
+-
+-    if (m_mediaSource) {
+-        m_mediaSource->Release();
+-        m_mediaSource = NULL;
+-    }
+-
+-    hr = pSource->QueryInterface(IID_PPV_ARGS(&m_mediaSource));
+-    if (FAILED(hr)) {
+-        emit error(hr);
+-        return S_OK;
+-    }
+-
+-    emit mediaSourceReady();
+-
+-    return S_OK;
+-}
+-
+-HRESULT STDMETHODCALLTYPE SourceResolver::GetParameters(DWORD*, DWORD*)
+-{
+-    return E_NOTIMPL;
+-}
+-
+-void SourceResolver::load(QMediaResourceList& resources, QIODevice* stream)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    HRESULT hr = S_OK;
+-    if (!m_sourceResolver)
+-        hr = MFCreateSourceResolver(&m_sourceResolver);
+-
+-    if (m_stream) {
+-        m_stream->Release();
+-        m_stream = NULL;
+-    }
+-
+-    if (FAILED(hr)) {
+-        qWarning() << "Failed to create Source Resolver!";
+-        emit error(hr);
+-    } else if (stream) {
+-        if (resources.count() > 0) {
+-            QMediaResource resource = resources.takeFirst();
+-            QUrl url = resource.url();
+-            m_stream = new MFStream(stream, false);
+-            hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
+-                MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
+-            if (FAILED(hr)) {
+-                qWarning() << "Unsupported stream!";
+-                emit error(hr);
+-            }
+-        } else {
+-            hr = MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
+-            qWarning() << "Can't load stream without a hint of MIME type in a url";
+-            emit error(hr);
+-        }
+-    } else {
+-        QMediaResource resource = resources.takeFirst();
+-        QUrl url = resource.url();
+-#ifdef DEBUG_MEDIAFOUNDATION
+-        qDebug() << "loading :" << url;
+-        qDebug() << "url path =" << url.path().mid(1);
+-#endif
+-#ifdef TEST_STREAMING
+-        //Testing stream function
+-        if (url.scheme() == QLatin1String("file")) {
+-            stream = new QFile(url.path().mid(1), this);
+-            if (stream->open(QIODevice::ReadOnly)) {
+-                m_stream = new MFStream(stream, true);
+-                hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
+-                        MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
+-                if (FAILED(hr)) {
+-                    qWarning() << "Unsupported stream!";
+-                    emit error(hr);
+-                }
+-            } else {
+-                delete stream;
+-                emit error(QMediaPlayer::FormatError);
+-            }
+-        } else
+-#endif
+-        if (url.scheme() == QLatin1String("qrc")) {
+-            // If the canonical URL refers to a Qt resource, open with QFile and use
+-            // the stream playback capability to play.
+-            stream = new QFile(QLatin1Char(':') + url.path(), this);
+-            if (stream->open(QIODevice::ReadOnly)) {
+-                m_stream = new MFStream(stream, true);
+-                hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
+-                         MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
+-                if (FAILED(hr)) {
+-                    qWarning() << "Unsupported stream!";
+-                    emit error(hr);
+-                }
+-            } else {
+-                delete stream;
+-                emit error(QMediaPlayer::FormatError);
+-            }
+-        } else {
+-            hr = m_sourceResolver->BeginCreateObjectFromURL(reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
+-                     MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, false));
+-            if (FAILED(hr)) {
+-                qWarning() << "Unsupported url scheme!";
+-                emit error(hr);
+-            }
+-        }
+-    }
+-}
+-
+-void SourceResolver::cancel()
+-{
+-    QMutexLocker locker(&m_mutex);
+-    if (m_cancelCookie) {
+-        m_sourceResolver->CancelObjectCreation(m_cancelCookie);
+-        m_cancelCookie->Release();
+-        m_cancelCookie = NULL;
+-        m_sourceResolver->Release();
+-        m_sourceResolver = NULL;
+-    }
+-}
+-
+-void SourceResolver::shutdown()
+-{
+-    if (m_mediaSource) {
+-        m_mediaSource->Shutdown();
+-    }
+-
+-    if (m_stream) {
+-        m_stream->Release();
+-        m_stream = NULL;
+-    }
+-}
+-
+-IMFMediaSource* SourceResolver::mediaSource() const
+-{
+-    return m_mediaSource;
+-}
+-
+-/////////////////////////////////////////////////////////////////////////////////
+-SourceResolver::State::State(IMFSourceResolver *sourceResolver, bool fromStream)
+-    : m_cRef(1)
+-    , m_sourceResolver(sourceResolver)
+-    , m_fromStream(fromStream)
+-{
+-    sourceResolver->AddRef();
+-}
+-
+-SourceResolver::State::~State()
+-{
+-    m_sourceResolver->Release();
+-}
+-
+-STDMETHODIMP SourceResolver::State::QueryInterface(REFIID riid, LPVOID *ppvObject)
+-{
+-    if (!ppvObject)
+-        return E_POINTER;
+-    if (riid == IID_IUnknown) {
+-        *ppvObject = static_cast<IUnknown*>(this);
+-    } else {
+-        *ppvObject =  NULL;
+-        return E_NOINTERFACE;
+-    }
+-    AddRef();
+-    return S_OK;
+-}
+-
+-STDMETHODIMP_(ULONG) SourceResolver::State::AddRef(void)
+-{
+-    return InterlockedIncrement(&m_cRef);
+-}
+-
+-STDMETHODIMP_(ULONG) SourceResolver::State::Release(void)
+-{
+-    LONG cRef = InterlockedDecrement(&m_cRef);
+-    if (cRef == 0)
+-        delete this;
+-    // For thread safety, return a temporary variable.
+-    return cRef;
+-}
+-
+-IMFSourceResolver* SourceResolver::State::sourceResolver() const
+-{
+-    return m_sourceResolver;
+-}
+-
+-bool SourceResolver::State::fromStream() const
+-{
+-    return m_fromStream;
+-}
+-
+diff --git a/src/plugins/wmf/player/sourceresolver.h b/src/plugins/wmf/player/sourceresolver.h
+deleted file mode 100644
+index f056855..0000000
+--- a/src/plugins/wmf/player/sourceresolver.h
++++ /dev/null
+@@ -1,106 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the Qt Mobility Components.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef SOURCERESOLVER_H
+-#define SOURCERESOLVER_H
+-
+-#include "mfstream.h"
+-#include "qmediaresource.h"
+-
+-class SourceResolver: public QObject, public IMFAsyncCallback
+-{
+-    Q_OBJECT
+-public:
+-    SourceResolver(QObject *parent);
+-
+-    ~SourceResolver();
+-
+-    STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
+-    STDMETHODIMP_(ULONG) AddRef(void);
+-    STDMETHODIMP_(ULONG) Release(void);
+-
+-    HRESULT STDMETHODCALLTYPE Invoke(IMFAsyncResult *pAsyncResult);
+-
+-    HRESULT STDMETHODCALLTYPE GetParameters(DWORD*, DWORD*);
+-
+-    void load(QMediaResourceList& resources, QIODevice* stream);
+-
+-    void cancel();
+-
+-    void shutdown();
+-
+-    IMFMediaSource* mediaSource() const;
+-
+-Q_SIGNALS:
+-    void error(long hr);
+-    void mediaSourceReady();
+-
+-private:
+-    class State : public IUnknown
+-    {
+-    public:
+-        State(IMFSourceResolver *sourceResolver, bool fromStream);
+-        ~State();
+-
+-        STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
+-
+-        STDMETHODIMP_(ULONG) AddRef(void);
+-
+-        STDMETHODIMP_(ULONG) Release(void);
+-
+-        IMFSourceResolver* sourceResolver() const;
+-        bool fromStream() const;
+-
+-    private:
+-        long m_cRef;
+-        IMFSourceResolver *m_sourceResolver;
+-        bool m_fromStream;
+-    };
+-
+-    long              m_cRef;
+-    IUnknown          *m_cancelCookie;
+-    IMFSourceResolver *m_sourceResolver;
+-    IMFMediaSource    *m_mediaSource;
+-    MFStream          *m_stream;
+-    QMutex            m_mutex;
+-};
+-
+-#endif
+diff --git a/src/plugins/wmf/sourceresolver.cpp b/src/plugins/wmf/sourceresolver.cpp
+new file mode 100644
+index 0000000..8db973a
+--- /dev/null
++++ b/src/plugins/wmf/sourceresolver.cpp
+@@ -0,0 +1,321 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Mobility Components.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "mfplayersession.h"
++#include "mfstream.h"
++#include "sourceresolver.h"
++#include <Mferror.h>
++#include <nserror.h>
++#include <QtCore/qfile.h>
++
++/*
++    SourceResolver is separated from MFPlayerSession to handle the work of resolving a media source
++    asynchronously. You call SourceResolver::load to request resolving a media source asynchronously,
++    and it will emit mediaSourceReady() when resolving is done. You can call SourceResolver::cancel to
++    stop the previous load operation if there is any.
++*/
++
++SourceResolver::SourceResolver(QObject *parent)
++    : QObject(parent)
++    , m_cRef(1)
++    , m_cancelCookie(0)
++    , m_sourceResolver(0)
++    , m_mediaSource(0)
++    , m_stream(0)
++{
++}
++
++SourceResolver::~SourceResolver()
++{
++    shutdown();
++    if (m_mediaSource) {
++        m_mediaSource->Release();
++        m_mediaSource = NULL;
++    }
++
++    if (m_cancelCookie)
++        m_cancelCookie->Release();
++    if (m_sourceResolver)
++        m_sourceResolver->Release();
++}
++
++STDMETHODIMP SourceResolver::QueryInterface(REFIID riid, LPVOID *ppvObject)
++{
++    if (!ppvObject)
++        return E_POINTER;
++    if (riid == IID_IUnknown) {
++        *ppvObject = static_cast<IUnknown*>(this);
++    } else if (riid == IID_IMFAsyncCallback) {
++        *ppvObject = static_cast<IMFAsyncCallback*>(this);
++    } else {
++        *ppvObject =  NULL;
++        return E_NOINTERFACE;
++    }
++    AddRef();
++    return S_OK;
++}
++
++STDMETHODIMP_(ULONG) SourceResolver::AddRef(void)
++{
++    return InterlockedIncrement(&m_cRef);
++}
++
++STDMETHODIMP_(ULONG) SourceResolver::Release(void)
++{
++    LONG cRef = InterlockedDecrement(&m_cRef);
++    if (cRef == 0)
++        this->deleteLater();
++    return cRef;
++}
++
++HRESULT STDMETHODCALLTYPE SourceResolver::Invoke(IMFAsyncResult *pAsyncResult)
++{
++    QMutexLocker locker(&m_mutex);
++    MF_OBJECT_TYPE ObjectType = MF_OBJECT_INVALID;
++    IUnknown* pSource = NULL;
++    State *state = static_cast<State*>(pAsyncResult->GetStateNoAddRef());
++
++    HRESULT hr = S_OK;
++    if (state->fromStream())
++        hr = m_sourceResolver->EndCreateObjectFromByteStream(pAsyncResult, &ObjectType, &pSource);
++    else
++        hr = m_sourceResolver->EndCreateObjectFromURL(pAsyncResult, &ObjectType, &pSource);
++
++    if (state->sourceResolver() != m_sourceResolver) {
++        //This is a cancelled one
++        return S_OK;
++    }
++
++    if (m_cancelCookie) {
++        m_cancelCookie->Release();
++        m_cancelCookie = NULL;
++    }
++
++    if (FAILED(hr)) {
++        emit error(hr);
++        return S_OK;
++    }
++
++    if (m_mediaSource) {
++        m_mediaSource->Release();
++        m_mediaSource = NULL;
++    }
++
++    hr = pSource->QueryInterface(IID_PPV_ARGS(&m_mediaSource));
++    if (FAILED(hr)) {
++        emit error(hr);
++        return S_OK;
++    }
++
++    emit mediaSourceReady();
++
++    return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE SourceResolver::GetParameters(DWORD*, DWORD*)
++{
++    return E_NOTIMPL;
++}
++
++void SourceResolver::load(QMediaResourceList& resources, QIODevice* stream)
++{
++    QMutexLocker locker(&m_mutex);
++    HRESULT hr = S_OK;
++    if (!m_sourceResolver)
++        hr = MFCreateSourceResolver(&m_sourceResolver);
++
++    if (m_stream) {
++        m_stream->Release();
++        m_stream = NULL;
++    }
++
++    if (FAILED(hr)) {
++        qWarning() << "Failed to create Source Resolver!";
++        emit error(hr);
++    } else if (stream) {
++        if (resources.count() > 0) {
++            QMediaResource resource = resources.takeFirst();
++            QUrl url = resource.url();
++            m_stream = new MFStream(stream, false);
++            hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
++                MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
++            if (FAILED(hr)) {
++                qWarning() << "Unsupported stream!";
++                emit error(hr);
++            }
++        } else {
++            hr = MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
++            qWarning() << "Can't load stream without a hint of MIME type in a url";
++            emit error(hr);
++        }
++    } else {
++        QMediaResource resource = resources.takeFirst();
++        QUrl url = resource.url();
++#ifdef DEBUG_MEDIAFOUNDATION
++        qDebug() << "loading :" << url;
++        qDebug() << "url path =" << url.path().mid(1);
++#endif
++#ifdef TEST_STREAMING
++        //Testing stream function
++        if (url.scheme() == QLatin1String("file")) {
++            stream = new QFile(url.path().mid(1), this);
++            if (stream->open(QIODevice::ReadOnly)) {
++                m_stream = new MFStream(stream, true);
++                hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
++                        MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
++                if (FAILED(hr)) {
++                    qWarning() << "Unsupported stream!";
++                    emit error(hr);
++                }
++            } else {
++                delete stream;
++                emit error(QMediaPlayer::FormatError);
++            }
++        } else
++#endif
++        if (url.scheme() == QLatin1String("qrc")) {
++            // If the canonical URL refers to a Qt resource, open with QFile and use
++            // the stream playback capability to play.
++            stream = new QFile(QLatin1Char(':') + url.path(), this);
++            if (stream->open(QIODevice::ReadOnly)) {
++                m_stream = new MFStream(stream, true);
++                hr = m_sourceResolver->BeginCreateObjectFromByteStream(m_stream, reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
++                         MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, true));
++                if (FAILED(hr)) {
++                    qWarning() << "Unsupported stream!";
++                    emit error(hr);
++                }
++            } else {
++                delete stream;
++                emit error(QMediaPlayer::FormatError);
++            }
++        } else {
++            hr = m_sourceResolver->BeginCreateObjectFromURL(reinterpret_cast<const OLECHAR *>(url.toString().utf16()),
++                     MF_RESOLUTION_MEDIASOURCE, NULL, &m_cancelCookie, this, new State(m_sourceResolver, false));
++            if (FAILED(hr)) {
++                qWarning() << "Unsupported url scheme!";
++                emit error(hr);
++            }
++        }
++    }
++}
++
++void SourceResolver::cancel()
++{
++    QMutexLocker locker(&m_mutex);
++    if (m_cancelCookie) {
++        m_sourceResolver->CancelObjectCreation(m_cancelCookie);
++        m_cancelCookie->Release();
++        m_cancelCookie = NULL;
++        m_sourceResolver->Release();
++        m_sourceResolver = NULL;
++    }
++}
++
++void SourceResolver::shutdown()
++{
++    if (m_mediaSource) {
++        m_mediaSource->Shutdown();
++    }
++
++    if (m_stream) {
++        m_stream->Release();
++        m_stream = NULL;
++    }
++}
++
++IMFMediaSource* SourceResolver::mediaSource() const
++{
++    return m_mediaSource;
++}
++
++/////////////////////////////////////////////////////////////////////////////////
++SourceResolver::State::State(IMFSourceResolver *sourceResolver, bool fromStream)
++    : m_cRef(1)
++    , m_sourceResolver(sourceResolver)
++    , m_fromStream(fromStream)
++{
++    sourceResolver->AddRef();
++}
++
++SourceResolver::State::~State()
++{
++    m_sourceResolver->Release();
++}
++
++STDMETHODIMP SourceResolver::State::QueryInterface(REFIID riid, LPVOID *ppvObject)
++{
++    if (!ppvObject)
++        return E_POINTER;
++    if (riid == IID_IUnknown) {
++        *ppvObject = static_cast<IUnknown*>(this);
++    } else {
++        *ppvObject =  NULL;
++        return E_NOINTERFACE;
++    }
++    AddRef();
++    return S_OK;
++}
++
++STDMETHODIMP_(ULONG) SourceResolver::State::AddRef(void)
++{
++    return InterlockedIncrement(&m_cRef);
++}
++
++STDMETHODIMP_(ULONG) SourceResolver::State::Release(void)
++{
++    LONG cRef = InterlockedDecrement(&m_cRef);
++    if (cRef == 0)
++        delete this;
++    // For thread safety, return a temporary variable.
++    return cRef;
++}
++
++IMFSourceResolver* SourceResolver::State::sourceResolver() const
++{
++    return m_sourceResolver;
++}
++
++bool SourceResolver::State::fromStream() const
++{
++    return m_fromStream;
++}
++
+diff --git a/src/plugins/wmf/sourceresolver.h b/src/plugins/wmf/sourceresolver.h
+new file mode 100644
+index 0000000..f056855
+--- /dev/null
++++ b/src/plugins/wmf/sourceresolver.h
+@@ -0,0 +1,106 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Mobility Components.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef SOURCERESOLVER_H
++#define SOURCERESOLVER_H
++
++#include "mfstream.h"
++#include "qmediaresource.h"
++
++class SourceResolver: public QObject, public IMFAsyncCallback
++{
++    Q_OBJECT
++public:
++    SourceResolver(QObject *parent);
++
++    ~SourceResolver();
++
++    STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
++    STDMETHODIMP_(ULONG) AddRef(void);
++    STDMETHODIMP_(ULONG) Release(void);
++
++    HRESULT STDMETHODCALLTYPE Invoke(IMFAsyncResult *pAsyncResult);
++
++    HRESULT STDMETHODCALLTYPE GetParameters(DWORD*, DWORD*);
++
++    void load(QMediaResourceList& resources, QIODevice* stream);
++
++    void cancel();
++
++    void shutdown();
++
++    IMFMediaSource* mediaSource() const;
++
++Q_SIGNALS:
++    void error(long hr);
++    void mediaSourceReady();
++
++private:
++    class State : public IUnknown
++    {
++    public:
++        State(IMFSourceResolver *sourceResolver, bool fromStream);
++        ~State();
++
++        STDMETHODIMP QueryInterface(REFIID riid, LPVOID *ppvObject);
++
++        STDMETHODIMP_(ULONG) AddRef(void);
++
++        STDMETHODIMP_(ULONG) Release(void);
++
++        IMFSourceResolver* sourceResolver() const;
++        bool fromStream() const;
++
++    private:
++        long m_cRef;
++        IMFSourceResolver *m_sourceResolver;
++        bool m_fromStream;
++    };
++
++    long              m_cRef;
++    IUnknown          *m_cancelCookie;
++    IMFSourceResolver *m_sourceResolver;
++    IMFMediaSource    *m_mediaSource;
++    MFStream          *m_stream;
++    QMutex            m_mutex;
++};
++
++#endif
+diff --git a/src/plugins/wmf/wmf.pro b/src/plugins/wmf/wmf.pro
+index 8daabf5..f7e1acf 100644
+--- a/src/plugins/wmf/wmf.pro
++++ b/src/plugins/wmf/wmf.pro
+@@ -12,8 +12,18 @@ load(qt_plugin)
+ 
+ DESTDIR = $$QT.multimedia.plugins/$${PLUGIN_TYPE}
+ 
+-HEADERS += wmfserviceplugin.h
+-SOURCES += wmfserviceplugin.cpp
++DEPENDPATH += .
++INCLUDEPATH += .
++
++HEADERS += \
++    wmfserviceplugin.h \
++    mfstream.h \
++    sourceresolver.h
++
++SOURCES += \
++    wmfserviceplugin.cpp \
++    mfstream.cpp \
++    sourceresolver.cpp
+ 
+ include (player/player.pri)
+ 
+diff --git a/src/plugins/wmf/wmfserviceplugin.cpp b/src/plugins/wmf/wmfserviceplugin.cpp
+index 34536ba..a796b81 100644
+--- a/src/plugins/wmf/wmfserviceplugin.cpp
++++ b/src/plugins/wmf/wmfserviceplugin.cpp
+@@ -48,19 +48,46 @@
+ #include "mfplayerservice.h"
+ #endif
+ 
++#include <mfapi.h>
++
++namespace
++{
++static int g_refCount = 0;
++void addRefCount()
++{
++    g_refCount++;
++    if (g_refCount == 1) {
++        CoInitialize(NULL);
++        MFStartup(MF_VERSION);
++    }
++}
++
++void releaseRefCount()
++{
++    g_refCount--;
++    if (g_refCount == 0) {
++        MFShutdown();
++        CoUninitialize();
++    }
++}
++
++}
++
+ QMediaService* WMFServicePlugin::create(QString const& key)
+ {
+ #ifdef QMEDIA_MEDIAFOUNDATION_PLAYER
+-    if (key == QLatin1String(Q_MEDIASERVICE_MEDIAPLAYER))
++    if (key == QLatin1String(Q_MEDIASERVICE_MEDIAPLAYER)) {
++        addRefCount();
+         return new MFPlayerService;
++    }
+ #endif
+-
+     //qDebug() << "unsupported key:" << key;
+     return 0;
+ }
+ 
+ void WMFServicePlugin::release(QMediaService *service)
+ {
++    releaseRefCount();
+     delete service;
+ }

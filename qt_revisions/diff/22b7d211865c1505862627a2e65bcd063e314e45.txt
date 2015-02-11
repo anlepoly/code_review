@@ -1,0 +1,252 @@
+diff --git a/src/widgets/itemviews/qabstractitemview.cpp b/src/widgets/itemviews/qabstractitemview.cpp
+index 8394e90..f4a45fb 100644
+--- a/src/widgets/itemviews/qabstractitemview.cpp
++++ b/src/widgets/itemviews/qabstractitemview.cpp
+@@ -4296,6 +4296,7 @@ QPixmap QAbstractItemViewPrivate::renderToPixmap(const QModelIndexList &indexes,
+     for (int j = 0; j < paintPairs.count(); ++j) {
+         option.rect = paintPairs.at(j).first.translated(-r->topLeft());
+         const QModelIndex &current = paintPairs.at(j).second;
++        adjustViewOptionsForIndex(&option, current);
+         delegateForIndex(current)->paint(&painter, option, current);
+     }
+     return pixmap;
+diff --git a/src/widgets/itemviews/qabstractitemview_p.h b/src/widgets/itemviews/qabstractitemview_p.h
+index 34c9ff2..801bb82 100644
+--- a/src/widgets/itemviews/qabstractitemview_p.h
++++ b/src/widgets/itemviews/qabstractitemview_p.h
+@@ -197,6 +197,8 @@ public:
+ 
+ #endif
+     virtual QItemViewPaintPairs draggablePaintPairs(const QModelIndexList &indexes, QRect *r) const;
++    // reimplemented in subclasses
++    virtual void adjustViewOptionsForIndex(QStyleOptionViewItemV4*, const QModelIndex&) const {}
+ 
+     inline void releaseEditor(QWidget *editor) const {
+         if (editor) {
+diff --git a/src/widgets/itemviews/qtreeview.cpp b/src/widgets/itemviews/qtreeview.cpp
+index 5da2185..1a1dc85 100644
+--- a/src/widgets/itemviews/qtreeview.cpp
++++ b/src/widgets/itemviews/qtreeview.cpp
+@@ -1378,6 +1378,23 @@ QItemViewPaintPairs QTreeViewPrivate::draggablePaintPairs(const QModelIndexList
+     return ret;
+ }
+ 
++void QTreeViewPrivate::adjustViewOptionsForIndex(QStyleOptionViewItemV4 *option, const QModelIndex &current) const
++{
++    const int row = current.row();
++    option->state = option->state | (viewItems.at(row).expanded ? QStyle::State_Open : QStyle::State_None)
++                                  | (viewItems.at(row).hasChildren ? QStyle::State_Children : QStyle::State_None)
++                                  | (viewItems.at(row).hasMoreSiblings ? QStyle::State_Sibling : QStyle::State_None);
++
++    option->showDecorationSelected = (selectionBehavior & QTreeView::SelectRows)
++                                     || option->showDecorationSelected;
++
++    QVector<int> logicalIndices;
++    QVector<QStyleOptionViewItemV4::ViewItemPosition> viewItemPosList; // vector of left/middle/end for each logicalIndex
++    calcLogicalIndices(&logicalIndices, &viewItemPosList);
++    int logicalIndex = header->logicalIndex(current.column());
++    option->viewItemPosition = viewItemPosList.at(logicalIndex);
++}
++
+ 
+ /*!
+   \since 4.2
+@@ -1463,6 +1480,59 @@ static inline bool ancestorOf(QObject *widget, QObject *other)
+     return false;
+ }
+ 
++void QTreeViewPrivate::calcLogicalIndices(QVector<int> *logicalIndices, QVector<QStyleOptionViewItemV4::ViewItemPosition> *itemPositions) const
++{
++    const int left = (spanning ? header->visualIndex(0) : leftAndRight.first);
++    const int right = (spanning ? header->visualIndex(0) : leftAndRight.second);
++    const int columnCount = header->count();
++    /* 'left' and 'right' are the left-most and right-most visible visual indices.
++       Compute the first visible logical indices before and after the left and right.
++       We will use these values to determine the QStyleOptionViewItemV4::viewItemPosition. */
++    int logicalIndexBeforeLeft = -1, logicalIndexAfterRight = -1;
++    for (int visualIndex = left - 1; visualIndex >= 0; --visualIndex) {
++        int logicalIndex = header->logicalIndex(visualIndex);
++        if (!header->isSectionHidden(logicalIndex)) {
++            logicalIndexBeforeLeft = logicalIndex;
++            break;
++        }
++    }
++
++    for (int visualIndex = left; visualIndex < columnCount; ++visualIndex) {
++        int logicalIndex = header->logicalIndex(visualIndex);
++        if (!header->isSectionHidden(logicalIndex)) {
++            if (visualIndex > right) {
++                logicalIndexAfterRight = logicalIndex;
++                break;
++            }
++            logicalIndices->append(logicalIndex);
++        }
++    }
++
++    itemPositions->resize(logicalIndices->count());
++    for (int currentLogicalSection = 0; currentLogicalSection < logicalIndices->count(); ++currentLogicalSection) {
++        const int headerSection = logicalIndices->at(currentLogicalSection);
++        // determine the viewItemPosition depending on the position of column 0
++        int nextLogicalSection = currentLogicalSection + 1 >= logicalIndices->count()
++                                 ? logicalIndexAfterRight
++                                 : logicalIndices->at(currentLogicalSection + 1);
++        int prevLogicalSection = currentLogicalSection - 1 < 0
++                                 ? logicalIndexBeforeLeft
++                                 : logicalIndices->at(currentLogicalSection - 1);
++        QStyleOptionViewItemV4::ViewItemPosition pos;
++        if (columnCount == 1 || (nextLogicalSection == 0 && prevLogicalSection == -1)
++            || (headerSection == 0 && nextLogicalSection == -1) || spanning)
++            pos = QStyleOptionViewItemV4::OnlyOne;
++        else if (headerSection == 0 || (nextLogicalSection != 0 && prevLogicalSection == -1))
++            pos = QStyleOptionViewItemV4::Beginning;
++        else if (nextLogicalSection == 0 || nextLogicalSection == -1)
++            pos = QStyleOptionViewItemV4::End;
++        else
++            pos = QStyleOptionViewItemV4::Middle;
++        (*itemPositions)[currentLogicalSection] = pos;
++    }
++}
++
++
+ /*!
+     Draws the row in the tree view that contains the model item \a index,
+     using the \a painter given. The \a option control how the item is
+@@ -1531,33 +1601,13 @@ void QTreeView::drawRow(QPainter *painter, const QStyleOptionViewItem &option,
+     int width, height = option.rect.height();
+     int position;
+     QModelIndex modelIndex;
+-    int columnCount = header->count();
+     const bool hoverRow = selectionBehavior() == QAbstractItemView::SelectRows
+                   && index.parent() == hover.parent()
+                   && index.row() == hover.row();
+ 
+-    /* 'left' and 'right' are the left-most and right-most visible visual indices.
+-       Compute the first visible logical indices before and after the left and right.
+-       We will use these values to determine the QStyleOptionViewItemV4::viewItemPosition. */
+-    int logicalIndexBeforeLeft = -1, logicalIndexAfterRight = -1;
+-    for (int visualIndex = left - 1; visualIndex >= 0; --visualIndex) {
+-        int logicalIndex = header->logicalIndex(visualIndex);
+-        if (!header->isSectionHidden(logicalIndex)) {
+-            logicalIndexBeforeLeft = logicalIndex;
+-            break;
+-        }
+-    }
+-    QVector<int> logicalIndices; // vector of currently visibly logical indices
+-    for (int visualIndex = left; visualIndex < columnCount; ++visualIndex) {
+-        int logicalIndex = header->logicalIndex(visualIndex);
+-        if (!header->isSectionHidden(logicalIndex)) {
+-            if (visualIndex > right) {
+-                logicalIndexAfterRight = logicalIndex;
+-                break;
+-            }
+-            logicalIndices.append(logicalIndex);
+-        }
+-    }
++    QVector<int> logicalIndices;
++    QVector<QStyleOptionViewItemV4::ViewItemPosition> viewItemPosList; // vector of left/middle/end for each logicalIndex
++    d->calcLogicalIndices(&logicalIndices, &viewItemPosList);
+ 
+     for (int currentLogicalSection = 0; currentLogicalSection < logicalIndices.count(); ++currentLogicalSection) {
+         int headerSection = logicalIndices.at(currentLogicalSection);
+@@ -1579,22 +1629,7 @@ void QTreeView::drawRow(QPainter *painter, const QStyleOptionViewItem &option,
+             continue;
+         opt.state = state;
+ 
+-        // determine the viewItemPosition depending on the position of column 0
+-        int nextLogicalSection = currentLogicalSection + 1 >= logicalIndices.count()
+-                                 ? logicalIndexAfterRight
+-                                 : logicalIndices.at(currentLogicalSection + 1);
+-        int prevLogicalSection = currentLogicalSection - 1 < 0
+-                                 ? logicalIndexBeforeLeft
+-                                 : logicalIndices.at(currentLogicalSection - 1);
+-        if (columnCount == 1 || (nextLogicalSection == 0 && prevLogicalSection == -1)
+-            || (headerSection == 0 && nextLogicalSection == -1) || spanning)
+-            opt.viewItemPosition = QStyleOptionViewItemV4::OnlyOne;
+-        else if (headerSection == 0 || (nextLogicalSection != 0 && prevLogicalSection == -1))
+-            opt.viewItemPosition = QStyleOptionViewItemV4::Beginning;
+-        else if (nextLogicalSection == 0 || nextLogicalSection == -1)
+-            opt.viewItemPosition = QStyleOptionViewItemV4::End;
+-        else
+-            opt.viewItemPosition = QStyleOptionViewItemV4::Middle;
++        opt.viewItemPosition = viewItemPosList.at(currentLogicalSection);
+ 
+         // fake activeness when row editor has focus
+         if (indexWidgetHasFocus)
+diff --git a/src/widgets/itemviews/qtreeview_p.h b/src/widgets/itemviews/qtreeview_p.h
+index 1c37a13..7f6413d 100644
+--- a/src/widgets/itemviews/qtreeview_p.h
++++ b/src/widgets/itemviews/qtreeview_p.h
+@@ -97,6 +97,7 @@ public:
+     void initialize();
+ 
+     QItemViewPaintPairs draggablePaintPairs(const QModelIndexList &indexes, QRect *r) const;
++    void adjustViewOptionsForIndex(QStyleOptionViewItemV4 *option, const QModelIndex &current) const;
+ 
+ #ifndef QT_NO_ANIMATION
+     struct AnimatedOperation : public QVariantAnimation
+@@ -167,6 +168,10 @@ public:
+ 
+     void paintAlternatingRowColors(QPainter *painter, QStyleOptionViewItemV4 *option, int y, int bottom) const;
+ 
++    // logicalIndices: vector of currently visibly logical indices
++    // itemPositions: vector of view item positions (beginning/middle/end/onlyone)
++    void calcLogicalIndices(QVector<int> *logicalIndices, QVector<QStyleOptionViewItemV4::ViewItemPosition> *itemPositions) const;
++
+     QHeaderView *header;
+     int indent;
+ 
+diff --git a/tests/auto/widgets/itemviews/qtreeview/qtreeview.pro b/tests/auto/widgets/itemviews/qtreeview/qtreeview.pro
+index e395546..f438fbc 100644
+--- a/tests/auto/widgets/itemviews/qtreeview/qtreeview.pro
++++ b/tests/auto/widgets/itemviews/qtreeview/qtreeview.pro
+@@ -1,4 +1,5 @@
+ CONFIG += testcase
+ TARGET = tst_qtreeview
+ QT += widgets testlib
++QT += widgets-private gui-private core-private
+ SOURCES  += tst_qtreeview.cpp
+diff --git a/tests/auto/widgets/itemviews/qtreeview/tst_qtreeview.cpp b/tests/auto/widgets/itemviews/qtreeview/tst_qtreeview.cpp
+index d2463bf..380683a 100644
+--- a/tests/auto/widgets/itemviews/qtreeview/tst_qtreeview.cpp
++++ b/tests/auto/widgets/itemviews/qtreeview/tst_qtreeview.cpp
+@@ -43,6 +43,7 @@
+ #include <QtTest/QtTest>
+ #include <QtGui/QtGui>
+ #include <QtWidgets/QtWidgets>
++#include <private/qabstractitemview_p.h>
+ 
+ Q_DECLARE_METATYPE(QModelIndex)
+ #ifndef QT_NO_DRAGANDDROP
+@@ -106,6 +107,8 @@ struct PublicView : public QTreeView
+ 
+     inline QStyleOptionViewItem viewOptions() const { return QTreeView::viewOptions(); }
+     inline int sizeHintForColumn(int column) const { return QTreeView::sizeHintForColumn(column); }
++    inline void startDrag(Qt::DropActions supportedActions) { QTreeView::startDrag(supportedActions); }
++    QAbstractItemViewPrivate* aiv_priv() { return static_cast<QAbstractItemViewPrivate*>(d_ptr.data()); }
+ };
+ 
+ class tst_QTreeView : public QObject
+@@ -2933,7 +2936,7 @@ void tst_QTreeView::styleOptionViewItem()
+             bool allCollapsed;
+     };
+ 
+-    QTreeView view;
++    PublicView view;
+     QStandardItemModel model;
+     view.setModel(&model);
+     MyDelegate delegate;
+@@ -2992,6 +2995,14 @@ void tst_QTreeView::styleOptionViewItem()
+     QApplication::processEvents();
+     QTRY_VERIFY(delegate.count >= 4);
+ 
++    // test that the rendering of drag pixmap sets the correct options too (QTBUG-15834)
++#ifdef QT_BUILD_INTERNAL
++    delegate.count = 0;
++    QItemSelection sel(model.index(0,0), model.index(0,3));
++    QRect rect;
++    view.aiv_priv()->renderToPixmap(sel.indexes(), &rect);
++    QTRY_VERIFY(delegate.count >= 4);
++#endif
+ 
+     //test dynamic models
+     {

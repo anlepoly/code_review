@@ -1,0 +1,260 @@
+diff --git a/src/gui/text/qtextengine.cpp b/src/gui/text/qtextengine.cpp
+index 8527a85..d5f086a 100644
+--- a/src/gui/text/qtextengine.cpp
++++ b/src/gui/text/qtextengine.cpp
+@@ -55,6 +55,7 @@
+ #include "qtextdocument_p.h"
+ #include "qrawfont.h"
+ #include "qrawfont_p.h"
++#include <qbitarray.h>
+ #include <qguiapplication.h>
+ #include <qinputmethod.h>
+ #include <algorithm>
+@@ -87,7 +88,7 @@ public:
+     /// The caps parameter is used to choose the algoritm of splitting text and assiging roles to the textitems
+     void generate(int start, int length, QFont::Capitalization caps)
+     {
+-        if ((int)caps == (int)QFont::SmallCaps)
++        if (caps == QFont::SmallCaps)
+             generateScriptItemsSmallCaps(reinterpret_cast<const ushort *>(m_string.unicode()), start, length);
+         else if(caps == QFont::Capitalize)
+             generateScriptItemsCapitalize(start, length);
+@@ -1381,6 +1382,13 @@ void QTextEngine::itemize() const
+ 
+     Itemizer itemizer(layoutData->string, scriptAnalysis.data(), layoutData->items);
+ 
++    QVarLengthArray<uchar, 128> capitalization;
++    if (formats()) {
++        capitalization.resize(length);
++        memset(capitalization.data(), formats()->defaultFont().capitalization(), length);
++    }
++    QBitArray edges(length+1); // First and last bit are not really used but this makes things simpler.
++
+     const QTextDocumentPrivate *p = block.docHandle();
+     if (p) {
+         SpecialData *s = specialData;
+@@ -1399,14 +1407,12 @@ void QTextEngine::itemize() const
+                     s = 0;
+                 }
+                 Q_ASSERT(position <= length);
+-                QFont::Capitalization capitalization =
+-                        formats()->charFormat(format).hasProperty(QTextFormat::FontCapitalization)
+-                        ? formats()->charFormat(format).fontCapitalization()
+-                        : formats()->defaultFont().capitalization();
+-                itemizer.generate(prevPosition, position - prevPosition, capitalization);
++                if (formats()->charFormat(format).hasProperty(QTextFormat::FontCapitalization))
++                    memset(capitalization.data() + prevPosition, formats()->charFormat(format).fontCapitalization(), position - prevPosition);
++                edges.setBit(position);
+                 if (it == end) {
+-                    if (position < length)
+-                        itemizer.generate(position, length - position, capitalization);
++                    if (position < length && formats()->charFormat(format).hasProperty(QTextFormat::FontCapitalization))
++                        memset(capitalization.data() + position, formats()->charFormat(format).fontCapitalization(), length - position);
+                     break;
+                 }
+                 format = frag->format;
+@@ -1415,22 +1421,33 @@ void QTextEngine::itemize() const
+             position += frag->size_array[0];
+             ++it;
+         }
+-    } else {
+-#ifndef QT_NO_RAWFONT
+-        if (useRawFont && specialData) {
+-            int lastIndex = 0;
+-            for (int i = 0; i < specialData->addFormats.size(); ++i) {
++    }
++
++    if (specialData && !specialData->addFormats.isEmpty()) {
++        Q_ASSERT(formats());
++        for (int i = 0; i < specialData->addFormats.size(); ++i) {
+                 const QTextLayout::FormatRange &range = specialData->addFormats.at(i);
+-                if (range.format.fontCapitalization()) {
+-                    itemizer.generate(lastIndex, range.start - lastIndex, QFont::MixedCase);
+-                    itemizer.generate(range.start, range.length, range.format.fontCapitalization());
+-                    lastIndex = range.start + range.length;
+-                }
+-            }
+-            itemizer.generate(lastIndex, length - lastIndex, QFont::MixedCase);
+-        } else
+-#endif
+-            itemizer.generate(0, length, static_cast<QFont::Capitalization> (fnt.d->capital));
++                Q_ASSERT(range.start + range.length <= length);
++                edges.setBit(range.start);
++                edges.setBit(range.start + range.length);
++                QTextCharFormat format = formats()->charFormat(specialData->addFormatIndices.at(i));
++                if (format.hasProperty(QTextFormat::FontCapitalization))
++                    memset(capitalization.data() + range.start, format.fontCapitalization(), range.length);
++        }
++    }
++
++    if (formats()) {
++        int previousBoundary = 0;
++        for (int i = 1; i < length; ++i) {
++            if (!edges.at(i))
++                continue;
++            itemizer.generate(previousBoundary, i - previousBoundary, static_cast<QFont::Capitalization>(capitalization[previousBoundary]));
++            previousBoundary = i;
++        }
++        itemizer.generate(previousBoundary, length - previousBoundary, static_cast<QFont::Capitalization>(capitalization[previousBoundary]));
++
++    } else {
++        itemizer.generate(0, length, static_cast<QFont::Capitalization> (fnt.d->capital));
+     }
+ 
+     addRequiredBoundaries();
+diff --git a/tests/auto/gui/text/qtextlayout/tst_qtextlayout.cpp b/tests/auto/gui/text/qtextlayout/tst_qtextlayout.cpp
+index 77f603a..2f8fab9 100644
+--- a/tests/auto/gui/text/qtextlayout/tst_qtextlayout.cpp
++++ b/tests/auto/gui/text/qtextlayout/tst_qtextlayout.cpp
+@@ -139,6 +139,11 @@ private slots:
+     void xToCursorForLigatures();
+     void cursorInNonStopChars();
+ 
++#ifndef QT_NO_RAWFONT
++    void additionalFormatsCapitalizationWithRawFont_data();
++    void additionalFormatsCapitalizationWithRawFont();
++#endif
++
+ private:
+     QFont testFont;
+ };
+@@ -2012,5 +2017,108 @@ void tst_QTextLayout::cursorInNonStopChars()
+     QVERIFY(line.cursorToX(2) == line.cursorToX(3));
+ }
+ 
++#ifndef QT_NO_RAWFONT
++
++typedef QList<QTextLayout::FormatRange> FormatRangeList;
++Q_DECLARE_METATYPE(FormatRangeList)
++
++void tst_QTextLayout::additionalFormatsCapitalizationWithRawFont_data()
++{
++    QTest::addColumn<QString>("text");
++    QTest::addColumn<FormatRangeList>("additionalFormats");
++
++    QString textSample = QLatin1String("Code Less, Create More.");
++
++    QTest::newRow("No Format") << textSample << FormatRangeList();
++    QTextLayout::FormatRange range;
++    range.start = 0;
++    range.length = textSample.size();
++    range.format.setFontCapitalization(QFont::SmallCaps);
++    QTest::newRow("SmallCaps") << textSample << (FormatRangeList() << range);
++    range.format.setFontCapitalization(QFont::Capitalize);
++    QTest::newRow("Capitalize") << textSample.toLower() << (FormatRangeList() << range);
++    range.format.setFontCapitalization(QFont::AllLowercase);
++    QTest::newRow("AllLowercase") << textSample << (FormatRangeList() << range);
++
++    FormatRangeList rangeList;
++    range.start = 0;
++    range.length = 5;
++    range.format.setFontCapitalization(QFont::SmallCaps);
++    rangeList << range;
++    range.start = 5;
++    range.format.setFontCapitalization(QFont::AllLowercase);
++    rangeList << range;
++    range.start = 18;
++    range.format.setFontCapitalization(QFont::Capitalize);
++    rangeList << range;
++    QTest::newRow("MixAndMatch") << textSample << rangeList;
++}
++
++void tst_QTextLayout::additionalFormatsCapitalizationWithRawFont()
++{
++    QFETCH(QString, text);
++    QFETCH(FormatRangeList, additionalFormats);
++
++    QRawFont rawFont = QRawFont::fromFont(testFont);
++
++    QTextLayout layout(text);
++    layout.setRawFont(rawFont);
++    layout.setAdditionalFormats(additionalFormats);
++    layout.beginLayout();
++    layout.createLine();
++    layout.endLayout();
++
++    QString expectedChars;
++    QTextBoundaryFinder splitter(QTextBoundaryFinder::Word,text.constData(), text.length(), 0, 0);
++
++    for (int i = 0; i < text.size(); ++i) {
++        bool hasFormat = false;
++        Q_FOREACH (const QTextLayout::FormatRange& range, additionalFormats) {
++            if (i >= range.start && i < range.start + range.length) {
++                hasFormat = true;
++                const QChar ch(text.at(i));
++                switch (range.format.fontCapitalization()) {
++                case QFont::SmallCaps:
++                case QFont::AllUppercase:
++                    expectedChars += ch.toUpper();
++                    break;
++                case QFont::AllLowercase:
++                    expectedChars += ch.toLower();
++                    break;
++                case QFont::Capitalize:
++                    splitter.setPosition(i);
++                    if (splitter.boundaryReasons() & QTextBoundaryFinder::StartWord)
++                        expectedChars += ch.toUpper();
++                    else
++                        expectedChars += ch;
++                    break;
++                case QFont::MixedCase:
++                default:
++                    expectedChars += ch;
++                    break;
++                }
++            }
++        }
++        if (!hasFormat)
++            expectedChars += text.at(i);
++    }
++
++    QVERIFY(layout.glyphRuns().size() > 0);
++    rawFont = layout.glyphRuns().first().rawFont();
++    // Can't assume anything about the order of the glyphs we get once they're split into several glyphRuns.
++    // Let's just compare the sets:
++    QVector<quint32> expected = rawFont.glyphIndexesForString(expectedChars);
++    qSort(expected);
++    QVector<quint32> sortedOutput;
++    sortedOutput.reserve(expected.size());
++    Q_FOREACH (const QGlyphRun& run, layout.glyphRuns()) {
++        Q_FOREACH (quint32 glyphIndex, run.glyphIndexes())
++            sortedOutput.append(glyphIndex);
++    }
++    qSort(sortedOutput);
++    QCOMPARE(sortedOutput, expected);
++}
++#endif
++
+ QTEST_MAIN(tst_QTextLayout)
+ #include "tst_qtextlayout.moc"
+diff --git a/tests/auto/widgets/widgets/qtextedit/tst_qtextedit.cpp b/tests/auto/widgets/widgets/qtextedit/tst_qtextedit.cpp
+index 27369ad..bc414f5 100644
+--- a/tests/auto/widgets/widgets/qtextedit/tst_qtextedit.cpp
++++ b/tests/auto/widgets/widgets/qtextedit/tst_qtextedit.cpp
+@@ -2473,10 +2473,11 @@ void tst_QTextEdit::highlightLongLine()
+     edit.setAcceptRichText(false);
+     edit.setWordWrapMode(QTextOption::NoWrap);
+ 
+-    QString singeLongLine;
++    QString singleLongLine;
++    singleLongLine.reserve(100000);
+     for (int i = 0; i < 10000; ++i)
+-        singeLongLine += "0123456789";
+-    edit.setPlainText(singeLongLine);
++        singleLongLine += "0123456789";
++    edit.setPlainText(singleLongLine);
+ 
+     class NumHighlighter : public QSyntaxHighlighter {
+     public:
+diff --git a/tests/benchmarks/gui/text/qtext/main.cpp b/tests/benchmarks/gui/text/qtext/main.cpp
+index 543b904..c9d5d59 100644
+--- a/tests/benchmarks/gui/text/qtext/main.cpp
++++ b/tests/benchmarks/gui/text/qtext/main.cpp
+@@ -362,7 +362,7 @@ void tst_QText::formattedLayout_data()
+             ranges.append(formatRange);
+         }
+ 
+-        QTest::newRow("long-many") << m_shortLorem << ranges;
++        QTest::newRow("long-many") << text << ranges;
+     }
+ }

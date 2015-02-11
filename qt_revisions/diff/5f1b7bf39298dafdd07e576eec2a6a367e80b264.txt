@@ -1,0 +1,236 @@
+diff --git a/src/quick/items/qquickloader.cpp b/src/quick/items/qquickloader.cpp
+index 730dfd4..864e03b 100644
+--- a/src/quick/items/qquickloader.cpp
++++ b/src/quick/items/qquickloader.cpp
+@@ -309,6 +309,13 @@ void QQuickLoader::setActive(bool newVal)
+                 loadFromSourceComponent();
+             }
+         } else {
++            // cancel any current incubation
++            if (d->incubator) {
++                d->incubator->clear();
++                delete d->itemContext;
++                d->itemContext = 0;
++            }
++
+             if (d->item) {
+                 QQuickItemPrivate *p = QQuickItemPrivate::get(d->item);
+                 p->removeItemChangeListener(d, watchedChanges);
+@@ -642,7 +649,8 @@ void QQuickLoaderPrivate::incubatorStateChanged(QQmlIncubator::Status status)
+         emit q->sourceComponentChanged();
+     emit q->statusChanged();
+     emit q->progressChanged();
+-    emit q->loaded();
++    if (status == QQmlIncubator::Ready)
++        emit q->loaded();
+     disposeInitialPropertyValues(); // cleanup
+ }
+ 
+diff --git a/tests/auto/quick/qquickloader/data/RedRect.qml b/tests/auto/quick/qquickloader/data/RedRect.qml
+new file mode 100644
+index 0000000..0eec9b5
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/RedRect.qml
+@@ -0,0 +1,8 @@
++import QtQuick 2.0
++
++Rectangle {
++    objectName: "red"
++    width: 100
++    height: 100
++    color: "red"
++}
+diff --git a/tests/auto/quick/qquickloader/data/loadedSignal.2.qml b/tests/auto/quick/qquickloader/data/loadedSignal.2.qml
+new file mode 100644
+index 0000000..a4a663c
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/loadedSignal.2.qml
+@@ -0,0 +1,31 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    width: 200
++    height: 200
++
++    property bool success: true
++    property int loadCount: 0
++
++    Loader {
++        id: loader
++        anchors.fill: parent
++        asynchronous: true
++        active: false
++        source: "TestComponent.qml"
++        onLoaded: {
++            if (status !== Loader.Ready) {
++                root.success = false;
++            }
++            root.loadCount++;
++        }
++    }
++
++    function triggerLoading() {
++        // we set source to a valid path (but which is an invalid / erroneous component)
++        // we should not get onLoaded, since the status should not be Ready.
++        loader.source = "GreenRect.qml" // causes reference error.
++    }
++}
+diff --git a/tests/auto/quick/qquickloader/data/loadedSignal.qml b/tests/auto/quick/qquickloader/data/loadedSignal.qml
+new file mode 100644
+index 0000000..7cc0fed
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/loadedSignal.qml
+@@ -0,0 +1,48 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    width: 200
++    height: 200
++
++    property bool success: true
++    property int loadCount: 0
++
++    Loader {
++        id: loader
++        anchors.fill: parent
++        asynchronous: true
++        active: false
++        source: "TestComponent.qml"
++        onLoaded: {
++            if (status !== Loader.Ready) {
++                root.success = false;
++            }
++            root.loadCount++;
++        }
++    }
++
++    function triggerLoading() {
++        // we set active to true, which triggers loading.
++        // we then immediately set active to false.
++        // this should clear the incubator and stop loading.
++        loader.active = true;
++        loader.active = false;
++    }
++
++    function activate() {
++        loader.active = true;
++    }
++
++    function deactivate() {
++        loader.active = false;
++    }
++
++    function triggerMultipleLoad() {
++        loader.active = false;          // deactivate as a precondition.
++        loader.source = "BlueRect.qml"
++        loader.active = true;           // should trigger loading to begin
++        loader.source = "RedRect.qml";  // should clear the incubator and restart loading
++    }
++}
+diff --git a/tests/auto/quick/qquickloader/tst_qquickloader.cpp b/tests/auto/quick/qquickloader/tst_qquickloader.cpp
+index ea35897..3bb06f7 100644
+--- a/tests/auto/quick/qquickloader/tst_qquickloader.cpp
++++ b/tests/auto/quick/qquickloader/tst_qquickloader.cpp
+@@ -92,7 +92,7 @@ private slots:
+     void noResize();
+     void networkRequestUrl();
+     void failNetworkRequest();
+-//    void networkComponent();
++    void networkComponent();
+     void active();
+     void initialPropertyValues_data();
+     void initialPropertyValues();
+@@ -111,6 +111,7 @@ private slots:
+     void asynchronous();
+     void asynchronous_clear();
+     void simultaneousSyncAsync();
++    void loadedSignal();
+ 
+     void parented();
+     void sizeBound();
+@@ -442,21 +443,21 @@ void tst_QQuickLoader::networkRequestUrl()
+     delete loader;
+ }
+ 
+-/* XXX Component waits until all dependencies are loaded.  Is this actually possible?
++/* XXX Component waits until all dependencies are loaded.  Is this actually possible? */
+ void tst_QQuickLoader::networkComponent()
+ {
+     TestHTTPServer server(SERVER_PORT);
+     QVERIFY(server.isValid());
+-    server.serveDirectory("slowdata", TestHTTPServer::Delay);
++    server.serveDirectory(dataDirectory(), TestHTTPServer::Delay);
+ 
+     QQmlComponent component(&engine);
+     component.setData(QByteArray(
+                 "import QtQuick 2.0\n"
+                 "import \"http://127.0.0.1:14450/\" as NW\n"
+                 "Item {\n"
+-                " Component { id: comp; NW.SlowRect {} }\n"
++                " Component { id: comp; NW.Rect120x60 {} }\n"
+                 " Loader { sourceComponent: comp } }")
+-            , dataDirectoryUrl());
++            , dataDirectory());
+ 
+     QQuickItem *item = qobject_cast<QQuickItem*>(component.create());
+     QVERIFY(item);
+@@ -472,7 +473,6 @@ void tst_QQuickLoader::networkComponent()
+ 
+     delete loader;
+ }
+-*/
+ 
+ void tst_QQuickLoader::failNetworkRequest()
+ {
+@@ -1000,6 +1000,47 @@ void tst_QQuickLoader::simultaneousSyncAsync()
+     delete root;
+ }
+ 
++void tst_QQuickLoader::loadedSignal()
++{
++    {
++        // ensure that triggering loading (by setting active = true)
++        // and then immediately setting active to false, causes the
++        // loader to be deactivated, including disabling the incubator.
++        QQmlComponent component(&engine, testFileUrl("loadedSignal.qml"));
++        QObject *obj = component.create();
++
++        QMetaObject::invokeMethod(obj, "triggerLoading");
++        QTest::qWait(100); // ensure that loading would have finished if it wasn't deactivated
++        QCOMPARE(obj->property("loadCount").toInt(), 0);
++        QVERIFY(obj->property("success").toBool());
++
++        QMetaObject::invokeMethod(obj, "triggerLoading");
++        QTest::qWait(100);
++        QCOMPARE(obj->property("loadCount").toInt(), 0);
++        QVERIFY(obj->property("success").toBool());
++
++        QMetaObject::invokeMethod(obj, "triggerMultipleLoad");
++        QTest::qWait(100);
++        QCOMPARE(obj->property("loadCount").toInt(), 1); // only one loaded signal should be emitted.
++        QVERIFY(obj->property("success").toBool());
++
++        delete obj;
++    }
++
++    {
++        // ensure that an error doesn't result in the onLoaded signal being emitted.
++        QQmlComponent component(&engine, testFileUrl("loadedSignal.2.qml"));
++        QObject *obj = component.create();
++
++        QMetaObject::invokeMethod(obj, "triggerLoading");
++        QTest::qWait(100);
++        QCOMPARE(obj->property("loadCount").toInt(), 0);
++        QVERIFY(obj->property("success").toBool());
++
++        delete obj;
++    }
++}
++
+ void tst_QQuickLoader::parented()
+ {
+     QQmlComponent component(&engine, testFileUrl("parented.qml"));

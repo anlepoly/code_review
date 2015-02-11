@@ -1,0 +1,354 @@
+diff --git a/src/gui/kernel/qplatformwindow.h b/src/gui/kernel/qplatformwindow.h
+index 7cb8d8c..6043989 100644
+--- a/src/gui/kernel/qplatformwindow.h
++++ b/src/gui/kernel/qplatformwindow.h
+@@ -117,6 +117,8 @@ public:
+ 
+     virtual void windowEvent(QEvent *event);
+ 
++    virtual bool startSystemResize(const QPoint &pos, Qt::Corner corner);
++
+ protected:
+     QScopedPointer<QPlatformWindowPrivate> d_ptr;
+ private:
+diff --git a/src/gui/kernel/qplatformwindow_qpa.cpp b/src/gui/kernel/qplatformwindow_qpa.cpp
+index 0125496..2380c6d 100644
+--- a/src/gui/kernel/qplatformwindow_qpa.cpp
++++ b/src/gui/kernel/qplatformwindow_qpa.cpp
+@@ -336,6 +336,23 @@ void QPlatformWindow::windowEvent(QEvent *event)
+ }
+ 
+ /*!
++    Reimplement this method to start a system size grip drag
++    operation if the system supports it and return true to indicate
++    success.
++    It is called from the mouse press event handler of the size grip.
++
++    The default implementation is empty and does nothing with \a pos
++    and \a corner.
++*/
++
++bool QPlatformWindow::startSystemResize(const QPoint &pos, Qt::Corner corner)
++{
++    Q_UNUSED(pos)
++    Q_UNUSED(corner)
++    return false;
++}
++
++/*!
+     \class QPlatformWindow
+     \since 4.8
+     \internal
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.cpp b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+index 2a98b7f..48d4385 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.cpp
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+@@ -151,6 +151,16 @@ bool QWindowsMouseHandler::translateMouseEvent(QWindow *window, HWND hwnd,
+         return true;
+     }
+     compressMouseMove(&msg);
++    // Eat mouse move after size grip drag.
++    if (msg.message == WM_MOUSEMOVE) {
++        QWindowsWindow *platformWindow = static_cast<QWindowsWindow *>(window->handle());
++        if (platformWindow->testFlag(QWindowsWindow::SizeGripOperation)) {
++            MSG mouseMsg;
++            while (PeekMessage(&mouseMsg, platformWindow->handle(), WM_MOUSEMOVE, WM_MOUSEMOVE, PM_REMOVE)) ;
++            platformWindow->clearFlag(QWindowsWindow::SizeGripOperation);
++            return true;
++        }
++    }
+     const QPoint client(GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam));
+     // Enter new window: track to generate leave event.
+     if (m_windowUnderMouse != window) {
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index b96d615..e49b215 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -1402,6 +1402,32 @@ void QWindowsWindow::setMouseGrabEnabled_sys(bool grab)
+     }
+ }
+ 
++static inline DWORD cornerToWinOrientation(Qt::Corner corner)
++{
++    switch (corner) {
++    case Qt::TopLeftCorner:
++        return 0xf004; // SZ_SIZETOPLEFT;
++    case Qt::TopRightCorner:
++        return 0xf005; // SZ_SIZETOPRIGHT
++    case Qt::BottomLeftCorner:
++        return 0xf007; // SZ_SIZEBOTTOMLEFT
++    case Qt::BottomRightCorner:
++        return 0xf008; // SZ_SIZEBOTTOMRIGHT
++    }
++    return 0;
++}
++
++bool QWindowsWindow::startSystemResize(const QPoint &, Qt::Corner corner)
++{
++    if (!GetSystemMenu(m_data.hwnd, FALSE))
++        return false;
++
++    ReleaseCapture();
++    PostMessage(m_data.hwnd, WM_SYSCOMMAND, cornerToWinOrientation(corner), 0);
++    setFlag(SizeGripOperation);
++    return true;
++}
++
+ #ifndef Q_OS_WINCE // maybe available on some SDKs revisit WM_GETMINMAXINFO
+ void QWindowsWindow::getSizeHints(MINMAXINFO *mmi) const
+ {
+diff --git a/src/plugins/platforms/windows/qwindowswindow.h b/src/plugins/platforms/windows/qwindowswindow.h
+index ee45be1..2fd4010 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.h
++++ b/src/plugins/platforms/windows/qwindowswindow.h
+@@ -122,7 +122,8 @@ public:
+         OpenGLSurface = 0x10,
+         OpenGLDoubleBuffered = 0x20,
+         OpenGlPixelFormatInitialized = 0x40,
+-        BlockedByModal = 0x80
++        BlockedByModal = 0x80,
++        SizeGripOperation = 0x100
+     };
+ 
+     struct WindowData
+@@ -173,6 +174,8 @@ public:
+     virtual bool setKeyboardGrabEnabled(bool grab);
+     virtual bool setMouseGrabEnabled(bool grab);
+ 
++    virtual bool startSystemResize(const QPoint &pos, Qt::Corner corner);
++
+     Qt::WindowState windowState_sys() const;
+     Qt::WindowStates windowStates_sys() const;
+ 
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.cpp b/src/plugins/platforms/xcb/qxcbwindow.cpp
+index 390628d..a1ac5c5 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.cpp
++++ b/src/plugins/platforms/xcb/qxcbwindow.cpp
+@@ -1670,4 +1670,37 @@ void QXcbWindow::setCursor(xcb_cursor_t cursor)
+     xcb_flush(xcb_connection());
+ }
+ 
++#ifdef XCB_USE_XLIB
++
++bool QXcbWindow::startSystemResize(const QPoint &pos, Qt::Corner corner)
++{
++    const xcb_atom_t moveResize = connection()->atom(QXcbAtom::_NET_WM_MOVERESIZE);
++    if (!connection()->wmSupport()->isSupportedByWM(moveResize))
++        return false;
++    XEvent xev;
++    xev.xclient.type = ClientMessage;
++    xev.xclient.message_type = moveResize;
++    Display *display = (Display *)connection()->xlib_display();
++    xev.xclient.display = display;
++    xev.xclient.window = xcb_window();
++    xev.xclient.format = 32;
++    const QPoint globalPos = window()->mapToGlobal(pos);
++    xev.xclient.data.l[0] = globalPos.x();
++    xev.xclient.data.l[1] = globalPos.y();
++    const bool bottom = corner == Qt::BottomRightCorner || corner == Qt::BottomLeftCorner;
++    const bool left = corner == Qt::BottomLeftCorner || corner == Qt::TopLeftCorner;
++    if (bottom)
++        xev.xclient.data.l[2] = left ? 6 : 4; // bottomleft/bottomright
++    else
++        xev.xclient.data.l[2] = left ? 0 : 2; // topleft/topright
++    xev.xclient.data.l[3] = Button1;
++    xev.xclient.data.l[4] = 0;
++    XUngrabPointer(display, CurrentTime);
++    XSendEvent(display, m_screen->root(), False,
++               SubstructureRedirectMask | SubstructureNotifyMask, &xev);
++    return true;
++}
++
++#endif // XCB_USE_XLIB
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.h b/src/plugins/platforms/xcb/qxcbwindow.h
+index c3ea4af..6cafa03 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.h
++++ b/src/plugins/platforms/xcb/qxcbwindow.h
+@@ -107,6 +107,10 @@ public:
+ 
+     QSurfaceFormat format() const;
+ 
++#ifdef XCB_USE_XLIB
++    bool startSystemResize(const QPoint &pos, Qt::Corner corner);
++#endif // XCB_USE_XLIB
++
+     xcb_window_t xcb_window() const { return m_window; }
+     uint depth() const { return m_depth; }
+     QImage::Format imageFormat() const { return m_imageFormat; }
+diff --git a/src/widgets/widgets/qsizegrip.cpp b/src/widgets/widgets/qsizegrip.cpp
+index c9860f2..16c2656 100644
+--- a/src/widgets/widgets/qsizegrip.cpp
++++ b/src/widgets/widgets/qsizegrip.cpp
+@@ -46,6 +46,8 @@
+ #include "qapplication.h"
+ #include "qevent.h"
+ #include "qpainter.h"
++#include "qwindow.h"
++#include <qpa/qplatformwindow.h>
+ #include "qstyle.h"
+ #include "qstyleoption.h"
+ #include "qlayout.h"
+@@ -59,23 +61,8 @@
+ #include <private/qwidget_p.h>
+ #include <QtWidgets/qabstractscrollarea.h>
+ 
+-#ifdef  Q_OS_WIN
+-#  include <QtCore/qt_windows.h>
+-#  include "private/qapplication_p.h"
+-#endif
+-
+ QT_BEGIN_NAMESPACE
+ 
+-#if defined (Q_OS_WIN)
+-#    define SZ_SIZEBOTTOMRIGHT  0xf008
+-#    define SZ_SIZEBOTTOMLEFT   0xf007
+-#    define SZ_SIZETOPLEFT      0xf004
+-#    define SZ_SIZETOPRIGHT     0xf005
+-
+-HMENU qt_getWindowsSystemMenu(const QWidget *w);
+-
+-#endif
+-
+ static QWidget *qt_sizegrip_topLevelWidget(QWidget* w)
+ {
+     while (w && !w->isWindow() && w->windowType() != Qt::SubWindow)
+@@ -87,6 +74,7 @@ class QSizeGripPrivate : public QWidgetPrivate
+ {
+     Q_DECLARE_PUBLIC(QSizeGrip)
+ public:
++    QSizeGripPrivate();
+     void init();
+     QPoint p;
+     QRect r;
+@@ -143,8 +131,19 @@ public:
+         if (showSizeGrip)
+             q->setVisible(true);
+     }
++
++    bool m_platformSizeGrip;
+ };
+ 
++QSizeGripPrivate::QSizeGripPrivate()
++    : dxMax(0)
++    , dyMax(0)
++    , gotMousePress(false)
++    , tlw(0)
++    , m_platformSizeGrip(false)
++{
++}
++
+ #ifdef Q_WS_MAC
+ void QSizeGripPrivate::updateMacSizer(bool hide) const
+ {
+@@ -226,11 +225,7 @@ QSizeGrip::QSizeGrip(QWidget * parent)
+ void QSizeGripPrivate::init()
+ {
+     Q_Q(QSizeGrip);
+-    dxMax = 0;
+-    dyMax = 0;
+-    tlw = 0;
+     m_corner = q->isLeftToRight() ? Qt::BottomRightCorner : Qt::BottomLeftCorner;
+-    gotMousePress = false;
+ 
+ #if !defined(QT_NO_CURSOR) && !defined(Q_WS_MAC)
+     q->setCursor(m_corner == Qt::TopLeftCorner || m_corner == Qt::BottomRightCorner
+@@ -284,6 +279,7 @@ void QSizeGrip::paintEvent(QPaintEvent *event)
+     resize operation. The mouse press event is passed in the \a event
+     parameter.
+ */
++
+ void QSizeGrip::mousePressEvent(QMouseEvent * e)
+ {
+     if (e->button() != Qt::LeftButton) {
+@@ -297,44 +293,20 @@ void QSizeGrip::mousePressEvent(QMouseEvent * e)
+     d->gotMousePress = true;
+     d->r = tlw->geometry();
+ 
+-#ifdef Q_WS_X11
+-    // Use a native X11 sizegrip for "real" top-level windows if supported.
+-    if (tlw->isWindow() && X11->isSupportedByWM(ATOM(_NET_WM_MOVERESIZE))
++    // Does the platform provide size grip support?
++    d->m_platformSizeGrip = false;
++    if (tlw->isWindow()
++        && tlw->windowHandle()
+         && !(tlw->windowFlags() & Qt::X11BypassWindowManagerHint)
+-        && !tlw->testAttribute(Qt::WA_DontShowOnScreen) && !tlw->hasHeightForWidth()) {
+-        XEvent xev;
+-        xev.xclient.type = ClientMessage;
+-        xev.xclient.message_type = ATOM(_NET_WM_MOVERESIZE);
+-        xev.xclient.display = X11->display;
+-        xev.xclient.window = tlw->winId();
+-        xev.xclient.format = 32;
+-        xev.xclient.data.l[0] = e->globalPos().x();
+-        xev.xclient.data.l[1] = e->globalPos().y();
+-        if (d->atBottom())
+-            xev.xclient.data.l[2] = d->atLeft() ? 6 : 4; // bottomleft/bottomright
+-        else
+-            xev.xclient.data.l[2] = d->atLeft() ? 0 : 2; // topleft/topright
+-        xev.xclient.data.l[3] = Button1;
+-        xev.xclient.data.l[4] = 0;
+-        XUngrabPointer(X11->display, X11->time);
+-        XSendEvent(X11->display, QX11Info::appRootWindow(x11Info().screen()), False,
+-                   SubstructureRedirectMask | SubstructureNotifyMask, &xev);
+-        return;
++        && !tlw->testAttribute(Qt::WA_DontShowOnScreen)
++        && !tlw->hasHeightForWidth()) {
++        QPlatformWindow *platformWindow = tlw->windowHandle()->handle();
++        const QPoint topLevelPos = mapTo(tlw, e->pos());
++        d->m_platformSizeGrip = platformWindow && platformWindow->startSystemResize(topLevelPos, d->m_corner);
+     }
+-#endif // Q_WS_X11
+-#ifdef Q_OS_WIN
+-    if (tlw->isWindow() && !tlw->testAttribute(Qt::WA_DontShowOnScreen) && !tlw->hasHeightForWidth()) {
+-        uint orientation = 0;
+-        if (d->atBottom())
+-            orientation = d->atLeft() ? SZ_SIZEBOTTOMLEFT : SZ_SIZEBOTTOMRIGHT;
+-        else
+-            orientation = d->atLeft() ? SZ_SIZETOPLEFT : SZ_SIZETOPRIGHT;
+ 
+-        ReleaseCapture();
+-        PostMessage(QApplicationPrivate::getHWNDForWidget(tlw), WM_SYSCOMMAND, orientation, 0);
++    if (d->m_platformSizeGrip)
+         return;
+-    }
+-#endif // Q_OS_WIN
+ 
+     // Find available desktop/workspace geometry.
+     QRect availableGeometry;
+@@ -400,32 +372,16 @@ void QSizeGrip::mousePressEvent(QMouseEvent * e)
+ */
+ void QSizeGrip::mouseMoveEvent(QMouseEvent * e)
+ {
+-    if (e->buttons() != Qt::LeftButton) {
++    Q_D(QSizeGrip);
++    if (e->buttons() != Qt::LeftButton || d->m_platformSizeGrip) {
+         QWidget::mouseMoveEvent(e);
+         return;
+     }
+ 
+-    Q_D(QSizeGrip);
+     QWidget* tlw = qt_sizegrip_topLevelWidget(this);
+     if (!d->gotMousePress || tlw->testAttribute(Qt::WA_WState_ConfigPending))
+         return;
+ 
+-#ifdef Q_WS_X11
+-    if (tlw->isWindow() && X11->isSupportedByWM(ATOM(_NET_WM_MOVERESIZE))
+-        && tlw->isTopLevel() && !(tlw->windowFlags() & Qt::X11BypassWindowManagerHint)
+-        && !tlw->testAttribute(Qt::WA_DontShowOnScreen) && !tlw->hasHeightForWidth())
+-        return;
+-#endif
+-#ifdef Q_OS_WIN
+-    if (tlw->isWindow() && qt_getWindowsSystemMenu(tlw) && !tlw->testAttribute(Qt::WA_DontShowOnScreen) && !tlw->hasHeightForWidth()) {
+-        if (const HWND hwnd = QApplicationPrivate::getHWNDForWidget(tlw)) {
+-            MSG msg;
+-            while (PeekMessage(&msg, hwnd, WM_MOUSEMOVE, WM_MOUSEMOVE, PM_REMOVE)) ;
+-            return;
+-        }
+-    }
+-#endif
+-
+     QPoint np(e->globalPos());
+ 
+     // Don't extend beyond the available geometry; bound to dyMax and dxMax.

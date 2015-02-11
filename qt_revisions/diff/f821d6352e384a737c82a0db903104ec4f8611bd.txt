@@ -1,0 +1,297 @@
+diff --git a/src/corelib/kernel/qabstracteventdispatcher.cpp b/src/corelib/kernel/qabstracteventdispatcher.cpp
+index 910b290..fae7eee 100644
+--- a/src/corelib/kernel/qabstracteventdispatcher.cpp
++++ b/src/corelib/kernel/qabstracteventdispatcher.cpp
+@@ -96,7 +96,10 @@ int QAbstractEventDispatcherPrivate::allocateTimerId()
+ 
+ void QAbstractEventDispatcherPrivate::releaseTimerId(int timerId)
+ {
+-    timerIdFreeList()->release(timerId);
++    // this function may be called by a global destructor after
++    // timerIdFreeList() has been destructed
++    if (QtTimerIdFreeList *fl = timerIdFreeList())
++        fl->release(timerId);
+ }
+ 
+ /*!
+diff --git a/src/corelib/kernel/qbasictimer.cpp b/src/corelib/kernel/qbasictimer.cpp
+index d91c5a9..acefcb8 100644
+--- a/src/corelib/kernel/qbasictimer.cpp
++++ b/src/corelib/kernel/qbasictimer.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include "qbasictimer.h"
+ #include "qabstracteventdispatcher.h"
++#include "qabstracteventdispatcher_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -114,9 +115,16 @@ QT_BEGIN_NAMESPACE
+  */
+ void QBasicTimer::start(int msec, QObject *obj)
+ {
+-   stop();
+-   if (obj)
+-       id = obj->startTimer(msec);
++    QAbstractEventDispatcher *eventDispatcher = QAbstractEventDispatcher::instance();
++    if (!eventDispatcher)
++        return;
++    if (id) {
++        eventDispatcher->unregisterTimer(id);
++        QAbstractEventDispatcherPrivate::releaseTimerId(id);
++    }
++    id = 0;
++    if (obj)
++        id = eventDispatcher->registerTimer(msec, Qt::CoarseTimer, obj);
+ }
+ 
+ /*!
+@@ -132,9 +140,16 @@ void QBasicTimer::start(int msec, QObject *obj)
+  */
+ void QBasicTimer::start(int msec, Qt::TimerType timerType, QObject *obj)
+ {
+-    stop();
++    QAbstractEventDispatcher *eventDispatcher = QAbstractEventDispatcher::instance();
++    if (!eventDispatcher)
++        return;
++    if (id) {
++        eventDispatcher->unregisterTimer(id);
++        QAbstractEventDispatcherPrivate::releaseTimerId(id);
++    }
++    id = 0;
+     if (obj)
+-        id = obj->startTimer(msec, timerType);
++        id = eventDispatcher->registerTimer(msec, timerType, obj);
+ }
+ 
+ /*!
+@@ -148,6 +163,7 @@ void QBasicTimer::stop()
+         QAbstractEventDispatcher *eventDispatcher = QAbstractEventDispatcher::instance();
+         if (eventDispatcher)
+             eventDispatcher->unregisterTimer(id);
++        QAbstractEventDispatcherPrivate::releaseTimerId(id);
+     }
+     id = 0;
+ }
+diff --git a/src/corelib/kernel/qeventdispatcher_win.cpp b/src/corelib/kernel/qeventdispatcher_win.cpp
+index 58a9279..c2f3382 100644
+--- a/src/corelib/kernel/qeventdispatcher_win.cpp
++++ b/src/corelib/kernel/qeventdispatcher_win.cpp
+@@ -548,12 +548,8 @@ void QEventDispatcherWin32Private::registerTimer(WinTimerInfo *t)
+         qErrnoWarning("QEventDispatcherWin32::registerTimer: Failed to create a timer");
+ }
+ 
+-void QEventDispatcherWin32Private::unregisterTimer(WinTimerInfo *t, bool closingDown)
++void QEventDispatcherWin32Private::unregisterTimer(WinTimerInfo *t)
+ {
+-    // mark timer as unused
+-    if (!QObjectPrivate::get(t->obj)->inThreadChangeEvent && !closingDown)
+-        QAbstractEventDispatcherPrivate::releaseTimerId(t->timerId);
+-
+     if (t->interval == 0) {
+         QCoreApplicationPrivate::removePostedTimerEvent(t->dispatcher, t->timerId);
+     } else if (t->fastTimerId != 0) {
+@@ -1051,7 +1047,7 @@ void QEventDispatcherWin32::closingDown()
+ 
+     // clean up any timers
+     for (int i = 0; i < d->timerVec.count(); ++i)
+-        d->unregisterTimer(d->timerVec.at(i), true);
++        d->unregisterTimer(d->timerVec.at(i));
+     d->timerVec.clear();
+     d->timerDict.clear();
+ 
+diff --git a/src/corelib/kernel/qeventdispatcher_win_p.h b/src/corelib/kernel/qeventdispatcher_win_p.h
+index 300449d..62502f7 100644
+--- a/src/corelib/kernel/qeventdispatcher_win_p.h
++++ b/src/corelib/kernel/qeventdispatcher_win_p.h
+@@ -161,7 +161,7 @@ public:
+     WinTimerVec timerVec;
+     WinTimerDict timerDict;
+     void registerTimer(WinTimerInfo *t);
+-    void unregisterTimer(WinTimerInfo *t, bool closingDown = false);
++    void unregisterTimer(WinTimerInfo *t);
+     void sendTimerEvent(int timerId);
+ 
+     // socket notifiers
+diff --git a/src/corelib/kernel/qobject.cpp b/src/corelib/kernel/qobject.cpp
+index db2ab42..6efff61 100644
+--- a/src/corelib/kernel/qobject.cpp
++++ b/src/corelib/kernel/qobject.cpp
+@@ -44,6 +44,7 @@
+ #include "qmetaobject_p.h"
+ 
+ #include "qabstracteventdispatcher.h"
++#include "qabstracteventdispatcher_p.h"
+ #include "qcoreapplication.h"
+ #include "qcoreapplication_p.h"
+ #include "qvariant.h"
+@@ -162,7 +163,6 @@ QObjectPrivate::QObjectPrivate(int version)
+     q_ptr = 0;
+     parent = 0;                                 // no parent yet. It is set by setParent()
+     isWidget = false;                           // assume not a widget object
+-    pendTimer = false;                          // no timers yet
+     blockSig = false;                           // not blocking signals
+     wasDeleted = false;                         // double-delete catcher
+     isDeletingChildren = false;                 // set by deleteChildren()
+@@ -171,17 +171,20 @@ QObjectPrivate::QObjectPrivate(int version)
+     postedEvents = 0;
+     extraData = 0;
+     connectedSignals[0] = connectedSignals[1] = 0;
+-    inThreadChangeEvent = false;
+     metaObject = 0;
+     isWindow = false;
+ }
+ 
+ QObjectPrivate::~QObjectPrivate()
+ {
+-    if (pendTimer) {
++    if (!runningTimers.isEmpty()) {
+         // unregister pending timers
+         if (threadData->eventDispatcher)
+             threadData->eventDispatcher->unregisterTimers(q_ptr);
++
++        // release the timer ids back to the pool
++        for (int i = 0; i < runningTimers.size(); ++i)
++            QAbstractEventDispatcherPrivate::releaseTimerId(runningTimers.at(i));
+     }
+ 
+     if (postedEvents)
+@@ -1019,11 +1022,8 @@ bool QObject::event(QEvent *e)
+         if (eventDispatcher) {
+             QList<QAbstractEventDispatcher::TimerInfo> timers = eventDispatcher->registeredTimers(this);
+             if (!timers.isEmpty()) {
+-                // set inThreadChangeEvent to true to tell the dispatcher not to release out timer ids
+-                // back to the pool (since the timer ids are moving to a new thread).
+-                d->inThreadChangeEvent = true;
++                // do not to release our timer ids back to the pool (since the timer ids are moving to a new thread).
+                 eventDispatcher->unregisterTimers(this);
+-                d->inThreadChangeEvent = false;
+                 QMetaObject::invokeMethod(this, "_q_reregisterTimers", Qt::QueuedConnection,
+                                           Q_ARG(void*, (new QList<QAbstractEventDispatcher::TimerInfo>(timers))));
+             }
+@@ -1382,13 +1382,13 @@ int QObject::startTimer(int interval, Qt::TimerType timerType)
+         return 0;
+     }
+ 
+-    d->pendTimer = true;                                // set timer flag
+-
+     if (!d->threadData->eventDispatcher) {
+         qWarning("QObject::startTimer: QTimer can only be used with threads started with QThread");
+         return 0;
+     }
+-    return d->threadData->eventDispatcher->registerTimer(interval, timerType, this);
++    int timerId = d->threadData->eventDispatcher->registerTimer(interval, timerType, this);
++    d->runningTimers.append(timerId);
++    return timerId;
+ }
+ 
+ /*!
+@@ -1403,8 +1403,23 @@ int QObject::startTimer(int interval, Qt::TimerType timerType)
+ void QObject::killTimer(int id)
+ {
+     Q_D(QObject);
+-    if (d->threadData->eventDispatcher)
+-        d->threadData->eventDispatcher->unregisterTimer(id);
++    if (id) {
++        int at = d->runningTimers.indexOf(id);
++        if (at == -1) {
++            // timer isn't owned by this object
++            qWarning("QObject::killTimer(): Error: timer id %d is not valid for object %p (%s), timer has not been killed",
++                     id,
++                     this,
++                     qPrintable(objectName()));
++            return;
++        }
++
++        if (d->threadData->eventDispatcher)
++            d->threadData->eventDispatcher->unregisterTimer(id);
++
++        d->runningTimers.remove(at);
++        QAbstractEventDispatcherPrivate::releaseTimerId(id);
++    }
+ }
+ 
+ 
+diff --git a/src/corelib/kernel/qobject.h b/src/corelib/kernel/qobject.h
+index a5ac8fe..f87309b 100644
+--- a/src/corelib/kernel/qobject.h
++++ b/src/corelib/kernel/qobject.h
+@@ -96,15 +96,13 @@ public:
+     QObjectList children;
+ 
+     uint isWidget : 1;
+-    uint pendTimer : 1;
+     uint blockSig : 1;
+     uint wasDeleted : 1;
+     uint isDeletingChildren : 1;
+     uint sendChildEvents : 1;
+     uint receiveChildEvents : 1;
+-    uint inThreadChangeEvent : 1;
+     uint isWindow : 1; //for QWindow
+-    uint unused : 23;
++    uint unused : 25;
+     int postedEvents;
+     QMetaObject *metaObject; // assert dynamic
+ };
+diff --git a/src/corelib/kernel/qobject_p.h b/src/corelib/kernel/qobject_p.h
+index 882ec9b..84f3626 100644
+--- a/src/corelib/kernel/qobject_p.h
++++ b/src/corelib/kernel/qobject_p.h
+@@ -198,6 +198,7 @@ public:
+     Sender *currentSender;   // object currently activating the object
+     mutable quint32 connectedSignals[2];
+ 
++    QVector<int> runningTimers;
+     QList<QPointer<QObject> > eventFilters;
+     union {
+         QObject *currentChildBeingDeleted;
+diff --git a/src/corelib/kernel/qtimerinfo_unix.cpp b/src/corelib/kernel/qtimerinfo_unix.cpp
+index 568f789..4ea1b75 100644
+--- a/src/corelib/kernel/qtimerinfo_unix.cpp
++++ b/src/corelib/kernel/qtimerinfo_unix.cpp
+@@ -266,11 +266,6 @@ bool QTimerInfoList::unregisterTimer(int timerId)
+                 firstTimerInfo = 0;
+             if (t->activateRef)
+                 *(t->activateRef) = 0;
+-
+-            // release the timer id
+-            if (!QObjectPrivate::get(t->obj)->inThreadChangeEvent)
+-                QAbstractEventDispatcherPrivate::releaseTimerId(timerId);
+-
+             delete t;
+             return true;
+         }
+@@ -292,11 +287,6 @@ bool QTimerInfoList::unregisterTimers(QObject *object)
+                 firstTimerInfo = 0;
+             if (t->activateRef)
+                 *(t->activateRef) = 0;
+-
+-            // release the timer id
+-            if (!QObjectPrivate::get(t->obj)->inThreadChangeEvent)
+-                QAbstractEventDispatcherPrivate::releaseTimerId(t->id);
+-
+             delete t;
+             // move back one so that we don't skip the new current item
+             --i;
+diff --git a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+index 1095d4b..35b6866 100644
+--- a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
++++ b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+@@ -190,8 +190,6 @@ bool QCocoaEventDispatcher::unregisterTimer(int identifier)
+     if (timerInfo == 0)
+         return false;
+ 
+-    if (!QObjectPrivate::get(timerInfo->obj)->inThreadChangeEvent)
+-        QAbstractEventDispatcherPrivate::releaseTimerId(identifier);
+     CFRunLoopTimerInvalidate(timerInfo->runLoopTimer);
+     CFRelease(timerInfo->runLoopTimer);
+     delete timerInfo;
+@@ -217,8 +215,6 @@ bool QCocoaEventDispatcher::unregisterTimers(QObject *obj)
+         if (timerInfo->obj != obj) {
+             ++it;
+         } else {
+-            if (!QObjectPrivate::get(timerInfo->obj)->inThreadChangeEvent)
+-                QAbstractEventDispatcherPrivate::releaseTimerId(timerInfo->id);
+             CFRunLoopTimerInvalidate(timerInfo->runLoopTimer);
+             CFRelease(timerInfo->runLoopTimer);
+             delete timerInfo;

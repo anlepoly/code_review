@@ -1,0 +1,174 @@
+diff --git a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.cpp b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.cpp
+index af0ee52..f690032 100644
+--- a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.cpp
++++ b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.cpp
+@@ -995,7 +995,7 @@ static HB_Stream getTableStream(void *font, HB_GetFontTableFunc tableFunc, HB_Ta
+     return stream;
+ }
+ 
+-HB_Face HB_NewFace(void *font, HB_GetFontTableFunc tableFunc)
++HB_Face HB_AllocFace(void *font, HB_GetFontTableFunc tableFunc)
+ {
+     HB_Face face = (HB_Face )malloc(sizeof(HB_FaceRec));
+     if (!face)
+@@ -1012,6 +1012,30 @@ HB_Face HB_NewFace(void *font, HB_GetFontTableFunc tableFunc)
+     face->tmpLogClusters = 0;
+     face->glyphs_substituted = false;
+     face->buffer = 0;
++    face->font_for_init = font;
++    face->get_font_table_func = tableFunc;
++
++    return face;
++}
++
++HB_Face HB_NewFace(void *font, HB_GetFontTableFunc tableFunc)
++{
++    HB_Face face = HB_AllocFace(font, tableFunc);
++    if (face)
++        face = HB_LoadFace(face);
++    return face;
++}
++
++HB_Face HB_LoadFace(HB_Face face)
++{
++    void *font = face->font_for_init;
++    if (!font)
++        return face;
++
++    HB_GetFontTableFunc tableFunc = face->get_font_table_func;
++
++    face->get_font_table_func = 0;
++    face->font_for_init = 0;
+ 
+     HB_Error error = HB_Err_Ok;
+     HB_Stream stream;
+diff --git a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
+index 470e27b..f225a86 100644
+--- a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
++++ b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
+@@ -201,6 +201,8 @@ typedef struct {
+     hb_bitfield combiningClass  :8;
+ } HB_GlyphAttributes;
+ 
++typedef HB_Error (*HB_GetFontTableFunc)(void *font, HB_Tag tag, HB_Byte *buffer, HB_UInt *length);
++
+ typedef struct HB_FaceRec_ {
+     HB_Bool isSymbolFont;
+ 
+@@ -217,11 +219,15 @@ typedef struct HB_FaceRec_ {
+     unsigned int *tmpLogClusters;
+     int length;
+     int orig_nglyphs;
++    void *font_for_init;
++    HB_GetFontTableFunc get_font_table_func;
+ } HB_FaceRec;
+ 
+-typedef HB_Error (*HB_GetFontTableFunc)(void *font, HB_Tag tag, HB_Byte *buffer, HB_UInt *length);
++
+ 
+ HB_Face HB_NewFace(void *font, HB_GetFontTableFunc tableFunc);
++HB_Face HB_AllocFace(void *font, HB_GetFontTableFunc tableFunc);
++HB_Face HB_LoadFace(HB_Face face);
+ void HB_FreeFace(HB_Face face);
+ 
+ typedef struct {
+diff --git a/src/corelib/tools/qharfbuzz.cpp b/src/corelib/tools/qharfbuzz.cpp
+index 7d08547..11126b8 100644
+--- a/src/corelib/tools/qharfbuzz.cpp
++++ b/src/corelib/tools/qharfbuzz.cpp
+@@ -122,7 +122,12 @@ HB_Bool qShapeItem(HB_ShaperItem *item)
+ 
+ HB_Face qHBNewFace(void *font, HB_GetFontTableFunc tableFunc)
+ {
+-    return HB_NewFace(font, tableFunc);
++    return HB_AllocFace(font, tableFunc);
++}
++
++HB_Face qHBLoadFace(HB_Face face)
++{
++    return HB_LoadFace(face);
+ }
+ 
+ void qHBFreeFace(HB_Face face)
+diff --git a/src/corelib/tools/qharfbuzz_p.h b/src/corelib/tools/qharfbuzz_p.h
+index cc575dd..3cef3a5 100644
+--- a/src/corelib/tools/qharfbuzz_p.h
++++ b/src/corelib/tools/qharfbuzz_p.h
+@@ -68,6 +68,7 @@ Q_CORE_EXPORT HB_Bool qShapeItem(HB_ShaperItem *item);
+ // ### temporary
+ Q_CORE_EXPORT HB_Face qHBNewFace(void *font, HB_GetFontTableFunc tableFunc);
+ Q_CORE_EXPORT void qHBFreeFace(HB_Face);
++Q_CORE_EXPORT HB_Face qHBLoadFace(HB_Face face);
+ 
+ Q_DECLARE_TYPEINFO(HB_GlyphAttributes, Q_PRIMITIVE_TYPE);
+ Q_DECLARE_TYPEINFO(HB_FixedPoint, Q_PRIMITIVE_TYPE);
+diff --git a/src/gui/text/qfontengine.cpp b/src/gui/text/qfontengine.cpp
+index 4bceb28..142d627 100644
+--- a/src/gui/text/qfontengine.cpp
++++ b/src/gui/text/qfontengine.cpp
+@@ -227,6 +227,15 @@ HB_Face QFontEngine::harfbuzzFace() const
+     return hbFace;
+ }
+ 
++HB_Face QFontEngine::initializedHarfbuzzFace() const
++{
++    HB_Face face = harfbuzzFace();
++    if (face != 0 && face->font_for_init != 0)
++        face = qHBLoadFace(face);
++
++    return face;
++}
++
+ glyph_metrics_t QFontEngine::boundingBox(glyph_t glyph, const QTransform &matrix)
+ {
+     glyph_metrics_t metrics = boundingBox(glyph);
+@@ -1364,15 +1373,13 @@ bool QFontEngineMulti::stringToCMap(const QChar *str, int len,
+         if (glyphs->glyphs[glyph_pos] == 0 && str[i].category() != QChar::Separator_Line) {
+             QGlyphLayoutInstance tmp = glyphs->instance(glyph_pos);
+             for (int x=1; x < engines.size(); ++x) {
+-                if (!shouldLoadFontEngineForCharacter(x, ucs4))
++                if (engines.at(x) == 0 && !shouldLoadFontEngineForCharacter(x, ucs4))
+                     continue;
+ 
+                 QFontEngine *engine = engines.at(x);
+-                bool deleteThisEngine = false;
+                 if (!engine) {
+                     const_cast<QFontEngineMulti *>(this)->loadEngine(x);
+                     engine = engines.at(x);
+-                    deleteThisEngine = true;
+                 }
+                 Q_ASSERT(engine != 0);
+                 if (engine->type() == Box)
+@@ -1388,8 +1395,6 @@ bool QFontEngineMulti::stringToCMap(const QChar *str, int len,
+                     // set the high byte to indicate which engine the glyph came from
+                     glyphs->glyphs[glyph_pos] |= (x << 24);
+                     break;
+-                } else if (deleteThisEngine) {
+-                    const_cast<QFontEngineMulti *>(this)->unloadEngine(x);
+                 }
+             }
+ 
+diff --git a/src/gui/text/qfontengine_p.h b/src/gui/text/qfontengine_p.h
+index 44464ee..660e3be 100644
+--- a/src/gui/text/qfontengine_p.h
++++ b/src/gui/text/qfontengine_p.h
+@@ -235,6 +235,7 @@ public:
+ 
+     HB_Font harfbuzzFont() const;
+     HB_Face harfbuzzFace() const;
++    HB_Face initializedHarfbuzzFace() const;
+ 
+     virtual HB_Error getPointInOutline(HB_Glyph glyph, int flags, hb_uint32 point, HB_Fixed *xpos, HB_Fixed *ypos, hb_uint32 *nPoints);
+ 
+diff --git a/src/gui/text/qtextengine.cpp b/src/gui/text/qtextengine.cpp
+index 0460db1..dae02de 100644
+--- a/src/gui/text/qtextengine.cpp
++++ b/src/gui/text/qtextengine.cpp
+@@ -1112,7 +1112,7 @@ void QTextEngine::shapeTextWithHarfbuzz(int item) const
+         si.leading = qMax(actualFontEngine->leading(), si.leading);
+ 
+         shaper_item.font = actualFontEngine->harfbuzzFont();
+-        shaper_item.face = actualFontEngine->harfbuzzFace();
++        shaper_item.face = actualFontEngine->initializedHarfbuzzFace();
+ 
+         shaper_item.glyphIndicesPresent = true;

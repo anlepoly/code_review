@@ -1,0 +1,1221 @@
+diff --git a/doc/src/declarative/modules.qdoc b/doc/src/declarative/modules.qdoc
+index 92a2c0d..437b41b 100644
+--- a/doc/src/declarative/modules.qdoc
++++ b/doc/src/declarative/modules.qdoc
+@@ -297,6 +297,38 @@ Item {
+ The qualifier ("MyScript" in the above example) must be unique within the QML document.
+ Unlike ordinary modules, multiple scripts cannot be imported into the same namespace.
+ 
++Javascript files can be provided by modules, by adding Namespace definitions to the
++\l{Writing a qmldir file}{qmldir file} for the module.  For example:
++
++\code
++SystemFunctions 1.0 SystemFunctions.js
++UserFunctions 1.0 UserFunctions.js
++\endcode
++
++Javascript can be imported from a module, where they will have the namespace defined
++for them in the module's \c qmldir file:
++
++\qml
++import projects.MyQMLProject.MyFunctions 1.0
++
++Window {
++    Component.onCompleted: { SystemFunctions.cleanUp(); }
++}
++\endqml
++
++Javascript provided by modules can also be imported into namespaces:
++
++\qml
++import projects.MyQMLProject.MyFunctions 1.0 as MyFuncs
++import org.example.Functions 1.0 as TheirFuncs
++
++Window {
++    Component.onCompleted: {
++        MyFuncs.SystemFunctions.cleanUp();
++        TheirFuncs.SystemFunctions.shutdown();
++    }
++}
++\endqml
+ 
+ \section1 Writing a qmldir File
+ 
+@@ -310,6 +342,7 @@ It is defined by a plain text file named "qmldir" that contains one or more line
+ # <Comment>
+ <TypeName> [<InitialVersion>] <File>
+ internal <TypeName> <File>
++<Namespace> <InitialVersion> <File>
+ plugin <Name> [<Path>]
+ typeinfo <File>
+ \endcode
+@@ -343,6 +376,11 @@ of installed software, since a versioned import \i only imports types for that v
+ leaving other identifiers available, even if the actual installed version might otherwise
+ provide those identifiers.
+ 
++\bold {<Namespace> <InitialVersion> <File>} lines are used to import javascript files
++into a Namespace exported by the module.  The contents of the script file are made
++available inside the namespace <Namespace>, which has the version number
++<InitialVersion>.
++
+ \bold {plugin <Name> [<Path>]} lines are used to add \l{QDeclarativeExtensionPlugin}{QML C++ plugins} to the module. <Name> is the name of the library.  It is usually not the same as the file name
+ of the plugin binary, which is platform dependent; e.g. the library \c MyAppTypes would produce
+ \c libMyAppTypes.so on Linux and \c MyAppTypes.dll on Windows.
+@@ -360,7 +398,6 @@ file.
+ Without such a file QML tools may be unable to offer features such as code completion
+ for the types defined in your plugins.
+ 
+-
+ \section1 Debugging
+ 
+ The \c QML_IMPORT_TRACE environment variable can be useful for debugging
+diff --git a/src/declarative/qml/ftw/qhashedstring_p.h b/src/declarative/qml/ftw/qhashedstring_p.h
+index 00c9e34..f4dd6ee 100644
+--- a/src/declarative/qml/ftw/qhashedstring_p.h
++++ b/src/declarative/qml/ftw/qhashedstring_p.h
+@@ -104,6 +104,8 @@ public:
+ 
+     inline v8::Handle<v8::String> string() const;
+ 
++    inline QString toString() const;
++
+ private:
+     v8::String::CompleteHashData m_hash;
+     v8::Handle<v8::String> m_string;
+@@ -917,6 +919,17 @@ v8::Handle<v8::String> QHashedV8String::string() const
+     return m_string;
+ }
+ 
++QString QHashedV8String::toString() const
++{
++    QString result;
++    result.reserve(m_hash.length);
++
++    for (int i = 0; i < m_hash.length; ++i)
++        result.append(m_string->GetCharacter(i));
++
++    return result;
++}
++
+ QHashedStringRef::QHashedStringRef() 
+ : m_data(0), m_length(0), m_utf8length(-1), m_hash(0) 
+ {
+diff --git a/src/declarative/qml/qdeclarativecompiler.cpp b/src/declarative/qml/qdeclarativecompiler.cpp
+index aec3993..07e381c 100644
+--- a/src/declarative/qml/qdeclarativecompiler.cpp
++++ b/src/declarative/qml/qdeclarativecompiler.cpp
+@@ -859,19 +859,28 @@ void QDeclarativeCompiler::compileTree(QDeclarativeScript::Object *tree)
+     if (componentStats)
+         componentStats->componentStat.lineNumber = tree->location.start.line;
+ 
+-    // Build global import scripts
+-    QStringList importedScriptIndexes;
+-
+-    foreach (const QDeclarativeTypeData::ScriptReference &script, unit->resolvedScripts()) {
+-        importedScriptIndexes.append(script.qualifier);
+-    }
+-
+     // We generate the importCache before we build the tree so that
+     // it can be used in the binding compiler.  Given we "expect" the
+     // QML compilation to succeed, this isn't a waste.
+     output->importCache = new QDeclarativeTypeNameCache();
+-    for (int ii = 0; ii < importedScriptIndexes.count(); ++ii) 
+-        output->importCache->add(importedScriptIndexes.at(ii), ii);
++    foreach (const QString &ns, unit->namespaces()) {
++        output->importCache->add(ns);
++    }
++
++    int scriptIndex = 0;
++    foreach (const QDeclarativeTypeData::ScriptReference &script, unit->resolvedScripts()) {
++        QString qualifier = script.qualifier;
++        QString enclosingNamespace;
++
++        const int lastDotIndex = qualifier.lastIndexOf(QLatin1Char('.'));
++        if (lastDotIndex != -1) {
++            enclosingNamespace = qualifier.left(lastDotIndex);
++            qualifier = qualifier.mid(lastDotIndex+1);
++        }
++
++        output->importCache->add(qualifier, scriptIndex++, enclosingNamespace);
++    }
++
+     unit->imports().populateCache(output->importCache, engine);
+ 
+     if (!buildObject(tree, BindingContext()) || !completeComponentBuild())
+diff --git a/src/declarative/qml/qdeclarativedirparser.cpp b/src/declarative/qml/qdeclarativedirparser.cpp
+index d7c44e4..c4a11a9 100644
+--- a/src/declarative/qml/qdeclarativedirparser.cpp
++++ b/src/declarative/qml/qdeclarativedirparser.cpp
+@@ -103,6 +103,7 @@ bool QDeclarativeDirParser::parse()
+     _errors.clear();
+     _plugins.clear();
+     _components.clear();
++    _scripts.clear();
+ 
+     if (_source.isEmpty() && !_filePathSouce.isEmpty()) {
+         QFile file(_filePathSouce);
+@@ -220,9 +221,16 @@ bool QDeclarativeDirParser::parse()
+                     const int minorVersion = version.mid(dotIndex + 1).toInt(&validVersionNumber);
+ 
+                     if (validVersionNumber) {
+-                        const Component entry(sections[0], sections[2], majorVersion, minorVersion);
+-
+-                        _components.append(entry);
++                        const QString &fileName = sections[2];
++
++                        if (fileName.endsWith(QLatin1String(".js"))) {
++                            // A 'js' extension indicates a namespaced script import
++                            const Script entry(sections[0], fileName, majorVersion, minorVersion);
++                            _scripts.append(entry);
++                        } else {
++                            const Component entry(sections[0], fileName, majorVersion, minorVersion);
++                            _components.append(entry);
++                        }
+                     }
+                 }
+             }
+@@ -275,6 +283,11 @@ QList<QDeclarativeDirParser::Component> QDeclarativeDirParser::components() cons
+     return _components;
+ }
+ 
++QList<QDeclarativeDirParser::Script> QDeclarativeDirParser::scripts() const
++{
++    return _scripts;
++}
++
+ #ifdef QT_CREATOR
+ QList<QDeclarativeDirParser::TypeInfo> QDeclarativeDirParser::typeInfos() const
+ {
+diff --git a/src/declarative/qml/qdeclarativedirparser_p.h b/src/declarative/qml/qdeclarativedirparser_p.h
+index d31666c..0f726b7 100644
+--- a/src/declarative/qml/qdeclarativedirparser_p.h
++++ b/src/declarative/qml/qdeclarativedirparser_p.h
+@@ -109,7 +109,22 @@ public:
+         bool internal;
+     };
+ 
++    struct Script
++    {
++        Script()
++            : majorVersion(0), minorVersion(0) {}
++
++        Script(const QString &nameSpace, const QString &fileName, int majorVersion, int minorVersion)
++            : nameSpace(nameSpace), fileName(fileName), majorVersion(majorVersion), minorVersion(minorVersion) {}
++
++        QString nameSpace;
++        QString fileName;
++        int majorVersion;
++        int minorVersion;
++    };
++
+     QList<Component> components() const;
++    QList<Script> scripts() const;
+     QList<Plugin> plugins() const;
+ 
+ #ifdef QT_CREATOR
+@@ -134,6 +149,7 @@ private:
+     QString _source;
+     QString _filePathSouce;
+     QList<Component> _components;
++    QList<Script> _scripts;
+     QList<Plugin> _plugins;
+ #ifdef QT_CREATOR
+     QList<TypeInfo> _typeInfos;
+@@ -142,6 +158,7 @@ private:
+ };
+ 
+ typedef QList<QDeclarativeDirParser::Component> QDeclarativeDirComponents;
++typedef QList<QDeclarativeDirParser::Script> QDeclarativeDirScripts;
+ 
+ 
+ QT_END_NAMESPACE
+diff --git a/src/declarative/qml/qdeclarativeimport.cpp b/src/declarative/qml/qdeclarativeimport.cpp
+index 7c4c582..34527e6 100644
+--- a/src/declarative/qml/qdeclarativeimport.cpp
++++ b/src/declarative/qml/qdeclarativeimport.cpp
+@@ -94,6 +94,7 @@ public:
+         int minversion;
+         bool isLibrary;
+         QDeclarativeDirComponents qmlDirComponents;
++        QDeclarativeDirScripts qmlDirScripts;
+     };
+     QList<Data> imports;
+ 
+@@ -112,6 +113,7 @@ public:
+ 
+     bool importExtension(const QString &absoluteFilePath, const QString &uri, 
+                          QDeclarativeImportDatabase *database, QDeclarativeDirComponents* components, 
++                         QDeclarativeDirScripts *scripts,
+                          QList<QDeclarativeError> *errors);
+ 
+     QString resolvedUri(const QString &dir_arg, QDeclarativeImportDatabase *database);
+@@ -199,15 +201,17 @@ void QDeclarativeImports::populateCache(QDeclarativeTypeNameCache *cache, QDecla
+          ++iter) {
+ 
+         const QDeclarativeImportedNamespace &set = *iter.value();
+-        QDeclarativeTypeNameCache::Import &import = cache->m_namedImports[iter.key()];
+         for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
+             const QDeclarativeImportedNamespace::Data &data = set.imports.at(ii);
+             QDeclarativeTypeModule *module = QDeclarativeMetaType::typeModule(data.uri, data.majversion);
+-            if (module)
++            if (module) {
++                QDeclarativeTypeNameCache::Import &import = cache->m_namedImports[iter.key()];
+                 import.modules.append(QDeclarativeTypeModuleVersion(module, data.minversion));
++            }
+ 
+             QDeclarativeMetaType::ModuleApi moduleApi = QDeclarativeMetaType::moduleApi(data.uri, data.majversion, data.minversion);
+             if (moduleApi.script || moduleApi.qobject) {
++                QDeclarativeTypeNameCache::Import &import = cache->m_namedImports[iter.key()];
+                 QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(engine);
+                 import.moduleApi = ep->moduleApiInstance(moduleApi);
+             }
+@@ -215,6 +219,44 @@ void QDeclarativeImports::populateCache(QDeclarativeTypeNameCache *cache, QDecla
+     }
+ }
+ 
++QList<QDeclarativeImports::ScriptReference> QDeclarativeImports::resolvedScripts() const
++{
++    QList<QDeclarativeImports::ScriptReference> scripts;
++
++    const QDeclarativeImportedNamespace &set = d->unqualifiedset;
++
++    for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
++        const QDeclarativeImportedNamespace::Data &data = set.imports.at(ii);
++
++        foreach (const QDeclarativeDirParser::Script &script, data.qmlDirScripts) {
++            ScriptReference ref;
++            ref.nameSpace = script.nameSpace;
++            ref.location = QUrl(data.url).resolved(QUrl(script.fileName));
++            scripts.append(ref);
++        }
++    }
++
++    for (QHash<QString,QDeclarativeImportedNamespace* >::ConstIterator iter = d->set.constBegin();
++         iter != d->set.constEnd();
++         ++iter) {
++        const QDeclarativeImportedNamespace &set = *iter.value();
++
++        for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
++            const QDeclarativeImportedNamespace::Data &data = set.imports.at(ii);
++
++            foreach (const QDeclarativeDirParser::Script &script, data.qmlDirScripts) {
++                ScriptReference ref;
++                ref.nameSpace = script.nameSpace;
++                ref.qualifier = iter.key();
++                ref.location = QUrl(data.url).resolved(QUrl(script.fileName));
++                scripts.append(ref);
++            }
++        }
++    }
++
++    return scripts;
++}
++
+ /*!
+   \internal
+ 
+@@ -350,9 +392,11 @@ QDeclarativeImportsPrivate::~QDeclarativeImportsPrivate()
+         delete s;
+ }
+ 
+-bool QDeclarativeImportsPrivate::importExtension(const QString &absoluteFilePath, const QString &uri, 
+-                                                 QDeclarativeImportDatabase *database, 
+-                                                 QDeclarativeDirComponents* components, QList<QDeclarativeError> *errors)
++bool QDeclarativeImportsPrivate::importExtension(const QString &absoluteFilePath, const QString &uri,
++                                                 QDeclarativeImportDatabase *database,
++                                                 QDeclarativeDirComponents* components,
++                                                 QDeclarativeDirScripts* scripts,
++                                                 QList<QDeclarativeError> *errors)
+ {
+     const QDeclarativeDirParser *qmldirParser = typeLoader->qmlDirParser(absoluteFilePath);
+     if (qmldirParser->hasError()) {
+@@ -406,6 +450,8 @@ bool QDeclarativeImportsPrivate::importExtension(const QString &absoluteFilePath
+ 
+     if (components)
+         *components = qmldirParser->components();
++    if (scripts)
++        *scripts = qmldirParser->scripts();
+ 
+     return true;
+ }
+@@ -450,6 +496,7 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+     static QLatin1Char Slash('/');
+ 
+     QDeclarativeDirComponents qmldircomponents = qmldircomponentsnetwork;
++    QDeclarativeDirScripts qmldirscripts;
+     QString uri = uri_arg;
+     QDeclarativeImportedNamespace *s;
+     if (prefix.isEmpty()) {
+@@ -486,12 +533,14 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+                 else
+                     url = QUrl::fromLocalFile(fi.absolutePath()).toString();
+                 uri = resolvedUri(dir, database);
+-                if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, errors))
++                if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, &qmldirscripts, errors))
+                     return false;
+                 break;
+             }
+         }
+ 
++        // TODO: Should this search be omitted if found == true?
++
+         // step 2: search for extension with encoded version major
+         foreach (const QString &p, database->fileImportPath) {
+             dir = p+Slash+url;
+@@ -508,7 +557,7 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+                 else
+                     url = QUrl::fromLocalFile(fi.absolutePath()).toString();
+                 uri = resolvedUri(dir, database);
+-                if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, errors))
++                if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, &qmldirscripts, errors))
+                     return false;
+                 break;
+             }
+@@ -530,7 +579,7 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+                     else
+                         url = QUrl::fromLocalFile(absolutePath).toString();
+                     uri = resolvedUri(dir, database);
+-                    if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, errors))
++                    if (!importExtension(absoluteFilePath, uri, database, &qmldircomponents, &qmldirscripts, errors))
+                         return false;
+                     break;
+                 }
+@@ -540,7 +589,7 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+         if (QDeclarativeMetaType::isModule(uri, vmaj, vmin))
+             versionFound = true;
+ 
+-        if (!versionFound && qmldircomponents.isEmpty()) {
++        if (!versionFound && qmldircomponents.isEmpty() && qmldirscripts.isEmpty()) {
+             if (errors) {
+                 QDeclarativeError error; // we don't set the url or line or column as these will be set by the loader.
+                 if (QDeclarativeMetaType::isAnyModule(uri))
+@@ -570,7 +619,7 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+                 if (uri.endsWith(Slash))
+                     uri.chop(1);
+                 if (!typeLoader->absoluteFilePath(localFileOrQrc).isEmpty()) {
+-                    if (!importExtension(localFileOrQrc,uri,database,&qmldircomponents,errors))
++                    if (!importExtension(localFileOrQrc,uri,database,&qmldircomponents,&qmldirscripts,errors))
+                         return false;
+                 }
+             } else {
+@@ -596,16 +645,18 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+         url = resolveLocalUrl(base, url);
+     }
+ 
+-    if (!versionFound && vmaj > -1 && vmin > -1 && !qmldircomponents.isEmpty()) {
+-        QList<QDeclarativeDirParser::Component>::ConstIterator it = qmldircomponents.begin();
++    if (!versionFound && (vmaj > -1) && (vmin > -1) && !qmldircomponents.isEmpty()) {
+         int lowest_min = INT_MAX;
+         int highest_min = INT_MIN;
+-        for (; it != qmldircomponents.end(); ++it) {
+-            if (it->majorVersion == vmaj) {
+-                lowest_min = qMin(lowest_min, it->minorVersion);
+-                highest_min = qMax(highest_min, it->minorVersion);
++
++        QList<QDeclarativeDirParser::Component>::const_iterator cend = qmldircomponents.constEnd();
++        for (QList<QDeclarativeDirParser::Component>::const_iterator cit = qmldircomponents.constBegin(); cit != cend; ++cit) {
++            if (cit->majorVersion == vmaj) {
++                lowest_min = qMin(lowest_min, cit->minorVersion);
++                highest_min = qMax(highest_min, cit->minorVersion);
+             }
+         }
++
+         if (lowest_min > vmin || highest_min < vmin) {
+             if (errors) {
+                 QDeclarativeError error; // we don't set the url or line or column information, as these will be set by the loader.
+@@ -619,6 +670,35 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+     if (!url.endsWith(Slash))
+         url += Slash;
+ 
++    QMap<QString, QDeclarativeDirParser::Script> scripts;
++
++    if (!qmldirscripts.isEmpty()) {
++        // Verify that we haven't imported these scripts already
++        QList<QDeclarativeImportedNamespace::Data>::const_iterator end = s->imports.constEnd();
++        for (QList<QDeclarativeImportedNamespace::Data>::const_iterator it = s->imports.constBegin(); it != end; ++it) {
++            if (it->uri == uri) {
++                QDeclarativeError error;
++                error.setDescription(QDeclarativeImportDatabase::tr("\"%1\" is ambiguous. Found in %2 and in %3").arg(uri).arg(url).arg(it->url));
++                errors->prepend(error);
++                return false;
++            }
++        }
++
++        QList<QDeclarativeDirParser::Script>::const_iterator send = qmldirscripts.constEnd();
++        for (QList<QDeclarativeDirParser::Script>::const_iterator sit = qmldirscripts.constBegin(); sit != send; ++sit) {
++            // Only include scripts that match our requested version
++            if (((vmaj == -1) || (sit->majorVersion == vmaj)) &&
++                ((vmin == -1) || (sit->minorVersion <= vmin))) {
++
++                // Load the highest version that matches
++                QMap<QString, QDeclarativeDirParser::Script>::iterator it = scripts.find(sit->nameSpace);
++                if (it == scripts.end() || (it->minorVersion < sit->minorVersion)) {
++                    scripts.insert(sit->nameSpace, *sit);
++                }
++            }
++        }
++    }
++
+     QDeclarativeImportedNamespace::Data data;
+     data.uri = uri;
+     data.url = url;
+@@ -626,6 +706,8 @@ bool QDeclarativeImportsPrivate::add(const QDeclarativeDirComponents &qmldircomp
+     data.minversion = vmin;
+     data.isLibrary = importType == QDeclarativeScript::Import::Library;
+     data.qmlDirComponents = qmldircomponents;
++    data.qmlDirScripts = scripts.values();
++
+     s->imports.prepend(data);
+ 
+     return true;
+diff --git a/src/declarative/qml/qdeclarativeimport_p.h b/src/declarative/qml/qdeclarativeimport_p.h
+index 31e6676..a9648c0 100644
+--- a/src/declarative/qml/qdeclarativeimport_p.h
++++ b/src/declarative/qml/qdeclarativeimport_p.h
+@@ -101,6 +101,15 @@ public:
+ 
+     void populateCache(QDeclarativeTypeNameCache *cache, QDeclarativeEngine *) const;
+ 
++    struct ScriptReference
++    {
++        QString nameSpace;
++        QString qualifier;
++        QUrl location;
++    };
++
++    QList<ScriptReference> resolvedScripts() const;
++
+ private:
+     friend class QDeclarativeImportDatabase;
+     QDeclarativeImportsPrivate *d;
+diff --git a/src/declarative/qml/qdeclarativetypeloader.cpp b/src/declarative/qml/qdeclarativetypeloader.cpp
+index 005e175..bf319e5 100644
+--- a/src/declarative/qml/qdeclarativetypeloader.cpp
++++ b/src/declarative/qml/qdeclarativetypeloader.cpp
+@@ -1427,6 +1427,11 @@ const QList<QDeclarativeTypeData::ScriptReference> &QDeclarativeTypeData::resolv
+     return m_scripts;
+ }
+ 
++const QSet<QString> &QDeclarativeTypeData::namespaces() const
++{
++    return m_namespaces;
++}
++
+ QDeclarativeCompiledData *QDeclarativeTypeData::compiledData() const
+ {
+     if (m_compiledData) 
+@@ -1648,6 +1653,27 @@ void QDeclarativeTypeData::resolveTypes()
+         }
+     }
+ 
++    // Add any imported scripts to our resolved set
++    foreach (const QDeclarativeImports::ScriptReference &script, m_imports.resolvedScripts())
++    {
++        QDeclarativeScriptBlob *blob = typeLoader()->getScript(script.location);
++        addDependency(blob);
++
++        ScriptReference ref;
++        //ref.location = ...
++        ref.qualifier = script.nameSpace;
++        if (!script.qualifier.isEmpty())
++        {
++            ref.qualifier.prepend(script.qualifier + QLatin1Char('.'));
++
++            // Add a reference to the enclosing namespace
++            m_namespaces.insert(script.qualifier);
++        }
++
++        ref.script = blob;
++        m_scripts << ref;
++    }
++
+     foreach (QDeclarativeScript::TypeReference *parserRef, scriptParser.referencedTypes()) {
+         TypeReference ref;
+ 
+diff --git a/src/declarative/qml/qdeclarativetypeloader_p.h b/src/declarative/qml/qdeclarativetypeloader_p.h
+index 36e8d93..7b29f4b 100644
+--- a/src/declarative/qml/qdeclarativetypeloader_p.h
++++ b/src/declarative/qml/qdeclarativetypeloader_p.h
+@@ -294,6 +294,7 @@ public:
+ 
+     const QList<TypeReference> &resolvedTypes() const;
+     const QList<ScriptReference> &resolvedScripts() const;
++    const QSet<QString> &namespaces() const;
+ 
+     QDeclarativeCompiledData *compiledData() const;
+ 
+@@ -327,6 +328,8 @@ private:
+     QList<ScriptReference> m_scripts;
+     QList<QDeclarativeQmldirData *> m_qmldirs;
+ 
++    QSet<QString> m_namespaces;
++
+     QList<TypeReference> m_types;
+     bool m_typesResolved:1;
+ 
+diff --git a/src/declarative/qml/qdeclarativetypenamecache.cpp b/src/declarative/qml/qdeclarativetypenamecache.cpp
+index b183bca..58ab199 100644
+--- a/src/declarative/qml/qdeclarativetypenamecache.cpp
++++ b/src/declarative/qml/qdeclarativetypenamecache.cpp
+@@ -53,85 +53,71 @@ QDeclarativeTypeNameCache::~QDeclarativeTypeNameCache()
+ {
+ }
+ 
+-void QDeclarativeTypeNameCache::add(const QHashedString &name, int importedScriptIndex)
++void QDeclarativeTypeNameCache::add(const QHashedString &name, int importedScriptIndex, const QHashedString &nameSpace)
+ {
++    Import import;
++    import.scriptIndex = importedScriptIndex;
++
++    if (nameSpace.length() != 0) {
++        Import *i = m_namedImports.value(nameSpace);
++        Q_ASSERT(i != 0);
++        m_namespacedImports[i].insert(name, import);
++        return;
++    }
++
+     if (m_namedImports.contains(name))
+         return;
+ 
+-    Import import;
+-    import.scriptIndex = importedScriptIndex;
+     m_namedImports.insert(name, import);
+ }
+ 
+ QDeclarativeTypeNameCache::Result QDeclarativeTypeNameCache::query(const QHashedStringRef &name)
+ {
+-    Import *i = m_namedImports.value(name);
+-    if (i) {
+-        if (i->scriptIndex != -1)
+-            return Result(i->scriptIndex);
+-        else
+-            return Result((const void *)i);
+-    }
++    Result result = query(m_namedImports, name);
+ 
+-    for (int ii = 0; ii < m_anonymousImports.count(); ++ii) {
+-        if (QDeclarativeType *type = m_anonymousImports.at(ii).type(name))
+-            return Result(type);
+-    }
++    if (!result.isValid())
++        result = typeSearch(m_anonymousImports, name);
+ 
+-    return Result();
++    return result;
+ }
+ 
+ QDeclarativeTypeNameCache::Result QDeclarativeTypeNameCache::query(const QHashedStringRef &name, 
+                                                                    const void *importNamespace)
+ {
+     Q_ASSERT(importNamespace);
+-    Import *i = (Import *)importNamespace;
++    const Import *i = static_cast<const Import *>(importNamespace);
+     Q_ASSERT(i->scriptIndex == -1);
+ 
+-    for (int ii = 0; ii < i->modules.count(); ++ii) {
+-        if (QDeclarativeType *type = i->modules.at(ii).type(name))
+-            return Result(type);
+-    }
+-    
+-    return Result();
++    return typeSearch(i->modules, name);
+ }
+ 
+ QDeclarativeTypeNameCache::Result QDeclarativeTypeNameCache::query(const QHashedV8String &name)
+ {
+-    Import *i = m_namedImports.value(name);
+-    if (i) {
+-        if (i->scriptIndex != -1)
+-            return Result(i->scriptIndex);
+-        else
+-            return Result((const void *)i);
+-    }
++    Result result = query(m_namedImports, name);
+ 
+-    for (int ii = 0; ii < m_anonymousImports.count(); ++ii) {
+-        if (QDeclarativeType *type = m_anonymousImports.at(ii).type(name))
+-            return Result(type);
+-    }
++    if (!result.isValid())
++        result = typeSearch(m_anonymousImports, name);
+ 
+-    return Result();
++    return result;
+ }
+ 
+ QDeclarativeTypeNameCache::Result QDeclarativeTypeNameCache::query(const QHashedV8String &name, const void *importNamespace)
+ {
+     Q_ASSERT(importNamespace);
+-    Import *i = (Import *)importNamespace;
++    const Import *i = static_cast<const Import *>(importNamespace);
+     Q_ASSERT(i->scriptIndex == -1);
+ 
+-    for (int ii = 0; ii < i->modules.count(); ++ii) {
+-        if (QDeclarativeType *type = i->modules.at(ii).type(name))
+-            return Result(type);
+-    }
+-    
+-    return Result();
++    QMap<const Import *, QStringHash<Import> >::const_iterator it = m_namespacedImports.find(i);
++    if (it != m_namespacedImports.constEnd())
++        return query(*it, name);
++
++    return typeSearch(i->modules, name);
+ }
+ 
+ QDeclarativeMetaType::ModuleApiInstance *QDeclarativeTypeNameCache::moduleApi(const void *importNamespace)
+ {
+     Q_ASSERT(importNamespace);
+-    Import *i = (Import *)importNamespace;
++    const Import *i = static_cast<const Import *>(importNamespace);
+     Q_ASSERT(i->scriptIndex == -1);
+ 
+     return i->moduleApi;
+diff --git a/src/declarative/qml/qdeclarativetypenamecache_p.h b/src/declarative/qml/qdeclarativetypenamecache_p.h
+index 68f6044..8edc34d 100644
+--- a/src/declarative/qml/qdeclarativetypenamecache_p.h
++++ b/src/declarative/qml/qdeclarativetypenamecache_p.h
+@@ -73,7 +73,7 @@ public:
+ 
+     inline bool isEmpty() const;
+ 
+-    void add(const QHashedString &, int);
++    void add(const QHashedString &name, int sciptIndex = -1, const QHashedString &nameSpace = QHashedString());
+ 
+     struct Result {
+         inline Result();
+@@ -107,7 +107,35 @@ private:
+         int scriptIndex;
+     };
+ 
++    template<typename Key>
++    Result query(const QStringHash<Import> &imports, Key key)
++    {
++        Import *i = imports.value(key);
++        if (i) {
++            if (i->scriptIndex != -1) {
++                return Result(i->scriptIndex);
++            } else {
++                return Result(static_cast<const void *>(i));
++            }
++        }
++
++        return Result();
++    }
++
++    template<typename Key>
++    Result typeSearch(const QVector<QDeclarativeTypeModuleVersion> &modules, Key key)
++    {
++        QVector<QDeclarativeTypeModuleVersion>::const_iterator end = modules.constEnd();
++        for (QVector<QDeclarativeTypeModuleVersion>::const_iterator it = modules.constBegin(); it != end; ++it) {
++            if (QDeclarativeType *type = it->type(key))
++                return Result(type);
++        }
++
++        return Result();
++    }
++
+     QStringHash<Import> m_namedImports;
++    QMap<const Import *, QStringHash<Import> > m_namespacedImports;
+     QVector<QDeclarativeTypeModuleVersion> m_anonymousImports;
+ 
+     QDeclarativeEngine *engine;
+diff --git a/src/declarative/qml/v8/qv8typewrapper.cpp b/src/declarative/qml/v8/qv8typewrapper.cpp
+index 32db263..f1c0956 100644
+--- a/src/declarative/qml/v8/qv8typewrapper.cpp
++++ b/src/declarative/qml/v8/qv8typewrapper.cpp
+@@ -196,9 +196,16 @@ v8::Handle<v8::Value> QV8TypeWrapper::Getter(v8::Local<v8::String> property,
+                                                                              resource->importNamespace);
+ 
+         if (r.isValid()) {
+-            Q_ASSERT(r.type);
++            if (r.type) {
++                return v8engine->typeWrapper()->newObject(object, r.type, resource->mode);
++            } else if (r.scriptIndex != -1) {
++                int index = r.scriptIndex;
++                QDeclarativeContextData *context = v8engine->callingContext();
++                if (index < context->importedScripts.count())
++                    return context->importedScripts.at(index);
++            }
+ 
+-            return v8engine->typeWrapper()->newObject(object, r.type, resource->mode);
++            return v8::Undefined();
+         } else if (QDeclarativeMetaType::ModuleApiInstance *moduleApi = resource->typeNamespace->moduleApi(resource->importNamespace)) {
+ 
+             if (moduleApi->scriptCallback) {
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.1.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.1.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.1.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.1.qml
+new file mode 100644
+index 0000000..eaba98e
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.1.qml
+@@ -0,0 +1,12 @@
++import com.nokia.PureJsModule 1.0
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((FirstAPI.greeting() == "Hello") &&
++                (FirstAPI.major == 1) &&
++                (FirstAPI.minor == 0))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.10.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.10.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.10.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.10.qml
+new file mode 100644
+index 0000000..578ca47
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.10.qml
+@@ -0,0 +1,16 @@
++import com.nokia.PureJsModule 1.0 as PJM
++import com.nokia.PureJsModule 1.0 as AnotherName
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((PJM.FirstAPI.greeting() == "Hello") &&
++                (PJM.FirstAPI.major == 1) &&
++                (PJM.FirstAPI.minor == 0) &&
++                (AnotherName.FirstAPI.greeting() == "Hello") &&
++                (AnotherName.FirstAPI.major == 1) &&
++                (AnotherName.FirstAPI.minor == 0))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.2.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.2.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.2.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.2.qml
+new file mode 100644
+index 0000000..dd3d65c
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.2.qml
+@@ -0,0 +1,12 @@
++import com.nokia.VersionedOnlyJsModule 9.0
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((SomeAPI.greeting() == "Hey hey hey") &&
++                (SomeAPI.major == 9) &&
++                (SomeAPI.minor == 0))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.3.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.3.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.3.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.3.qml
+new file mode 100644
+index 0000000..f59d445
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.3.qml
+@@ -0,0 +1,16 @@
++import com.nokia.PureJsModule 1.0
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((FirstAPI.greeting() == "Hello") &&
++                (FirstAPI.major == 1) &&
++                (FirstAPI.minor == 0) &&
++                (SecondAPI.greeting() == "Howdy") &&
++                (SecondAPI.major == 1) &&
++                (SecondAPI.minor == 5))
++
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.4.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.4.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.4.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.4.qml
+new file mode 100644
+index 0000000..e7b74ba
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.4.qml
+@@ -0,0 +1,15 @@
++import com.nokia.PureJsModule 1.6
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((FirstAPI.greeting() == "Good news, everybody!") &&
++                (FirstAPI.major == 1) &&
++                (FirstAPI.minor == 6) &&
++                (SecondAPI.greeting() == "Howdy") &&
++                (SecondAPI.major == 1) &&
++                (SecondAPI.minor == 5))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.errors.txt
+new file mode 100644
+index 0000000..10dbc80
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.errors.txt
+@@ -0,0 +1 @@
++1:1:module "com.nokia.VersionedOnlyJsModule" is not installed
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.qml
+new file mode 100644
+index 0000000..a9ec20c
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.5.qml
+@@ -0,0 +1,6 @@
++import com.nokia.VersionedOnlyJsModule 1.0
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.errors.txt
+new file mode 100644
+index 0000000..41c9970
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.errors.txt
+@@ -0,0 +1 @@
++2:1:"com.nokia.VersionedOnlyJsModule" is ambiguous.
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.qml
+new file mode 100644
+index 0000000..6c4eb89
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.6.qml
+@@ -0,0 +1,13 @@
++import com.nokia.VersionedOnlyJsModule 9.0
++import com.nokia.VersionedOnlyJsModule 9.0
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((SomeAPI.greeting() == "Hey hey hey") &&
++                (SomeAPI.major == 9) &&
++                (SomeAPI.minor == 0))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.errors.txt
+new file mode 100644
+index 0000000..56bc4c5
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.errors.txt
+@@ -0,0 +1 @@
++2:1:"com.nokia.PureJsModule" is ambiguous.
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.qml
+new file mode 100644
+index 0000000..5523a15
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.7.qml
+@@ -0,0 +1,13 @@
++import com.nokia.PureJsModule 1.0
++import com.nokia.PureJsModule 1.6
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((FirstAPI.greeting() == "Hello") &&
++                (FirstAPI.major == 1) &&
++                (FirstAPI.minor == 0))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.8.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.8.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.8.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.8.qml
+new file mode 100644
+index 0000000..4ddedc3
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.8.qml
+@@ -0,0 +1,15 @@
++import com.nokia.PureJsModule 1.5 as PJM
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((PJM.FirstAPI.greeting() == "Hello") &&
++                (PJM.FirstAPI.major == 1) &&
++                (PJM.FirstAPI.minor == 0) &&
++                (PJM.SecondAPI.greeting() == "Howdy") &&
++                (PJM.SecondAPI.major == 1) &&
++                (PJM.SecondAPI.minor == 5))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.9.errors.txt b/tests/auto/declarative/qdeclarativelanguage/data/importJs.9.errors.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/importJs.9.qml b/tests/auto/declarative/qdeclarativelanguage/data/importJs.9.qml
+new file mode 100644
+index 0000000..351164b
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/importJs.9.qml
+@@ -0,0 +1,19 @@
++import com.nokia.PureJsModule 1.5 as PJM_1_5
++import com.nokia.PureJsModule 1.6 as PJM_1_6
++import QtQuick 2.0
++
++Item {
++    property bool test: false
++
++    Component.onCompleted: {
++        test = ((PJM_1_5.FirstAPI.greeting() == "Hello") &&
++                (PJM_1_5.FirstAPI.major == 1) &&
++                (PJM_1_5.FirstAPI.minor == 0) &&
++                (PJM_1_5.SecondAPI.greeting() == "Howdy") &&
++                (PJM_1_5.SecondAPI.major == 1) &&
++                (PJM_1_5.SecondAPI.minor == 5) &&
++                (PJM_1_6.FirstAPI.greeting() == "Good news, everybody!") &&
++                (PJM_1_6.FirstAPI.major == 1) &&
++                (PJM_1_6.FirstAPI.minor == 6))
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.1.6.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.1.6.js
+new file mode 100644
+index 0000000..c7b3c8b
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.1.6.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 6
++
++function greeting() { return "Good news, everybody!" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.js
+new file mode 100644
+index 0000000..b90033e
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/FirstAPI.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 0
++
++function greeting() { return "Hello" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/SecondAPI.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/SecondAPI.js
+new file mode 100644
+index 0000000..b802477
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/SecondAPI.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 5
++
++function greeting() { return "Howdy" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/qmldir b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/qmldir
+new file mode 100644
+index 0000000..083afb0
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule.1.6/qmldir
+@@ -0,0 +1,3 @@
++FirstAPI 1.0 FirstAPI.js
++FirstAPI 1.6 FirstAPI.1.6.js
++SecondAPI 1.5 SecondAPI.js
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/FirstAPI.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/FirstAPI.js
+new file mode 100644
+index 0000000..b90033e
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/FirstAPI.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 0
++
++function greeting() { return "Hello" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/SecondAPI.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/SecondAPI.js
+new file mode 100644
+index 0000000..b802477
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/SecondAPI.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 5
++
++function greeting() { return "Howdy" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/qmldir b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/qmldir
+new file mode 100644
+index 0000000..5c3aceb
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/PureJsModule/qmldir
+@@ -0,0 +1,2 @@
++FirstAPI 1.0 FirstAPI.js
++SecondAPI 1.5 SecondAPI.js
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/SomeAPI.js b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/SomeAPI.js
+new file mode 100644
+index 0000000..efac613
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/SomeAPI.js
+@@ -0,0 +1,5 @@
++var major = 9
++var minor = 0
++
++function greeting() { return "Hey hey hey" }
++
+diff --git a/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/qmldir b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/qmldir
+new file mode 100644
+index 0000000..5c1b182
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativelanguage/data/lib/com/nokia/VersionedOnlyJsModule.9.0/qmldir
+@@ -0,0 +1 @@
++SomeAPI 9.0 SomeAPI.js
+diff --git a/tests/auto/declarative/qdeclarativelanguage/tst_qdeclarativelanguage.cpp b/tests/auto/declarative/qdeclarativelanguage/tst_qdeclarativelanguage.cpp
+index 422b34c..ff956ec 100644
+--- a/tests/auto/declarative/qdeclarativelanguage/tst_qdeclarativelanguage.cpp
++++ b/tests/auto/declarative/qdeclarativelanguage/tst_qdeclarativelanguage.cpp
+@@ -159,6 +159,8 @@ private slots:
+     void importsOrder_data();
+     void importsOrder();
+     void importIncorrectCase();
++    void importJs_data();
++    void importJs();
+ 
+     void qmlAttachedPropertiesObjectMethod();
+     void customOnProperty();
+@@ -179,21 +181,17 @@ private:
+     void testType(const QString& qml, const QString& type, const QString& error);
+ };
+ 
+-#define VERIFY_ERRORS(errorfile) \
+-    if (!errorfile) { \
+-        if (qgetenv("DEBUG") != "" && !component.errors().isEmpty()) \
+-            qWarning() << "Unexpected Errors:" << component.errors(); \
+-        QVERIFY(!component.isError()); \
+-        QVERIFY(component.errors().isEmpty()); \
+-    } else { \
++#define DETERMINE_ERRORS(errorfile,expected,actual)\
++    QList<QByteArray> expected; \
++    QList<QByteArray> actual; \
++    do { \
+         QFile file(testdata(QLatin1String(errorfile))); \
+         QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text)); \
+         QByteArray data = file.readAll(); \
+         file.close(); \
+-        QList<QByteArray> expected = data.split('\n'); \
++        expected = data.split('\n'); \
+         expected.removeAll(QByteArray("")); \
+         QList<QDeclarativeError> errors = component.errors(); \
+-        QList<QByteArray> actual; \
+         for (int ii = 0; ii < errors.count(); ++ii) { \
+             const QDeclarativeError &error = errors.at(ii); \
+             QByteArray errorStr = QByteArray::number(error.line()) + ":" +  \
+@@ -201,6 +199,16 @@ private:
+                                   error.description().toUtf8(); \
+             actual << errorStr; \
+         } \
++    } while (false);
++
++#define VERIFY_ERRORS(errorfile) \
++    if (!errorfile) { \
++        if (qgetenv("DEBUG") != "" && !component.errors().isEmpty()) \
++            qWarning() << "Unexpected Errors:" << component.errors(); \
++        QVERIFY(!component.isError()); \
++        QVERIFY(component.errors().isEmpty()); \
++    } else { \
++        DETERMINE_ERRORS(errorfile,actual,expected);\
+         if (qgetenv("DEBUG") != "" && expected != actual) \
+             qWarning() << "Expected:" << expected << "Actual:" << actual;  \
+         if (qgetenv("QDECLARATIVELANGUAGE_UPDATEERRORS") != "" && expected != actual) {\
+@@ -1923,6 +1931,89 @@ void tst_qdeclarativelanguage::importIncorrectCase()
+     QCOMPARE(errors.at(0).description(), expectedError);
+ }
+ 
++void tst_qdeclarativelanguage::importJs_data()
++{
++    QTest::addColumn<QString>("file");
++    QTest::addColumn<QString>("errorFile");
++    QTest::addColumn<bool>("performTest");
++
++    QTest::newRow("defaultVersion")
++        << "importJs.1.qml"
++        << "importJs.1.errors.txt"
++        << true;
++
++    QTest::newRow("specifiedVersion")
++        << "importJs.2.qml"
++        << "importJs.2.errors.txt"
++        << true;
++
++    QTest::newRow("excludeExcessiveVersion")
++        << "importJs.3.qml"
++        << "importJs.3.errors.txt"
++        << false;
++
++    QTest::newRow("includeAppropriateVersion")
++        << "importJs.4.qml"
++        << "importJs.4.errors.txt"
++        << true;
++
++    QTest::newRow("noDefaultVersion")
++        << "importJs.5.qml"
++        << "importJs.5.errors.txt"
++        << false;
++
++    QTest::newRow("repeatImportFails")
++        << "importJs.6.qml"
++        << "importJs.6.errors.txt"
++        << false;
++
++    QTest::newRow("multipleVersionImportFails")
++        << "importJs.7.qml"
++        << "importJs.7.errors.txt"
++        << false;
++
++    QTest::newRow("namespacedImport")
++        << "importJs.8.qml"
++        << "importJs.8.errors.txt"
++        << true;
++
++    QTest::newRow("namespacedVersionedImport")
++        << "importJs.9.qml"
++        << "importJs.9.errors.txt"
++        << true;
++
++    QTest::newRow("namespacedRepeatImport")
++        << "importJs.10.qml"
++        << "importJs.10.errors.txt"
++        << true;
++}
++
++void tst_qdeclarativelanguage::importJs()
++{
++    QFETCH(QString, file);
++    QFETCH(QString, errorFile);
++    QFETCH(bool, performTest);
++
++    QDeclarativeComponent component(&engine, TEST_FILE(file));
++
++    {
++        DETERMINE_ERRORS(errorFile.toLatin1().constData(),expected,actual);
++        QCOMPARE(expected.size(), actual.size());
++        for (int i = 0; i < expected.size(); ++i)
++        {
++            size_t compareLen = std::min(expected.at(i).length(), actual.at(i).length());
++            QCOMPARE(expected.at(i).left(compareLen), actual.at(i).left(compareLen));
++        }
++    }
++
++    if (performTest) {
++        QObject *object = component.create();
++        QVERIFY(object != 0);
++        QCOMPARE(object->property("test").toBool(),true);
++        delete object;
++    }
++}
++
+ void tst_qdeclarativelanguage::qmlAttachedPropertiesObjectMethod()
+ {
+     QObject object;

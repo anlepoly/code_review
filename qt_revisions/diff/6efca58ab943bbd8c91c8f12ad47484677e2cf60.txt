@@ -1,0 +1,319 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 596db6c..0f281a3 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -199,10 +199,22 @@ void QQuickCanvasPrivate::polishItems()
+     updateFocusItemTransform();
+ }
+ 
++void forceUpdate(QQuickItem *item)
++{
++    if (item->flags() & QQuickItem::ItemHasContents)
++        item->update();
++    QQuickItemPrivate::get(item)->dirty(QQuickItemPrivate::ChildrenUpdateMask);
++
++    QList <QQuickItem *> items = item->childItems();
++    for (int i=0; i<items.size(); ++i)
++        forceUpdate(items.at(i));
++}
+ 
+ void QQuickCanvasPrivate::syncSceneGraph()
+ {
+     if (!renderer) {
++        forceUpdate(rootItem);
++
+         QSGRootNode *rootNode = new QSGRootNode;
+         rootNode->appendChildNode(QQuickItemPrivate::get(rootItem)->itemNode());
+         renderer = context->createRenderer();
+@@ -273,9 +285,9 @@ void QQuickCanvasPrivate::init(QQuickCanvas *c)
+     q->setSurfaceType(QWindow::OpenGLSurface);
+     q->setFormat(context->defaultSurfaceFormat());
+ 
+-    QObject::connect(context, SIGNAL(initialized()), q, SIGNAL(sceneGraphInitialized()));
+-    QObject::connect(context, SIGNAL(invalidated()), q, SIGNAL(sceneGraphInvalidated()));
+-    QObject::connect(context, SIGNAL(invalidated()), q, SLOT(cleanupSceneGraph()));
++    QObject::connect(context, SIGNAL(initialized()), q, SIGNAL(sceneGraphInitialized()), Qt::DirectConnection);
++    QObject::connect(context, SIGNAL(invalidated()), q, SIGNAL(sceneGraphInvalidated()), Qt::DirectConnection);
++    QObject::connect(context, SIGNAL(invalidated()), q, SLOT(cleanupSceneGraph()), Qt::DirectConnection);
+ 
+     // ### TODO: remove QSGEngine
+     engine = new QSGEngine();
+@@ -1686,11 +1698,42 @@ void QQuickCanvas::cleanupSceneGraph()
+ }
+ 
+ /*!
+-    \fn void QSGEngine::sceneGraphInitialized();
++    Returns the opengl context used for rendering.
++
++    If the scene graph is not ready, this function will return 0.
++
++    \sa sceneGraphInitialized(), sceneGraphInvalidated()
++ */
++
++QOpenGLContext *QQuickCanvas::openglContext() const
++{
++    Q_D(const QQuickCanvas);
++    if (d->context->isReady())
++        return d->context->glContext();
++    return 0;
++}
++
++
++/*!
++    \fn void QSGContext::sceneGraphInitialized()
+ 
+     This signal is emitted when the scene graph has been initialized.
+ 
+     This signal will be emitted from the scene graph rendering thread.
++
++ */
++
++
++/*!
++    \fn void QSGContext::sceneGraphInvalidated()
++
++    This signal is emitted when the scene graph has been invalidated.
++
++    This signal implies that the opengl rendering context used
++    has been invalidated and all user resources tied to that context
++    should be released.
++
++    This signal will be emitted from the scene graph rendering thread.
+  */
+ 
+ /*!
+diff --git a/src/quick/items/qquickwindowmanager.cpp b/src/quick/items/qquickwindowmanager.cpp
+index 6c75294..ea17cae 100644
+--- a/src/quick/items/qquickwindowmanager.cpp
++++ b/src/quick/items/qquickwindowmanager.cpp
+@@ -452,7 +452,7 @@ void QQuickRenderThreadSingleContextWindowManager::handleRemovedWindows()
+     while (m_removed_windows.size()) {
+         QQuickCanvas *canvas = m_removed_windows.takeLast();
+ #ifdef THREAD_DEBUG
+-    printf("            RenderThread: removing %p\n", canvas);
++    printf("                RenderThread: removing %p\n", canvas);
+ #endif
+ 
+         QQuickCanvasPrivate::get(canvas)->cleanupNodesOnShutdown();
+@@ -527,8 +527,13 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+     printf("QML Rendering Thread Started\n");
+ #endif
+ 
+-    if (!gl)
+-        initialize();
++    lock();
++    Q_ASSERT(!gl);
++    initialize();
++    // Wake GUI as it is waiting for the GL context to have appeared, as
++    // an indication that the render thread is now running.
++    wake();
++    unlock();
+ 
+     while (!shouldExit) {
+         lock();
+@@ -895,10 +900,6 @@ void QQuickRenderThreadSingleContextWindowManager::paint(QQuickCanvas *canvas)
+     printf("GUI: paint called: %p\n", canvas);
+ #endif
+ 
+-    return;
+-
+-
+-
+     lockInGui();
+     exhaustSyncEvent();
+ 
+@@ -963,7 +964,10 @@ void QQuickRenderThreadSingleContextWindowManager::startRendering()
+     renderThreadAwakened = false;
+     inSync = false;
+ 
++    lockInGui();
+     start(); // Start the render thread...
++    wait();
++    unlockInGui();
+ 
+     // Animations will now be driven from the rendering thread.
+     if (animationTimer >= 0) {
+diff --git a/src/quick/scenegraph/qsgcontext.cpp b/src/quick/scenegraph/qsgcontext.cpp
+index a81571e..5af7c76 100644
+--- a/src/quick/scenegraph/qsgcontext.cpp
++++ b/src/quick/scenegraph/qsgcontext.cpp
+@@ -87,9 +87,7 @@ class QSGContextPrivate : public QObjectPrivate
+ {
+ public:
+     QSGContextPrivate()
+-        : rootNode(0)
+-        , renderer(0)
+-        , gl(0)
++        : gl(0)
+         , distanceFieldCacheManager(0)
+         , flashMode(qmlFlashMode())
+         , distanceFieldDisabled(qmlDisableDistanceField())
+@@ -101,9 +99,6 @@ public:
+     {
+     }
+ 
+-    QSGRootNode *rootNode;
+-    QSGRenderer *renderer;
+-
+     QOpenGLContext *gl;
+ 
+     QHash<QSGMaterialType *, QSGMaterialShader *> materials;
+diff --git a/tests/auto/qtquick2/qquickcanvas/data/Headless.qml b/tests/auto/qtquick2/qquickcanvas/data/Headless.qml
+new file mode 100644
+index 0000000..2e09cb1
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickcanvas/data/Headless.qml
+@@ -0,0 +1,33 @@
++import QtQuick 2.0
++import QtQuick.Window 2.0 as Window
++
++Window.Window {
++
++    width: 300
++    height: 200
++    visible: true
++
++    Text {
++        anchors.left: parent.left
++        anchors.top: parent.top
++        text: "Testing headless mode"
++    }
++
++    Rectangle {
++        anchors.centerIn: parent
++        width: 100
++        height: 50
++        rotation: -30
++        gradient: Gradient {
++            GradientStop { position: 0; color: "lightsteelblue" }
++            GradientStop { position: 1; color: "black" }
++        }
++    }
++
++    Image {
++        source: "colors.png"
++        anchors.bottom: parent.bottom
++        anchors.right: parent.right
++    }
++
++}
+diff --git a/tests/auto/qtquick2/qquickcanvas/data/colors.png b/tests/auto/qtquick2/qquickcanvas/data/colors.png
+new file mode 100644
+index 0000000..dfb62f3
+Binary files /dev/null and b/tests/auto/qtquick2/qquickcanvas/data/colors.png differ
+diff --git a/tests/auto/qtquick2/qquickcanvas/qquickcanvas.pro b/tests/auto/qtquick2/qquickcanvas/qquickcanvas.pro
+index b4a4bc5..9523697 100644
+--- a/tests/auto/qtquick2/qquickcanvas/qquickcanvas.pro
++++ b/tests/auto/qtquick2/qquickcanvas/qquickcanvas.pro
+@@ -7,6 +7,12 @@ macx:CONFIG -= app_bundle
+ CONFIG += parallel_test
+ QT += core-private gui-private declarative-private quick-private testlib
+ 
++testData.files = data
++testData.path = .
++DEPLOYMENT += testData
++
+ OTHER_FILES += \
+-    data/AnimationsWhileHidden.qml
++    data/AnimationsWhileHidden.qml \
++    data/Headless.qml
++
+ 
+diff --git a/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp b/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
+index f8e3596..780f58c 100644
+--- a/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
++++ b/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
+@@ -196,6 +196,8 @@ private slots:
+     void multipleWindows();
+ 
+     void animationsWhileHidden();
++
++    void headless();
+ };
+ 
+ tst_qquickcanvas::tst_qquickcanvas()
+@@ -541,6 +543,8 @@ void tst_qquickcanvas::qmlCreation()
+     QQuickItem* item = canvas->findChild<QQuickItem*>("item");
+     QVERIFY(item);
+     QCOMPARE(item->canvas(), canvas);
++
++    delete canvas;
+ }
+ 
+ void tst_qquickcanvas::clearColor()
+@@ -616,6 +620,75 @@ void tst_qquickcanvas::animationsWhileHidden()
+ 
+     // Running animaiton should cause it to become visible again shortly.
+     QTRY_VERIFY(canvas->visible());
++
++    delete canvas;
++}
++
++
++class SceneGraphListener : public QObject
++{
++    Q_OBJECT
++
++public:
++    SceneGraphListener()
++        : wasInitialized(false)
++        , wasInvalidated(false)
++    {
++    }
++
++    bool wasInitialized;
++    bool wasInvalidated;
++
++public slots:
++    void initialized() { wasInitialized = true; }
++    void invalidated() { wasInvalidated = true; }
++};
++
++void tst_qquickcanvas::headless()
++{
++    QDeclarativeEngine engine;
++    QDeclarativeComponent component(&engine);
++    component.loadUrl(TESTDATA("Headless.qml"));
++    QObject* created = component.create();
++
++    QQuickCanvas* canvas = qobject_cast<QQuickCanvas*>(created);
++    QVERIFY(canvas);
++
++    QTest::qWaitForWindowShown(canvas);
++    QVERIFY(canvas->visible());
++
++    SceneGraphListener listener;
++    connect(canvas, SIGNAL(sceneGraphInitialized()), &listener, SLOT(initialized()), Qt::DirectConnection);
++    connect(canvas, SIGNAL(sceneGraphInvalidated()), &listener, SLOT(invalidated()), Qt::DirectConnection);
++
++    // Verify that the canvas is alive and kicking
++    QVERIFY(canvas->openglContext() != 0);
++
++    // Store the visual result
++    QImage originalContent = canvas->grabFrameBuffer();
++
++    // Hide the canvas and verify signal emittion and GL context deletion
++    canvas->hide();
++    QVERIFY(listener.wasInvalidated);
++    QVERIFY(canvas->openglContext() == 0);
++
++    // Destroy the native windowing system buffers
++    canvas->destroy();
++    QVERIFY(canvas->handle() == 0);
++
++    // Show and verify that we are back and running
++    canvas->show();
++    QTest::qWaitForWindowShown(canvas);
++
++    QVERIFY(listener.wasInitialized);
++    QVERIFY(canvas->openglContext() != 0);
++
++    // Verify that the visual output is the same
++    QImage newContent = canvas->grabFrameBuffer();
++
++    QCOMPARE(originalContent, newContent);
++
++
+ }
+ 
+ QTEST_MAIN(tst_qquickcanvas)

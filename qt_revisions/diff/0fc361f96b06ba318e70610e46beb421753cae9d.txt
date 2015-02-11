@@ -1,0 +1,349 @@
+diff --git a/src/quick/doc/src/whatsnew.qdoc b/src/quick/doc/src/whatsnew.qdoc
+index c82ddf7..813656c 100644
+--- a/src/quick/doc/src/whatsnew.qdoc
++++ b/src/quick/doc/src/whatsnew.qdoc
+@@ -319,6 +319,8 @@ the window loses focus.
+     \li New \l{PathView::}{maximumFlickVelocity} property controls the maximum flick velocity of the
+         view.
+     \li New \l{PathView::}{snapMode} property controls the snap model when flicking between items
++    \li If the model is changed after the component is completed, the offset and currentIndex are
++        reset to 0.
+     \endlist
+ \endlist
+ 
+diff --git a/src/quick/items/qquickpathview.cpp b/src/quick/items/qquickpathview.cpp
+index cb56dd2..272fdce 100644
+--- a/src/quick/items/qquickpathview.cpp
++++ b/src/quick/items/qquickpathview.cpp
+@@ -250,6 +250,7 @@ void QQuickPathViewPrivate::clear()
+         releaseItem(p);
+     }
+     items.clear();
++    tl.clear();
+ }
+ 
+ void QQuickPathViewPrivate::updateMappedRange()
+@@ -579,6 +580,8 @@ QQuickPathView::~QQuickPathView()
+     For large or dynamic datasets the model is usually provided by a C++ model object.
+     Models can also be created directly in QML, using the ListModel type.
+ 
++    \note changing the model will reset the offset and currentIndex to 0.
++
+     \sa {qmlmodels}{Data Models}
+ */
+ QVariant QQuickPathView::model() const
+@@ -600,11 +603,7 @@ void QQuickPathView::setModel(const QVariant &model)
+                              this, QQuickPathView, SLOT(createdItem(int,QQuickItem*)));
+         qmlobject_disconnect(d->model, QQuickVisualModel, SIGNAL(initItem(int,QQuickItem*)),
+                              this, QQuickPathView, SLOT(initItem(int,QQuickItem*)));
+-        for (int i=0; i<d->items.count(); i++){
+-            QQuickItem *p = d->items[i];
+-            d->releaseItem(p);
+-        }
+-        d->items.clear();
++        d->clear();
+     }
+ 
+     d->modelVariant = model;
+@@ -626,6 +625,7 @@ void QQuickPathView::setModel(const QVariant &model)
+         if (QQuickVisualDataModel *dataModel = qobject_cast<QQuickVisualDataModel*>(d->model))
+             dataModel->setModel(model);
+     }
++    int oldModelCount = d->modelCount;
+     d->modelCount = 0;
+     if (d->model) {
+         qmlobject_connect(d->model, QQuickVisualModel, SIGNAL(modelUpdated(QQuickChangeSet,bool)),
+@@ -635,17 +635,20 @@ void QQuickPathView::setModel(const QVariant &model)
+         qmlobject_connect(d->model, QQuickVisualModel, SIGNAL(initItem(int,QQuickItem*)),
+                           this, QQuickPathView, SLOT(initItem(int,QQuickItem*)));
+         d->modelCount = d->model->count();
+-        if (d->model->count())
+-            d->offset = qmlMod(d->offset, qreal(d->model->count()));
+-        if (d->offset < 0)
+-            d->offset = d->model->count() + d->offset;
+-}
++    }
++    if (isComponentComplete()) {
++        if (d->currentIndex != 0) {
++            d->currentIndex = 0;
++            emit currentIndexChanged();
++        }
++        if (d->offset != 0.0) {
++            d->offset = 0;
++            emit offsetChanged();
++        }
++    }
+     d->regenerate();
+-    if (d->currentIndex < d->modelCount)
+-        setOffset(qmlMod(d->modelCount - d->currentIndex, d->modelCount));
+-    else
+-        d->fixOffset();
+-    emit countChanged();
++    if (d->modelCount != oldModelCount)
++        emit countChanged();
+     emit modelChanged();
+ }
+ 
+@@ -705,6 +708,14 @@ int QQuickPathView::currentIndex() const
+ void QQuickPathView::setCurrentIndex(int idx)
+ {
+     Q_D(QQuickPathView);
++    if (!isComponentComplete()) {
++        if (idx != d->currentIndex) {
++            d->currentIndex = idx;
++            emit currentIndexChanged();
++        }
++        return;
++    }
++
+     idx = d->modelCount
+         ? ((idx % d->modelCount) + d->modelCount) % d->modelCount
+         : 0;
+@@ -1600,14 +1611,14 @@ void QQuickPathView::componentComplete()
+ 
+     QQuickItem::componentComplete();
+ 
+-    d->createHighlight();
+-    // It is possible that a refill has already happended to to Path
+-    // bindings being handled in the componentComplete().  If so
+-    // don't do it again.
+-    if (d->items.count() == 0 && d->model) {
++    if (d->model) {
+         d->modelCount = d->model->count();
+-        d->regenerate();
++        if (d->modelCount && d->currentIndex != 0) // an initial value has been provided for currentIndex
++            d->offset = qmlMod(d->modelCount - d->currentIndex, d->modelCount);
+     }
++
++    d->createHighlight();
++    d->regenerate();
+     d->updateHighlight();
+     d->updateCurrent();
+ 
+@@ -1920,16 +1931,19 @@ void QQuickPathViewPrivate::updateCurrent()
+         return;
+ 
+     int idx = calcCurrentIndex();
+-    if (model && idx != currentIndex) {
++    if (model && (idx != currentIndex || !currentItem)) {
+         if (currentItem) {
+             if (QQuickPathViewAttached *att = attached(currentItem))
+                 att->setIsCurrentItem(false);
+             releaseItem(currentItem);
+         }
++        int oldCurrentIndex = currentIndex;
+         currentIndex = idx;
+         currentItem = 0;
+         createCurrentItem();
+-        emit q->currentIndexChanged();
++        if (oldCurrentIndex != currentIndex)
++            emit q->currentIndexChanged();
++        emit q->currentItemChanged();
+     }
+ }
+ 
+diff --git a/tests/auto/quick/qquickpathview/data/initialCurrentIndex.qml b/tests/auto/quick/qquickpathview/data/initialCurrentIndex.qml
+new file mode 100644
+index 0000000..86f7fe4
+--- /dev/null
++++ b/tests/auto/quick/qquickpathview/data/initialCurrentIndex.qml
+@@ -0,0 +1,60 @@
++import QtQuick 2.0
++
++PathView {
++    id: photoPathView
++    y: 100; width: 800; height: 330; pathItemCount: 4
++    currentIndex: 3
++    dragMargin: 24
++    preferredHighlightBegin: 0.50
++    preferredHighlightEnd: 0.50
++
++    path: Path {
++        startX: -50; startY: 40;
++
++        PathAttribute { name: "scale"; value: 0.5 }
++        PathAttribute { name: "angle"; value: -45 }
++
++        PathCubic {
++            x: 400; y: 220
++            control1X: 140; control1Y: 40
++            control2X: 210; control2Y: 220
++        }
++
++        PathAttribute { name: "scale"; value: 1.2  }
++        PathAttribute { name: "angle"; value: 0 }
++
++        PathCubic {
++            x: 850; y: 40
++            control2X: 660; control2Y: 40
++            control1X: 590; control1Y: 220
++        }
++
++        PathAttribute { name: "scale"; value: 0.5 }
++        PathAttribute { name: "angle"; value: 45 }
++    }
++
++    model: ListModel {
++        id: rssModel
++        ListElement { lColor: "red" }
++        ListElement { lColor: "green" }
++        ListElement { lColor: "yellow" }
++        ListElement { lColor: "blue" }
++        ListElement { lColor: "purple" }
++        ListElement { lColor: "gray" }
++        ListElement { lColor: "brown" }
++        ListElement { lColor: "thistle" }
++    }
++
++    delegate: Component {
++        id: photoDelegate
++        Rectangle {
++            id: wrapper
++            width: 85; height: 85; color: lColor
++
++            transform: Rotation {
++                id: itemRotation; origin.x: wrapper.width/2; origin.y: wrapper.height/2
++                axis.y: 1; axis.z: 0
++            }
++        }
++    }
++}
+diff --git a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+index 65175a6..b6b6d24 100644
+--- a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
++++ b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+@@ -52,6 +52,7 @@
+ #include <QtQuick/private/qquickrectangle_p.h>
+ #include <QtQml/private/qquicklistmodel_p.h>
+ #include <QtQml/private/qqmlvaluetype_p.h>
++#include <QtGui/qstandarditemmodel.h>
+ #include <QStringListModel>
+ #include <QFile>
+ 
+@@ -64,8 +65,6 @@ using namespace QQuickVisualTestUtil;
+ 
+ Q_DECLARE_METATYPE(QQuickPathView::HighlightRangeMode)
+ 
+-#ifndef QT_NO_WIDGETS
+-#include <QStandardItemModel>
+ static void initStandardTreeModel(QStandardItemModel *model)
+ {
+     QStandardItem *item;
+@@ -83,8 +82,6 @@ static void initStandardTreeModel(QStandardItemModel *model)
+     item->setIcon(QIcon());
+     model->insertRow(2, item);
+ }
+-#endif
+-
+ 
+ class tst_QQuickPathView : public QQmlDataTest
+ {
+@@ -98,6 +95,7 @@ private slots:
+     void dataModel();
+     void pathview2();
+     void pathview3();
++    void initialCurrentIndex();
+     void insertModel_data();
+     void insertModel();
+     void removeModel_data();
+@@ -124,9 +122,7 @@ private slots:
+     void visualDataModel();
+     void undefinedPath();
+     void mouseDrag();
+-#ifndef QT_NO_WIDGETS
+     void treeModel();
+-#endif
+     void changePreferredHighlight();
+     void missingPercent();
+     void creationContext();
+@@ -279,6 +275,26 @@ void tst_QQuickPathView::pathview3()
+     delete obj;
+ }
+ 
++void tst_QQuickPathView::initialCurrentIndex()
++{
++    QQmlEngine engine;
++    QQmlComponent c(&engine, testFileUrl("initialCurrentIndex.qml"));
++    QQuickPathView *obj = qobject_cast<QQuickPathView*>(c.create());
++
++    QVERIFY(obj != 0);
++    QVERIFY(obj->path() != 0);
++    QVERIFY(obj->delegate() != 0);
++    QVERIFY(obj->model() != QVariant());
++    QCOMPARE(obj->currentIndex(), 3);
++    QCOMPARE(obj->offset(), 5.0);
++    QCOMPARE(obj->preferredHighlightBegin(), 0.5);
++    QCOMPARE(obj->dragMargin(), 24.);
++    QCOMPARE(obj->count(), 8);
++    QCOMPARE(obj->pathItemCount(), 4);
++
++    delete obj;
++}
++
+ void tst_QQuickPathView::insertModel_data()
+ {
+     QTest::addColumn<int>("mode");
+@@ -1258,21 +1274,29 @@ void tst_QQuickPathView::modelChanges()
+ 
+     QQuickPathView *pathView = window->rootObject()->findChild<QQuickPathView*>("pathView");
+     QVERIFY(pathView);
++    pathView->setCurrentIndex(3);
++    QTRY_COMPARE(pathView->offset(), 6.0);
+ 
+     QQuickListModel *alternateModel = window->rootObject()->findChild<QQuickListModel*>("alternateModel");
+     QVERIFY(alternateModel);
+     QVariant modelVariant = QVariant::fromValue<QObject *>(alternateModel);
+     QSignalSpy modelSpy(pathView, SIGNAL(modelChanged()));
++    QSignalSpy currentIndexSpy(pathView, SIGNAL(currentIndexChanged()));
+ 
++    QCOMPARE(pathView->currentIndex(), 3);
+     pathView->setModel(modelVariant);
+     QCOMPARE(pathView->model(), modelVariant);
+     QCOMPARE(modelSpy.count(),1);
++    QCOMPARE(pathView->currentIndex(), 0);
++    QCOMPARE(currentIndexSpy.count(), 1);
+ 
+     pathView->setModel(modelVariant);
+     QCOMPARE(modelSpy.count(),1);
+ 
+     pathView->setModel(QVariant());
+     QCOMPARE(modelSpy.count(),2);
++    QCOMPARE(pathView->currentIndex(), 0);
++    QCOMPARE(currentIndexSpy.count(), 1);
+ 
+     delete window;
+ }
+@@ -1483,7 +1507,6 @@ void tst_QQuickPathView::mouseDrag()
+     delete window;
+ }
+ 
+-#ifndef QT_NO_WIDGETS
+ void tst_QQuickPathView::treeModel()
+ {
+     QQuickView *window = createView();
+@@ -1511,7 +1534,6 @@ void tst_QQuickPathView::treeModel()
+ 
+     delete window;
+ }
+-#endif
+ 
+ void tst_QQuickPathView::changePreferredHighlight()
+ {
+@@ -1826,6 +1848,8 @@ void tst_QQuickPathView::snapToItem()
+         QVERIFY(pathview->currentIndex() != currentIndex);
+     else
+         QVERIFY(pathview->currentIndex() == currentIndex);
++
++    delete window;
+ }
+ 
+ void tst_QQuickPathView::snapToItem_data()
+@@ -1873,6 +1897,8 @@ void tst_QQuickPathView::snapOneItem()
+         QVERIFY(pathview->currentIndex() == currentIndex+1);
+     else
+         QVERIFY(pathview->currentIndex() == currentIndex);
++
++    delete window;
+ }
+ 
+ void tst_QQuickPathView::snapOneItem_data()

@@ -1,0 +1,758 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index b824bc0..4f72829 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -56,6 +56,7 @@
+ 
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qmetaobject.h>
++#include <private/qmetaobject_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -273,7 +274,7 @@ void QQmlEngineDebugService::buildObjectDump(QDataStream &message,
+                 prop.value = expr->expression();
+                 QObject *scope = expr->scopeObject();
+                 if (scope) {
+-                    QString methodName = QString::fromLatin1(scope->metaObject()->method(signalHandler->index()).name());
++                    QString methodName = QString::fromLatin1(QMetaObjectPrivate::signal(scope->metaObject(), signalHandler->index()).name());
+                     if (!methodName.isEmpty()) {
+                         prop.name = QLatin1String("on") + methodName[0].toUpper()
+                                 + methodName.mid(1);
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index 7ed7230..3713de9 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include "qqmlboundsignal_p.h"
+ 
++#include <private/qmetaobject_p.h>
+ #include <private/qmetaobjectbuilder_p.h>
+ #include "qqmlengine_p.h"
+ #include "qqmlexpression_p.h"
+@@ -242,6 +243,10 @@ void QQmlAbstractBoundSignal::removeFromObject()
+     }
+ }
+ 
++/*! \internal
++    \a signal MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
+ QQmlBoundSignal::QQmlBoundSignal(QObject *scope, int signal, QObject *owner,
+                                  QQmlEngine *engine)
+ : m_expression(0), m_params(0), m_scope(scope), m_index(signal)
+@@ -259,10 +264,10 @@ QQmlBoundSignal::QQmlBoundSignal(QObject *scope, int signal, QObject *owner,
+     */
+     if (QQmlData::get(scope, false) && QQmlData::get(scope, false)->propertyCache) {
+         QQmlPropertyCache *cache = QQmlData::get(scope, false)->propertyCache;
+-        while (cache->method(m_index)->isCloned())
++        while (cache->signal(m_index)->isCloned())
+             --m_index;
+     } else {
+-        while (scope->metaObject()->method(m_index).attributes() & QMetaMethod::Cloned)
++        while (QMetaObjectPrivate::signal(scope->metaObject(), m_index).attributes() & QMetaMethod::Cloned)
+             --m_index;
+     }
+ 
+@@ -275,6 +280,10 @@ QQmlBoundSignal::~QQmlBoundSignal()
+     delete m_params;
+ }
+ 
++/*!
++    Returns the signal index in the range returned by QObjectPrivate::signalIndex().
++    This is different from QMetaMethod::methodIndex().
++*/
+ int QQmlBoundSignal::index() const
+ {
+     return m_index;
+@@ -325,16 +334,16 @@ void QQmlBoundSignal_callback(QQmlNotifierEndpoint *e, void **a)
+         return;
+ 
+     if (QQmlDebugService::isDebuggingEnabled())
+-        QV8DebugService::instance()->signalEmitted(QString::fromLatin1(s->m_scope->metaObject()->method(s->m_index).methodSignature()));
++        QV8DebugService::instance()->signalEmitted(QString::fromLatin1(QMetaObjectPrivate::signal(s->m_scope->metaObject(), s->m_index).methodSignature()));
+ 
+     QQmlHandlingSignalProfiler prof(s->m_expression);
+ 
+     s->setIsEvaluating(true);
+ 
+     if (!s->paramsValid()) {
+-        QList<QByteArray> names = QQmlPropertyCache::methodParameterNames(*s->m_scope, s->m_index);
++        QList<QByteArray> names = QQmlPropertyCache::signalParameterNames(*s->m_scope, s->m_index);
+         if (!names.isEmpty()) {
+-            QMetaMethod signal = s->m_scope->metaObject()->method(s->m_index);
++            QMetaMethod signal = QMetaObjectPrivate::signal(s->m_scope->metaObject(), s->m_index);
+             s->m_params = new QQmlBoundSignalParameters(signal, s);
+         }
+ 
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index 218d719..8450221 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -1669,7 +1669,7 @@ bool QQmlCompiler::buildSignal(QQmlScript::Property *prop, QQmlScript::Object *o
+         if (prop->value || !prop->values.isOne())
+             COMPILE_EXCEPTION(prop, tr("Incorrectly specified signal assignment"));
+ 
+-        prop->index = sig->coreIndex;
++        prop->index = propertyCacheForObject(obj)->methodIndexToSignalIndex(sig->coreIndex);
+         prop->core = *sig;
+ 
+         obj->addSignalProperty(prop);
+@@ -2981,7 +2981,7 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+ 
+ 
+     // Dynamic properties (except var and aliases)
+-    effectiveMethodIndex = cache->methodIndexCacheStart;
++    int effectiveSignalIndex = cache->signalHandlerIndexCacheStart;
+     for (Object::DynamicProperty *p = obj->dynamicProperties.first(); p;
+          p = obj->dynamicProperties.next(p)) {
+ 
+@@ -3048,15 +3048,15 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+                                            p->name.hash());
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName.toUtf16();
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  propertyType, effectiveMethodIndex);
++                                  propertyType, effectiveSignalIndex);
+         } else {
+             QString propertyName = p->name.toString();
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName;
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  propertyType, effectiveMethodIndex);
++                                  propertyType, effectiveSignalIndex);
+         }
+ 
+-        effectiveMethodIndex++;
++        effectiveSignalIndex++;
+ 
+         VMD *vmd = (QQmlVMEMetaData *)dynamicData.data();
+         (vmd->propertyData() + vmd->propertyCount)->propertyType = vmePropertyType;
+@@ -3084,15 +3084,15 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+                                            p->name.hash());
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName.toUtf16();
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  QMetaType::QVariant, effectiveMethodIndex);
++                                  QMetaType::QVariant, effectiveSignalIndex);
+         } else {
+             QString propertyName = p->name.toString();
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName;
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  QMetaType::QVariant, effectiveMethodIndex);
++                                  QMetaType::QVariant, effectiveSignalIndex);
+         }
+ 
+-        effectiveMethodIndex++;
++        effectiveSignalIndex++;
+     }
+ 
+     // Alias property count.  Actual data is setup in buildDynamicMetaAliases
+@@ -3147,7 +3147,7 @@ bool QQmlCompiler::buildDynamicMetaAliases(QQmlScript::Object *obj)
+     QQmlPropertyCache *cache = obj->synthCache;
+     char *cStringData = cache->_dynamicStringData.data();
+ 
+-    int effectiveMethodIndex = cache->methodIndexCacheStart + cache->propertyIndexCache.count();
++    int effectiveSignalIndex = cache->signalHandlerIndexCacheStart + cache->propertyIndexCache.count();
+     int effectivePropertyIndex = cache->propertyIndexCacheStart + cache->propertyIndexCache.count();
+     int effectiveAliasIndex = 0;
+ 
+@@ -3264,12 +3264,12 @@ bool QQmlCompiler::buildDynamicMetaAliases(QQmlScript::Object *obj)
+                                            p->name.hash());
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName.toUtf16();
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  type, effectiveMethodIndex++);
++                                  type, effectiveSignalIndex++);
+         } else {
+             QString propertyName = p->name.toString();
+             if (p->isDefaultProperty) cache->_defaultPropertyName = propertyName;
+             cache->appendProperty(propertyName, propertyFlags, effectivePropertyIndex++,
+-                                  type, effectiveMethodIndex++);
++                                  type, effectiveSignalIndex++);
+         }
+     }
+ 
+@@ -3821,7 +3821,7 @@ QQmlCompiler::signal(QQmlScript::Object *object, const QHashedStringRef &name, b
+ 
+         d = property(object, propName, notInRevision);
+         if (d) 
+-            return cache->method(d->notifyIndex);
++            return cache->signal(d->notifyIndex);
+     }
+ 
+     return 0;
+diff --git a/src/qml/qml/qqmlcontext.cpp b/src/qml/qml/qqmlcontext.cpp
+index a02b2b7..153d888 100644
+--- a/src/qml/qml/qqmlcontext.cpp
++++ b/src/qml/qml/qqmlcontext.cpp
+@@ -53,6 +53,7 @@
+ 
+ #include <qjsengine.h>
+ #include <QtCore/qvarlengtharray.h>
++#include <private/qmetaobject_p.h>
+ #include <QtCore/qdebug.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -289,7 +290,7 @@ void QQmlContext::setContextProperty(const QString &name, const QVariant &value)
+ {
+     Q_D(QQmlContext);
+     if (d->notifyIndex == -1)
+-        d->notifyIndex = this->metaObject()->methodCount();
++        d->notifyIndex = QMetaObjectPrivate::absoluteSignalCount(&QQmlContext::staticMetaObject);
+ 
+     QQmlContextData *data = d->data;
+ 
+@@ -322,7 +323,7 @@ void QQmlContext::setContextProperty(const QString &name, const QVariant &value)
+         data->refreshExpressions();
+     } else {
+         d->propertyValues[idx] = value;
+-        QMetaObject::activate(this, idx + d->notifyIndex, 0);
++        QMetaObject::activate(this, d->notifyIndex, idx, 0);
+     }
+ }
+ 
+@@ -335,7 +336,7 @@ void QQmlContext::setContextProperty(const QString &name, QObject *value)
+ {
+     Q_D(QQmlContext);
+     if (d->notifyIndex == -1)
+-        d->notifyIndex = this->metaObject()->methodCount();
++        d->notifyIndex = QMetaObjectPrivate::absoluteSignalCount(&QQmlContext::staticMetaObject);
+ 
+     QQmlContextData *data = d->data;
+ 
+@@ -359,7 +360,7 @@ void QQmlContext::setContextProperty(const QString &name, QObject *value)
+         data->refreshExpressions();
+     } else {
+         d->propertyValues[idx] = QVariant::fromValue(value);
+-        QMetaObject::activate(this, idx + d->notifyIndex, 0);
++        QMetaObject::activate(this, d->notifyIndex, idx, 0);
+     }
+ }
+ 
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index b122d74..ca1ac84 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -477,12 +477,15 @@ class QQmlThreadNotifierProxyObject : public QObject
+ public:
+     QPointer<QObject> target;
+ 
+-    virtual int qt_metacall(QMetaObject::Call, int id, void **a) {
++    virtual int qt_metacall(QMetaObject::Call, int methodIndex, void **a) {
+         if (!target)
+             return -1;
+ 
++        QMetaMethod method = target->metaObject()->method(methodIndex);
++        Q_ASSERT(method.methodType() == QMetaMethod::Signal);
++        int signalIndex = QMetaObjectPrivate::signalIndex(method);
+         QQmlData *ddata = QQmlData::get(target, false);
+-        QQmlNotifierEndpoint *ep = ddata->notify(id);
++        QQmlNotifierEndpoint *ep = ddata->notify(signalIndex);
+         if (ep) QQmlNotifier::emitNotify(ep, a);
+ 
+         delete this;
+@@ -508,7 +511,7 @@ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int in
+         if (!QObjectPrivate::get(object)->threadData->thread)
+             return;
+ 
+-        QMetaMethod m = object->metaObject()->method(index);
++        QMetaMethod m = QMetaObjectPrivate::signal(object->metaObject(), index);
+         QList<QByteArray> parameterTypes = m.parameterTypes();
+ 
+         int *types = (int *)malloc((parameterTypes.count() + 1) * sizeof(int));
+@@ -536,7 +539,7 @@ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int in
+             args[ii + 1] = QMetaType::create(types[ii + 1], a[ii + 1]);
+         }
+ 
+-        QMetaCallEvent *ev = new QMetaCallEvent(index, 0, 0, object, index,
++        QMetaCallEvent *ev = new QMetaCallEvent(m.methodIndex(), 0, 0, object, index,
+                                                 parameterTypes.count() + 1, types, args);
+ 
+         QQmlThreadNotifierProxyObject *mpo = new QQmlThreadNotifierProxyObject;
+@@ -1288,15 +1291,15 @@ void QQmlData::addNotify(int index, QQmlNotifierEndpoint *endpoint)
+     }
+ }
+ 
+-bool QQml_isSignalConnected(QObject *obj, int signal_index, int index)
++bool QQml_isSignalConnected(QObject *obj, int signal_index)
+ {
+     QQmlData *data = QQmlData::get(obj);
+-    return QObjectPrivate::get(obj)->isSignalConnected(signal_index) || (data && data->signalHasEndpoint(index));
++    return QObjectPrivate::get(obj)->isSignalConnected(signal_index) || (data && data->signalHasEndpoint(signal_index));
+ }
+ 
+ /*
+-    index MUST be the index returned by QMetaMethod::index()
+-    This is different than the index returned by QObjectPrivate::signalIndex()
++    index MUST in the range returned by QObjectPrivate::signalIndex()
++    This is different than the index returned by QMetaMethod::methodIndex()
+ */
+ bool QQmlData::signalHasEndpoint(int index)
+ {
+diff --git a/src/qml/qml/qqmlglobal_p.h b/src/qml/qml/qqmlglobal_p.h
+index 75974a4..b52e55c 100644
+--- a/src/qml/qml/qqmlglobal_p.h
++++ b/src/qml/qml/qqmlglobal_p.h
+@@ -164,7 +164,7 @@ T qmlobject_cast(QObject *object)
+         return 0;
+ }
+ 
+-bool Q_QML_PRIVATE_EXPORT QQml_isSignalConnected(QObject*, int, int);
++bool Q_QML_PRIVATE_EXPORT QQml_isSignalConnected(QObject*, int);
+ 
+ #define IS_SIGNAL_CONNECTED(Sender, SenderType, Name, Arguments) \
+ do { \
+@@ -172,8 +172,7 @@ do { \
+     void (SenderType::*signal)Arguments = &SenderType::Name; \
+     static QMetaMethod method = QMetaMethod::fromSignal(signal); \
+     static int signalIdx = QMetaObjectPrivate::signalIndex(method); \
+-    static int methodIdx = method.methodIndex(); \
+-    return QQml_isSignalConnected(sender, signalIdx, methodIdx); \
++    return QQml_isSignalConnected(sender, signalIdx); \
+ } while (0)
+ 
+ struct QQmlGraphics_DerivedObject : public QObject
+diff --git a/src/qml/qml/qqmljavascriptexpression.cpp b/src/qml/qml/qqmljavascriptexpression.cpp
+index 9b61756..a33db84 100644
+--- a/src/qml/qml/qqmljavascriptexpression.cpp
++++ b/src/qml/qml/qqmljavascriptexpression.cpp
+@@ -229,6 +229,11 @@ void QQmlJavaScriptExpression::GuardCapture::captureProperty(QQmlNotifier *n)
+     }
+ }
+ 
++/*! \internal
++    \reimp
++
++    \a n is in the signal index range (see QObjectPrivate::signalIndex()).
++*/
+ void QQmlJavaScriptExpression::GuardCapture::captureProperty(QObject *o, int c, int n)
+ {
+     if (expression) {
+diff --git a/src/qml/qml/qqmlnotifier.cpp b/src/qml/qml/qqmlnotifier.cpp
+index 7cbc5e6..2e451ee 100644
+--- a/src/qml/qml/qqmlnotifier.cpp
++++ b/src/qml/qml/qqmlnotifier.cpp
+@@ -89,6 +89,10 @@ void QQmlNotifier::emitNotify(QQmlNotifierEndpoint *endpoint, void **a)
+     } 
+ }
+ 
++/*! \internal
++    \a sourceSignal MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
+ void QQmlNotifierEndpoint::connect(QObject *source, int sourceSignal, QQmlEngine *engine)
+ {
+     disconnect();
+diff --git a/src/qml/qml/qqmlnotifier_p.h b/src/qml/qml/qqmlnotifier_p.h
+index 2d827aa..7f5606f 100644
+--- a/src/qml/qml/qqmlnotifier_p.h
++++ b/src/qml/qml/qqmlnotifier_p.h
+@@ -108,6 +108,8 @@ private:
+     inline QQmlNotifier *senderAsNotifier() const;
+ 
+     Callback callback:4;
++    // The index is in the range returned by QObjectPrivate::signalIndex().
++    // This is different from QMetaMethod::methodIndex().
+     signed int sourceSignal:28;
+ 
+     QQmlNotifierEndpoint  *next;
+@@ -157,6 +159,10 @@ bool QQmlNotifierEndpoint::isConnected()
+     return prev != 0;
+ }
+ 
++/*! \internal
++    \a sourceSignal MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
+ bool QQmlNotifierEndpoint::isConnected(QObject *source, int sourceSignal)
+ {
+     return this->sourceSignal != -1 && senderAsObject() == source &&
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index a797a73..945f6de 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -58,6 +58,7 @@
+ #include "qqmlvaluetypeproxybinding_p.h"
+ 
+ #include <QStringList>
++#include <private/qmetaobject_p.h>
+ #include <QtCore/qdebug.h>
+ 
+ #include <math.h>
+@@ -362,7 +363,7 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+ 
+                 if (d && d->notifyIndex != -1) {
+                     object = currentObject;
+-                    core = *ddata->propertyCache->method(d->notifyIndex);
++                    core = *ddata->propertyCache->signal(d->notifyIndex);
+                     return;
+                 }
+             }
+@@ -390,6 +391,18 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+     }
+ }
+ 
++/*! \internal
++    Returns the index of this property's signal, in the signal index range
++    (see QObjectPrivate::signalIndex()). This is different from
++    QMetaMethod::methodIndex().
++*/
++int QQmlPropertyPrivate::signalIndex() const
++{
++    Q_ASSERT(type() == QQmlProperty::SignalProperty);
++    QMetaMethod m = object->metaObject()->method(core.coreIndex);
++    return QMetaObjectPrivate::signalIndex(m);
++}
++
+ /*!
+     Create a copy of \a other.
+ */
+@@ -963,7 +976,7 @@ QQmlPropertyPrivate::signalExpression(const QQmlProperty &that)
+ 
+     QQmlAbstractBoundSignal *signalHandler = data->signalHandlers;
+ 
+-    while (signalHandler && signalHandler->index() != that.index())
++    while (signalHandler && signalHandler->index() != QQmlPropertyPrivate::get(that)->signalIndex())
+         signalHandler = signalHandler->m_nextSignal;
+ 
+     if (signalHandler)
+@@ -1011,14 +1024,15 @@ QQmlPropertyPrivate::takeSignalExpression(const QQmlProperty &that,
+ 
+     QQmlAbstractBoundSignal *signalHandler = data->signalHandlers;
+ 
+-    while (signalHandler && signalHandler->index() != that.index())
++    while (signalHandler && signalHandler->index() != QQmlPropertyPrivate::get(that)->signalIndex())
+         signalHandler = signalHandler->m_nextSignal;
+ 
+     if (signalHandler)
+         return signalHandler->takeExpression(expr);
+ 
+     if (expr) {
+-        QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, that.index(), that.d->object,
++        int signalIndex = QQmlPropertyPrivate::get(that)->signalIndex();
++        QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, signalIndex, that.d->object,
+                                                       expr->context()->engine);
+         signal->takeExpression(expr);
+     }
+@@ -1875,16 +1889,25 @@ QMetaMethod QQmlPropertyPrivate::findSignalByName(const QMetaObject *mo, const Q
+     return QMetaMethod();
+ }
+ 
+-static inline void flush_vme_signal(const QObject *object, int index)
++/*! \internal
++    If \a indexInSignalRange is true, \a index is treated as a signal index
++    (see QObjectPrivate::signalIndex()), otherwise it is treated as a
++    method index (QMetaMethod::methodIndex()).
++*/
++static inline void flush_vme_signal(const QObject *object, int index, bool indexInSignalRange)
+ {
+     QQmlData *data = static_cast<QQmlData *>(QObjectPrivate::get(const_cast<QObject *>(object))->declarativeData);
+     if (data && data->propertyCache) {
+-        QQmlPropertyData *property = data->propertyCache->method(index);
++        QQmlPropertyData *property = indexInSignalRange ? data->propertyCache->signal(index)
++                                                        : data->propertyCache->method(index);
+ 
+         if (property && property->isVMESignal()) {
+-            QQmlVMEMetaObject *vme = QQmlVMEMetaObject::getForMethod(const_cast<QObject *>(object),
+-                                                                     index);
+-            vme->connectAliasSignal(index);
++            QQmlVMEMetaObject *vme;
++            if (indexInSignalRange)
++                vme = QQmlVMEMetaObject::getForSignal(const_cast<QObject *>(object), index);
++            else
++                vme = QQmlVMEMetaObject::getForMethod(const_cast<QObject *>(object), index);
++            vme->connectAliasSignal(index, indexInSignalRange);
+         }
+     }
+ }
+@@ -1900,15 +1923,21 @@ bool QQmlPropertyPrivate::connect(const QObject *sender, int signal_index,
+                                           const QObject *receiver, int method_index,
+                                           int type, int *types)
+ {
+-    flush_vme_signal(sender, signal_index);
+-    flush_vme_signal(receiver, method_index);
++    static const bool indexInSignalRange = false;
++    flush_vme_signal(sender, signal_index, indexInSignalRange);
++    flush_vme_signal(receiver, method_index, indexInSignalRange);
+ 
+     return QMetaObject::connect(sender, signal_index, receiver, method_index, type, types);
+ }
+ 
++/*! \internal
++    \a signal_index MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
+ void QQmlPropertyPrivate::flushSignal(const QObject *sender, int signal_index)
+ {
+-    flush_vme_signal(sender, signal_index);
++    static const bool indexInSignalRange = true;
++    flush_vme_signal(sender, signal_index, indexInSignalRange);
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlproperty_p.h b/src/qml/qml/qqmlproperty_p.h
+index 4f0db34..36aa142 100644
+--- a/src/qml/qml/qqmlproperty_p.h
++++ b/src/qml/qml/qqmlproperty_p.h
+@@ -129,6 +129,8 @@ public:
+                                         const QQmlPropertyData &,
+                                         QQmlContextData *);
+ 
++    int signalIndex() const;
++
+     static inline QQmlPropertyPrivate *get(const QQmlProperty &p) {
+         return p.d;
+     }
+diff --git a/src/qml/qml/qqmlpropertycache.cpp b/src/qml/qml/qqmlpropertycache.cpp
+index b073d22..b665bc9 100644
+--- a/src/qml/qml/qqmlpropertycache.cpp
++++ b/src/qml/qml/qqmlpropertycache.cpp
+@@ -146,7 +146,7 @@ void QQmlPropertyData::lazyLoad(const QMetaProperty &p, QQmlEngine *engine)
+     Q_UNUSED(engine);
+ 
+     coreIndex = p.propertyIndex();
+-    notifyIndex = p.notifySignalIndex();
++    notifyIndex = QMetaObjectPrivate::signalIndex(p.notifySignal());
+     Q_ASSERT(p.revision() <= Q_INT16_MAX);
+     revision = p.revision();
+ 
+@@ -171,7 +171,7 @@ void QQmlPropertyData::load(const QMetaProperty &p, QQmlEngine *engine)
+ {
+     propType = p.userType();
+     coreIndex = p.propertyIndex();
+-    notifyIndex = p.notifySignalIndex();
++    notifyIndex = QMetaObjectPrivate::signalIndex(p.notifySignal());
+     flags = fastFlagsForProperty(p) | flagsForPropertyType(propType, engine);
+     Q_ASSERT(p.revision() <= Q_INT16_MAX);
+     revision = p.revision();
+@@ -328,6 +328,11 @@ QQmlPropertyCache *QQmlPropertyCache::copyAndReserve(QQmlEngine *, int propertyC
+     return rv;
+ }
+ 
++/*! \internal
++
++    \a notifyIndex MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
+ void QQmlPropertyCache::appendProperty(const QString &name,
+                                        quint32 flags, int coreIndex, int propType, int notifyIndex)
+ {
+@@ -840,6 +845,36 @@ void QQmlPropertyCache::update(QQmlEngine *engine, const QMetaObject *metaObject
+     updateRecur(engine,metaObject);
+ }
+ 
++/*! \internal
++    \a index MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
++QQmlPropertyData *
++QQmlPropertyCache::signal(int index) const
++{
++    if (index < 0 || index >= (signalHandlerIndexCacheStart + signalHandlerIndexCache.count()))
++        return 0;
++
++    if (index < signalHandlerIndexCacheStart)
++        return _parent->signal(index);
++
++    QQmlPropertyData *rv = const_cast<QQmlPropertyData *>(&methodIndexCache.at(index - signalHandlerIndexCacheStart));
++    if (rv->notFullyResolved()) resolve(rv);
++    Q_ASSERT(rv->isSignal() || rv->coreIndex == -1);
++    return rv;
++}
++
++int QQmlPropertyCache::methodIndexToSignalIndex(int index) const
++{
++    if (index < 0 || index >= (methodIndexCacheStart + methodIndexCache.count()))
++        return index;
++
++    if (index < methodIndexCacheStart)
++        return _parent->methodIndexToSignalIndex(index);
++
++    return index - methodIndexCacheStart + signalHandlerIndexCacheStart;
++}
++
+ QQmlPropertyData *
+ QQmlPropertyCache::property(int index) const
+ {
+@@ -953,16 +988,20 @@ static int EnumType(const QMetaObject *metaobj, const QByteArray &str, int type)
+     return type;
+ }
+ 
+-QList<QByteArray> QQmlPropertyCache::methodParameterNames(QObject *object, int index)
++/*! \internal
++    \a index MUST be in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
++QList<QByteArray> QQmlPropertyCache::signalParameterNames(QObject *object, int index)
+ {
+     QQmlData *data = QQmlData::get(object, false);
+     if (data->propertyCache) {
+-        QQmlPropertyData *p = data->propertyCache->method(index);
++        QQmlPropertyData *p = data->propertyCache->signal(index);
+         if (!p->hasArguments())
+             return QList<QByteArray>();
+     }
+ 
+-    return object->metaObject()->method(index).parameterNames();
++    return QMetaObjectPrivate::signal(object->metaObject(), index).parameterNames();
+ }
+ 
+ // Returns an array of the arguments for method \a index.  The first entry in the array
+@@ -1236,7 +1275,7 @@ void QQmlPropertyCache::toMetaObjectBuilder(QMetaObjectBuilder &builder)
+ 
+         int notifierId = -1;
+         if (data->notifyIndex != -1)
+-            notifierId = data->notifyIndex - methodIndexCacheStart;
++            notifierId = data->notifyIndex - signalHandlerIndexCacheStart;
+ 
+         QMetaPropertyBuilder property = builder.addProperty(properties.at(ii).first.toUtf8(),
+                                                             QMetaType::typeName(data->propType),
+diff --git a/src/qml/qml/qqmlpropertycache_p.h b/src/qml/qml/qqmlpropertycache_p.h
+index 3be85c7..4641a8d 100644
+--- a/src/qml/qml/qqmlpropertycache_p.h
++++ b/src/qml/qml/qqmlpropertycache_p.h
+@@ -172,6 +172,8 @@ public:
+     };
+     int coreIndex;
+     union {
++        // The notify index is in the range returned by QObjectPrivate::signalIndex().
++        // This is different from QMetaMethod::methodIndex().
+         int notifyIndex;  // When !IsFunction
+         void *arguments;  // When IsFunction && HasArguments
+     };
+@@ -276,6 +278,8 @@ public:
+     QQmlPropertyData *property(const QString &) const;
+     QQmlPropertyData *property(int) const;
+     QQmlPropertyData *method(int) const;
++    QQmlPropertyData *signal(int) const;
++    int methodIndexToSignalIndex(int) const;
+     QStringList propertyNames() const;
+ 
+     QString defaultPropertyName() const;
+@@ -292,7 +296,7 @@ public:
+                                               QQmlPropertyData &);
+     static int *methodParameterTypes(QObject *, int index, QVarLengthArray<int, 9> &dummy,
+                                      QByteArray *unknownTypeError);
+-    static QList<QByteArray> methodParameterNames(QObject *, int index);
++    static QList<QByteArray> signalParameterNames(QObject *, int index);
+ 
+     const char *className() const;
+ 
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index 2434ef0..cc2a158 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -1205,21 +1205,21 @@ void QQmlVMEMetaObject::connectAlias(int aliasId)
+     }
+ }
+ 
+-void QQmlVMEMetaObject::connectAliasSignal(int index)
++void QQmlVMEMetaObject::connectAliasSignal(int index, bool indexInSignalRange)
+ {
+-    int aliasId = (index - methodOffset()) - metaData->propertyCount;
++    int aliasId = (index - (indexInSignalRange ? signalOffset() : methodOffset())) - metaData->propertyCount;
+     if (aliasId < 0 || aliasId >= metaData->aliasCount)
+         return;
+ 
+     connectAlias(aliasId);
+ }
+ 
++/*! \internal
++    \a index is in the method index range (QMetaMethod::methodIndex()).
++*/
+ void QQmlVMEMetaObject::activate(QObject *object, int index, void **args)
+ {
+-    int signalOffset = cache->signalOffset();
+-    int methodOffset = cache->methodOffset();
+-
+-    QMetaObject::activate(object, methodOffset, signalOffset, index - methodOffset, args);
++    QMetaObject::activate(object, signalOffset(), index - methodOffset(), args);
+ }
+ 
+ QQmlVMEMetaObject *QQmlVMEMetaObject::getForProperty(QObject *o, int coreIndex)
+@@ -1242,4 +1242,18 @@ QQmlVMEMetaObject *QQmlVMEMetaObject::getForMethod(QObject *o, int coreIndex)
+     return vme;
+ }
+ 
++/*! \internal
++    \a coreIndex is in the signal index range (see QObjectPrivate::signalIndex()).
++    This is different from QMetaMethod::methodIndex().
++*/
++QQmlVMEMetaObject *QQmlVMEMetaObject::getForSignal(QObject *o, int coreIndex)
++{
++    QQmlVMEMetaObject *vme = QQmlVMEMetaObject::get(o);
++    while (vme->signalOffset() > coreIndex) {
++        Q_ASSERT(vme->parent.isT1());
++        vme = static_cast<QQmlVMEMetaObject *>(vme->parent.asT1());
++    }
++    return vme;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 77e300d..7a01b70 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -169,13 +169,14 @@ public:
+     v8::Handle<v8::Value> vmeProperty(int index);
+     void setVMEProperty(int index, v8::Handle<v8::Value> v);
+ 
+-    void connectAliasSignal(int index);
++    void connectAliasSignal(int index, bool indexInSignalRange);
+ 
+     virtual QAbstractDynamicMetaObject *toDynamicMetaObject(QObject *o);
+ 
+     static inline QQmlVMEMetaObject *get(QObject *o);
+     static QQmlVMEMetaObject *getForProperty(QObject *o, int coreIndex);
+     static QQmlVMEMetaObject *getForMethod(QObject *o, int coreIndex);
++    static QQmlVMEMetaObject *getForSignal(QObject *o, int coreIndex);
+ 
+ protected:
+     virtual int metaCall(QMetaObject::Call _c, int _id, void **_a);
+@@ -191,6 +192,7 @@ public:
+     const QQmlVMEMetaData *metaData;
+     inline int propOffset() const;
+     inline int methodOffset() const;
++    inline int signalOffset() const;
+ 
+     bool hasAssignedMetaObjectData;
+     QQmlVMEVariant *data;
+@@ -262,6 +264,11 @@ int QQmlVMEMetaObject::methodOffset() const
+     return cache->methodOffset();
+ }
+ 
++int QQmlVMEMetaObject::signalOffset() const
++{
++    return cache->signalOffset();
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLVMEMETAOBJECT_P_H
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 863d095..4ec255b 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -910,10 +910,8 @@ const QQuickKeysAttached::SigMap QQuickKeysAttached::sigMap[] = {
+ bool QQuickKeysAttached::isConnected(const char *signalName)
+ {
+     Q_D(QQuickKeysAttached);
+-    //### doing two string-based lookups isn't ideal
+     int signal_index = d->signalIndex(signalName);
+-    int index = metaObject()->indexOfSignal(signalName);
+-    return QQml_isSignalConnected(this, signal_index, index);
++    return QQml_isSignalConnected(this, signal_index);
+ }
+ 
+ /*!
+diff --git a/src/quick/util/qquickconnections.cpp b/src/quick/util/qquickconnections.cpp
+index 6a20e31..be3d953 100644
+--- a/src/quick/util/qquickconnections.cpp
++++ b/src/quick/util/qquickconnections.cpp
+@@ -279,7 +279,7 @@ void QQuickConnections::connectSignals()
+         QQmlProperty prop(target(), propName);
+         if (prop.isValid() && (prop.type() & QQmlProperty::SignalProperty)) {
+             QQmlBoundSignal *signal =
+-                new QQmlBoundSignal(target(), prop.index(), this, qmlEngine(this));
++                new QQmlBoundSignal(target(), QQmlPropertyPrivate::get(prop)->signalIndex(), this, qmlEngine(this));
+ 
+             QString location;
+             QQmlContextData *ctxtdata = 0;

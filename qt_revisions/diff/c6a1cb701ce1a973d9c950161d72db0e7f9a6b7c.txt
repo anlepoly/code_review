@@ -1,0 +1,161 @@
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index b1cbb5f..d41c906 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -502,6 +502,8 @@ void QGuiApplicationPrivate::init()
+     QWindowSystemInterface::sendWindowSystemEvents(QCoreApplicationPrivate::eventDispatcher, QEventLoop::AllEvents);
+ }
+ 
++extern void qt_cleanupFontDatabase();
++
+ QGuiApplicationPrivate::~QGuiApplicationPrivate()
+ {
+     is_app_closing = true;
+@@ -526,6 +528,8 @@ QGuiApplicationPrivate::~QGuiApplicationPrivate()
+     delete styleHints;
+     delete inputMethod;
+ 
++    qt_cleanupFontDatabase();
++
+     delete platform_integration;
+     platform_integration = 0;
+ }
+diff --git a/src/gui/text/qfontdatabase.cpp b/src/gui/text/qfontdatabase.cpp
+index e9b7d1a..be8c1c0 100644
+--- a/src/gui/text/qfontdatabase.cpp
++++ b/src/gui/text/qfontdatabase.cpp
+@@ -196,7 +196,7 @@ struct QtFontStyle
+             // bitfield count-- in while condition does not work correctly in mwccsym2
+             count--;
+             QPlatformIntegration *integration = QGuiApplicationPrivate::platformIntegration();
+-            if (integration) { //on shut down there will be some that we don't release.
++            if (integration) {
+                 integration->fontDatabase()->releaseHandle(pixelSizes[count].handle);
+             }
+         }
+@@ -796,6 +796,14 @@ static QStringList familyList(const QFontDef &req)
+ Q_GLOBAL_STATIC(QFontDatabasePrivate, privateDb)
+ Q_GLOBAL_STATIC_WITH_ARGS(QMutex, fontDatabaseMutex, (QMutex::Recursive))
+ 
++// used in qguiapplication.cpp
++void qt_cleanupFontDatabase()
++{
++    QFontDatabasePrivate *db = privateDb();
++    if (db)
++        db->free();
++}
++
+ // used in qfontengine_x11.cpp
+ QMutex *qt_fontdatabase_mutex()
+ {
+diff --git a/src/gui/text/qfontdatabase_qpa.cpp b/src/gui/text/qfontdatabase_qpa.cpp
+index 266ad4d..c3d7529 100644
+--- a/src/gui/text/qfontdatabase_qpa.cpp
++++ b/src/gui/text/qfontdatabase_qpa.cpp
+@@ -58,28 +58,33 @@ Q_GUI_EXPORT  void qt_registerFont(const QString &familyName, const QString &fou
+                                    const QSupportedWritingSystems &writingSystems, void *handle)
+ {
+     QFontDatabasePrivate *d = privateDb();
+-    //    qDebug() << "Adding font" << familyName << weight << style << pixelSize << antialiased;
+-        QtFontStyle::Key styleKey;
+-        styleKey.style = style;
+-        styleKey.weight = weight;
+-        styleKey.stretch = stretch;
+-        QtFontFamily *f = d->family(familyName, true);
+-        f->fixedPitch = fixedPitch;
+-
+-        for (int i = 0; i < QFontDatabase::WritingSystemsCount; ++i) {
+-            if (writingSystems.supported(QFontDatabase::WritingSystem(i))) {
+-                f->writingSystems[i] = QtFontFamily::Supported;
+-            } else {
+-                f->writingSystems[i] = QtFontFamily::Unsupported;
+-            }
++//    qDebug() << "Adding font" << familyName << weight << style << pixelSize << antialiased;
++    QtFontStyle::Key styleKey;
++    styleKey.style = style;
++    styleKey.weight = weight;
++    styleKey.stretch = stretch;
++    QtFontFamily *f = d->family(familyName, true);
++    f->fixedPitch = fixedPitch;
++
++    for (int i = 0; i < QFontDatabase::WritingSystemsCount; ++i) {
++        if (writingSystems.supported(QFontDatabase::WritingSystem(i))) {
++            f->writingSystems[i] = QtFontFamily::Supported;
++        } else {
++            f->writingSystems[i] = QtFontFamily::Unsupported;
+         }
++    }
+ 
+-        QtFontFoundry *foundry = f->foundry(foundryname, true);
+-        QtFontStyle *fontStyle = foundry->style(styleKey, QString(), true);
+-        fontStyle->smoothScalable = scalable;
+-        fontStyle->antialiased = antialiased;
+-        QtFontSize *size = fontStyle->pixelSize(pixelSize?pixelSize:SMOOTH_SCALABLE, true);
+-        size->handle = handle;
++    QtFontFoundry *foundry = f->foundry(foundryname, true);
++    QtFontStyle *fontStyle = foundry->style(styleKey, QString(), true);
++    fontStyle->smoothScalable = scalable;
++    fontStyle->antialiased = antialiased;
++    QtFontSize *size = fontStyle->pixelSize(pixelSize ? pixelSize : SMOOTH_SCALABLE, true);
++    if (size->handle) {
++        QPlatformIntegration *integration = QGuiApplicationPrivate::platformIntegration();
++        if (integration)
++            integration->fontDatabase()->releaseHandle(size->handle);
++    }
++    size->handle = handle;
+ }
+ 
+ static QStringList fallbackFamilies(const QString &family, const QFont::Style &style, const QFont::StyleHint &styleHint, const QUnicodeTables::Script &script)
+diff --git a/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp b/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
+index f397e9c..8455e9e 100644
+--- a/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
++++ b/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
+@@ -100,6 +100,14 @@ static inline QFont::Weight weightFromInteger(long weight)
+     return QFont::Black;
+ }
+ 
++static FontFile * createFontFile(const QString &fileName, int index)
++{
++    FontFile *fontFile = new FontFile;
++    fontFile->fileName = fileName;
++    fontFile->indexValue = index;
++    return fontFile;
++}
++
+ static bool addFontToDatabase(QString familyName, const QString &scriptName,
+                               const TEXTMETRIC *textmetric,
+                               const FONTSIGNATURE *signature,
+@@ -212,23 +220,22 @@ static bool addFontToDatabase(QString familyName, const QString &scriptName,
+     if (!QDir::isAbsolutePath(value))
+         value.prepend(QString::fromLocal8Bit(qgetenv("windir") + "\\Fonts\\"));
+ 
+-    // Pointer is deleted in QBasicFontDatabase::releaseHandle(void *handle)
+-    FontFile *fontFile = new FontFile;
+-    fontFile->fileName = value;
+-    fontFile->indexValue = index;
++    QPlatformFontDatabase::registerFont(faceName, foundryName, weight, style, stretch,
++        antialias, scalable, size, fixed, writingSystems, createFontFile(value, index));
+ 
+-    QPlatformFontDatabase::registerFont(faceName, foundryName, weight,
+-                                        style, stretch, antialias, scalable, size, fixed, writingSystems, fontFile);
+     // add fonts windows can generate for us:
+     if (weight <= QFont::DemiBold)
+-        QPlatformFontDatabase::registerFont(faceName, foundryName, QFont::Bold,
+-                                            style, stretch, antialias, scalable, size, fixed, writingSystems, fontFile);
++        QPlatformFontDatabase::registerFont(faceName, foundryName, QFont::Bold, style, stretch,
++                                            antialias, scalable, size, fixed, writingSystems, createFontFile(value, index));
++
+     if (style != QFont::StyleItalic)
+-        QPlatformFontDatabase::registerFont(faceName, foundryName, weight,
+-                                            QFont::StyleItalic, stretch, antialias, scalable, size, fixed, writingSystems, fontFile);
++        QPlatformFontDatabase::registerFont(faceName, foundryName, weight, QFont::StyleItalic, stretch,
++                                            antialias, scalable, size, fixed, writingSystems, createFontFile(value, index));
++
+     if (weight <= QFont::DemiBold && style != QFont::StyleItalic)
+-        QPlatformFontDatabase::registerFont(faceName, foundryName, QFont::Bold,
+-                                            QFont::StyleItalic, stretch, antialias, scalable, size, fixed, writingSystems, fontFile);
++        QPlatformFontDatabase::registerFont(faceName, foundryName, QFont::Bold, QFont::StyleItalic, stretch,
++                                            antialias, scalable, size, fixed, writingSystems, createFontFile(value, index));
++
+     return true;
+ }

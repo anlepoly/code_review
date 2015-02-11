@@ -1,0 +1,151 @@
+diff --git a/src/plugins/platforms/eglfs/qeglfscursor.cpp b/src/plugins/platforms/eglfs/qeglfscursor.cpp
+index c1f667c..aae5b2a 100644
+--- a/src/plugins/platforms/eglfs/qeglfscursor.cpp
++++ b/src/plugins/platforms/eglfs/qeglfscursor.cpp
+@@ -52,7 +52,6 @@ QT_BEGIN_NAMESPACE
+ QEglFSCursor::QEglFSCursor(QEglFSScreen *screen)
+     : m_screen(screen), m_pos(0, 0), m_program(0), m_vertexCoordEntry(0), m_textureCoordEntry(0), m_textureEntry(0)
+ {
+-    createShaderPrograms();
+     initCursorAtlas();
+ 
+     // ## this shouldn't be required
+@@ -64,10 +63,7 @@ QEglFSCursor::~QEglFSCursor()
+ {
+     if (QOpenGLContext::currentContext()) {
+         glDeleteProgram(m_program);
+-
+-        if (m_cursor.shape == Qt::BitmapCursor && m_cursor.texture)
+-            glDeleteTextures(1, &m_cursor.texture);
+-
++        glDeleteTextures(1, &m_cursor.customCursorTexture);
+         glDeleteTextures(1, &m_cursorAtlas.texture);
+     }
+ }
+@@ -142,7 +138,8 @@ void QEglFSCursor::createShaderPrograms()
+ 
+ void QEglFSCursor::createCursorTexture(uint *texture, const QImage &image)
+ {
+-    glGenTextures(1, texture);
++    if (!*texture)
++        glGenTextures(1, texture);
+     glBindTexture(GL_TEXTURE_2D, *texture);
+     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+@@ -183,15 +180,16 @@ void QEglFSCursor::initCursorAtlas()
+     m_cursorAtlas.cursorHeight = image.height() / ((Qt::LastCursor + cursorsPerRow - 1) / cursorsPerRow);
+     m_cursorAtlas.width = image.width();
+     m_cursorAtlas.height = image.height();
+-    createCursorTexture(&m_cursorAtlas.texture, image);
++    m_cursorAtlas.image = image;
+ }
+ 
+ void QEglFSCursor::changeCursor(QCursor *cursor, QWindow *window)
+ {
+     const QRect oldCursorRect = cursorRect();
+ 
+-    if (m_cursor.shape == Qt::BitmapCursor && m_cursor.texture)
+-        glDeleteTextures(1, &m_cursor.texture);
++    if (m_cursor.shape == Qt::BitmapCursor) {
++        m_cursor.customCursorImage = QImage(); // in case render() never uploaded it
++    }
+ 
+     m_cursor.shape = cursor->shape();
+     if (cursor->shape() != Qt::BitmapCursor) { // standard cursor
+@@ -207,8 +205,9 @@ void QEglFSCursor::changeCursor(QCursor *cursor, QWindow *window)
+         QImage image = cursor->pixmap().toImage();
+         m_cursor.textureRect = QRectF(0, 0, 1, 1);
+         m_cursor.hotSpot = cursor->hotSpot();
++        m_cursor.texture = 0; // will get updated in the next render()
+         m_cursor.size = image.size();
+-        createCursorTexture(&m_cursor.texture, image);
++        m_cursor.customCursorImage = image;
+     }
+ 
+     QRegion rgn = oldCursorRect | cursorRect();
+@@ -245,6 +244,28 @@ void QEglFSCursor::pointerEvent(const QMouseEvent &event)
+ 
+ void QEglFSCursor::render()
+ {
++    if (!m_program) {
++        // one time initialization
++        createShaderPrograms();
++
++        if (!m_cursorAtlas.texture) {
++            createCursorTexture(&m_cursorAtlas.texture, m_cursorAtlas.image);
++            m_cursorAtlas.image = QImage();
++
++            if (m_cursor.shape != Qt::BitmapCursor)
++                m_cursor.texture = m_cursorAtlas.texture;
++        }
++    }
++
++    if (m_cursor.shape == Qt::BitmapCursor && !m_cursor.customCursorImage.isNull()) {
++        // upload the custom cursor
++        createCursorTexture(&m_cursor.customCursorTexture, m_cursor.customCursorImage);
++        m_cursor.texture = m_cursor.customCursorTexture;
++        m_cursor.customCursorImage = QImage();
++    }
++
++    Q_ASSERT(m_cursor.texture);
++
+     glUseProgram(m_program);
+ 
+     const QRectF cr = cursorRect();
+diff --git a/src/plugins/platforms/eglfs/qeglfscursor.h b/src/plugins/platforms/eglfs/qeglfscursor.h
+index 1fdb648..c8c4a83 100644
+--- a/src/plugins/platforms/eglfs/qeglfscursor.h
++++ b/src/plugins/platforms/eglfs/qeglfscursor.h
+@@ -81,16 +81,19 @@ private:
+         int width, height; // width and height of the the atlas
+         int cursorWidth, cursorHeight; // width and height of cursors inside the atlas
+         QList<QPoint> hotSpots;
++        QImage image; // valid until it's uploaded
+     } m_cursorAtlas;
+ 
+     // current cursor information
+     struct Cursor {
+-        Cursor() : texture(0), shape(Qt::BlankCursor) { }
++        Cursor() : texture(0), shape(Qt::BlankCursor), customCursorTexture(0) { }
+         uint texture; // a texture from 'image' or the atlas
+         Qt::CursorShape shape;
+         QRectF textureRect; // normalized rect inside texture
+         QSize size; // size of the cursor
+         QPoint hotSpot;
++        QImage customCursorImage;
++        uint customCursorTexture;
+     } m_cursor;
+ 
+     QPoint m_pos;
+diff --git a/src/plugins/platforms/eglfs/qeglfsscreen.cpp b/src/plugins/platforms/eglfs/qeglfsscreen.cpp
+index cf39aa3..b29981f 100644
+--- a/src/plugins/platforms/eglfs/qeglfsscreen.cpp
++++ b/src/plugins/platforms/eglfs/qeglfsscreen.cpp
+@@ -122,6 +122,10 @@ QEglFSScreen::QEglFSScreen()
+             swapInterval = 1;
+     }
+     eglSwapInterval(m_dpy, swapInterval);
++
++    static int hideCursor = qgetenv("QT_QPA_EGLFS_HIDECURSOR").toInt();
++    if (!hideCursor)
++        m_cursor = new QEglFSCursor(this);
+ }
+ 
+ QEglFSScreen::~QEglFSScreen()
+@@ -216,17 +220,6 @@ QImage::Format QEglFSScreen::format() const
+ 
+ QPlatformCursor *QEglFSScreen::cursor() const
+ {
+-    static int hideCursor = qgetenv("QT_QPA_EGLFS_HIDECURSOR").toInt();
+-    if (hideCursor)
+-        return 0;
+-
+-    if (!m_cursor) {
+-        QEglFSScreen *that = const_cast<QEglFSScreen *>(this);
+-        // cursor requires a gl context
+-        if (!m_platformContext)
+-            that->createAndSetPlatformContext();
+-        that->m_cursor = new QEglFSCursor(that);
+-    }
+     return m_cursor;
+ }

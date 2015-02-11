@@ -1,0 +1,435 @@
+diff --git a/src/qml/qml/qml.pri b/src/qml/qml/qml.pri
+index 30acea1..fbbdc84 100644
+--- a/src/qml/qml/qml.pri
++++ b/src/qml/qml/qml.pri
+@@ -53,6 +53,7 @@ SOURCES += \
+     $$PWD/qqmlglobal.cpp \
+     $$PWD/qqmlfile.cpp \
+     $$PWD/qqmlbundle.cpp \
++    $$PWD/qqmlmemoryprofiler.cpp
+ 
+ HEADERS += \
+     $$PWD/qqmlglobal_p.h \
+@@ -126,6 +127,7 @@ HEADERS += \
+     $$PWD/qqmlvaluetypeproxybinding_p.h \
+     $$PWD/qqmlfile.h \
+     $$PWD/qqmlbundle_p.h \
++    $$PWD/qqmlmemoryprofiler_p.h
+ 
+ include(parser/parser.pri)
+ include(rewriter/rewriter.pri)
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index c210639..ffa08c3 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -65,6 +65,7 @@
+ #include <QStringList>
+ #include <QtCore/qdebug.h>
+ #include <qqmlinfo.h>
++#include "qqmlmemoryprofiler_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -744,6 +745,7 @@ QQmlComponent::QQmlComponent(QQmlComponentPrivate &dd, QObject *parent)
+ QObject *QQmlComponent::create(QQmlContext *context)
+ {
+     Q_D(QQmlComponent);
++    QML_MEMORY_SCOPE_URL(url());
+ 
+     if (!context)
+         context = d->engine->rootContext();
+diff --git a/src/qml/qml/qqmlincubator.cpp b/src/qml/qml/qqmlincubator.cpp
+index bd3fe52..3cd03a9 100644
+--- a/src/qml/qml/qqmlincubator.cpp
++++ b/src/qml/qml/qqmlincubator.cpp
+@@ -45,6 +45,7 @@
+ 
+ #include "qqmlcompiler_p.h"
+ #include "qqmlexpression_p.h"
++#include "qqmlmemoryprofiler_p.h"
+ 
+ // XXX TODO 
+ //   - check that the Component.onCompleted behavior is the same as 4.8 in the synchronous and 
+@@ -259,6 +260,8 @@ void QQmlIncubatorPrivate::incubate(QQmlVME::Interrupt &i)
+ {
+     if (!component)
+         return;
++    QML_MEMORY_SCOPE_URL(component->url);
++
+     typedef QQmlIncubatorPrivate IP;
+     QRecursionWatcher<IP, &IP::recursion> watcher(this);
+ 
+diff --git a/src/qml/qml/qqmlmemoryprofiler.cpp b/src/qml/qml/qqmlmemoryprofiler.cpp
+new file mode 100644
+index 0000000..b43ac86
+--- /dev/null
++++ b/src/qml/qml/qqmlmemoryprofiler.cpp
+@@ -0,0 +1,161 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qqmlmemoryprofiler_p.h"
++#include <QUrl>
++
++QT_BEGIN_NAMESPACE
++
++enum LibraryState
++{
++    Unloaded,
++    Failed,
++    Loaded
++};
++
++static LibraryState state = Unloaded;
++
++typedef void (qmlmemprofile_stats)(int *allocCount, int *bytesAllocated);
++typedef void (qmlmemprofile_clear)();
++typedef void (qmlmemprofile_enable)();
++typedef void (qmlmemprofile_disable)();
++typedef void (qmlmemprofile_push_location)(const char *filename, int lineNumber);
++typedef void (qmlmemprofile_pop_location)();
++typedef void (qmlmemprofile_save)(const char *filename);
++typedef int (qmlmemprofile_is_enabled)();
++
++static qmlmemprofile_stats *memprofile_stats;
++static qmlmemprofile_clear *memprofile_clear;
++static qmlmemprofile_enable *memprofile_enable;
++static qmlmemprofile_disable *memprofile_disable;
++static qmlmemprofile_push_location *memprofile_push_location;
++static qmlmemprofile_pop_location *memprofile_pop_location;
++static qmlmemprofile_save *memprofile_save;
++static qmlmemprofile_is_enabled *memprofile_is_enabled;
++
++extern QFunctionPointer qt_linux_find_symbol_sys(const char *symbol);
++
++static bool openLibrary()
++{
++#if 0//def Q_OS_LINUX   [Disabled until qt_linux_find_symbol_sys is available in qtbase]
++    if (state == Unloaded) {
++        memprofile_stats = (qmlmemprofile_stats *) qt_linux_find_symbol_sys("qmlmemprofile_stats");
++        memprofile_clear = (qmlmemprofile_clear *) qt_linux_find_symbol_sys("qmlmemprofile_clear");
++        memprofile_enable = (qmlmemprofile_enable *) qt_linux_find_symbol_sys("qmlmemprofile_enable");
++        memprofile_disable = (qmlmemprofile_disable *) qt_linux_find_symbol_sys("qmlmemprofile_disable");
++        memprofile_push_location = (qmlmemprofile_push_location *) qt_linux_find_symbol_sys("qmlmemprofile_push_location");
++        memprofile_pop_location = (qmlmemprofile_pop_location *) qt_linux_find_symbol_sys("qmlmemprofile_pop_location");
++        memprofile_save = (qmlmemprofile_save *) qt_linux_find_symbol_sys("qmlmemprofile_save");
++        memprofile_is_enabled = (qmlmemprofile_is_enabled *) qt_linux_find_symbol_sys("qmlmemprofile_is_enabled");
++
++        if (memprofile_stats && memprofile_clear && memprofile_enable && memprofile_disable &&
++            memprofile_push_location && memprofile_pop_location && memprofile_save && memprofile_is_enabled)
++            state = Loaded;
++        else
++            state = Failed;
++    }
++#endif  // Q_OS_LINUX
++
++    return state == Loaded;
++}
++
++QQmlMemoryScope::QQmlMemoryScope(const QUrl &url) : pushed(false)
++{
++    if (openLibrary() && memprofile_is_enabled()) {
++        const char *location = url.path().toUtf8().constData();
++        memprofile_push_location(location, 0);
++        pushed = true;
++    }
++}
++
++QQmlMemoryScope::QQmlMemoryScope(const char *string) : pushed(false)
++{
++    if (openLibrary() && memprofile_is_enabled()) {
++        memprofile_push_location(string, 0);
++        pushed = true;
++    }
++}
++
++QQmlMemoryScope::~QQmlMemoryScope()
++{
++    if (pushed)
++        memprofile_pop_location();
++}
++
++bool QQmlMemoryProfiler::isEnabled()
++{
++    if (openLibrary())
++        return memprofile_is_enabled();
++
++    return false;
++}
++
++void QQmlMemoryProfiler::enable()
++{
++    if (openLibrary())
++        memprofile_enable();
++}
++
++void QQmlMemoryProfiler::disable()
++{
++    if (openLibrary())
++        memprofile_disable();
++}
++
++void QQmlMemoryProfiler::clear()
++{
++    if (openLibrary())
++        memprofile_clear();
++}
++
++void QQmlMemoryProfiler::stats(int *allocCount, int *bytesAllocated)
++{
++    if (openLibrary())
++        memprofile_stats(allocCount, bytesAllocated);
++}
++
++void QQmlMemoryProfiler::save(const char *filename)
++{
++    if (openLibrary())
++        memprofile_save(filename);
++}
++
++QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlmemoryprofiler_p.h b/src/qml/qml/qqmlmemoryprofiler_p.h
+new file mode 100644
+index 0000000..61c8811
+--- /dev/null
++++ b/src/qml/qml/qqmlmemoryprofiler_p.h
+@@ -0,0 +1,81 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QQMLMEMORYPROFILER_H
++#define QQMLMEMORYPROFILER_H
++
++#include <private/qtqmlglobal_p.h>
++
++QT_BEGIN_HEADER
++QT_BEGIN_NAMESPACE
++
++class QUrl;
++
++class Q_QML_PRIVATE_EXPORT QQmlMemoryScope
++{
++public:
++    explicit QQmlMemoryScope(const QUrl &url);
++    explicit QQmlMemoryScope(const char *string);
++    ~QQmlMemoryScope();
++
++private:
++    bool pushed;
++};
++
++class Q_QML_PRIVATE_EXPORT QQmlMemoryProfiler
++{
++public:
++    static void enable();
++    static void disable();
++    static bool isEnabled();
++
++    static void clear();
++    static void stats(int *allocCount, int *bytesAllocated);
++    static void save(const char *filename);
++};
++
++#define QML_MEMORY_SCOPE_URL(url)       QQmlMemoryScope _qml_memory_scope(url)
++#define QML_MEMORY_SCOPE_STRING(s)      QQmlMemoryScope _qml_memory_scope(s)
++
++QT_END_NAMESPACE
++QT_END_HEADER
++
++#endif // QQMLMEMORYPROFILER_H
+diff --git a/src/qml/qml/qqmltypeloader.cpp b/src/qml/qml/qqmltypeloader.cpp
+index c01a41d..a766ee7 100644
+--- a/src/qml/qml/qqmltypeloader.cpp
++++ b/src/qml/qml/qqmltypeloader.cpp
+@@ -47,6 +47,7 @@
+ #include <private/qqmlcompiler_p.h>
+ #include <private/qqmlcomponent_p.h>
+ #include <private/qqmlprofilerservice_p.h>
++#include <private/qqmlmemoryprofiler_p.h>
+ 
+ #include <QtCore/qdir.h>
+ #include <QtCore/qfile.h>
+@@ -852,6 +853,7 @@ void QQmlDataLoaderThread::loadWithStaticDataThread(QQmlDataBlob *b, const QByte
+ 
+ void QQmlDataLoaderThread::callCompletedMain(QQmlDataBlob *b) 
+ { 
++    QML_MEMORY_SCOPE_URL(b->url());
+ #ifdef DATABLOB_DEBUG
+     qWarning("QQmlDataLoaderThread: %s completed() callback", qPrintable(b->url().toString())); 
+ #endif
+@@ -1026,6 +1028,7 @@ void QQmlDataLoader::loadThread(QQmlDataBlob *blob)
+         return;
+     }
+ 
++    QML_MEMORY_SCOPE_URL(blob->m_url);
+     QQmlEnginePrivate *engine_d = QQmlEnginePrivate::get(m_engine);
+     QHash<QUrl, QByteArray> debugCache = engine_d->debugChangesCache();
+ 
+@@ -1155,6 +1158,7 @@ void QQmlDataLoader::initializeEngine(QQmlExtensionInterface *iface,
+ 
+ void QQmlDataLoader::setData(QQmlDataBlob *blob, const QByteArray &data)
+ {
++    QML_MEMORY_SCOPE_URL(blob->url());
+     QQmlDataBlob::Data d;
+     d.d = &data;
+     setData(blob, d);
+@@ -1162,6 +1166,7 @@ void QQmlDataLoader::setData(QQmlDataBlob *blob, const QByteArray &data)
+ 
+ void QQmlDataLoader::setData(QQmlDataBlob *blob, QQmlFile *file)
+ {
++    QML_MEMORY_SCOPE_URL(blob->url());
+     QQmlDataBlob::Data d;
+     d.d = file;
+     setData(blob, d);
+@@ -1169,6 +1174,7 @@ void QQmlDataLoader::setData(QQmlDataBlob *blob, QQmlFile *file)
+ 
+ void QQmlDataLoader::setData(QQmlDataBlob *blob, const QQmlDataBlob::Data &d)
+ {
++    QML_MEMORY_SCOPE_URL(blob->url());
+     blob->m_inCallback = true;
+ 
+     blob->dataReceived(d);
+diff --git a/src/qml/qml/v8/qv8engine.cpp b/src/qml/qml/v8/qv8engine.cpp
+index 13d766a..5fecd71 100644
+--- a/src/qml/qml/v8/qv8engine.cpp
++++ b/src/qml/qml/v8/qv8engine.cpp
+@@ -53,6 +53,7 @@
+ #include <private/qqmlxmlhttprequest_p.h>
+ #include <private/qqmllocale_p.h>
+ #include <private/qqmlglobal_p.h>
++#include <private/qqmlmemoryprofiler_p.h>
+ 
+ #include "qscript_impl_p.h"
+ #include "qv8domerrors_p.h"
+@@ -127,6 +128,7 @@ QV8Engine::QV8Engine(QJSEngine* qq, QJSEngine::ContextOwnership ownership)
+     , m_listModelData(0)
+     , m_application(0)
+ {
++    QML_MEMORY_SCOPE_STRING("QV8Engine::QV8Engine");
+     qMetaTypeId<QJSValue>();
+     qMetaTypeId<QList<int> >();
+ 
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 6de38da..4fd3bf0 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -68,6 +68,7 @@
+ #include <QtQuick/private/qquickpixmapcache_p.h>
+ 
+ #include <private/qqmlprofilerservice_p.h>
++#include <private/qqmlmemoryprofiler_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -267,6 +268,7 @@ void forceUpdate(QQuickItem *item)
+ 
+ void QQuickCanvasPrivate::syncSceneGraph()
+ {
++    QML_MEMORY_SCOPE_STRING("SceneGraph");
+     if (!renderer) {
+         forceUpdate(rootItem);
+ 
+@@ -289,6 +291,7 @@ void QQuickCanvasPrivate::syncSceneGraph()
+ 
+ void QQuickCanvasPrivate::renderSceneGraph(const QSize &size)
+ {
++    QML_MEMORY_SCOPE_STRING("SceneGraph");
+     Q_Q(QQuickCanvas);
+     emit q->beforeRendering();
+     int fboId = 0;
+diff --git a/src/quick/items/qquickview.cpp b/src/quick/items/qquickview.cpp
+index 7ffafeb..03a8e6e 100644
+--- a/src/quick/items/qquickview.cpp
++++ b/src/quick/items/qquickview.cpp
+@@ -48,6 +48,7 @@
+ 
+ #include <private/qqmlprofilerservice_p.h>
+ #include <private/qqmlinspectorservice_p.h>
++#include <private/qqmlmemoryprofiler_p.h>
+ 
+ #include <QtQml/qqmlengine.h>
+ #include <private/qqmlengine_p.h>
+@@ -91,6 +92,7 @@ void QQuickViewPrivate::execute()
+         component = 0;
+     }
+     if (!source.isEmpty()) {
++        QML_MEMORY_SCOPE_URL(engine.baseUrl().resolved(source));
+         component = new QQmlComponent(&engine, source, q);
+         if (!component->isLoading()) {
+             q->continueExecute();

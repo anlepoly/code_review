@@ -1,0 +1,243 @@
+diff --git a/src/tools/qdoc/cppcodeparser.cpp b/src/tools/qdoc/cppcodeparser.cpp
+index 02b81ee..c95e03f 100644
+--- a/src/tools/qdoc/cppcodeparser.cpp
++++ b/src/tools/qdoc/cppcodeparser.cpp
+@@ -474,6 +474,7 @@ QSet<QString> CppCodeParser::topicCommands()
+                            << COMMAND_TYPEDEF
+                            << COMMAND_VARIABLE
+                            << COMMAND_QMLCLASS
++                           << COMMAND_QMLTYPE
+                            << COMMAND_QMLPROPERTY
+                            << COMMAND_QMLATTACHEDPROPERTY
+                            << COMMAND_QMLSIGNAL
+@@ -725,11 +726,29 @@ Node* CppCodeParser::processTopicCommand(const Doc& doc,
+         fn->setLocation(doc.startLocation());
+         return fn;
+     }
+-    else if (command == COMMAND_QMLCLASS) {
++    else if ((command == COMMAND_QMLCLASS) || (command == COMMAND_QMLTYPE)) {
++        if (command == COMMAND_QMLCLASS)
++            doc.startLocation().warning(tr("\\qmlclass is deprecated; use \\qmltype instead"));
+         ClassNode* classNode = 0;
+         QStringList names = arg.first.split(QLatin1Char(' '));
+-        if (names.size() > 1)
+-            classNode = tree_->findClassNode(names[1].split("::"));
++        if (names.size() > 1) {
++            if (names[1] != "0")
++                doc.startLocation().warning(tr("\\qmltype no longer has a 2nd argument; "
++                                               "use '\\instantiates <class>' in \\qmltype "
++                                               "comments instead"));
++            else
++                doc.startLocation().warning(tr("The 0 arg is no longer used for indicating "
++                                               "that the QML type does not instantiate a "
++                                               "C++ class"));
++            /*
++              If the second argument of the \\qmlclass command
++              is 0 we should ignore the C++ class. The second
++              argument should only be 0 when you are documenting
++              QML in a .qdoc file.
++             */
++            if (names[1] != "0")
++                classNode = tree_->findClassNode(names[1].split("::"));
++        }
+ 
+         /*
+           Search for a node with the same name. If there is one,
+@@ -743,8 +762,11 @@ Node* CppCodeParser::processTopicCommand(const Doc& doc,
+           node and return that one.
+          */
+         NameCollisionNode* ncn = tree_->checkForCollision(names[0]);
+-        QmlClassNode* qcn = new QmlClassNode(tree_->root(), names[0], classNode);
++        QmlClassNode* qcn = new QmlClassNode(tree_->root(), names[0]);
++        qcn->setClassNode(classNode);
+         qcn->setLocation(doc.startLocation());
++#if 0
++        // to be removed if \qmltype and \instantiates work ok
+         if (isParsingCpp() || isParsingQdoc()) {
+             qcn->requireCppClass();
+             if (names.size() < 2) {
+@@ -758,6 +780,7 @@ Node* CppCodeParser::processTopicCommand(const Doc& doc,
+                 doc.startLocation().warning(tr(msg.toLatin1().data()));
+             }
+         }
++#endif
+         if (ncn)
+             ncn->addCollision(qcn);
+         return qcn;
+@@ -984,6 +1007,7 @@ QSet<QString> CppCodeParser::otherMetaCommands()
+                                 << COMMAND_INDEXPAGE
+                                 << COMMAND_STARTPAGE
+                                 << COMMAND_QMLINHERITS
++                                << COMMAND_QMLINSTANTIATES
+                                 << COMMAND_QMLDEFAULT
+                                 << COMMAND_QMLREADONLY
+                                 << COMMAND_QMLABSTRACT;
+@@ -1110,6 +1134,17 @@ void CppCodeParser::processOtherMetaCommand(const Doc& doc,
+             }
+         }
+     }
++    else if (command == COMMAND_QMLINSTANTIATES) {
++        if ((node->type() == Node::Fake) && (node->subType() == Node::QmlClass)) {
++            ClassNode* classNode = tree_->findClassNode(arg.split("::"));
++            if (classNode)
++                node->setClassNode(classNode);
++            else
++                doc.location().warning(tr("C++ class %1 not found: \\instantiates %1").arg(arg));
++        }
++        else
++            doc.location().warning(tr("\\instantiates is only allowed in \\qmltype"));
++    }
+     else if (command == COMMAND_QMLDEFAULT) {
+         if (node->type() == Node::QmlProperty) {
+             QmlPropertyNode* qpn = static_cast<QmlPropertyNode*>(node);
+diff --git a/src/tools/qdoc/cppcodeparser.h b/src/tools/qdoc/cppcodeparser.h
+index 68ed041..b6a7dbc 100644
+--- a/src/tools/qdoc/cppcodeparser.h
++++ b/src/tools/qdoc/cppcodeparser.h
+@@ -217,9 +217,11 @@ protected:
+ #define COMMAND_VARIABLE                Doc::alias("variable")
+ #define COMMAND_QMLABSTRACT             Doc::alias("qmlabstract")
+ #define COMMAND_QMLCLASS                Doc::alias("qmlclass")
++#define COMMAND_QMLTYPE                 Doc::alias("qmltype")
+ #define COMMAND_QMLPROPERTY             Doc::alias("qmlproperty")
+ #define COMMAND_QMLATTACHEDPROPERTY     Doc::alias("qmlattachedproperty")
+ #define COMMAND_QMLINHERITS             Doc::alias("inherits")
++#define COMMAND_QMLINSTANTIATES         Doc::alias("instantiates")
+ #define COMMAND_QMLSIGNAL               Doc::alias("qmlsignal")
+ #define COMMAND_QMLATTACHEDSIGNAL       Doc::alias("qmlattachedsignal")
+ #define COMMAND_QMLMETHOD               Doc::alias("qmlmethod")
+diff --git a/src/tools/qdoc/node.cpp b/src/tools/qdoc/node.cpp
+index 1464603..7931cab 100644
+--- a/src/tools/qdoc/node.cpp
++++ b/src/tools/qdoc/node.cpp
+@@ -2006,17 +2006,13 @@ QMap<QString, QmlClassNode*> QmlClassNode::qmlModuleMemberMap_;
+ /*!
+   Constructs a Qml class node (i.e. a Fake node with the
+   subtype QmlClass. The new node has the given \a parent
+-  and \a name and is associated with the C++ class node
+-  specified by \a cn which may be null if the the Qml
+-  class node is not associated with a C++ class node.
++  and \a name.
+  */
+-QmlClassNode::QmlClassNode(InnerNode *parent,
+-                           const QString& name,
+-                           ClassNode* cn)
++QmlClassNode::QmlClassNode(InnerNode *parent, const QString& name)
+     : FakeNode(parent, name, QmlClass, Node::ApiPage),
+       abstract_(false),
+       cnodeRequired_(false),
+-      cnode_(cn),
++      cnode_(0),
+       base_(0)
+ {
+     int i = 0;
+diff --git a/src/tools/qdoc/node.h b/src/tools/qdoc/node.h
+index b89eeb8..fbb6c6f 100644
+--- a/src/tools/qdoc/node.h
++++ b/src/tools/qdoc/node.h
+@@ -227,7 +227,6 @@ public:
+ 
+     void clearRelated() { relatesTo_ = 0; }
+ 
+-    //virtual QString fileBase() const;
+     QString guid() const;
+     QString extractClassName(const QString &string) const;
+     virtual QString qmlTypeName() const { return name_; }
+@@ -236,6 +235,7 @@ public:
+     virtual QString qmlModuleIdentifier() const { return qmlModuleName_ + qmlModuleVersionMajor_; }
+     virtual bool setQmlModule(const ArgLocPair& );
+     virtual ClassNode* classNode() { return 0; }
++    virtual void setClassNode(ClassNode* ) { }
+     virtual void clearCurrentChild() { }
+     virtual const ImportList* importList() const { return 0; }
+     virtual void setImportList(const ImportList& ) { }
+@@ -521,14 +521,12 @@ private:
+ class QmlClassNode : public FakeNode
+ {
+ public:
+-    QmlClassNode(InnerNode* parent,
+-                 const QString& name,
+-                 ClassNode* cn);
++    QmlClassNode(InnerNode* parent, const QString& name);
+     virtual ~QmlClassNode();
+     virtual bool isQmlNode() const { return true; }
+     virtual bool isQtQuickNode() const { return (qmlModuleName() == QLatin1String("QtQuick")); }
+     virtual ClassNode* classNode() { return cnode_; }
+-    //virtual QString fileBase() const;
++    virtual void setClassNode(ClassNode* cn) { cnode_ = cn; }
+     virtual void setCurrentChild();
+     virtual void clearCurrentChild();
+     virtual const ImportList* importList() const { return &importList_; }
+diff --git a/src/tools/qdoc/qmlcodeparser.cpp b/src/tools/qdoc/qmlcodeparser.cpp
+index f096a39..57885cf 100644
+--- a/src/tools/qdoc/qmlcodeparser.cpp
++++ b/src/tools/qdoc/qmlcodeparser.cpp
+@@ -68,10 +68,12 @@ QT_BEGIN_NAMESPACE
+ 
+ #define COMMAND_QMLABSTRACT             Doc::alias("qmlabstract")
+ #define COMMAND_QMLCLASS                Doc::alias("qmlclass")
++#define COMMAND_QMLTYPE                 Doc::alias("qmltype")
+ #define COMMAND_QMLMODULE               Doc::alias("qmlmodule")
+ #define COMMAND_QMLPROPERTY             Doc::alias("qmlproperty")
+ #define COMMAND_QMLATTACHEDPROPERTY     Doc::alias("qmlattachedproperty")
+ #define COMMAND_QMLINHERITS             Doc::alias("inherits")
++#define COMMAND_QMLINSTANTIATES         Doc::alias("instantiates")
+ #define COMMAND_INQMLMODULE             Doc::alias("inqmlmodule")
+ #define COMMAND_QMLSIGNAL               Doc::alias("qmlsignal")
+ #define COMMAND_QMLATTACHEDSIGNAL       Doc::alias("qmlattachedsignal")
+@@ -196,6 +198,7 @@ QSet<QString> QmlCodeParser::topicCommands()
+ {
+     return QSet<QString>() << COMMAND_VARIABLE
+                            << COMMAND_QMLCLASS
++                           << COMMAND_QMLTYPE
+                            << COMMAND_QMLPROPERTY
+                            << COMMAND_QMLATTACHEDPROPERTY
+                            << COMMAND_QMLSIGNAL
+diff --git a/src/tools/qdoc/qmlvisitor.cpp b/src/tools/qdoc/qmlvisitor.cpp
+index f4ce6e5..76b6308 100644
+--- a/src/tools/qdoc/qmlvisitor.cpp
++++ b/src/tools/qdoc/qmlvisitor.cpp
+@@ -62,10 +62,12 @@ QT_BEGIN_NAMESPACE
+ 
+ #define COMMAND_QMLABSTRACT             Doc::alias(QLatin1String("qmlabstract"))
+ #define COMMAND_QMLCLASS                Doc::alias(QLatin1String("qmlclass"))
++#define COMMAND_QMLTYPE                 Doc::alias(QLatin1String("qmltype"))
+ #define COMMAND_QMLMODULE               Doc::alias(QLatin1String("qmlmodule"))
+ #define COMMAND_QMLPROPERTY             Doc::alias(QLatin1String("qmlproperty"))
+ #define COMMAND_QMLATTACHEDPROPERTY     Doc::alias(QLatin1String("qmlattachedproperty"))
+ #define COMMAND_QMLINHERITS             Doc::alias(QLatin1String("inherits"))
++#define COMMAND_QMLINSTANTIATES         Doc::alias(QLatin1String("instantiates"))
+ #define COMMAND_INQMLMODULE             Doc::alias(QLatin1String("inqmlmodule"))
+ #define COMMAND_QMLSIGNAL               Doc::alias(QLatin1String("qmlsignal"))
+ #define COMMAND_QMLATTACHEDSIGNAL       Doc::alias(QLatin1String("qmlattachedsignal"))
+@@ -269,7 +271,7 @@ void QmlDocVisitor::applyMetacommands(QQmlJS::AST::SourceLocation,
+         }
+         if (!topic.isEmpty()) {
+             args = doc.metaCommandArgs(topic);
+-            if (topic == COMMAND_QMLCLASS) {
++            if ((topic == COMMAND_QMLCLASS) || (topic == COMMAND_QMLTYPE)) {
+                 // do nothing.
+             }
+             else if (topic == COMMAND_QMLPROPERTY) {
+@@ -389,7 +391,7 @@ bool QmlDocVisitor::visit(QQmlJS::AST::UiObjectDefinition *definition)
+     nestingLevel++;
+ 
+     if (current->type() == Node::Namespace) {
+-        QmlClassNode *component = new QmlClassNode(current, name, 0);
++        QmlClassNode *component = new QmlClassNode(current, name);
+         component->setTitle(name);
+         component->setImportList(importList);
+ 
+diff --git a/src/tools/qdoc/tree.cpp b/src/tools/qdoc/tree.cpp
+index 4bfbd00..3123055 100644
+--- a/src/tools/qdoc/tree.cpp
++++ b/src/tools/qdoc/tree.cpp
+@@ -1006,7 +1006,7 @@ void Tree::readIndexSection(const QDomElement& element,
+     }
+     else if ((element.nodeName() == "qmlclass") ||
+              ((element.nodeName() == "page") && (element.attribute("subtype") == "qmlclass"))) {
+-        QmlClassNode* qcn = new QmlClassNode(parent, name, 0);
++        QmlClassNode* qcn = new QmlClassNode(parent, name);
+         qcn->setTitle(element.attribute("title"));
+         if (element.hasAttribute("location"))
+             name = element.attribute("location", "");

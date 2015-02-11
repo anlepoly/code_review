@@ -1,0 +1,275 @@
+diff --git a/src/qml/debugger/qqmldebugserver.cpp b/src/qml/debugger/qqmldebugserver.cpp
+index 468b653..3b18f75 100644
+--- a/src/qml/debugger/qqmldebugserver.cpp
++++ b/src/qml/debugger/qqmldebugserver.cpp
+@@ -45,6 +45,7 @@
+ #include <private/qqmlengine_p.h>
+ #include <private/qqmlglobal_p.h>
+ 
++#include <QtCore/QAtomicInt>
+ #include <QtCore/QDir>
+ #include <QtCore/QPluginLoader>
+ #include <QtCore/QStringList>
+@@ -104,9 +105,12 @@ public:
+     QStringList waitingForMessageNames;
+     QQmlDebugServerThread *thread;
+     QPluginLoader loader;
++    QAtomicInt changeServiceStateCalls;
+ 
+ private:
+-    // private slot
++    // private slots
++    void _q_changeServiceState(const QString &serviceName,
++                               QQmlDebugService::State newState);
+     void _q_sendMessages(const QList<QByteArray> &messages);
+ };
+ 
+@@ -139,6 +143,8 @@ QQmlDebugServerPrivate::QQmlDebugServerPrivate() :
+ {
+     // used in _q_sendMessages
+     qRegisterMetaType<QList<QByteArray> >("QList<QByteArray>");
++    // used in _q_changeServiceState
++    qRegisterMetaType<QQmlDebugService::State>("QQmlDebugService::State");
+ }
+ 
+ void QQmlDebugServerPrivate::advertisePlugins()
+@@ -332,6 +338,7 @@ QQmlDebugServer::QQmlDebugServer()
+     qAddPostRoutine(cleanup);
+ }
+ 
++// called from GUI thread!
+ QQmlDebugServer::~QQmlDebugServer()
+ {
+     Q_D(QQmlDebugServer);
+@@ -339,13 +346,20 @@ QQmlDebugServer::~QQmlDebugServer()
+     QReadLocker(&d->pluginsLock);
+     {
+         foreach (QQmlDebugService *service, d->plugins.values()) {
+-            service->stateAboutToBeChanged(QQmlDebugService::NotConnected);
+-            service->d_func()->server = 0;
+-            service->d_func()->state = QQmlDebugService::NotConnected;
+-            service->stateChanged(QQmlDebugService::NotConnected);
++            d->changeServiceStateCalls.ref();
++            QMetaObject::invokeMethod(this, "_q_changeServiceState", Qt::QueuedConnection,
++                                      Q_ARG(QString, service->name()),
++                                      Q_ARG(QQmlDebugService::State, QQmlDebugService::NotConnected));
+         }
+     }
+ 
++    // Wait for changeServiceState calls to finish
++    // (while running an event loop because some services
++    // might again use slots to execute stuff in the GUI thread)
++    QEventLoop loop;
++    while (!d->changeServiceStateCalls.testAndSetOrdered(0, 0))
++        loop.processEvents();
++
+     if (d->thread) {
+         d->thread->exit();
+         d->thread->wait();
+@@ -394,8 +408,8 @@ void QQmlDebugServer::receiveMessage(const QByteArray &message)
+                 QQmlDebugService::State newState = QQmlDebugService::Unavailable;
+                 if (d->clientPlugins.contains(iter.key()))
+                     newState = QQmlDebugService::Enabled;
+-                iter.value()->d_func()->state = newState;
+-                iter.value()->stateChanged(newState);
++                d->changeServiceStateCalls.ref();
++                d->_q_changeServiceState(iter.value()->name(), newState);
+             }
+ 
+             d->messageArrivedCondition.wakeAll();
+@@ -416,8 +430,8 @@ void QQmlDebugServer::receiveMessage(const QByteArray &message)
+ 
+                 if (oldClientPlugins.contains(pluginName)
+                         != d->clientPlugins.contains(pluginName)) {
+-                    iter.value()->d_func()->state = newState;
+-                    iter.value()->stateChanged(newState);
++                    d->changeServiceStateCalls.ref();
++                    d->_q_changeServiceState(iter.value()->name(), newState);
+                 }
+             }
+ 
+@@ -449,8 +463,34 @@ void QQmlDebugServer::receiveMessage(const QByteArray &message)
+     }
+ }
+ 
++void QQmlDebugServerPrivate::_q_changeServiceState(const QString &serviceName,
++                                                   QQmlDebugService::State newState)
++{
++    // to be executed in debugger thread
++    Q_ASSERT(QThread::currentThread() == q_func()->thread());
++
++    QQmlDebugService *service = 0;
++    {
++        QReadLocker lock(&pluginsLock);
++        service = plugins.value(serviceName);
++    }
++
++    if (service && (service->d_func()->state != newState)) {
++        service->stateAboutToBeChanged(newState);
++        service->d_func()->state = newState;
++        if (newState == QQmlDebugService::NotConnected)
++            service->d_func()->server = 0;
++        service->stateChanged(newState);
++    }
++
++    changeServiceStateCalls.deref();
++}
++
+ void QQmlDebugServerPrivate::_q_sendMessages(const QList<QByteArray> &messages)
+ {
++    // to be executed in debugger thread
++    Q_ASSERT(QThread::currentThread() == q_func()->thread());
++
+     if (connection)
+         connection->send(messages);
+ }
+@@ -494,18 +534,18 @@ bool QQmlDebugServer::removeService(QQmlDebugService *service)
+     Q_D(QQmlDebugServer);
+     {
+         QWriteLocker(&d->pluginsLock);
++        QQmlDebugService::State newState = QQmlDebugService::NotConnected;
++
++        d->changeServiceStateCalls.ref();
++        QMetaObject::invokeMethod(this, "_q_changeServiceState", Qt::QueuedConnection,
++                                  Q_ARG(QString, service->name()),
++                                  Q_ARG(QQmlDebugService::State, newState));
++
+         if (!service || !d->plugins.contains(service->name()))
+             return false;
+         d->plugins.remove(service->name());
+-    }
+-    {
+-        QReadLocker(&d->pluginsLock);
+-        QQmlDebugService::State newState = QQmlDebugService::NotConnected;
+-        service->stateAboutToBeChanged(newState);
++
+         d->advertisePlugins();
+-        service->d_func()->server = 0;
+-        service->d_func()->state = newState;
+-        service->stateChanged(newState);
+     }
+ 
+     return true;
+@@ -522,7 +562,8 @@ void QQmlDebugServer::sendMessages(QQmlDebugService *service,
+         prefixedMessages << prefixed;
+     }
+ 
+-    QMetaObject::invokeMethod(this, "_q_sendMessages", Qt::QueuedConnection, Q_ARG(QList<QByteArray>, prefixedMessages));
++    QMetaObject::invokeMethod(this, "_q_sendMessages", Qt::QueuedConnection,
++                              Q_ARG(QList<QByteArray>, prefixedMessages));
+ }
+ 
+ bool QQmlDebugServer::waitForMessage(QQmlDebugService *service)
+diff --git a/src/qml/debugger/qqmldebugserver_p.h b/src/qml/debugger/qqmldebugserver_p.h
+index 9c6b543..5de7e73 100644
+--- a/src/qml/debugger/qqmldebugserver_p.h
++++ b/src/qml/debugger/qqmldebugserver_p.h
+@@ -44,6 +44,7 @@
+ 
+ #include <QtQml/qtqmlglobal.h>
+ #include <private/qqmldebugserverconnection_p.h>
++#include <private/qqmldebugservice_p.h>
+ 
+ //
+ //  W A R N I N G
+@@ -61,8 +62,6 @@ QT_BEGIN_HEADER
+ QT_BEGIN_NAMESPACE
+ 
+ 
+-class QQmlDebugService;
+-
+ class QQmlDebugServerPrivate;
+ class Q_QML_EXPORT QQmlDebugServer : public QObject
+ {
+@@ -95,6 +94,8 @@ private:
+     friend class QQmlDebugServicePrivate;
+     friend class QQmlDebugServerThread;
+     QQmlDebugServer();
++    Q_PRIVATE_SLOT(d_func(), void _q_changeServiceState(const QString &serviceName,
++                                                        QQmlDebugService::State state))
+     Q_PRIVATE_SLOT(d_func(), void _q_sendMessages(QList<QByteArray>))
+ };
+ 
+diff --git a/src/qml/debugger/qv8profilerservice.cpp b/src/qml/debugger/qv8profilerservice.cpp
+index c75c258..1cd7606 100644
+--- a/src/qml/debugger/qv8profilerservice.cpp
++++ b/src/qml/debugger/qv8profilerservice.cpp
+@@ -134,9 +134,11 @@ void QV8ProfilerService::stateAboutToBeChanged(QQmlDebugService::State newState)
+         return;
+ 
+     if (state() == Enabled) {
+-        foreach (const QString &title, d->m_ongoing)
+-            QMetaObject::invokeMethod(this, "stopProfiling", Qt::QueuedConnection, Q_ARG(QString, title));
+-        sendProfilingData();
++        foreach (const QString &title, d->m_ongoing) {
++            QMetaObject::invokeMethod(this, "stopProfiling", Qt::BlockingQueuedConnection,
++                                      Q_ARG(QString, title));
++        }
++        QMetaObject::invokeMethod(this, "sendProfilingData", Qt::BlockingQueuedConnection);
+     }
+ }
+ 
+diff --git a/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp b/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+index a258028..d482e81 100644
+--- a/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
++++ b/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+@@ -314,7 +314,6 @@ void tst_QV8ProfilerService::profileOnExit()
+     m_client->startProfiling("");
+     QVERIFY2(QQmlDebugTest::waitForSignal(m_client, SIGNAL(complete())),
+              "No trace received in time.");
+-    //QVERIFY(!m_client->traceMessages.isEmpty());
+ }
+ 
+ void tst_QV8ProfilerService::console()
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp b/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp
+index 1c8afd8..33f5fc6 100644
+--- a/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp
++++ b/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp
+@@ -40,6 +40,7 @@
+ ****************************************************************************/
+ 
+ #include "qqmldebugtestservice.h"
++#include <QThread>
+ 
+ QQmlDebugTestService::QQmlDebugTestService(const QString &s, float version, QObject *parent)
+     : QQmlDebugService(s, version, parent)
+@@ -49,10 +50,22 @@ QQmlDebugTestService::QQmlDebugTestService(const QString &s, float version, QObj
+ 
+ void QQmlDebugTestService::messageReceived(const QByteArray &ba)
+ {
+-    sendMessage(ba);
++    Q_ASSERT(QThread::currentThread() != thread());
++    QMetaObject::invokeMethod(this, "_sendMessage", Qt::QueuedConnection, Q_ARG(QByteArray, ba));
++}
++
++void QQmlDebugTestService::stateAboutToBeChanged(QQmlDebugService::State state)
++{
++    Q_ASSERT(QThread::currentThread() != thread());
+ }
+ 
+ void QQmlDebugTestService::stateChanged(State)
+ {
++    Q_ASSERT(QThread::currentThread() != thread());
+     emit stateHasChanged();
+ }
++
++void QQmlDebugTestService::_sendMessage(const QByteArray &msg)
++{
++    QQmlDebugService::sendMessage(msg);
++}
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugtestservice.h b/tests/auto/qml/debugger/shared/qqmldebugtestservice.h
+index 14fda55..4b9fb47 100644
+--- a/tests/auto/qml/debugger/shared/qqmldebugtestservice.h
++++ b/tests/auto/qml/debugger/shared/qqmldebugtestservice.h
+@@ -54,8 +54,12 @@ public:
+ signals:
+     void stateHasChanged();
+ 
++private slots:
++    void _sendMessage(const QByteArray &msg);
++
+ protected:
+     virtual void messageReceived(const QByteArray &ba);
++    virtual void stateAboutToBeChanged(State state);
+     virtual void stateChanged(State state);
+ };

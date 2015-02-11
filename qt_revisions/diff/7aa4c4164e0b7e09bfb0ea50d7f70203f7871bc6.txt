@@ -1,0 +1,167 @@
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index e7e001c..3dd1c3c 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -181,11 +181,25 @@ public:
+     QQmlNotifier *objectNameNotifier() const;
+     QHash<int, QObject *> *attachedProperties() const;
+ 
++    static inline bool wasDeleted(QObject *);
+ private:
+     // For objectNameNotifier and attachedProperties
+     mutable QQmlDataExtended *extendedData;
+ };
+ 
++bool QQmlData::wasDeleted(QObject *object)
++{
++    if (!object)
++        return true;
++
++    QObjectPrivate *priv = QObjectPrivate::get(const_cast<QObject *>(object));
++    if (priv->wasDeleted)
++        return true;
++
++    return priv->declarativeData &&
++           static_cast<QQmlData *>(priv->declarativeData)->isQueuedForDeletion;
++}
++
+ QQmlNotifierEndpoint *QQmlData::notify(int index)
+ {
+     Q_ASSERT(index <= 0xFFFF);
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 3faea2c..d311218 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -269,7 +269,7 @@ static v8::Handle<v8::Value> GenericValueGetter(v8::Local<v8::String>, const v8:
+     QV8QObjectResource *resource = v8_resource_check<QV8QObjectResource>(This);
+ 
+     QObject *object = resource->object;
+-    if (!object) return v8::Undefined();
++    if (QQmlData::wasDeleted(object)) return v8::Undefined();
+ 
+     QQmlPropertyData *property =
+         (QQmlPropertyData *)v8::External::Unwrap(info.Data());
+@@ -476,6 +476,7 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+                objectHandle?*objectHandle:engine->newQObject(object),
+                v8::Integer::New(index)
+            };
++           Q_ASSERT(argv[0]->IsObject());
+            return engine->qobjectWrapper()->m_methodConstructor->Call(engine->global(), 2, argv);
+        }
+        static v8::Handle<v8::Value> createWithGlobal(QV8Engine *engine, QObject *object, 
+@@ -486,10 +487,14 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+                v8::Integer::New(index),
+                v8::Context::GetCallingQmlGlobal()
+            };
++           Q_ASSERT(argv[0]->IsObject());
+            return engine->qobjectWrapper()->m_methodConstructor->Call(engine->global(), 3, argv);
+        }
+     };
+ 
++    if (QQmlData::wasDeleted(object))
++        return v8::Handle<v8::Value>();
++
+     {
+         // Comparing the hash first actually makes a measurable difference here, at least on x86
+         quint32 hash = property.hash();
+@@ -665,6 +670,9 @@ bool QV8QObjectWrapper::SetProperty(QV8Engine *engine, QObject *object, const QH
+         engine->qobjectWrapper()->m_destroyString == property)
+         return true;
+ 
++    if (QQmlData::wasDeleted(object))
++        return false;
++
+     QQmlPropertyData local;
+     QQmlPropertyData *result = 0;
+     result = QQmlPropertyCache::property(engine->engine(), object, property, local);
+@@ -695,7 +703,7 @@ v8::Handle<v8::Value> QV8QObjectWrapper::Getter(v8::Local<v8::String> property,
+ {
+     QV8QObjectResource *resource = v8_resource_check<QV8QObjectResource>(info.This());
+ 
+-    if (resource->object.isNull()) 
++    if (QQmlData::wasDeleted(resource->object))
+         return v8::Handle<v8::Value>();
+ 
+     QObject *object = resource->object;
+@@ -739,7 +747,7 @@ v8::Handle<v8::Value> QV8QObjectWrapper::Setter(v8::Local<v8::String> property,
+ {
+     QV8QObjectResource *resource = v8_resource_check<QV8QObjectResource>(info.This());
+ 
+-    if (resource->object.isNull()) 
++    if (QQmlData::wasDeleted(resource->object))
+         return value;
+ 
+     QObject *object = resource->object;
+@@ -833,7 +841,7 @@ static void FastValueSetter(v8::Local<v8::String>, v8::Local<v8::Value> value,
+ {
+     QV8QObjectResource *resource = v8_resource_check<QV8QObjectResource>(info.This());
+ 
+-    if (resource->object.isNull()) 
++    if (QQmlData::wasDeleted(resource->object))
+         return; 
+ 
+     QObject *object = resource->object;
+@@ -860,7 +868,7 @@ static void FastValueSetterReadOnly(v8::Local<v8::String> property, v8::Local<v8
+ {
+     QV8QObjectResource *resource = v8_resource_check<QV8QObjectResource>(info.This());
+ 
+-    if (resource->object.isNull()) 
++    if (QQmlData::wasDeleted(resource->object))
+         return; 
+ 
+     QV8Engine *v8engine = resource->engine;
+diff --git a/tests/auto/qml/qqmlecmascript/data/deleteLaterObjectMethodCall.qml b/tests/auto/qml/qqmlecmascript/data/deleteLaterObjectMethodCall.qml
+new file mode 100644
+index 0000000..d1418e5
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/deleteLaterObjectMethodCall.qml
+@@ -0,0 +1,22 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++QtObject {
++    property var fn
++
++    property var c: Component {
++        MyQmlObject {
++            function go() {
++                try { methodNoArgs(); } catch(e) { }
++            }
++        }
++    }
++
++    Component.onCompleted: {
++        var f = c.createObject().go;
++
++        gc();
++
++        f();
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 5842ab0..ee9c7ee 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -246,7 +246,7 @@ private slots:
+     void invokableWithQObjectDerived();
+     void realTypePrecision();
+     void registeredFlagMethod();
+-
++    void deleteLaterObjectMethodCall();
+     void automaticSemicolon();
+     void unaryExpression();
+     void switchStatement();
+@@ -6001,6 +6001,13 @@ void tst_qqmlecmascript::dynamicString()
+              QString::fromLatin1("string:Hello World false:0 true:1 uint32:100 int32:-100 double:3.14159 date:2011-02-11 05::30:50!"));
+ }
+ 
++void tst_qqmlecmascript::deleteLaterObjectMethodCall()
++{
++    QQmlComponent component(&engine, testFileUrl("deleteLaterObjectMethodCall.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++}
++
+ void tst_qqmlecmascript::automaticSemicolon()
+ {
+     QQmlComponent component(&engine, testFileUrl("automaticSemicolon.qml"));

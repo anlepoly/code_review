@@ -1,0 +1,1490 @@
+diff --git a/src/corelib/kernel/qobjectdefs.h b/src/corelib/kernel/qobjectdefs.h
+index 3156197..0b1fa88 100644
+--- a/src/corelib/kernel/qobjectdefs.h
++++ b/src/corelib/kernel/qobjectdefs.h
+@@ -76,6 +76,7 @@ class QString;
+ # define emit
+ #endif
+ #define Q_CLASSINFO(name, value)
++#define Q_PLUGIN_METADATA(x)
+ #define Q_INTERFACES(x)
+ #define Q_PROPERTY(text)
+ #define Q_PRIVATE_PROPERTY(d, text)
+diff --git a/src/corelib/plugin/qelfparser_p.cpp b/src/corelib/plugin/qelfparser_p.cpp
+index 0e8d434..70abbaf 100644
+--- a/src/corelib/plugin/qelfparser_p.cpp
++++ b/src/corelib/plugin/qelfparser_p.cpp
+@@ -203,7 +203,7 @@ int QElfParser::parse(const char *dataStart, ulong fdlen, const QString &library
+         qDebug() << "++++" << i << shnam;
+ #endif
+ 
+-        if (qstrcmp(shnam, ".qtplugin") == 0 || qstrcmp(shnam, ".rodata") == 0) {
++        if (qstrcmp(shnam, ".qtmetadata") == 0 || qstrcmp(shnam, ".qtplugin") == 0 || qstrcmp(shnam, ".rodata") == 0) {
+             if (!(sh.type & 0x1)) {
+                 if (shnam[1] == 'r') {
+                     if (lib)
+@@ -227,7 +227,7 @@ int QElfParser::parse(const char *dataStart, ulong fdlen, const QString &library
+             *pos = sh.offset;
+             *sectionlen = sh.size - 1;
+             if (shnam[1] == 'q')
+-                return Ok;
++                return shnam[3] == 'm' ? QtMetaDataSection : QtPluginSection;
+         }
+         s += e_shentsize;
+     }
+diff --git a/src/corelib/plugin/qelfparser_p.h b/src/corelib/plugin/qelfparser_p.h
+index 96e1eac..afd8112 100644
+--- a/src/corelib/plugin/qelfparser_p.h
++++ b/src/corelib/plugin/qelfparser_p.h
+@@ -72,7 +72,7 @@ typedef quintptr qelfaddr_t;
+ class QElfParser
+ {
+ public:
+-    enum {Ok = 0, NotElf = 1, NoQtSection = 2, Corrupt = 3};
++    enum { QtMetaDataSection, QtPluginSection, NoQtSection, NotElf, Corrupt };
+     enum {ElfLittleEndian = 0, ElfBigEndian = 1};
+ 
+     struct ElfSectionHeader
+diff --git a/src/corelib/plugin/qfactoryloader.cpp b/src/corelib/plugin/qfactoryloader.cpp
+index fe5aea0..ce988fa 100644
+--- a/src/corelib/plugin/qfactoryloader.cpp
++++ b/src/corelib/plugin/qfactoryloader.cpp
+@@ -51,6 +51,10 @@
+ #include "qpluginloader.h"
+ #include "private/qobject_p.h"
+ #include "private/qcoreapplication_p.h"
++#include "qjsondocument.h"
++#include "qjsonvalue.h"
++#include "qjsonobject.h"
++#include "qjsonarray.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -137,29 +141,44 @@ void QFactoryLoader::update()
+                 continue;
+             }
+             QStringList keys;
+-            if (!library->loadPlugin()) {
+-                if (qt_debug_component()) {
+-                    qDebug() << library->errorString;
+-                    qDebug() << "           could not load";
++            if (library->compatPlugin) {
++                qWarning() << "Compat plugin, need to load for accessing meta data";
++                if (!library->loadPlugin()) {
++                    if (qt_debug_component()) {
++                        qDebug() << library->errorString;
++                        qDebug() << "           could not load";
++                    }
++                    library->release();
++                    continue;
+                 }
+-                library->release();
+-                continue;
+-            }
+ 
+-            if (!library->inst)
+-                library->inst = library->instance();
+-            QObject *instance = library->inst.data();
+-            if (!instance) {
+-                library->release();
+-                // ignore plugins that have a valid signature but cannot be loaded.
+-                continue;
++                if (!library->inst)
++                    library->inst = library->instance();
++                QObject *instance = library->inst.data();
++                if (!instance) {
++                    library->release();
++                    // ignore plugins that have a valid signature but cannot be loaded.
++                    continue;
++                }
++                QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instance);
++                if (instance && factory && instance->qt_metacast(d->iid))
++                    keys = factory->keys();
++            } else {
++                QString iid = library->metaData.value(QLatin1String("IID")).toString();
++                if (iid == QLatin1String(d->iid.constData(), d->iid.size())) {
++                    QJsonObject object = library->metaData.value(QLatin1String("MetaData")).toObject();
++                    QJsonArray k = object.value(QLatin1String("Keys")).toArray();
++                    for (int i = 0; i < k.size(); ++i) {
++                        QString s = k.at(i).toString();
++                        keys += s;
++                    }
++                }
++                if (qt_debug_component())
++                    qDebug() << "Got keys from plugin meta data" << keys;
+             }
+-            QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instance);
+-            if (instance && factory && instance->qt_metacast(d->iid))
+-                keys = factory->keys();
+-            if (keys.isEmpty())
+-                library->unload();
++
+             if (keys.isEmpty()) {
++                library->unload();
+                 library->release();
+                 continue;
+             }
+@@ -173,7 +192,12 @@ void QFactoryLoader::update()
+                 if (!d->cs)
+                     key = key.toLower();
+                 QLibraryPrivate *previous = d->keyMap.value(key);
+-                if (!previous || (previous->qt_version > QT_VERSION && library->qt_version <= QT_VERSION)) {
++                int prev_qt_version = 0;
++                if (previous) {
++                    prev_qt_version = (int)previous->metaData.value(QLatin1String("version")).toDouble();
++                }
++                int qt_version = (int)library->metaData.value(QLatin1String("version")).toDouble();
++                if (!previous || (prev_qt_version > QT_VERSION && qt_version <= QT_VERSION)) {
+                     d->keyMap[key] = library;
+                     d->keyList += keys.at(k);
+                 }
+@@ -200,23 +224,76 @@ QStringList QFactoryLoader::keys() const
+     Q_D(const QFactoryLoader);
+     QMutexLocker locker(&d->mutex);
+     QStringList keys = d->keyList;
+-    QObjectList instances = QPluginLoader::staticInstances();
+-    for (int i = 0; i < instances.count(); ++i)
+-        if (QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instances.at(i)))
+-            if (instances.at(i)->qt_metacast(d->iid))
+-                keys += factory->keys();
++    QVector<QStaticPlugin> staticPlugins = QLibraryPrivate::staticPlugins();
++    for (int i = 0; i < staticPlugins.count(); ++i) {
++        if (staticPlugins.at(i).metaData) {
++            const char *rawMetaData = staticPlugins.at(i).metaData();
++            QJsonObject object = QLibraryPrivate::fromRawMetaData(rawMetaData).object();
++            if (object.value(QLatin1String("IID")) != QLatin1String(d->iid.constData(), d->iid.size()))
++                continue;
++
++            QJsonObject meta = object.value(QLatin1String("MetaData")).toObject();
++            QJsonArray a = meta.value(QLatin1String("Keys")).toArray();
++            for (int i = 0; i < a.size(); ++i) {
++                QString s = a.at(i).toString();
++                if (!s.isEmpty())
++                    keys += s;
++            }
++        } else {
++            // compat plugin
++            QObject *instance = staticPlugins.at(i).instance();
++            QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instance);
++            if (instance && factory && instance->qt_metacast(d->iid))
++                keys = factory->keys();
++        }
++    }
+     return keys;
+ }
+ 
++QList<QJsonObject> QFactoryLoader::metaData() const
++{
++    Q_D(const QFactoryLoader);
++    QMutexLocker locker(&d->mutex);
++    QList<QJsonObject> metaData;
++    for (int i = 0; i < d->libraryList.size(); ++i)
++        metaData.append(d->libraryList.at(i)->metaData);
++
++    QVector<QStaticPlugin> staticPlugins = QLibraryPrivate::staticPlugins();
++    for (int i = 0; i < staticPlugins.count(); ++i) {
++        if (staticPlugins.at(i).metaData) {
++            const char *rawMetaData = staticPlugins.at(i).metaData();
++            QJsonObject object = QLibraryPrivate::fromRawMetaData(rawMetaData).object();
++            if (object.value(QLatin1String("IID")) != QLatin1String(d->iid.constData(), d->iid.size()))
++                continue;
++
++            QJsonObject meta = object.value(QLatin1String("MetaData")).toObject();
++            metaData.append(meta);
++        } else {
++            // compat plugins
++            QObject *instance = staticPlugins.at(i).instance();
++            QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instance);
++            if (instance && factory && instance->qt_metacast(d->iid)) {
++                QJsonObject meta;
++                QJsonArray a = QJsonArray::fromStringList(factory->keys());
++                meta.insert(QLatin1String("Keys"), a);
++                metaData.append(meta);
++            }
++        }
++    }
++    return metaData;
++}
++
+ QObject *QFactoryLoader::instance(const QString &key) const
+ {
+     Q_D(const QFactoryLoader);
+     QMutexLocker locker(&d->mutex);
+-    QObjectList instances = QPluginLoader::staticInstances();
+-    for (int i = 0; i < instances.count(); ++i)
+-        if (QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instances.at(i)))
+-            if (instances.at(i)->qt_metacast(d->iid) && factory->keys().contains(key, Qt::CaseInsensitive))
+-                return instances.at(i);
++    QVector<QStaticPlugin> staticPlugins = QLibraryPrivate::staticPlugins();
++    for (int i = 0; i < staticPlugins.count(); ++i) {
++        QObject *instance = staticPlugins.at(i).instance();
++        if (QFactoryInterface *factory = qobject_cast<QFactoryInterface*>(instance))
++            if (instance->qt_metacast(d->iid) && factory->keys().contains(key, Qt::CaseInsensitive))
++                return instance;
++    }
+ 
+     QString lowered = d->cs ? key : key.toLower();
+     if (QLibraryPrivate* library = d->keyMap.value(lowered)) {
+@@ -234,6 +311,26 @@ QObject *QFactoryLoader::instance(const QString &key) const
+     return 0;
+ }
+ 
++QObject *QFactoryLoader::instance(int index) const
++{
++    Q_D(const QFactoryLoader);
++    if (index < 0 || index >= d->libraryList.size())
++        return 0;
++
++    QLibraryPrivate *library = d->libraryList.at(index);
++    if (library->instance || library->loadPlugin()) {
++        if (!library->inst)
++            library->inst = library->instance();
++        QObject *obj = library->inst.data();
++        if (obj) {
++            if (!obj->parent())
++                obj->moveToThread(QCoreApplicationPrivate::mainThread());
++            return obj;
++        }
++    }
++    return 0;
++}
++
+ #if defined(Q_OS_UNIX) && !defined (Q_OS_MAC)
+ QLibraryPrivate *QFactoryLoader::library(const QString &key) const
+ {
+diff --git a/src/corelib/plugin/qfactoryloader_p.h b/src/corelib/plugin/qfactoryloader_p.h
+index 2241a22..ee7a68d 100644
+--- a/src/corelib/plugin/qfactoryloader_p.h
++++ b/src/corelib/plugin/qfactoryloader_p.h
+@@ -55,8 +55,8 @@
+ 
+ #include "QtCore/qobject.h"
+ #include "QtCore/qstringlist.h"
++#include "QtCore/qjsonobject.h"
+ #include "private/qlibrary_p.h"
+-
+ #ifndef QT_NO_LIBRARY
+ 
+ QT_BEGIN_NAMESPACE
+@@ -74,8 +74,11 @@ public:
+                    Qt::CaseSensitivity = Qt::CaseSensitive);
+     ~QFactoryLoader();
+ 
+-    QStringList keys() const;
+-    QObject *instance(const QString &key) const;
++    QT_DEPRECATED QStringList keys() const;
++    QList<QJsonObject> metaData() const;
++
++    QT_DEPRECATED QObject *instance(const QString &key) const;
++    QObject *instance(int index) const;
+ 
+ #if defined(Q_OS_UNIX) && !defined (Q_OS_MAC)
+     QLibraryPrivate *library(const QString &key) const;
+diff --git a/src/corelib/plugin/qlibrary.cpp b/src/corelib/plugin/qlibrary.cpp
+index dc08b32..b171577 100644
+--- a/src/corelib/plugin/qlibrary.cpp
++++ b/src/corelib/plugin/qlibrary.cpp
+@@ -60,6 +60,9 @@
+ #include <qdebug.h>
+ #include <qvector.h>
+ #include <qdir.h>
++#include <qendian.h>
++#include <qjsondocument.h>
++#include <qjsonvalue.h>
+ #include "qelfparser_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+@@ -330,7 +333,7 @@ static long qt_find_pattern(const char *s, ulong s_len,
+                 information could not be read.
+   Returns  true if version information is present and successfully read.
+ */
+-static bool qt_unix_query(const QString &library, uint *version, bool *debug, QLibraryPrivate *lib = 0)
++static bool qt_unix_query(const QString &library, QLibraryPrivate *lib)
+ {
+     QFile file(library);
+     if (!file.open(QIODevice::ReadOnly)) {
+@@ -357,35 +360,71 @@ static bool qt_unix_query(const QString &library, uint *version, bool *debug, QL
+     /*
+        ELF binaries on GNU, have .qplugin sections.
+     */
++    bool hasMetaData = false;
+     long pos = 0;
+-    const char pattern[] = "pattern=QT_PLUGIN_VERIFICATION_DATA";
++    const char oldPattern[] = "pattern=QT_PLUGIN_VERIFICATION_DATA";
++    const ulong oldPlen = qstrlen(oldPattern);
++    const char pattern[] = "QTMETADATA  ";
+     const ulong plen = qstrlen(pattern);
+ #if defined (Q_OF_ELF) && defined(Q_CC_GNU)
+     int r = QElfParser().parse(filedata, fdlen, library, lib, &pos, &fdlen);
+-    if (r == QElfParser::NoQtSection) {
++    if (r == QElfParser::Corrupt || r == QElfParser::NotElf) {
++            if (lib && qt_debug_component()) {
++                qWarning("QElfParser: %s",qPrintable(lib->errorString));
++            }
++            return false;
++    } else if (r == QElfParser::NoQtSection || r == QElfParser::QtPluginSection) {
+         if (pos > 0) {
+             // find inside .rodata
+-            long rel = qt_find_pattern(filedata + pos, fdlen, pattern, plen);
++            long rel = qt_find_pattern(filedata + pos, fdlen, oldPattern, oldPlen);
+             if (rel < 0) {
+                 pos = -1;
+             } else {
+                 pos += rel;
+             }
+         } else {
+-            pos = qt_find_pattern(filedata, fdlen, pattern, plen);
+-        }
+-    } else if (r != QElfParser::Ok) {
+-        if (lib && qt_debug_component()) {
+-            qWarning("QElfParser: %s",qPrintable(lib->errorString));
++            pos = qt_find_pattern(filedata, fdlen, oldPattern, oldPlen);
+         }
+-        return false;
++    } else if (r == QElfParser::QtMetaDataSection) {
++        long rel = qt_find_pattern(filedata + pos, fdlen, pattern, plen);
++        if (rel < 0)
++            pos = -1;
++        else
++            pos += rel;
++        hasMetaData = true;
+     }
+ #else
+     pos = qt_find_pattern(filedata, fdlen, pattern, plen);
++    if (pos > 0)
++        hasMetaData = true;
++    else
++        pos = qt_find_pattern(filedata, fdlen, oldPattern, oldPlen);
+ #endif // defined(Q_OF_ELF) && defined(Q_CC_GNU)
++
+     bool ret = false;
+-    if (pos >= 0)
+-        ret = qt_parse_pattern(filedata + pos, version, debug);
++
++    if (pos >= 0) {
++        if (hasMetaData) {
++            const char *data = filedata + pos;
++            QJsonDocument doc = QLibraryPrivate::fromRawMetaData(data);
++            lib->metaData = doc.object();
++            lib->compatPlugin = false;
++            if (qt_debug_component())
++                qWarning("Found metadata in lib %s, metadata=\n%s\n",
++                         library.toLocal8Bit().constData(), doc.toJson().constData());
++            ret = !doc.isNull();
++        } else {
++            qWarning("Old plugin format found in lib %s", library.toLocal8Bit().constData());
++            uint version;
++            bool isDebug;
++            ret = qt_parse_pattern(filedata + pos, &version, &isDebug);
++            if (ret) {
++                lib->metaData.insert(QLatin1String("version"), (int)version);
++                lib->metaData.insert(QLatin1String("debug"), isDebug);
++                lib->compatPlugin = true;
++            }
++        }
++    }
+ 
+     if (!ret && lib)
+         lib->errorString = QLibrary::tr("Plugin verification data mismatch in '%1'").arg(library);
+@@ -446,8 +485,9 @@ static LibraryMap *libraryMap()
+ }
+ 
+ QLibraryPrivate::QLibraryPrivate(const QString &canonicalFileName, const QString &version)
+-    :pHnd(0), fileName(canonicalFileName), fullVersion(version), instance(0), qt_version(0),
+-     libraryRefCount(1), libraryUnloadCount(0), pluginState(MightBeAPlugin)
++    : pHnd(0), fileName(canonicalFileName), fullVersion(version), instance(0),
++      compatPlugin(false), loadHints(0),
++      libraryRefCount(1), libraryUnloadCount(0), pluginState(MightBeAPlugin)
+ { libraryMap()->insert(canonicalFileName, this); }
+ 
+ QLibraryPrivate *QLibraryPrivate::findOrCreate(const QString &fileName, const QString &version)
+@@ -488,6 +528,8 @@ bool QLibraryPrivate::load()
+         return false;
+ 
+     bool ret = load_sys();
++    if (qt_debug_component())
++        qDebug() << "loaded library" << fileName;
+     if (ret) {
+         //when loading a library we add a reference to it so that the QLibraryPrivate won't get deleted
+         //this allows to unload the library at a later time
+@@ -643,13 +685,33 @@ const char* qt_try_versioninfo(void *pfn, bool *exceptionThrown)
+ }
+ #endif
+ 
+-#ifdef Q_CC_BOR
+-typedef const char * __stdcall (*QtPluginQueryVerificationDataFunction)();
+-#else
+ typedef const char * (*QtPluginQueryVerificationDataFunction)();
++
++bool qt_get_verificationdata(QtPluginQueryVerificationDataFunction pfn, QLibraryPrivate *priv, bool *exceptionThrown)
++{
++    *exceptionThrown = false;
++    const char *szData = 0;
++    if (!pfn)
++        return false;
++#ifdef QT_USE_MS_STD_EXCEPTION
++    szData = qt_try_versioninfo((void *)pfn, exceptionThrown);
++    if (*exceptionThrown)
++        return false;
++#else
++    szData = pfn();
+ #endif
++    uint qt_version;
++    bool debug;
++    if (qt_parse_pattern(szData, &qt_version, &debug)) {
++        priv->metaData.insert(QLatin1String("version"), (int)qt_version);
++        priv->metaData.insert(QLatin1String("debug"), debug);
++        priv->compatPlugin = true;
++        return true;
++    }
++    return false;
++}
+ 
+-bool qt_get_verificationdata(QtPluginQueryVerificationDataFunction pfn, uint *qt_version, bool *debug, bool *exceptionThrown)
++bool qt_get_metadata(QtPluginQueryVerificationDataFunction pfn, QLibraryPrivate *priv, bool *exceptionThrown)
+ {
+     *exceptionThrown = false;
+     const char *szData = 0;
+@@ -662,9 +724,17 @@ bool qt_get_verificationdata(QtPluginQueryVerificationDataFunction pfn, uint *qt
+ #else
+     szData = pfn();
+ #endif
+-    return qt_parse_pattern(szData, qt_version, debug);
++    if (!szData)
++        return false;
++    QJsonDocument doc = QLibraryPrivate::fromRawMetaData(szData);
++    if (doc.isNull())
++        return false;
++    priv->metaData = doc.object();
++    priv->compatPlugin = false;
++    return true;
+ }
+ 
++
+ bool QLibraryPrivate::isPlugin()
+ {
+     errorString.clear();
+@@ -672,7 +742,6 @@ bool QLibraryPrivate::isPlugin()
+         return pluginState == IsAPlugin;
+ 
+ #ifndef QT_NO_PLUGIN_CHECK
+-    bool debug = !QLIBRARY_AS_DEBUG;
+     bool success = false;
+ 
+ #if defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
+@@ -692,7 +761,7 @@ bool QLibraryPrivate::isPlugin()
+ #if defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
+     if (!pHnd) {
+         // use unix shortcut to avoid loading the library
+-        success = qt_unix_query(fileName, &qt_version, &debug, this);
++        success = qt_unix_query(fileName, this);
+     } else
+ #endif
+     {
+@@ -713,24 +782,50 @@ bool QLibraryPrivate::isPlugin()
+                 temporary_load =  load_sys();
+ #endif
+             }
++            QtPluginQueryVerificationDataFunction getMetaData = NULL;
++
++            bool exceptionThrown = false;
++            bool ret = false;
+ #ifdef Q_OS_WIN
+-            QtPluginQueryVerificationDataFunction qtPluginQueryVerificationDataFunction = hTempModule ? (QtPluginQueryVerificationDataFunction)
++            if (hTempModule) {
++                getMetaData = (QtPluginQueryVerificationDataFunction)
+ #ifdef Q_OS_WINCE
+-                    ::GetProcAddress(hTempModule, L"qt_plugin_query_verification_data")
++                    ::GetProcAddress(hTempModule, L"qt_plugin_query_metadata")
+ #else
+-                    ::GetProcAddress(hTempModule, "qt_plugin_query_verification_data")
++                    ::GetProcAddress(hTempModule, "qt_plugin_query_metadata")
++#endif
++                        ;
++            } else
+ #endif
+-                    : (QtPluginQueryVerificationDataFunction) resolve("qt_plugin_query_verification_data");
++            {
++                getMetaData = (QtPluginQueryVerificationDataFunction) resolve("qt_plugin_query_metadata");
++            }
++
++            if (getMetaData) {
++                ret = qt_get_metadata(getMetaData, this, &exceptionThrown);
++            } else {
++                // try the old plugin style
++                QtPluginQueryVerificationDataFunction qtPluginQueryVerificationDataFunction = NULL;
++#ifdef Q_OS_WIN
++                if (hTempModule) {
++                    qtPluginQueryVerificationDataFunction = (QtPluginQueryVerificationDataFunction)
++#ifdef Q_OS_WINCE
++                        ::GetProcAddress(hTempModule, L"qt_plugin_query_verification_data")
+ #else
+-            QtPluginQueryVerificationDataFunction qtPluginQueryVerificationDataFunction = NULL;
+-            qtPluginQueryVerificationDataFunction = (QtPluginQueryVerificationDataFunction) resolve("qt_plugin_query_verification_data");
++                        ::GetProcAddress(hTempModule, "qt_plugin_query_verification_data")
+ #endif
+-            bool exceptionThrown = false;
+-            bool ret = qt_get_verificationdata(qtPluginQueryVerificationDataFunction,
+-                                               &qt_version, &debug, &exceptionThrown);
++                            ;
++                } else
++#endif
++                {
++                    qtPluginQueryVerificationDataFunction = (QtPluginQueryVerificationDataFunction) resolve("qt_plugin_query_verification_data");
++                }
++
++                ret = qt_get_verificationdata(qtPluginQueryVerificationDataFunction, this, &exceptionThrown);
++            }
++
+             if (!exceptionThrown) {
+                 if (!ret) {
+-                    qt_version = 0;
+                     if (temporary_load)
+                         unload_sys();
+                 } else {
+@@ -772,6 +867,8 @@ bool QLibraryPrivate::isPlugin()
+ 
+     pluginState = IsNotAPlugin; // be pessimistic
+ 
++    uint qt_version = (uint)metaData.value(QLatin1String("version")).toDouble();
++    bool debug = metaData.value(QLatin1String("debug")).toBool();
+     if ((qt_version & 0x00ff00) > (QT_VERSION & 0x00ff00) || (qt_version & 0xff0000) != (QT_VERSION & 0xff0000)) {
+         if (qt_debug_component()) {
+             qWarning("In %s:\n"
+diff --git a/src/corelib/plugin/qlibrary_p.h b/src/corelib/plugin/qlibrary_p.h
+index a5f3660..604a5fb 100644
+--- a/src/corelib/plugin/qlibrary_p.h
++++ b/src/corelib/plugin/qlibrary_p.h
+@@ -58,6 +58,9 @@
+ #include "QtCore/qstringlist.h"
+ #include "QtCore/qplugin.h"
+ #include "QtCore/qsharedpointer.h"
++#include "QtCore/qjsonobject.h"
++#include "QtCore/qjsondocument.h"
++#include "QtCore/qendian.h"
+ #ifdef Q_OS_WIN
+ #  include "QtCore/qt_windows.h"
+ #endif
+@@ -90,16 +93,26 @@ public:
+ 
+     static QLibraryPrivate *findOrCreate(const QString &fileName, const QString &version = QString());
+ 
++    static QVector<QStaticPlugin> staticPlugins();
++
++
+     QWeakPointer<QObject> inst;
+     QtPluginInstanceFunction instance;
+-    uint qt_version;
+-    QString lastModified;
++    QJsonObject metaData;
++    bool compatPlugin;
+ 
+     QString errorString;
+     QLibrary::LoadHints loadHints;
+ 
+     bool isPlugin();
+ 
++    static inline QJsonDocument fromRawMetaData(const char *raw) {
++        raw += strlen("QTMETADATA  ");
++        // the size of the embedded JSON object can be found 8 bytes into the data (see qjson_p.h),
++        // but doesn't include the size of the header (8 bytes)
++        QByteArray json(raw, qFromLittleEndian<uint>(*(uint *)(raw + 8)) + 8);
++        return QJsonDocument::fromBinaryData(json);
++    }
+ 
+ private:
+     explicit QLibraryPrivate(const QString &canonicalFileName, const QString &version);
+@@ -112,7 +125,7 @@ private:
+     QAtomicInt libraryRefCount;
+     QAtomicInt libraryUnloadCount;
+ 
+-    enum {IsAPlugin, IsNotAPlugin, MightBeAPlugin } pluginState;
++    enum { IsAPlugin, IsNotAPlugin, MightBeAPlugin } pluginState;
+     friend class QLibraryPrivateHasFriends;
+ };
+ 
+diff --git a/src/corelib/plugin/qplugin.h b/src/corelib/plugin/qplugin.h
+index 6cc0ceb..90ab836 100644
+--- a/src/corelib/plugin/qplugin.h
++++ b/src/corelib/plugin/qplugin.h
+@@ -59,15 +59,33 @@ QT_BEGIN_NAMESPACE
+ #endif
+ 
+ typedef QObject *(*QtPluginInstanceFunction)();
++typedef const char *(*QtPluginMetaDataFunction)();
++
++struct QStaticPlugin
++{
++    QtPluginInstanceFunction instance;
++    QtPluginMetaDataFunction metaData;
++};
++
++void Q_CORE_EXPORT qRegisterStaticPluginFunction(QStaticPlugin staticPlugin);
++
++#if defined (Q_OF_ELF) && defined (Q_CC_GNU)
++#  define QT_PLUGIN_VERIFICATION_SECTION \
++    __attribute__ ((section (".qtplugin"))) __attribute__((used))
++#  define QT_PLUGIN_METADATA_SECTION \
++    __attribute__ ((section (".qtmetadata"))) __attribute__((used))
++#else
++#  define QT_PLUGIN_VERIFICATION_SECTION
++#  define QT_PLUGIN_METADATA_SECTION
++#endif
+ 
+-void Q_CORE_EXPORT qRegisterStaticPluginInstanceFunction(QtPluginInstanceFunction function);
+ 
+ #define Q_IMPORT_PLUGIN(PLUGIN) \
+-        extern QT_PREPEND_NAMESPACE(QObject) *qt_plugin_instance_##PLUGIN(); \
++        extern const QT_PREPEND_NAMESPACE(QStaticPlugin) qt_static_plugin_##PLUGIN(); \
+         class Static##PLUGIN##PluginInstance{ \
+         public: \
+                 Static##PLUGIN##PluginInstance() { \
+-                qRegisterStaticPluginInstanceFunction(qt_plugin_instance_##PLUGIN); \
++                    qRegisterStaticPluginFunction(qt_static_plugin_##PLUGIN()); \
+                 } \
+         }; \
+        static Static##PLUGIN##PluginInstance static##PLUGIN##Instance;
+@@ -80,21 +98,43 @@ void Q_CORE_EXPORT qRegisterStaticPluginInstanceFunction(QtPluginInstanceFunctio
+             return _instance; \
+         }
+ 
+-#  define Q_EXPORT_PLUGIN(PLUGIN) \
+-            Q_EXPORT_PLUGIN2(PLUGIN, PLUGIN)
++#if defined(QT_STATICPLUGIN)
+ 
+-#  define Q_EXPORT_STATIC_PLUGIN(PLUGIN) \
+-            Q_EXPORT_STATIC_PLUGIN2(PLUGIN, PLUGIN)
++#  define QT_MOC_EXPORT_PLUGIN(PLUGINCLASS) \
++    static QT_PREPEND_NAMESPACE(QObject) *qt_plugin_instance() \
++    Q_PLUGIN_INSTANCE(PLUGINCLASS) \
++    static const char *qt_plugin_query_metadata() { return (const char *)qt_pluginMetaData; } \
++    const QT_PREPEND_NAMESPACE(QStaticPlugin) qt_static_plugin_##PLUGINCLASS() { \
++        QT_PREPEND_NAMESPACE(QStaticPlugin) plugin = { qt_plugin_instance, qt_plugin_query_metadata }; \
++        return plugin; \
++    }
+ 
+-#if defined(QT_STATICPLUGIN)
++#else
+ 
+-#  define Q_EXPORT_PLUGIN2(PLUGIN, PLUGINCLASS) \
+-            QT_PREPEND_NAMESPACE(QObject) \
+-                *qt_plugin_instance_##PLUGIN() \
++#  define QT_MOC_EXPORT_PLUGIN(PLUGINCLASS)      \
++            Q_EXTERN_C Q_DECL_EXPORT \
++            const char *qt_plugin_query_metadata() \
++            { return (const char *)qt_pluginMetaData; } \
++            Q_EXTERN_C Q_DECL_EXPORT QT_PREPEND_NAMESPACE(QObject) *qt_plugin_instance() \
+             Q_PLUGIN_INSTANCE(PLUGINCLASS)
+ 
+-#  define Q_EXPORT_STATIC_PLUGIN2(PLUGIN, PLUGINCLASS) \
+-            Q_EXPORT_PLUGIN2(PLUGIN, PLUGINCLASS)
++#endif
++
++
++#define Q_EXPORT_PLUGIN(PLUGIN) \
++            Q_EXPORT_PLUGIN2(PLUGIN, PLUGIN)
++#define Q_EXPORT_STATIC_PLUGIN(PLUGIN)
++#define Q_EXPORT_STATIC_PLUGIN2(PLUGIN, PLUGINCLASS)
++
++#if defined(QT_STATICPLUGIN)
++
++#  define Q_EXPORT_PLUGIN2(PLUGIN, PLUGINCLASS) \
++    static QT_PREPEND_NAMESPACE(QObject) *qt_plugin_instance() \
++    Q_PLUGIN_INSTANCE(PLUGINCLASS) \
++    const QT_PREPEND_NAMESPACE(QStaticPlugin) qt_static_plugin_##PLUGIN() { \
++        QT_PREPEND_NAMESPACE(QStaticPlugin) plugin = { qt_plugin_instance, 0 }; \
++        return plugin; \
++    }
+ 
+ #else
+ // NOTE: if you change pattern, you MUST change the pattern in
+@@ -118,25 +158,13 @@ void Q_CORE_EXPORT qRegisterStaticPluginInstanceFunction(QtPluginInstanceFunctio
+       "version="QT_VERSION_STR"\n" \
+       "debug="QPLUGIN_DEBUG_STR;
+ 
+-#  if defined (Q_OF_ELF) && defined (Q_CC_GNU)
+-#  define Q_PLUGIN_VERIFICATION_SECTION \
+-    __attribute__ ((section (".qtplugin"))) __attribute__((used))
+-#  else
+-#  define Q_PLUGIN_VERIFICATION_SECTION
+-#  endif
+-
+-#  if defined (Q_OS_WIN32) && defined(Q_CC_BOR)
+-#     define Q_STANDARD_CALL __stdcall
+-#  else
+-#     define Q_STANDARD_CALL
+-#  endif
+ 
+ #  define Q_EXPORT_PLUGIN2(PLUGIN, PLUGINCLASS)      \
+-            Q_PLUGIN_VERIFICATION_SECTION Q_PLUGIN_VERIFICATION_DATA \
++            QT_PLUGIN_VERIFICATION_SECTION Q_PLUGIN_VERIFICATION_DATA \
+             Q_EXTERN_C Q_DECL_EXPORT \
+-            const char * Q_STANDARD_CALL qt_plugin_query_verification_data() \
++            const char * qt_plugin_query_verification_data() \
+             { return qt_plugin_verification_data; } \
+-            Q_EXTERN_C Q_DECL_EXPORT QT_PREPEND_NAMESPACE(QObject) * Q_STANDARD_CALL qt_plugin_instance() \
++            Q_EXTERN_C Q_DECL_EXPORT QT_PREPEND_NAMESPACE(QObject) * qt_plugin_instance() \
+             Q_PLUGIN_INSTANCE(PLUGINCLASS)
+ 
+ #  define Q_EXPORT_STATIC_PLUGIN2(PLUGIN, PLUGINCLASS)
+diff --git a/src/corelib/plugin/qpluginloader.cpp b/src/corelib/plugin/qpluginloader.cpp
+index 4ef04f2..d652b25 100644
+--- a/src/corelib/plugin/qpluginloader.cpp
++++ b/src/corelib/plugin/qpluginloader.cpp
+@@ -291,8 +291,8 @@ QString QPluginLoader::errorString() const
+     return (!d || d->errorString.isEmpty()) ? tr("Unknown error") : d->errorString;
+ }
+ 
+-typedef QList<QtPluginInstanceFunction> StaticInstanceFunctionList;
+-Q_GLOBAL_STATIC(StaticInstanceFunctionList, staticInstanceFunctionList)
++typedef QVector<QStaticPlugin> StaticPluginList;
++Q_GLOBAL_STATIC(StaticPluginList, staticPluginList)
+ 
+ /*! \since 4.4
+ 
+@@ -329,13 +329,13 @@ QLibrary::LoadHints QPluginLoader::loadHints() const
+ 
+ /*!
+     \relates QPluginLoader
+-    \since 4.4
++    \since 5.0
+ 
+-    Registers the given \a function with the plugin loader.
++    Registers the given \a plugin with the plugin loader.
+ */
+-void Q_CORE_EXPORT qRegisterStaticPluginInstanceFunction(QtPluginInstanceFunction function)
++void Q_CORE_EXPORT qRegisterStaticPluginFunction(QStaticPlugin plugin)
+ {
+-    staticInstanceFunctionList()->append(function);
++    staticPluginList()->append(plugin);
+ }
+ 
+ /*!
+@@ -345,14 +345,23 @@ void Q_CORE_EXPORT qRegisterStaticPluginInstanceFunction(QtPluginInstanceFunctio
+ QObjectList QPluginLoader::staticInstances()
+ {
+     QObjectList instances;
+-    StaticInstanceFunctionList *functions = staticInstanceFunctionList();
+-    if (functions) {
+-        for (int i = 0; i < functions->count(); ++i)
+-            instances.append((*functions)[i]());
++    const StaticPluginList *plugins = staticPluginList();
++    if (plugins) {
++        for (int i = 0; i < plugins->size(); ++i)
++            instances += plugins->at(i).instance();
+     }
+     return instances;
+ }
+ 
++
++QVector<QStaticPlugin> QLibraryPrivate::staticPlugins()
++{
++    StaticPluginList *plugins = staticPluginList();
++    if (plugins)
++        return *plugins;
++    return QVector<QStaticPlugin>();
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QT_NO_LIBRARY
+diff --git a/src/corelib/plugin/qpluginloader.h b/src/corelib/plugin/qpluginloader.h
+index ee62986..6ca1892 100644
+--- a/src/corelib/plugin/qpluginloader.h
++++ b/src/corelib/plugin/qpluginloader.h
+@@ -55,7 +55,6 @@ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-
+ class QLibraryPrivate;
+ 
+ class Q_CORE_EXPORT QPluginLoader : public QObject
+@@ -70,7 +69,7 @@ public:
+ 
+     QObject *instance();
+ 
+-    static QObjectList staticInstances();
++    QT_DEPRECATED static QObjectList staticInstances();
+ 
+     bool load();
+     bool unload();
+diff --git a/src/tools/moc/generator.cpp b/src/tools/moc/generator.cpp
+index b4f3d23..e2055e4 100644
+--- a/src/tools/moc/generator.cpp
++++ b/src/tools/moc/generator.cpp
+@@ -43,6 +43,11 @@
+ #include "outputrevision.h"
+ #include "utils.h"
+ #include <QtCore/qmetatype.h>
++#include <QtCore/qjsondocument.h>
++#include <QtCore/qjsonobject.h>
++#include <QtCore/qjsonvalue.h>
++#include <QtCore/qjsonarray.h>
++#include <QtCore/qplugin.h>
+ #include <stdio.h>
+ 
+ #include <private/qmetaobject_p.h> //for the flags.
+@@ -421,6 +426,11 @@ void Generator::generateCode()
+ //
+     for (int signalindex = 0; signalindex < cdef->signalList.size(); ++signalindex)
+         generateSignal(&cdef->signalList[signalindex], signalindex);
++
++//
++// Generate plugin meta data
++//
++    generatePluginMetaData();
+ }
+ 
+ 
+@@ -1051,4 +1061,42 @@ void Generator::generateSignal(FunctionDef *def,int index)
+     fprintf(out, "}\n");
+ }
+ 
++void Generator::generatePluginMetaData()
++{
++    if (cdef->pluginData.iid.isEmpty())
++        return;
++
++    QJsonObject data;
++    data.insert(QLatin1String("IID"), QLatin1String(cdef->pluginData.iid.constData()));
++    data.insert(QLatin1String("className"), QLatin1String(cdef->classname.constData()));
++    data.insert(QLatin1String("version"), (int)QT_VERSION);
++    data.insert(QLatin1String("debug"),
++#ifdef QT_NO_DEBUG
++                false
++#else
++                true
++#endif
++                );
++    data.insert(QLatin1String("MetaData"), cdef->pluginData.metaData.object());
++    QJsonDocument doc(data);
++
++    fprintf(out, "\nQT_PLUGIN_METADATA_SECTION const uint qt_section_alignment_dummy = 42;\n");
++    fprintf(out,
++            "\nQT_PLUGIN_METADATA_SECTION\n"
++            "static const unsigned char qt_pluginMetaData[] = {\n"
++            "    'Q', 'T', 'M', 'E', 'T', 'A', 'D', 'A', 'T', 'A', ' ', ' ',\n   ");
++#if 0
++    fprintf(out, "\"%s\";\n", doc.toJson().constData());
++#else
++    QByteArray binary = doc.toBinaryData();
++    for (int i = 0; i < binary.size() - 1; ++i) {
++        fprintf(out, " 0x%02x,", (uchar)binary.at(i));
++        if (!((i + 1) % 8))
++            fprintf(out, "\n   ");
++    }
++    fprintf(out, " 0x%02x\n};\n", (uchar)binary.at(binary.size() - 1));
++#endif
++    fprintf(out, "QT_MOC_EXPORT_PLUGIN(%s)\n\n", cdef->classname.constData());
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/tools/moc/generator.h b/src/tools/moc/generator.h
+index a3dc3d0..6682e1a 100644
+--- a/src/tools/moc/generator.h
++++ b/src/tools/moc/generator.h
+@@ -63,6 +63,7 @@ private:
+     void generateMetacall();
+     void generateStaticMetacall();
+     void generateSignal(FunctionDef *def, int index);
++    void generatePluginMetaData();
+ 
+     int strreg(const char *); // registers a string and returns its id
+     QList<QByteArray> strings;
+diff --git a/src/tools/moc/keywords.cpp b/src/tools/moc/keywords.cpp
+index 7a6b440..f6151bd 100644
+--- a/src/tools/moc/keywords.cpp
++++ b/src/tools/moc/keywords.cpp
+@@ -43,12 +43,12 @@
+ // DO NOT EDIT.
+ 
+ static const short keyword_trans[][128] = {
+-    {0,0,0,0,0,0,0,0,0,532,529,0,0,0,0,0,
++    {0,0,0,0,0,0,0,0,0,546,543,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     532,252,530,533,0,38,239,531,25,26,236,234,30,235,27,237,
++     546,252,544,547,0,38,239,545,25,26,236,234,30,235,27,237,
+      22,22,22,22,22,22,22,22,22,22,34,41,23,39,24,43,
+      0,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+-     8,21,8,8,8,8,8,8,8,8,8,31,534,32,238,8,
++     8,21,8,8,8,8,8,8,8,8,8,31,548,32,238,8,
+      0,1,2,3,4,5,6,7,8,9,8,8,10,11,12,13,
+      14,8,15,16,17,18,19,20,8,8,8,36,245,37,248,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -129,7 +129,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,0,0,0,0,290,222,0,0,461,0,0,0,
++     0,0,0,0,0,0,0,0,290,222,0,0,475,0,0,0,
+      0,0,0,0,55,0,0,330,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -168,7 +168,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,485,0,0,0,0,0,0,0,0,0,0,357,
++     0,0,0,0,499,0,0,0,0,0,0,0,0,0,0,357,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -190,7 +190,7 @@ static const short keyword_trans[][128] = {
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,42,0,0,0,28,0,
+-     537,537,537,537,537,537,537,537,537,537,0,0,0,0,0,0,
++     551,551,551,551,551,551,551,551,551,551,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -349,7 +349,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,0,0,0,0,0,0,536,0,0,0,0,535,
++     0,0,0,0,0,0,0,0,0,0,550,0,0,0,0,549,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,258,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -385,21 +385,29 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,458,0,0,0,300,0,0,0,0,0,0,0,0,0,0,
++     0,472,0,0,0,300,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,439,388,378,383,364,0,448,0,0,0,0,0,358,
+-     370,0,521,436,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,453,402,392,397,364,0,462,0,0,0,0,0,358,
++     370,0,535,450,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,0,0,0,0,0,475,0,0,0,0,0,372,
++     0,0,0,0,0,0,0,0,0,0,0,0,378,0,0,0,
++     0,0,371,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
++    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,0,0,0,0,0,489,0,0,0,0,0,372,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+@@ -407,7 +415,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,0,418,396,0,0,401,0,0,0,410,0,0,
++     0,0,0,0,0,432,410,0,0,415,0,0,0,424,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+@@ -415,7 +423,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,504,0,437,0,0,0,465,0,0,471,0,0,0,
++     0,0,0,518,0,451,0,0,0,479,0,0,485,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+@@ -424,7 +432,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     0,0,0,0,450,0,497,0,0,0,0,0,0,0,0,0,
++     0,0,0,0,464,0,511,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+@@ -432,7 +440,7 @@ static const short keyword_trans[][128] = {
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+-     513,0,0,481,0,0,0,0,0,0,0,0,0,0,0,0,
++     527,0,0,495,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+ };
+@@ -815,164 +823,178 @@ static const struct
+     {CHARACTER, 0, 69, 368, CHARACTER},
+     {CHARACTER, 0, 84, 369, CHARACTER},
+     {Q_GADGET_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 82, 371, CHARACTER},
+     {CHARACTER, 44, 0, 0, CHARACTER},
++    {CHARACTER, 45, 0, 0, CHARACTER},
+     {CHARACTER, 0, 80, 373, CHARACTER},
+     {CHARACTER, 0, 69, 374, CHARACTER},
+     {CHARACTER, 0, 82, 375, CHARACTER},
+     {CHARACTER, 0, 84, 376, CHARACTER},
+     {CHARACTER, 0, 89, 377, CHARACTER},
+     {Q_PROPERTY_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 78, 379, CHARACTER},
+-    {CHARACTER, 0, 85, 380, CHARACTER},
+-    {CHARACTER, 0, 77, 381, CHARACTER},
+-    {CHARACTER, 0, 83, 382, CHARACTER},
++    {CHARACTER, 0, 85, 379, CHARACTER},
++    {CHARACTER, 0, 71, 380, CHARACTER},
++    {CHARACTER, 0, 73, 381, CHARACTER},
++    {CHARACTER, 0, 78, 382, CHARACTER},
++    {CHARACTER, 0, 95, 383, CHARACTER},
++    {CHARACTER, 0, 77, 384, CHARACTER},
++    {CHARACTER, 0, 69, 385, CHARACTER},
++    {CHARACTER, 0, 84, 386, CHARACTER},
++    {CHARACTER, 0, 65, 387, CHARACTER},
++    {CHARACTER, 0, 68, 388, CHARACTER},
++    {CHARACTER, 0, 65, 389, CHARACTER},
++    {CHARACTER, 0, 84, 390, CHARACTER},
++    {CHARACTER, 0, 65, 391, CHARACTER},
++    {Q_PLUGIN_METADATA_TOKEN, 0, 0, 0, CHARACTER},
++    {CHARACTER, 0, 78, 393, CHARACTER},
++    {CHARACTER, 0, 85, 394, CHARACTER},
++    {CHARACTER, 0, 77, 395, CHARACTER},
++    {CHARACTER, 0, 83, 396, CHARACTER},
+     {Q_ENUMS_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 76, 384, CHARACTER},
+-    {CHARACTER, 0, 65, 385, CHARACTER},
+-    {CHARACTER, 0, 71, 386, CHARACTER},
+-    {CHARACTER, 0, 83, 387, CHARACTER},
++    {CHARACTER, 0, 76, 398, CHARACTER},
++    {CHARACTER, 0, 65, 399, CHARACTER},
++    {CHARACTER, 0, 71, 400, CHARACTER},
++    {CHARACTER, 0, 83, 401, CHARACTER},
+     {Q_FLAGS_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 69, 389, CHARACTER},
+-    {CHARACTER, 0, 67, 390, CHARACTER},
+-    {CHARACTER, 0, 76, 391, CHARACTER},
+-    {CHARACTER, 0, 65, 392, CHARACTER},
+-    {CHARACTER, 0, 82, 393, CHARACTER},
+-    {CHARACTER, 0, 69, 394, CHARACTER},
+-    {CHARACTER, 0, 95, 395, CHARACTER},
+-    {CHARACTER, 45, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 76, 397, CHARACTER},
+-    {CHARACTER, 0, 65, 398, CHARACTER},
+-    {CHARACTER, 0, 71, 399, CHARACTER},
+-    {CHARACTER, 0, 83, 400, CHARACTER},
++    {CHARACTER, 0, 69, 403, CHARACTER},
++    {CHARACTER, 0, 67, 404, CHARACTER},
++    {CHARACTER, 0, 76, 405, CHARACTER},
++    {CHARACTER, 0, 65, 406, CHARACTER},
++    {CHARACTER, 0, 82, 407, CHARACTER},
++    {CHARACTER, 0, 69, 408, CHARACTER},
++    {CHARACTER, 0, 95, 409, CHARACTER},
++    {CHARACTER, 46, 0, 0, CHARACTER},
++    {CHARACTER, 0, 76, 411, CHARACTER},
++    {CHARACTER, 0, 65, 412, CHARACTER},
++    {CHARACTER, 0, 71, 413, CHARACTER},
++    {CHARACTER, 0, 83, 414, CHARACTER},
+     {Q_DECLARE_FLAGS_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 78, 402, CHARACTER},
+-    {CHARACTER, 0, 84, 403, CHARACTER},
+-    {CHARACTER, 0, 69, 404, CHARACTER},
+-    {CHARACTER, 0, 82, 405, CHARACTER},
+-    {CHARACTER, 0, 70, 406, CHARACTER},
+-    {CHARACTER, 0, 65, 407, CHARACTER},
+-    {CHARACTER, 0, 67, 408, CHARACTER},
+-    {CHARACTER, 0, 69, 409, CHARACTER},
++    {CHARACTER, 0, 78, 416, CHARACTER},
++    {CHARACTER, 0, 84, 417, CHARACTER},
++    {CHARACTER, 0, 69, 418, CHARACTER},
++    {CHARACTER, 0, 82, 419, CHARACTER},
++    {CHARACTER, 0, 70, 420, CHARACTER},
++    {CHARACTER, 0, 65, 421, CHARACTER},
++    {CHARACTER, 0, 67, 422, CHARACTER},
++    {CHARACTER, 0, 69, 423, CHARACTER},
+     {Q_DECLARE_INTERFACE_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 69, 411, CHARACTER},
+-    {CHARACTER, 0, 84, 412, CHARACTER},
+-    {CHARACTER, 0, 65, 413, CHARACTER},
+-    {CHARACTER, 0, 84, 414, CHARACTER},
+-    {CHARACTER, 0, 89, 415, CHARACTER},
+-    {CHARACTER, 0, 80, 416, CHARACTER},
+-    {CHARACTER, 0, 69, 417, CHARACTER},
+-    {Q_DECLARE_METATYPE_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 88, 419, CHARACTER},
+-    {CHARACTER, 0, 84, 420, CHARACTER},
+-    {CHARACTER, 0, 69, 421, CHARACTER},
+-    {CHARACTER, 0, 78, 422, CHARACTER},
+-    {CHARACTER, 0, 83, 423, CHARACTER},
+-    {CHARACTER, 0, 73, 424, CHARACTER},
+-    {CHARACTER, 0, 79, 425, CHARACTER},
+-    {CHARACTER, 0, 78, 426, CHARACTER},
+-    {CHARACTER, 0, 95, 427, CHARACTER},
+-    {CHARACTER, 0, 73, 428, CHARACTER},
+-    {CHARACTER, 0, 78, 429, CHARACTER},
+-    {CHARACTER, 0, 84, 430, CHARACTER},
++    {CHARACTER, 0, 69, 425, CHARACTER},
++    {CHARACTER, 0, 84, 426, CHARACTER},
++    {CHARACTER, 0, 65, 427, CHARACTER},
++    {CHARACTER, 0, 84, 428, CHARACTER},
++    {CHARACTER, 0, 89, 429, CHARACTER},
++    {CHARACTER, 0, 80, 430, CHARACTER},
+     {CHARACTER, 0, 69, 431, CHARACTER},
+-    {CHARACTER, 0, 82, 432, CHARACTER},
+-    {CHARACTER, 0, 70, 433, CHARACTER},
+-    {CHARACTER, 0, 65, 434, CHARACTER},
+-    {CHARACTER, 0, 67, 435, CHARACTER},
+-    {CHARACTER, 0, 69, 409, CHARACTER},
+-    {CHARACTER, 46, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 84, 438, CHARACTER},
+-    {CHARACTER, 0, 83, 387, CHARACTER},
+-    {CHARACTER, 0, 76, 440, CHARACTER},
+-    {CHARACTER, 0, 65, 441, CHARACTER},
+-    {CHARACTER, 0, 83, 442, CHARACTER},
+-    {CHARACTER, 0, 83, 443, CHARACTER},
+-    {CHARACTER, 0, 73, 444, CHARACTER},
+-    {CHARACTER, 0, 78, 445, CHARACTER},
+-    {CHARACTER, 0, 70, 446, CHARACTER},
+-    {CHARACTER, 0, 79, 447, CHARACTER},
+-    {Q_CLASSINFO_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 78, 449, CHARACTER},
++    {Q_DECLARE_METATYPE_TOKEN, 0, 0, 0, CHARACTER},
++    {CHARACTER, 0, 88, 433, CHARACTER},
++    {CHARACTER, 0, 84, 434, CHARACTER},
++    {CHARACTER, 0, 69, 435, CHARACTER},
++    {CHARACTER, 0, 78, 436, CHARACTER},
++    {CHARACTER, 0, 83, 437, CHARACTER},
++    {CHARACTER, 0, 73, 438, CHARACTER},
++    {CHARACTER, 0, 79, 439, CHARACTER},
++    {CHARACTER, 0, 78, 440, CHARACTER},
++    {CHARACTER, 0, 95, 441, CHARACTER},
++    {CHARACTER, 0, 73, 442, CHARACTER},
++    {CHARACTER, 0, 78, 443, CHARACTER},
++    {CHARACTER, 0, 84, 444, CHARACTER},
++    {CHARACTER, 0, 69, 445, CHARACTER},
++    {CHARACTER, 0, 82, 446, CHARACTER},
++    {CHARACTER, 0, 70, 447, CHARACTER},
++    {CHARACTER, 0, 65, 448, CHARACTER},
++    {CHARACTER, 0, 67, 449, CHARACTER},
++    {CHARACTER, 0, 69, 423, CHARACTER},
+     {CHARACTER, 47, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 69, 451, CHARACTER},
+-    {CHARACTER, 0, 82, 452, CHARACTER},
+-    {CHARACTER, 0, 70, 453, CHARACTER},
+-    {CHARACTER, 0, 65, 454, CHARACTER},
+-    {CHARACTER, 0, 67, 455, CHARACTER},
+-    {CHARACTER, 0, 69, 456, CHARACTER},
++    {CHARACTER, 0, 84, 452, CHARACTER},
++    {CHARACTER, 0, 83, 401, CHARACTER},
++    {CHARACTER, 0, 76, 454, CHARACTER},
++    {CHARACTER, 0, 65, 455, CHARACTER},
++    {CHARACTER, 0, 83, 456, CHARACTER},
+     {CHARACTER, 0, 83, 457, CHARACTER},
++    {CHARACTER, 0, 73, 458, CHARACTER},
++    {CHARACTER, 0, 78, 459, CHARACTER},
++    {CHARACTER, 0, 70, 460, CHARACTER},
++    {CHARACTER, 0, 79, 461, CHARACTER},
++    {Q_CLASSINFO_TOKEN, 0, 0, 0, CHARACTER},
++    {CHARACTER, 0, 78, 463, CHARACTER},
++    {CHARACTER, 48, 0, 0, CHARACTER},
++    {CHARACTER, 0, 69, 465, CHARACTER},
++    {CHARACTER, 0, 82, 466, CHARACTER},
++    {CHARACTER, 0, 70, 467, CHARACTER},
++    {CHARACTER, 0, 65, 468, CHARACTER},
++    {CHARACTER, 0, 67, 469, CHARACTER},
++    {CHARACTER, 0, 69, 470, CHARACTER},
++    {CHARACTER, 0, 83, 471, CHARACTER},
+     {Q_INTERFACES_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 108, 459, CHARACTER},
+-    {CHARACTER, 0, 115, 460, CHARACTER},
++    {CHARACTER, 0, 108, 473, CHARACTER},
++    {CHARACTER, 0, 115, 474, CHARACTER},
+     {SIGNALS, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 111, 462, CHARACTER},
+-    {CHARACTER, 0, 116, 463, CHARACTER},
+-    {CHARACTER, 0, 115, 464, CHARACTER},
++    {CHARACTER, 0, 111, 476, CHARACTER},
++    {CHARACTER, 0, 116, 477, CHARACTER},
++    {CHARACTER, 0, 115, 478, CHARACTER},
+     {SLOTS, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 71, 466, CHARACTER},
+-    {CHARACTER, 0, 78, 467, CHARACTER},
+-    {CHARACTER, 0, 65, 468, CHARACTER},
+-    {CHARACTER, 0, 76, 469, CHARACTER},
+-    {Q_SIGNAL_TOKEN, 0, 83, 470, CHARACTER},
++    {CHARACTER, 0, 71, 480, CHARACTER},
++    {CHARACTER, 0, 78, 481, CHARACTER},
++    {CHARACTER, 0, 65, 482, CHARACTER},
++    {CHARACTER, 0, 76, 483, CHARACTER},
++    {Q_SIGNAL_TOKEN, 0, 83, 484, CHARACTER},
+     {Q_SIGNALS_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 79, 472, CHARACTER},
+-    {CHARACTER, 0, 84, 473, CHARACTER},
+-    {Q_SLOT_TOKEN, 0, 83, 474, CHARACTER},
++    {CHARACTER, 0, 79, 486, CHARACTER},
++    {CHARACTER, 0, 84, 487, CHARACTER},
++    {Q_SLOT_TOKEN, 0, 83, 488, CHARACTER},
+     {Q_SLOTS_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 86, 476, CHARACTER},
+-    {CHARACTER, 0, 65, 477, CHARACTER},
+-    {CHARACTER, 0, 84, 478, CHARACTER},
+-    {CHARACTER, 0, 69, 479, CHARACTER},
+-    {CHARACTER, 0, 95, 480, CHARACTER},
+-    {CHARACTER, 48, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 76, 482, CHARACTER},
+-    {CHARACTER, 0, 79, 483, CHARACTER},
+-    {CHARACTER, 0, 84, 484, CHARACTER},
++    {CHARACTER, 0, 86, 490, CHARACTER},
++    {CHARACTER, 0, 65, 491, CHARACTER},
++    {CHARACTER, 0, 84, 492, CHARACTER},
++    {CHARACTER, 0, 69, 493, CHARACTER},
++    {CHARACTER, 0, 95, 494, CHARACTER},
++    {CHARACTER, 49, 0, 0, CHARACTER},
++    {CHARACTER, 0, 76, 496, CHARACTER},
++    {CHARACTER, 0, 79, 497, CHARACTER},
++    {CHARACTER, 0, 84, 498, CHARACTER},
+     {Q_PRIVATE_SLOT_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 95, 486, CHARACTER},
+-    {CHARACTER, 0, 77, 487, CHARACTER},
+-    {CHARACTER, 0, 79, 488, CHARACTER},
+-    {CHARACTER, 0, 67, 489, CHARACTER},
+-    {CHARACTER, 0, 95, 490, CHARACTER},
+-    {CHARACTER, 0, 67, 491, CHARACTER},
+-    {CHARACTER, 0, 79, 492, CHARACTER},
+-    {CHARACTER, 0, 77, 493, CHARACTER},
+-    {CHARACTER, 0, 80, 494, CHARACTER},
+-    {CHARACTER, 0, 65, 495, CHARACTER},
+-    {CHARACTER, 0, 84, 496, CHARACTER},
++    {CHARACTER, 0, 95, 500, CHARACTER},
++    {CHARACTER, 0, 77, 501, CHARACTER},
++    {CHARACTER, 0, 79, 502, CHARACTER},
++    {CHARACTER, 0, 67, 503, CHARACTER},
++    {CHARACTER, 0, 95, 504, CHARACTER},
++    {CHARACTER, 0, 67, 505, CHARACTER},
++    {CHARACTER, 0, 79, 506, CHARACTER},
++    {CHARACTER, 0, 77, 507, CHARACTER},
++    {CHARACTER, 0, 80, 508, CHARACTER},
++    {CHARACTER, 0, 65, 509, CHARACTER},
++    {CHARACTER, 0, 84, 510, CHARACTER},
+     {Q_MOC_COMPAT_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 79, 498, CHARACTER},
+-    {CHARACTER, 0, 75, 499, CHARACTER},
+-    {CHARACTER, 0, 65, 500, CHARACTER},
+-    {CHARACTER, 0, 66, 501, CHARACTER},
+-    {CHARACTER, 0, 76, 502, CHARACTER},
+-    {CHARACTER, 0, 69, 503, CHARACTER},
++    {CHARACTER, 0, 79, 512, CHARACTER},
++    {CHARACTER, 0, 75, 513, CHARACTER},
++    {CHARACTER, 0, 65, 514, CHARACTER},
++    {CHARACTER, 0, 66, 515, CHARACTER},
++    {CHARACTER, 0, 76, 516, CHARACTER},
++    {CHARACTER, 0, 69, 517, CHARACTER},
+     {Q_INVOKABLE_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 82, 505, CHARACTER},
+-    {CHARACTER, 0, 73, 506, CHARACTER},
+-    {CHARACTER, 0, 80, 507, CHARACTER},
+-    {CHARACTER, 0, 84, 508, CHARACTER},
+-    {CHARACTER, 0, 65, 509, CHARACTER},
+-    {CHARACTER, 0, 66, 510, CHARACTER},
+-    {CHARACTER, 0, 76, 511, CHARACTER},
+-    {CHARACTER, 0, 69, 512, CHARACTER},
++    {CHARACTER, 0, 82, 519, CHARACTER},
++    {CHARACTER, 0, 73, 520, CHARACTER},
++    {CHARACTER, 0, 80, 521, CHARACTER},
++    {CHARACTER, 0, 84, 522, CHARACTER},
++    {CHARACTER, 0, 65, 523, CHARACTER},
++    {CHARACTER, 0, 66, 524, CHARACTER},
++    {CHARACTER, 0, 76, 525, CHARACTER},
++    {CHARACTER, 0, 69, 526, CHARACTER},
+     {Q_SCRIPTABLE_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 82, 514, CHARACTER},
+-    {CHARACTER, 0, 79, 515, CHARACTER},
+-    {CHARACTER, 0, 80, 516, CHARACTER},
+-    {CHARACTER, 0, 69, 517, CHARACTER},
+-    {CHARACTER, 0, 82, 518, CHARACTER},
+-    {CHARACTER, 0, 84, 519, CHARACTER},
+-    {CHARACTER, 0, 89, 520, CHARACTER},
++    {CHARACTER, 0, 82, 528, CHARACTER},
++    {CHARACTER, 0, 79, 529, CHARACTER},
++    {CHARACTER, 0, 80, 530, CHARACTER},
++    {CHARACTER, 0, 69, 531, CHARACTER},
++    {CHARACTER, 0, 82, 532, CHARACTER},
++    {CHARACTER, 0, 84, 533, CHARACTER},
++    {CHARACTER, 0, 89, 534, CHARACTER},
+     {Q_PRIVATE_PROPERTY_TOKEN, 0, 0, 0, CHARACTER},
+-    {CHARACTER, 0, 69, 522, CHARACTER},
+-    {CHARACTER, 0, 86, 523, CHARACTER},
+-    {CHARACTER, 0, 73, 524, CHARACTER},
+-    {CHARACTER, 0, 83, 525, CHARACTER},
+-    {CHARACTER, 0, 73, 526, CHARACTER},
+-    {CHARACTER, 0, 79, 527, CHARACTER},
+-    {CHARACTER, 0, 78, 528, CHARACTER},
++    {CHARACTER, 0, 69, 536, CHARACTER},
++    {CHARACTER, 0, 86, 537, CHARACTER},
++    {CHARACTER, 0, 73, 538, CHARACTER},
++    {CHARACTER, 0, 83, 539, CHARACTER},
++    {CHARACTER, 0, 73, 540, CHARACTER},
++    {CHARACTER, 0, 79, 541, CHARACTER},
++    {CHARACTER, 0, 78, 542, CHARACTER},
+     {Q_REVISION_TOKEN, 0, 0, 0, CHARACTER},
+     {NEWLINE, 0, 0, 0, NOTOKEN},
+     {QUOTE, 0, 0, 0, NOTOKEN},
+diff --git a/src/tools/moc/moc.cpp b/src/tools/moc/moc.cpp
+index 5c9e1ee..97316ee 100644
+--- a/src/tools/moc/moc.cpp
++++ b/src/tools/moc/moc.cpp
+@@ -44,6 +44,9 @@
+ #include "qdatetime.h"
+ #include "utils.h"
+ #include "outputrevision.h"
++#include <QtCore/qfile.h>
++#include <QtCore/qfileinfo.h>
++#include <QtCore/qdir.h>
+ 
+ // for normalizeTypeInternal
+ #include <private/qmetaobject_moc_p.h>
+@@ -673,6 +676,9 @@ void Moc::parse()
+                 case Q_PROPERTY_TOKEN:
+                     parseProperty(&def);
+                     break;
++                case Q_PLUGIN_METADATA_TOKEN:
++                    parsePluginData(&def);
++                    break;
+                 case Q_ENUMS_TOKEN:
+                     parseEnumOrFlag(&def, false);
+                     break;
+@@ -813,6 +819,8 @@ void Moc::generate(FILE *out)
+ 
+     if (mustIncludeQMetaTypeH)
+         fprintf(out, "#include <QtCore/qmetatype.h>\n");
++    if (mustIncludeQPluginH)
++        fprintf(out, "#include <QtCore/qplugin.h>\n");
+ 
+     fprintf(out, "#if !defined(Q_MOC_OUTPUT_REVISION)\n"
+             "#error \"The header file '%s' doesn't include <QObject>.\"\n", (const char *)fn);
+@@ -1080,6 +1088,50 @@ void Moc::parseProperty(ClassDef *def)
+     def->propertyList += propDef;
+ }
+ 
++void Moc::parsePluginData(ClassDef *def)
++{
++    next(LPAREN);
++    QByteArray metaData;
++    while (test(IDENTIFIER)) {
++        QByteArray l = lexem();
++        if (l == "IID") {
++            next(STRING_LITERAL);
++            def->pluginData.iid = unquotedLexem();
++        } else if (l == "FILE") {
++            next(STRING_LITERAL);
++            QByteArray metaDataFile = unquotedLexem();
++            QFileInfo fi(QFileInfo(QString::fromLocal8Bit(currentFilenames.top())).dir(), QString::fromLocal8Bit(metaDataFile));
++            if (!fi.exists()) {
++                QByteArray msg;
++                msg += "Plugin Metadata file ";
++                msg += lexem();
++                msg += " does not exist. Declaration will be ignored";
++                warning(msg.constData());
++                return;
++            }
++            QFile file(fi.canonicalFilePath());
++            file.open(QFile::ReadOnly);
++            metaData = file.readAll();
++        }
++    }
++
++    if (!metaData.isEmpty()) {
++        def->pluginData.metaData = QJsonDocument::fromJson(metaData);
++        if (!def->pluginData.metaData.isObject()) {
++            QByteArray msg;
++            msg += "Plugin Metadata file ";
++            msg += lexem();
++            msg += " does not contain a valid JSON object. Declaration will be ignored";
++            warning(msg.constData());
++            def->pluginData.iid = QByteArray();
++            return;
++        }
++    }
++
++    mustIncludeQPluginH = true;
++    next(RPAREN);
++}
++
+ void Moc::parsePrivateProperty(ClassDef *def)
+ {
+     next(LPAREN);
+diff --git a/src/tools/moc/moc.h b/src/tools/moc/moc.h
+index b780272..aedb97b 100644
+--- a/src/tools/moc/moc.h
++++ b/src/tools/moc/moc.h
+@@ -46,6 +46,7 @@
+ #include <QStringList>
+ #include <QMap>
+ #include <QPair>
++#include <QJsonDocument>
+ #include <stdio.h>
+ #include <ctype.h>
+ 
+@@ -167,6 +168,11 @@ struct ClassDef {
+     bool hasQObject;
+     bool hasQGadget;
+ 
++    struct PluginData {
++        QByteArray iid;
++        QJsonDocument metaData;
++    } pluginData;
++
+     QList<FunctionDef> constructorList;
+     QList<FunctionDef> signalList, slotList, methodList, publicList;
+     int notifyableProperties;
+@@ -192,7 +198,7 @@ class Moc : public Parser
+ {
+ public:
+     Moc()
+-        : noInclude(false), generatedCode(false), mustIncludeQMetaTypeH(false)
++        : noInclude(false), generatedCode(false), mustIncludeQMetaTypeH(false), mustIncludeQPluginH(false)
+         {}
+ 
+     QByteArray filename;
+@@ -200,6 +206,7 @@ public:
+     bool noInclude;
+     bool generatedCode;
+     bool mustIncludeQMetaTypeH;
++    bool mustIncludeQPluginH;
+     QByteArray includePath;
+     QList<QByteArray> includeFiles;
+     QList<ClassDef> classList;
+@@ -229,6 +236,7 @@ public:
+     void parseSlots(ClassDef *def, FunctionDef::Access access);
+     void parseSignals(ClassDef *def);
+     void parseProperty(ClassDef *def);
++    void parsePluginData(ClassDef *def);
+     void createPropertyDef(PropertyDef &def);
+     void parseEnumOrFlag(ClassDef *def, bool isFlag);
+     void parseFlag(ClassDef *def);
+diff --git a/src/tools/moc/token.h b/src/tools/moc/token.h
+index a694ff4..a9f028f 100644
+--- a/src/tools/moc/token.h
++++ b/src/tools/moc/token.h
+@@ -169,6 +169,7 @@ enum Token {
+     Q_OBJECT_TOKEN = Q_META_TOKEN_BEGIN,
+     Q_GADGET_TOKEN,
+     Q_PROPERTY_TOKEN,
++    Q_PLUGIN_METADATA_TOKEN,
+     Q_ENUMS_TOKEN,
+     Q_FLAGS_TOKEN,
+     Q_DECLARE_FLAGS_TOKEN,
+diff --git a/src/tools/moc/util/generate_keywords.cpp b/src/tools/moc/util/generate_keywords.cpp
+index eb06315..4560944 100644
+--- a/src/tools/moc/util/generate_keywords.cpp
++++ b/src/tools/moc/util/generate_keywords.cpp
+@@ -228,6 +228,7 @@ static const Keyword keywords[] = {
+     { "Q_OBJECT", "Q_OBJECT_TOKEN" },
+     { "Q_GADGET", "Q_GADGET_TOKEN" },
+     { "Q_PROPERTY", "Q_PROPERTY_TOKEN" },
++    { "Q_PLUGIN_METADATA", "Q_PLUGIN_METADATA_TOKEN" },
+     { "Q_ENUMS", "Q_ENUMS_TOKEN" },
+     { "Q_FLAGS", "Q_FLAGS_TOKEN" },
+     { "Q_DECLARE_FLAGS", "Q_DECLARE_FLAGS_TOKEN" },

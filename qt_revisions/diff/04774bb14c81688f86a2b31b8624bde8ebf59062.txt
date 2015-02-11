@@ -1,0 +1,873 @@
+diff --git a/src/qml/qml/qqmlabstractbinding_p.h b/src/qml/qml/qqmlabstractbinding_p.h
+index a49b591..d4088e6 100644
+--- a/src/qml/qml/qqmlabstractbinding_p.h
++++ b/src/qml/qml/qqmlabstractbinding_p.h
+@@ -149,6 +149,8 @@ private:
+     friend class QQmlPropertyPrivate;
+     friend class QQmlVME;
+     friend class QtSharedPointer::ExternalRefCount<QQmlAbstractBinding>;
++    friend class QV8QObjectWrapper;
++    friend class QV4Bindings;
+ 
+     typedef QSharedPointer<QQmlAbstractBinding> SharedPointer;
+     // To save memory, we also store the rarely used weakPointer() instance in here
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index 88312be..a1ad635 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -3578,6 +3578,7 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+         store.context = js.bindingContext.stack;
+         store.owner = js.bindingContext.owner;
+         store.isAlias = prop->isAlias;
++        store.isSafe = js.isSafe;
+         if (valueTypeProperty) {
+             store.isRoot = (compileState->root == valueTypeProperty->parent);
+         } else {
+@@ -3699,7 +3700,9 @@ bool QQmlCompiler::completeComponentBuild()
+         QQmlRewrite::RewriteBinding rewriteBinding;
+         rewriteBinding.setName(QLatin1Char('$')+binding.property->name().toString());
+         bool isSharable = false;
+-        binding.rewrittenExpression = rewriteBinding(binding.expression.asAST(), expression, &isSharable);
++        bool isSafe = false;
++        binding.rewrittenExpression = rewriteBinding(binding.expression.asAST(), expression, &isSharable, &isSafe);
++        binding.isSafe = isSafe;
+ 
+         if (isSharable && binding.property->type != qMetaTypeId<QQmlBinding*>()) {
+             sharedBindings.append(b);
+diff --git a/src/qml/qml/qqmlcompiler_p.h b/src/qml/qml/qqmlcompiler_p.h
+index 9d610c0..6a4f41f 100644
+--- a/src/qml/qml/qqmlcompiler_p.h
++++ b/src/qml/qml/qqmlcompiler_p.h
+@@ -195,7 +195,7 @@ namespace QQmlCompilerTypes {
+     struct JSBindingReference : public QQmlPool::Class,
+                                 public BindingReference
+     {
+-        JSBindingReference() : nextReference(0) {}
++        JSBindingReference() : isSafe(false), nextReference(0) {}
+ 
+         QQmlScript::Variant expression;
+         QQmlScript::Property *property;
+@@ -203,6 +203,7 @@ namespace QQmlCompilerTypes {
+ 
+         int compiledIndex:15;
+         int sharedIndex:15;
++        bool isSafe:1;
+ 
+         QString rewrittenExpression;
+         BindingContext bindingContext;
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 5f5dafa..2703825 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -161,10 +161,15 @@ public:
+ 
+     int bindingBitsSize;
+     quint32 *bindingBits; 
+-    bool hasBindingBit(int) const;
++
++    inline bool hasBindingBit(int) const;
+     void clearBindingBit(int);
+     void setBindingBit(QObject *obj, int);
+ 
++    inline bool hasPendingBindingBit(int) const;
++    void setPendingBindingBit(QObject *obj, int);
++    void clearPendingBindingBit(int);
++
+     quint16 lineNumber;
+     quint16 columnNumber;
+ 
+@@ -201,9 +206,13 @@ public:
+     static void markAsDeleted(QObject *);
+     static void setQueuedForDeletion(QObject *);
+ 
++    static inline void flushPendingBinding(QObject *, int coreIndex);
++
+ private:
+     // For attachedProperties
+     mutable QQmlDataExtended *extendedData;
++
++    void flushPendingBindingImpl(int coreIndex);
+ };
+ 
+ bool QQmlData::wasDeleted(QObject *object)
+@@ -238,6 +247,31 @@ QQmlNotifierEndpoint *QQmlData::notify(int index)
+     }
+ }
+ 
++bool QQmlData::hasBindingBit(int coreIndex) const
++{
++    int bit = coreIndex * 2;
++    if (bindingBitsSize > bit)
++        return bindingBits[bit / 32] & (1 << (bit % 32));
++    else
++        return false;
++}
++
++bool QQmlData::hasPendingBindingBit(int coreIndex) const
++{
++    int bit = coreIndex * 2 + 1;
++    if (bindingBitsSize > bit)
++        return bindingBits[bit / 32] & (1 << (bit % 32));
++    else
++        return false;
++}
++
++void QQmlData::flushPendingBinding(QObject *o, int coreIndex)
++{
++    QQmlData *data = QQmlData::get(o, false);
++    if (data && data->hasPendingBindingBit(coreIndex))
++        data->flushPendingBindingImpl(coreIndex);
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLDATA_P_H
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 1a9fc58..c046a4c 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -627,6 +627,22 @@ void QQmlData::setQueuedForDeletion(QObject *object)
+     }
+ }
+ 
++void QQmlData::flushPendingBindingImpl(int coreIndex)
++{
++    clearPendingBindingBit(coreIndex);
++
++    // Find the binding
++    QQmlAbstractBinding *b = bindings;
++    while (b && *b->m_mePtr && b->propertyIndex() != coreIndex)
++        b = b->nextBinding();
++
++    if (b) {
++        b->m_mePtr = 0;
++        b->setEnabled(true, QQmlPropertyPrivate::BypassInterceptor |
++                            QQmlPropertyPrivate::DontRemoveBinding);
++    }
++}
++
+ void QQmlEnginePrivate::init()
+ {
+     Q_Q(QQmlEngine);
+@@ -1456,40 +1472,52 @@ void QQmlData::parentChanged(QObject *object, QObject *parent)
+     }
+ }
+ 
+-bool QQmlData::hasBindingBit(int bit) const
+-{
+-    if (bindingBitsSize > bit)
+-        return bindingBits[bit / 32] & (1 << (bit % 32));
+-    else
+-        return false;
+-}
+-
+-void QQmlData::clearBindingBit(int bit)
++static void QQmlData_setBit(QQmlData *data, QObject *obj, int bit)
+ {
+-    if (bindingBitsSize > bit)
+-        bindingBits[bit / 32] &= ~(1 << (bit % 32));
+-}
+-
+-void QQmlData::setBindingBit(QObject *obj, int bit)
+-{
+-    if (bindingBitsSize <= bit) {
++    if (data->bindingBitsSize <= bit) {
+         int props = QQmlMetaObject(obj).propertyCount();
+-        Q_ASSERT(bit < props);
++        Q_ASSERT(bit < 2 * props);
+ 
+-        int arraySize = (props + 31) / 32;
+-        int oldArraySize = bindingBitsSize / 32;
++        int arraySize = (2 * props + 31) / 32;
++        int oldArraySize = data->bindingBitsSize / 32;
+ 
+-        bindingBits = (quint32 *)realloc(bindingBits,
+-                                         arraySize * sizeof(quint32));
++        data->bindingBits = (quint32 *)realloc(data->bindingBits,
++                                               arraySize * sizeof(quint32));
+ 
+-        memset(bindingBits + oldArraySize,
++        memset(data->bindingBits + oldArraySize,
+                0x00,
+                sizeof(quint32) * (arraySize - oldArraySize));
+ 
+-        bindingBitsSize = arraySize * 32;
++        data->bindingBitsSize = arraySize * 32;
+     }
+ 
+-    bindingBits[bit / 32] |= (1 << (bit % 32));
++    data->bindingBits[bit / 32] |= (1 << (bit % 32));
++}
++
++static void QQmlData_clearBit(QQmlData *data, int bit)
++{
++    if (data->bindingBitsSize > bit)
++        data->bindingBits[bit / 32] &= ~(1 << (bit % 32));
++}
++
++void QQmlData::clearBindingBit(int coreIndex)
++{
++    QQmlData_clearBit(this, coreIndex * 2);
++}
++
++void QQmlData::setBindingBit(QObject *obj, int coreIndex)
++{
++    QQmlData_setBit(this, obj, coreIndex * 2);
++}
++
++void QQmlData::clearPendingBindingBit(int coreIndex)
++{
++    QQmlData_clearBit(this, coreIndex * 2 + 1);
++}
++
++void QQmlData::setPendingBindingBit(QObject *obj, int coreIndex)
++{
++    QQmlData_setBit(this, obj, coreIndex * 2 + 1);
+ }
+ 
+ void QQmlEnginePrivate::sendQuit()
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index 49bbd0e..2ada260 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -199,8 +199,8 @@ union QQmlInstruction
+         int data;
+         ushort column;
+         ushort line; 
+-        bool isRoot;
+-        bool parentToSuper;
++        bool isRoot:1;
++        bool parentToSuper:1;
+     };
+     struct instr_createSimple {
+         QML_INSTR_HEADER
+@@ -244,8 +244,8 @@ union QQmlInstruction
+         int fallbackValue;
+         short context;
+         short owner;
+-        bool isRoot;
+-        bool isAlias;
++        bool isRoot:1;
++        bool isAlias:1;
+         ushort line;
+         ushort column;
+     };
+@@ -255,9 +255,10 @@ union QQmlInstruction
+         int value;
+         short context;
+         short owner;
+-        bool isRoot;
+-        bool isAlias;
+-        bool isFallback;
++        bool isRoot:1;
++        bool isAlias:1;
++        bool isFallback:1;
++        bool isSafe:1;
+         ushort line;
+         ushort column;
+     };
+@@ -334,8 +335,8 @@ union QQmlInstruction
+         ushort line;
+         ushort column;
+         double numberValue;
+-        bool isStringLiteral;
+-        bool isNumberLiteral;
++        bool isStringLiteral:1;
++        bool isNumberLiteral:1;
+     }; 
+     struct instr_storeScript {
+         QML_INSTR_HEADER
+diff --git a/src/qml/qml/qqmlrewrite.cpp b/src/qml/qml/qqmlrewrite.cpp
+index 50e732b..82e0939 100644
+--- a/src/qml/qml/qqmlrewrite.cpp
++++ b/src/qml/qml/qqmlrewrite.cpp
+@@ -90,27 +90,112 @@ static void rewriteStringLiteral(AST::StringLiteral *ast, const QString *code, i
+     }
+ }
+ 
+-bool SharedBindingTester::isSharable(const QString &code)
++SharedBindingTester::SharedBindingTester()
++: _sharable(false), _safe(false)
+ {
++}
++
++void SharedBindingTester::parse(const QString &code)
++{
++    _sharable = _safe = false;
++
+     Engine engine;
+     Lexer lexer(&engine);
+     Parser parser(&engine);
+     lexer.setCode(code, 0);
+     parser.parseStatement();
+     if (!parser.statement()) 
+-        return false;
++        return;
+ 
+-    return isSharable(parser.statement());
++    return parse(parser.statement());
+ }
+ 
+-bool SharedBindingTester::isSharable(AST::Node *node)
++void SharedBindingTester::parse(AST::Node *node)
+ {
+     _sharable = true;
++    _safe = true;
++
+     AST::Node::acceptChild(node, this);
+-    return _sharable;
+ }
+ 
+-QString RewriteBinding::operator()(const QString &code, bool *ok, bool *sharable)
++bool SharedBindingTester::visit(AST::FunctionDeclaration *)
++{
++    _sharable = false;
++    return false;
++}
++
++bool SharedBindingTester::visit(AST::FunctionExpression *)
++{
++    _sharable = false;
++    return false;
++}
++
++bool SharedBindingTester::visit(AST::CallExpression *e)
++{
++    static const QString mathString = QStringLiteral("Math");
++
++    if (AST::IdentifierExpression *ie = AST::cast<AST::IdentifierExpression *>(e->base)) {
++        if (ie->name == mathString)
++            return true;
++    }
++
++    _safe = false;
++    return true;
++}
++
++bool SharedBindingTester::visit(AST::IdentifierExpression *e)
++{
++    static const QString evalString = QStringLiteral("eval");
++    if (e->name == evalString)
++        _sharable = false;
++
++    return false; // IdentifierExpression is a leaf node anyway
++}
++
++bool SharedBindingTester::visit(AST::PostDecrementExpression *)
++{
++    _safe = false;
++    return true;
++}
++
++bool SharedBindingTester::visit(AST::PostIncrementExpression *)
++{
++    _safe = false;
++    return true;
++}
++
++bool SharedBindingTester::visit(AST::PreDecrementExpression *)
++{
++    _safe = false;
++    return true;
++}
++
++bool SharedBindingTester::visit(AST::PreIncrementExpression *)
++{
++    _safe = false;
++    return true;
++}
++
++bool SharedBindingTester::visit(AST::BinaryExpression *e)
++{
++    if (e->op == QSOperator::InplaceAnd ||
++        e->op == QSOperator::Assign ||
++        e->op == QSOperator::InplaceSub ||
++        e->op == QSOperator::InplaceDiv ||
++        e->op == QSOperator::InplaceAdd ||
++        e->op == QSOperator::InplaceLeftShift ||
++        e->op == QSOperator::InplaceMod ||
++        e->op == QSOperator::InplaceMul ||
++        e->op == QSOperator::InplaceOr ||
++        e->op == QSOperator::InplaceRightShift ||
++        e->op == QSOperator::InplaceURightShift ||
++        e->op == QSOperator::InplaceXor)
++        _safe = false;
++
++    return true;
++}
++
++QString RewriteBinding::operator()(const QString &code, bool *ok, bool *sharable, bool *safe)
+ {
+     Engine engine;
+     Lexer lexer(&engine);
+@@ -122,22 +207,26 @@ QString RewriteBinding::operator()(const QString &code, bool *ok, bool *sharable
+         return QString();
+     } else {
+         if (ok) *ok = true;
+-        if (sharable) {
++        if (sharable || safe) {
+             SharedBindingTester tester;
+-            *sharable = tester.isSharable(parser.statement());
++            tester.parse(parser.statement());
++            if (sharable) *sharable = tester.isSharable();
++            if (safe) *safe = tester.isSafe();
+         }
+     }
+     return rewrite(code, 0, parser.statement());
+ }
+ 
+-QString RewriteBinding::operator()(QQmlJS::AST::Node *node, const QString &code, bool *sharable)
++QString RewriteBinding::operator()(QQmlJS::AST::Node *node, const QString &code, bool *sharable, bool *safe)
+ {
+     if (!node)
+         return code;
+ 
+-    if (sharable) {
++    if (sharable || safe) {
+         SharedBindingTester tester;
+-        *sharable = tester.isSharable(node);
++        tester.parse(node);
++        if (sharable) *sharable = tester.isSharable();
++        if (safe) *safe = tester.isSafe();
+     }
+ 
+     QQmlJS::AST::ExpressionNode *expression = node->expressionCast();
+diff --git a/src/qml/qml/qqmlrewrite_p.h b/src/qml/qml/qqmlrewrite_p.h
+index 26027a0..519846c 100644
+--- a/src/qml/qml/qqmlrewrite_p.h
++++ b/src/qml/qml/qqmlrewrite_p.h
+@@ -67,13 +67,25 @@ using namespace QQmlJS;
+ class SharedBindingTester : protected AST::Visitor
+ {
+     bool _sharable;
++    bool _safe;
+ public:
+-    bool isSharable(const QString &code);
+-    bool isSharable(AST::Node *Node);
++    SharedBindingTester();
++
++    bool isSharable() const { return _sharable; }
++    bool isSafe() const { return isSharable() && _safe; }
++
++    void parse(const QString &code);
++    void parse(AST::Node *Node);
+     
+-    inline virtual bool visit(AST::FunctionDeclaration *);
+-    inline virtual bool visit(AST::FunctionExpression *);
+-    inline virtual bool visit(AST::IdentifierExpression *);
++    virtual bool visit(AST::FunctionDeclaration *);
++    virtual bool visit(AST::FunctionExpression *);
++    virtual bool visit(AST::IdentifierExpression *);
++    virtual bool visit(AST::CallExpression *);
++    virtual bool visit(AST::PostDecrementExpression *);
++    virtual bool visit(AST::PostIncrementExpression *);
++    virtual bool visit(AST::PreDecrementExpression *);
++    virtual bool visit(AST::PreIncrementExpression *);
++    virtual bool visit(AST::BinaryExpression *);
+ };
+ 
+ class RewriteBinding: protected AST::Visitor
+@@ -84,8 +96,8 @@ class RewriteBinding: protected AST::Visitor
+     const QString *_code;
+ 
+ public:
+-    QString operator()(const QString &code, bool *ok = 0, bool *sharable = 0);
+-    QString operator()(QQmlJS::AST::Node *node, const QString &code, bool *sharable = 0);
++    QString operator()(const QString &code, bool *ok = 0, bool *sharable = 0, bool *safe = 0);
++    QString operator()(QQmlJS::AST::Node *node, const QString &code, bool *sharable = 0, bool *safe = 0);
+ 
+     //name of the function:  used for the debugger
+     void setName(const QString &name) { _name = name; }
+@@ -177,27 +189,6 @@ private:
+     QString _error;
+ };
+ 
+-bool SharedBindingTester::visit(AST::FunctionDeclaration *)
+-{
+-    _sharable = false;
+-    return false;
+-}
+-
+-bool SharedBindingTester::visit(AST::FunctionExpression *)
+-{
+-    _sharable = false;
+-    return false;
+-}
+-
+-bool SharedBindingTester::visit(AST::IdentifierExpression *e)
+-{
+-    static const QString evalString = QStringLiteral("eval");
+-    if (e->name == evalString)
+-        _sharable = false;
+-
+-    return false; // IdentifierExpression is a leaf node anyway
+-}
+-
+ } // namespace QQmlRewrite
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 6565824..1f12af3 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -201,12 +201,12 @@ QObject *QQmlVME::execute(QList<QQmlError> *errors, const Interrupt &interrupt)
+ 
+ inline bool fastHasBinding(QObject *o, int index) 
+ {
+-    QQmlData *ddata = static_cast<QQmlData *>(QObjectPrivate::get(o)->declarativeData);
+-
+-    index &= 0x0000FFFF; // To handle value types
++    if (QQmlData *ddata = static_cast<QQmlData *>(QObjectPrivate::get(o)->declarativeData)) {
++        int coreIndex = index & 0x0000FFFF;
++        return ddata->hasBindingBit(coreIndex);
++    }
+ 
+-    return ddata && (ddata->bindingBitsSize > index) && 
+-           (ddata->bindingBits[index / 32] & (1 << (index % 32)));
++    return false;
+ }
+ 
+ static void removeBindingOnProperty(QObject *o, int index)
+@@ -867,6 +867,13 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 CLEAN_PROPERTY(target, instr.property);
+ 
+                 binding->addToObject();
++
++                if (instr.propType == 0) {
++                    // All non-valuetype V4 bindings are safe bindings
++                    QQmlData *data = QQmlData::get(target);
++                    Q_ASSERT(data);
++                    data->setPendingBindingBit(target, propertyIdx);
++                }
+             }
+         QML_END_INSTR(StoreV4Binding)
+ 
+@@ -876,7 +883,9 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             QObject *scope = 
+                 objects.at(objects.count() - 1 - instr.context);
+ 
+-            if (instr.isRoot && BINDINGSKIPLIST.testBit(instr.property.coreIndex))
++            int coreIndex = instr.property.coreIndex;
++
++            if (instr.isRoot && BINDINGSKIPLIST.testBit(coreIndex))
+                 QML_NEXT_INSTR(StoreV8Binding);
+ 
+             QQmlAbstractBinding *binding = CTXT->v8bindings->configBinding(target, scope,
+@@ -887,8 +896,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+ 
+                 if (instr.isAlias) {
+                     QQmlAbstractBinding *old =
+-                        QQmlPropertyPrivate::setBindingNoEnable(target,
+-                                                                instr.property.coreIndex,
++                        QQmlPropertyPrivate::setBindingNoEnable(target, coreIndex,
+                                                                 instr.property.getValueTypeCoreIndex(),
+                                                                 binding);
+                     if (old) { old->destroy(); }
+@@ -900,6 +908,12 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                     CLEAN_PROPERTY(target, QDPP::bindingIndex(instr.property));
+ 
+                     binding->addToObject();
++
++                    if (instr.isSafe && !instr.property.isValueTypeVirtual()) {
++                        QQmlData *data = QQmlData::get(target);
++                        Q_ASSERT(data);
++                        data->setPendingBindingBit(target, coreIndex);
++                    }
+                 }
+             }
+         QML_END_INSTR(StoreV8Binding)
+@@ -1289,6 +1303,9 @@ QQmlContextData *QQmlVME::complete(const Interrupt &interrupt)
+ 
+         if (b) {
+             b->m_mePtr = 0;
++            QQmlData *data = QQmlData::get(b->object());
++            Q_ASSERT(data);
++            data->clearPendingBindingBit(b->propertyIndex());
+             b->setEnabled(true, QQmlPropertyPrivate::BypassInterceptor |
+                                 QQmlPropertyPrivate::DontRemoveBinding);
+         }
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 2ad69de..4d6bf92 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -448,6 +448,11 @@ void QV4Bindings::Binding::disconnect()
+     }
+ }
+ 
++void QV4Bindings::Binding::dump()
++{
++    qWarning() << parent->context()->url << instruction->line << instruction->column;
++}
++
+ QV4Bindings::Subscription::Subscription()
+     : m_bindings(0)
+ {
+@@ -884,23 +889,33 @@ inline quint32 QV4Bindings::toUint32(double n)
+     MARK_REGISTER(reg); \
+ }
+ 
+-//TODO: avoid construction of name and name-based lookup
+-#define INVALIDATION_CHECK(inv, obj, index) { \
+-    if ((inv) != 0) { \
+-        QQmlData *data = QQmlData::get((obj)); \
+-        if (data && !data->propertyCache) { \
+-            data->propertyCache = QQmlEnginePrivate::get(context->engine)->cache(object); \
+-            if (data->propertyCache) data->propertyCache->addref(); \
+-        } \
+-        QQmlPropertyData *prop = (data && data->propertyCache) ? data->propertyCache->property((index)) : 0; \
+-        if (prop && prop->isOverridden()) { \
+-            int resolvedIndex = data->propertyCache->property(prop->name(obj), obj, context)->coreIndex; \
+-            if ((int)index < resolvedIndex) { \
+-                *(inv) = true; \
+-                goto programExit; \
+-            } \
+-        } \
+-    } \
++namespace {
++
++bool bindingInvalidated(bool *invalidated, QObject *obj, QQmlContextData *context, int index)
++{
++    if (invalidated != 0) {
++        if (QQmlData *data = QQmlData::get(obj, true)) {
++            if (!data->propertyCache) {
++                data->propertyCache = QQmlEnginePrivate::get(context->engine)->cache(obj);
++                if (data->propertyCache) data->propertyCache->addref();
++            }
++
++            if (QQmlPropertyData *prop = data->propertyCache ? data->propertyCache->property(index) : 0) {
++                if (prop->isOverridden()) {
++                    // TODO: avoid construction of name and name-based lookup
++                    int resolvedIndex = data->propertyCache->property(prop->name(obj), obj, context)->coreIndex;
++                    if (index < resolvedIndex) {
++                        *invalidated = true;
++                        return true;
++                    }
++                }
++            }
++        }
++    }
++
++    return false;
++}
++
+ }
+ 
+ #ifdef QML_THREADED_INTERPRETER
+@@ -978,15 +993,6 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         subscribeId(context, instr->subscribeop.index, instr->subscribeop.offset);
+     QML_V4_END_INSTR(SubscribeId, subscribeop)
+ 
+-    QML_V4_BEGIN_INSTR(Subscribe, subscribeop)
+-    {
+-        QObject *o = 0;
+-        const Register &object = registers[instr->subscribeop.reg];
+-        if (!object.isUndefined()) o = object.getQObject();
+-        subscribe(o, instr->subscribeop.index, instr->subscribeop.offset, context->engine);
+-    }
+-    QML_V4_END_INSTR(Subscribe, subscribeop)
+-
+     QML_V4_BEGIN_INSTR(FetchAndSubscribe, fetchAndSubscribe)
+     {
+         Register &reg = registers[instr->fetchAndSubscribe.reg];
+@@ -998,12 +1004,16 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         if (!object) {
+             THROW_EXCEPTION(instr->fetchAndSubscribe.exceptionId);
+         } else {
+-            INVALIDATION_CHECK(invalidated, object, instr->fetchAndSubscribe.property.coreIndex);
++            if (bindingInvalidated(invalidated, object, context, instr->fetchAndSubscribe.property.coreIndex))
++                goto programExit;
+ 
+             const Register::Type valueType = (Register::Type)instr->fetchAndSubscribe.valueType;
+             reg.init(valueType);
+             if (instr->fetchAndSubscribe.valueType >= FirstCleanupType)
+                 MARK_REGISTER(instr->fetchAndSubscribe.reg);
++
++            QQmlData::flushPendingBinding(object, instr->fetchAndSubscribe.property.coreIndex);
++
+             QQmlAccessors *accessors = instr->fetchAndSubscribe.property.accessors;
+             accessors->read(object, instr->fetchAndSubscribe.property.accessorData,
+                             reg.typeDataPtr());
+@@ -2313,12 +2323,16 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         if (!object) {
+             THROW_EXCEPTION(instr->fetch.exceptionId);
+         } else {
+-            INVALIDATION_CHECK(invalidated, object, instr->fetch.index);
++            if (bindingInvalidated(invalidated, object, context, instr->fetch.index))
++                goto programExit;
+ 
+             const Register::Type valueType = (Register::Type)instr->fetch.valueType;
+             reg.init(valueType);
+             if (instr->fetch.valueType >= FirstCleanupType)
+                 MARK_REGISTER(instr->fetch.reg);
++
++            QQmlData::flushPendingBinding(object, instr->fetch.index);
++
+             void *argv[] = { reg.typeDataPtr(), 0 };
+             QMetaObject::metacall(object, QMetaObject::ReadProperty, instr->fetch.index, argv);
+             if (valueType == FloatType) {
+@@ -2326,6 +2340,10 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+                 const double v = reg.getfloat();
+                 reg.setnumber(v);
+             }
++
++            if (instr->fetch.subIndex != static_cast<quint32>(-1))
++                subscribe(object, instr->fetch.subIndex, instr->fetch.subOffset, context->engine);
++
+         }
+     }
+     QML_V4_END_INSTR(Fetch, fetch)
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index 4053c47..9991821 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -93,6 +93,8 @@ public:
+ 
+         void disconnect();
+ 
++        void dump();
++
+         struct Retarget {
+             QObject *target;
+             int targetProperty;
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index d5f44c4..9c1053d 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -407,19 +407,20 @@ void QV4CompilerPrivate::visitName(IR::Name *e)
+             fetch.property = *e->property;
+             gen(fetch);
+         } else {
+-            if (blockNeedsSubscription(_subscribeName) && e->property->notifyIndex != -1) {
+-                Instr::Subscribe sub;
+-                sub.reg = currentReg;
+-                sub.offset = subscriptionIndex(_subscribeName);
+-                sub.index = e->property->notifyIndex;
+-                gen(sub);
+-            }
+-
+             Instr::Fetch fetch;
+             fetch.reg = currentReg;
+             fetch.index = e->property->coreIndex;
+             fetch.exceptionId = exceptionId(e->line, e->column);
+             fetch.valueType = regType;
++
++            if (blockNeedsSubscription(_subscribeName) && e->property->notifyIndex != -1) {
++                fetch.subOffset = subscriptionIndex(_subscribeName);
++                fetch.subIndex = e->property->notifyIndex;
++            } else {
++                fetch.subOffset = static_cast<quint16>(-1);
++                fetch.subIndex = static_cast<quint32>(-1);
++            }
++
+             gen(fetch);
+         }
+ 
+diff --git a/src/qml/qml/v4/qv4instruction.cpp b/src/qml/qml/v4/qv4instruction.cpp
+index 252c9e9..d550450 100644
+--- a/src/qml/qml/v4/qv4instruction.cpp
++++ b/src/qml/qml/v4/qv4instruction.cpp
+@@ -96,9 +96,6 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::BindingId:
+         INSTR_DUMP << i->id.line << ':' << i->id.column << ':';
+         break;
+-    case V4Instr::Subscribe:
+-        INSTR_DUMP << '\t' << "Subscribe" << "\t\t" << "Object_Reg(" << i->subscribeop.reg << ") Notify_Signal(" << i->subscribeop.index << ") -> Subscribe_Slot(" << i->subscribeop.offset << ')';
+-        break;
+     case V4Instr::SubscribeId:
+         INSTR_DUMP << '\t' << "SubscribeId" << "\t\t" << "Id_Offset(" << i->subscribeop.index << ") -> Subscribe_Slot(" << i->subscribeop.offset << ')';
+         break;
+diff --git a/src/qml/qml/v4/qv4instruction_p.h b/src/qml/qml/v4/qv4instruction_p.h
+index 34d483b..a918992 100644
+--- a/src/qml/qml/v4/qv4instruction_p.h
++++ b/src/qml/qml/v4/qv4instruction_p.h
+@@ -67,7 +67,6 @@ QT_BEGIN_NAMESPACE
+ #define FOR_EACH_V4_INSTR(F) \
+     F(Noop, common) \
+     F(BindingId, id) \
+-    F(Subscribe, subscribeop) \
+     F(SubscribeId, subscribeop) \
+     F(FetchAndSubscribe, fetchAndSubscribe) \
+     F(LoadId, load) \
+@@ -291,6 +290,8 @@ union Q_AUTOTEST_EXPORT V4Instr {
+         quint8 exceptionId;
+         quint8 valueType;
+         quint32 index;
++        quint16 subOffset;
++        quint32 subIndex;
+     };
+ 
+     struct instr_copy {
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index a15831a..fc61dcd 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -131,12 +131,18 @@ void QV8Bindings::Binding::update(QQmlAbstractBinding *_This, QQmlPropertyPrivat
+     This->update(flags);
+ }
+ 
++void QV8Bindings::Binding::dump()
++{
++    qWarning() << parent->url() << instruction->line << instruction->column;
++}
++
+ void QV8Bindings::Binding::update(QQmlPropertyPrivate::WriteFlags flags)
+ {
+     if (!enabledFlag())
+         return;
+ 
+     QQmlContextData *context = parent->context();
++
+     if (!context || !context->isValid())
+         return;
+ 
+diff --git a/src/qml/qml/v8/qv8bindings_p.h b/src/qml/qml/v8/qv8bindings_p.h
+index 9fbeaeb..fd99507 100644
+--- a/src/qml/qml/v8/qv8bindings_p.h
++++ b/src/qml/qml/v8/qv8bindings_p.h
+@@ -104,6 +104,8 @@ public:
+         QObject *object() const;
+         void update(QQmlPropertyPrivate::WriteFlags flags);
+ 
++        void dump();
++
+         QV8Bindings *parent;
+ 
+         struct Retarget {
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 9cb3410..ee80dde 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -534,6 +534,8 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+     if (!result)
+         return v8::Handle<v8::Value>();
+ 
++    QQmlData::flushPendingBinding(object, result->coreIndex);
++
+     if (revisionMode == QV8QObjectWrapper::CheckRevision && result->hasRevision()) {
+         QQmlData *ddata = QQmlData::get(object);
+         if (ddata && ddata->propertyCache && !ddata->propertyCache->isAllowedInRevision(result))
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 96c0ec1..e5661bd 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -610,7 +610,7 @@ void tst_qqmlecmascript::methods()
+ void tst_qqmlecmascript::bindingLoop()
+ {
+     QQmlComponent component(&engine, testFileUrl("bindingLoop.qml"));
+-    QString warning = component.url().toString() + ":5:9: QML MyQmlObject: Binding loop detected for property \"stringProperty\"";
++    QString warning = component.url().toString() + ":9:9: QML MyQmlObject: Binding loop detected for property \"stringProperty\"";
+     QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
+     QObject *object = component.create();
+     QVERIFY(object != 0);
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index d39649a..e4a8a2e 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -989,7 +989,6 @@ void tst_v4::debuggingDumpInstructions()
+     QStringList expectedPreAddress;
+     expectedPreAddress << "\t\tNoop";
+     expectedPreAddress << "\t0:0:";
+-    expectedPreAddress << "\t\tSubscribe\t\tObject_Reg(0) Notify_Signal(0) -> Subscribe_Slot(0)";
+     expectedPreAddress << "\t\tSubscribeId\t\tId_Offset(0) -> Subscribe_Slot(0)";
+     expectedPreAddress << "\t\tFetchAndSubscribe\tObject_Reg(0) Fast_Accessor(0x0) -> Output_Reg(0) Subscription_Slot(0)";
+     expectedPreAddress << "\t\tLoadId\t\t\tId_Offset(0) -> Output_Reg(0)";

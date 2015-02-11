@@ -1,0 +1,389 @@
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index 6c4465e..5f5e7b0 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -186,7 +186,7 @@ class QQmlBoundSignalParameters : public QObject
+ {
+ Q_OBJECT
+ public:
+-    QQmlBoundSignalParameters(const QMetaMethod &, QQmlAbstractBoundSignal*);
++    QQmlBoundSignalParameters(const QMetaMethod &, QQmlAbstractBoundSignal*, QQmlEngine*);
+     ~QQmlBoundSignalParameters();
+ 
+     void setValues(void **);
+@@ -344,7 +344,7 @@ void QQmlBoundSignal_callback(QQmlNotifierEndpoint *e, void **a)
+         QList<QByteArray> names = QQmlPropertyCache::signalParameterNames(*s->m_scope, s->m_index);
+         if (!names.isEmpty()) {
+             QMetaMethod signal = QMetaObjectPrivate::signal(s->m_scope->metaObject(), s->m_index);
+-            s->m_params = new QQmlBoundSignalParameters(signal, s);
++            s->m_params = new QQmlBoundSignalParameters(signal, s, s->m_expression->engine());
+         }
+ 
+         s->setParamsValid(true);
+@@ -364,7 +364,8 @@ void QQmlBoundSignal_callback(QQmlNotifierEndpoint *e, void **a)
+ }
+ 
+ QQmlBoundSignalParameters::QQmlBoundSignalParameters(const QMetaMethod &method, 
+-                                                     QQmlAbstractBoundSignal *owner)
++                                                     QQmlAbstractBoundSignal *owner,
++                                                     QQmlEngine *engine)
+ : types(0), values(0)
+ {
+     MetaObject *mo = new MetaObject(this);
+@@ -389,7 +390,7 @@ QQmlBoundSignalParameters::QQmlBoundSignalParameters(const QMetaMethod &method,
+             name = "__qt_anonymous_param_" + QByteArray::number(ii);
+ 
+         int t = QMetaType::type(type.constData());
+-        if (QQmlMetaType::isQObject(t)) {
++        if (QQmlEnginePrivate::get(engine)->isQObject(t)) {
+             types[ii] = QMetaType::QObjectStar;
+             QMetaPropertyBuilder prop = mob.addProperty(name, "QObject*");
+             prop.setWritable(false);
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index 453ee08..af84480 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -2978,9 +2978,33 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+             paramTypes[0] = paramCount;
+ 
+             for (int i = 0; i < paramCount; ++i) {
+-                Q_ASSERT(s->parameterTypes.at(i) < builtinTypeCount);
+-                paramTypes[i + 1] = builtinTypes[s->parameterTypes.at(i)].metaType;
+-                names.append(s->parameterNames.at(i).toString().toUtf8());
++                if (s->parameterTypes.at(i) < builtinTypeCount) {
++                    // built-in type
++                    paramTypes[i + 1] = builtinTypes[s->parameterTypes.at(i)].metaType;
++                    names.append(s->parameterNames.at(i).toString().toUtf8());
++                } else {
++                    // lazily resolved type
++                    Q_ASSERT(s->parameterTypes.at(i) == Object::DynamicProperty::Custom);
++                    QQmlType *qmltype = 0;
++                    QString url;
++                    if (!unit->imports().resolveType(s->parameterTypeNames.at(i).toString(), &qmltype, &url, 0, 0, 0))
++                        COMPILE_EXCEPTION(s, tr("Invalid signal parameter type: %1").arg(s->parameterTypeNames.at(i).toString()));
++
++                    if (!qmltype) {
++                        QQmlTypeData *tdata = enginePrivate->typeLoader.getType(QUrl(url));
++                        Q_ASSERT(tdata);
++                        Q_ASSERT(tdata->isComplete());
++
++                        QQmlCompiledData *data = tdata->compiledData();
++
++                        paramTypes[i + 1] = data->metaTypeId;
++
++                        tdata->release();
++                    } else {
++                        paramTypes[i + 1] = qmltype->typeId();
++                    }
++                    names.append(s->parameterNames.at(i).toString().toUtf8());
++                }
+             }
+         }
+ 
+diff --git a/src/qml/qml/qqmlscript.cpp b/src/qml/qml/qqmlscript.cpp
+index a237f9a..985b6b6 100644
+--- a/src/qml/qml/qqmlscript.cpp
++++ b/src/qml/qml/qqmlscript.cpp
+@@ -937,6 +937,7 @@ bool ProcessAST::visit(AST::UiPublicMember *node)
+ 
+         if (paramLength) {
+             signal->parameterTypes = _parser->_pool.NewRawList<Object::DynamicProperty::Type>(paramLength);
++            signal->parameterTypeNames = _parser->_pool.NewRawList<QHashedStringRef>(paramLength);
+             signal->parameterNames = _parser->_pool.NewRawList<QHashedStringRef>(paramLength);
+         }
+ 
+@@ -944,6 +945,15 @@ bool ProcessAST::visit(AST::UiPublicMember *node)
+         while (p) {
+             const QStringRef &memberType = p->type;
+ 
++            if (memberType.isEmpty()) {
++                QQmlError error;
++                error.setDescription(QCoreApplication::translate("QQmlParser","Expected parameter type"));
++                error.setLine(node->typeToken.startLine);
++                error.setColumn(node->typeToken.startColumn);
++                _parser->_errors << error;
++                return false;
++            }
++
+             const TypeNameToType *type = 0;
+             for(int typeIndex = 0; typeIndex < propTypeNameToTypesCount; ++typeIndex) {
+                 const TypeNameToType *t = propTypeNameToTypes + typeIndex;
+@@ -955,15 +965,26 @@ bool ProcessAST::visit(AST::UiPublicMember *node)
+             }
+ 
+             if (!type) {
+-                QQmlError error;
+-                error.setDescription(QCoreApplication::translate("QQmlParser","Expected parameter type"));
+-                error.setLine(node->typeToken.startLine);
+-                error.setColumn(node->typeToken.startColumn);
+-                _parser->_errors << error;
+-                return false;
++                if (memberType.at(0).isUpper()) {
++                    // Must be a QML object type.
++                    // Lazily determine type during compilation.
++                    signal->parameterTypes[index] = Object::DynamicProperty::Custom;
++                    signal->parameterTypeNames[index] = QHashedStringRef(p->type);
++                } else {
++                    QQmlError error;
++                    QString errStr = QCoreApplication::translate("QQmlParser","Invalid signal parameter type: ");
++                    errStr.append(memberType.toString());
++                    error.setDescription(errStr);
++                    error.setLine(node->typeToken.startLine);
++                    error.setColumn(node->typeToken.startColumn);
++                    _parser->_errors << error;
++                    return false;
++                }
++            } else {
++                // the parameter is a known basic type
++                signal->parameterTypes[index] = type->type;
+             }
+-            
+-            signal->parameterTypes[index] = type->type;
++
+             signal->parameterNames[index] = QHashedStringRef(p->name);
+             p = p->next;
+             index++;
+diff --git a/src/qml/qml/qqmlscript_p.h b/src/qml/qml/qqmlscript_p.h
+index e08afa8..60e667e 100644
+--- a/src/qml/qml/qqmlscript_p.h
++++ b/src/qml/qml/qqmlscript_p.h
+@@ -409,6 +409,7 @@ public:
+ 
+         QHashedStringRef name;
+         QQmlPool::List<DynamicProperty::Type> parameterTypes;
++        QQmlPool::List<QHashedStringRef> parameterTypeNames;
+         QQmlPool::List<QHashedStringRef> parameterNames;
+ 
+         // Used by Object::DynamicSignalList
+diff --git a/tests/auto/qml/qqmllanguage/data/OtherSignalParam.qml b/tests/auto/qml/qqmllanguage/data/OtherSignalParam.qml
+new file mode 100644
+index 0000000..5707f5e
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/OtherSignalParam.qml
+@@ -0,0 +1,6 @@
++import QtQml 2.0
++
++QtObject {
++    property string testProperty: "Hello, World"
++    property int answer: 42
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/SignalEmitter.qml b/tests/auto/qml/qqmllanguage/data/SignalEmitter.qml
+new file mode 100644
+index 0000000..259f45b
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/SignalEmitter.qml
+@@ -0,0 +1,25 @@
++import QtQml 2.0
++
++QtObject {
++    // these two need to be set by the test qml
++    property QtObject testObject
++    property bool handleSignal
++
++    property SignalParam p: SignalParam { }
++    property OtherSignalParam op: OtherSignalParam { }
++    signal testSignal(SignalParam spp);
++
++    function emitTestSignal() {
++        testObject.expectNull = true;
++        testSignal(op);
++
++        testObject.expectNull = false;
++        testSignal(p);
++    }
++
++    onTestSignal: {
++        if (handleSignal == true) {
++            testObject.determineSuccess(spp);
++        }
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/SignalParam.qml b/tests/auto/qml/qqmllanguage/data/SignalParam.qml
+new file mode 100644
+index 0000000..8139b20
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/SignalParam.qml
+@@ -0,0 +1,5 @@
++import QtQml 2.0
++
++QtObject {
++    property int testProperty: 42
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/signal.1.errors.txt b/tests/auto/qml/qqmllanguage/data/signal.1.errors.txt
+index 78d9960..f5c7891 100644
+--- a/tests/auto/qml/qqmllanguage/data/signal.1.errors.txt
++++ b/tests/auto/qml/qqmllanguage/data/signal.1.errors.txt
+@@ -1 +1 @@
+-4:12:Expected parameter type
++4:12:Invalid signal parameter type: nontype
+diff --git a/tests/auto/qml/qqmllanguage/data/signal.6.errors.txt b/tests/auto/qml/qqmllanguage/data/signal.6.errors.txt
+new file mode 100644
+index 0000000..183b05f
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/signal.6.errors.txt
+@@ -0,0 +1 @@
++4:12:Invalid signal parameter type: Nontype
+diff --git a/tests/auto/qml/qqmllanguage/data/signal.6.qml b/tests/auto/qml/qqmllanguage/data/signal.6.qml
+new file mode 100644
+index 0000000..8b6e401
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/signal.6.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++QtObject {
++    signal mySignal(Nontype a)
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/signalParameterTypes.1.qml b/tests/auto/qml/qqmllanguage/data/signalParameterTypes.1.qml
+new file mode 100644
+index 0000000..e3d4008
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/signalParameterTypes.1.qml
+@@ -0,0 +1,44 @@
++import QtQml 2.0
++
++QtObject {
++    id: root
++
++    property bool success: false
++    property bool gotInvalid: false
++    property bool expectNull: false
++    property SignalEmitter e: SignalEmitter { testObject: root; handleSignal: true }
++
++    function determineSuccess(param) {
++        if (root.expectNull == true) {
++            if (param != null) {
++                // the parameter shouldn't have been passed through, but was.
++                root.success = false;
++                root.gotInvalid = true;
++            } else {
++                root.success = true;
++                root.gotInvalid = false;
++            }
++            return;
++        } else if (param == null) {
++            // the parameter should have been passed through, but wasn't.
++            root.success = false;
++            return;
++        }
++
++        if (param.testProperty == 42) {
++            // got the expected value.  if we didn't previously
++            // get an unexpected value, set success to true.
++            root.success = (!root.gotInvalid);
++        } else {
++             // the value passed through was not what we expected.
++            root.gotInvalid = true;
++            root.success = false;
++        }
++    }
++
++    Component.onCompleted: {
++        success = false;
++        e.emitTestSignal();
++        // the handler in the SignalEmitter should call determineSuccess.
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/signalParameterTypes.2.qml b/tests/auto/qml/qqmllanguage/data/signalParameterTypes.2.qml
+new file mode 100644
+index 0000000..5ae1bce
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/signalParameterTypes.2.qml
+@@ -0,0 +1,48 @@
++import QtQml 2.0
++
++QtObject {
++    id: root
++
++    property bool success: false
++    property bool gotInvalid: false
++    property bool expectNull: false
++    property SignalEmitter e: SignalEmitter { testObject: root; handleSignal: false } // false so it doesn't use bound handler.
++
++    function determineSuccess(param) {
++        if (root.expectNull == true) {
++            if (param != null) {
++                // the parameter shouldn't have been passed through, but was.
++                root.success = false;
++                root.gotInvalid = true;
++            } else {
++                root.success = true;
++                root.gotInvalid = false;
++            }
++            return;
++        } else if (param == null) {
++            // the parameter should have been passed through, but wasn't.
++            root.success = false;
++            return;
++        }
++
++        if (param.testProperty == 42) {
++            // got the expected value.  if we didn't previously
++            // get an unexpected value, set success to true.
++            root.success = (!root.gotInvalid);
++        } else {
++             // the value passed through was not what we expected.
++            root.gotInvalid = true;
++            root.success = false;
++        }
++    }
++
++    function handleTestSignal(spp) {
++        root.determineSuccess(spp);
++    }
++
++    Component.onCompleted: {
++        success = false;
++        e.testSignal.connect(handleTestSignal)
++        e.emitTestSignal();
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 04a4bf7..ab547dc 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -171,6 +171,7 @@ private slots:
+     void propertyInit();
+     void remoteLoadCrash();
+     void signalWithDefaultArg();
++    void signalParameterTypes();
+ 
+     // regression tests for crashes
+     void crash1();
+@@ -355,6 +356,7 @@ void tst_qqmllanguage::errors_data()
+     QTest::newRow("signal.3") << "signal.3.qml" << "signal.3.errors.txt" << false;
+     QTest::newRow("signal.4") << "signal.4.qml" << "signal.4.errors.txt" << false;
+     QTest::newRow("signal.5") << "signal.5.qml" << "signal.5.errors.txt" << false;
++    QTest::newRow("signal.6") << "signal.6.qml" << "signal.6.errors.txt" << false;
+ 
+     QTest::newRow("method.1") << "method.1.qml" << "method.1.errors.txt" << false;
+ 
+@@ -2923,6 +2925,28 @@ void tst_qqmllanguage::signalWithDefaultArg()
+     delete object;
+ }
+ 
++void tst_qqmllanguage::signalParameterTypes()
++{
++    // bound signal handlers
++    {
++    QQmlComponent component(&engine, testFileUrl("signalParameterTypes.1.qml"));
++    QObject *obj = component.create();
++    QVERIFY(obj != 0);
++    QVERIFY(obj->property("success").toBool());
++    delete obj;
++    }
++
++    // dynamic signal connections
++    {
++    QQmlComponent component(&engine, testFileUrl("signalParameterTypes.2.qml"));
++    QObject *obj = component.create();
++    QVERIFY(obj != 0);
++    QEXPECT_FAIL("", "Dynamic connections don't enforce type safety - QTBUG-26662", Abort);
++    QVERIFY(obj->property("success").toBool());
++    delete obj;
++    }
++}
++
+ // QTBUG-20639
+ void tst_qqmllanguage::globalEnums()
+ {

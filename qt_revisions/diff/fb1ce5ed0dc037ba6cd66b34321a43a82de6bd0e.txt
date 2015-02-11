@@ -1,0 +1,211 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 6438873..2636022 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -376,10 +376,8 @@ void QQuickCanvasPrivate::translateTouchToMouse(QTouchEvent *event)
+ {
+     if (event->type() == QEvent::TouchCancel) {
+         touchMouseId = -1;
+-        if (!mouseGrabberItem)
+-            return;
+-        mouseGrabberItem->ungrabMouse();
+-        mouseGrabberItem = 0;
++        if (mouseGrabberItem)
++            mouseGrabberItem->ungrabMouse();
+         return;
+     }
+     for (int i = 0; i < event->touchPoints().count(); ++i) {
+@@ -447,7 +445,8 @@ void QQuickCanvasPrivate::translateTouchToMouse(QTouchEvent *event)
+                 me.setTimestamp(event->timestamp());
+                 me.setCapabilities(event->device()->capabilities());
+                 deliverMouseEvent(&me);
+-                mouseGrabberItem = 0;
++                if (mouseGrabberItem)
++                    mouseGrabberItem->ungrabMouse();
+             }
+             break;
+         }
+@@ -947,13 +946,13 @@ bool QQuickCanvasPrivate::deliverInitialMousePressEvent(QQuickItem *item, QMouse
+             QMouseEvent me(event->type(), p, event->windowPos(), event->screenPos(),
+                            event->button(), event->buttons(), event->modifiers());
+             me.accept();
+-            mouseGrabberItem = item;
++            item->grabMouse();
+             q->sendEvent(item, &me);
+             event->setAccepted(me.isAccepted());
+             if (me.isAccepted())
+                 return true;
+-            mouseGrabberItem->ungrabMouse();
+-            mouseGrabberItem = 0;
++            if (mouseGrabberItem)
++                mouseGrabberItem->ungrabMouse();
+         }
+     }
+ 
+@@ -1023,7 +1022,8 @@ void QQuickCanvas::mouseReleaseEvent(QMouseEvent *event)
+     }
+ 
+     d->deliverMouseEvent(event);
+-    d->mouseGrabberItem = 0;
++    if (d->mouseGrabberItem)
++        d->mouseGrabberItem->ungrabMouse();
+ }
+ 
+ /*! \reimp */
+@@ -1560,6 +1560,12 @@ bool QQuickCanvas::sendEvent(QQuickItem *item, QEvent *e)
+             QQuickItemPrivate::get(item)->deliverMouseEvent(static_cast<QMouseEvent *>(e));
+         }
+         break;
++    case QEvent::UngrabMouse:
++        if (!d->sendFilteredMouseEvent(item->parentItem(), item, e)) {
++            e->accept();
++            item->mouseUngrabEvent();
++        }
++        break;
+     case QEvent::Wheel:
+         QQuickItemPrivate::get(item)->deliverWheelEvent(static_cast<QWheelEvent *>(e));
+         break;
+diff --git a/src/quick/items/qquickflickable.cpp b/src/quick/items/qquickflickable.cpp
+index d0721f3..82f6747 100644
+--- a/src/quick/items/qquickflickable.cpp
++++ b/src/quick/items/qquickflickable.cpp
+@@ -107,7 +107,7 @@ static const int FlickThreshold = 20;
+ 
+ // RetainGrabVelocity is the maxmimum instantaneous velocity that
+ // will ensure the Flickable retains the grab on consecutive flicks.
+-static const int RetainGrabVelocity = 15;
++static const int RetainGrabVelocity = 100;
+ 
+ QQuickFlickableVisibleArea::QQuickFlickableVisibleArea(QQuickFlickable *parent)
+     : QObject(parent), flickable(parent), m_xPosition(0.), m_widthRatio(0.)
+@@ -823,8 +823,8 @@ void QQuickFlickablePrivate::handleMousePressEvent(QMouseEvent *event)
+     Q_Q(QQuickFlickable);
+     QQuickItemPrivate::start(timer);
+     if (interactive && timeline.isActive()
+-        && (qAbs(hData.smoothVelocity.value()) > RetainGrabVelocity
+-            || qAbs(vData.smoothVelocity.value()) > RetainGrabVelocity)) {
++        && ((qAbs(hData.smoothVelocity.value()) > RetainGrabVelocity && !hData.fixingUp && !hData.inOvershoot)
++            || (qAbs(vData.smoothVelocity.value()) > RetainGrabVelocity && !vData.fixingUp && !vData.inOvershoot))) {
+         stealMouse = true; // If we've been flicked then steal the click.
+         int flickTime = timeline.time();
+         if (flickTime > 600) {
+@@ -846,7 +846,10 @@ void QQuickFlickablePrivate::handleMousePressEvent(QMouseEvent *event)
+     }
+     q->setKeepMouseGrab(stealMouse);
+     pressed = true;
+-    timeline.clear();
++    if (!hData.fixingUp)
++        timeline.reset(hData.move);
++    if (!vData.fixingUp)
++        timeline.reset(vData.move);
+     hData.reset();
+     vData.reset();
+     hData.dragMinBound = q->minXExtent();
+@@ -910,6 +913,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+                 }
+             }
+             if (!rejectY && stealMouse && dy != 0.0) {
++                timeline.clear();
+                 vData.move.setValue(newY);
+                 vMoved = true;
+             }
+@@ -942,6 +946,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+                 }
+             }
+             if (!rejectX && stealMouse && dx != 0.0) {
++                timeline.clear();
+                 hData.move.setValue(newX);
+                 hMoved = true;
+             }
+@@ -1753,6 +1758,7 @@ void QQuickFlickable::mouseUngrabEvent()
+     if (d->pressed) {
+         // if our mouse grab has been removed (probably by another Flickable),
+         // fix our state
++        d->clearDelayedPress();
+         d->pressed = false;
+         d->draggingEnding();
+         d->stealMouse = false;
+@@ -1845,6 +1851,12 @@ bool QQuickFlickable::childMouseEventFilter(QQuickItem *i, QEvent *e)
+     case QEvent::MouseMove:
+     case QEvent::MouseButtonRelease:
+         return sendMouseEvent(static_cast<QMouseEvent *>(e));
++    case QEvent::UngrabMouse:
++        if (d->canvas && d->canvas->mouseGrabberItem() && d->canvas->mouseGrabberItem() != this) {
++            // The grab has been taken away from a child and given to some other item.
++            mouseUngrabEvent();
++        }
++        break;
+     default:
+         break;
+     }
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 2b3bb55..f2ec0d6 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -4743,8 +4743,10 @@ void QQuickItem::grabMouse()
+ 
+     QQuickItem *oldGrabber = canvasPriv->mouseGrabberItem;
+     canvasPriv->mouseGrabberItem = this;
+-    if (oldGrabber)
+-        oldGrabber->mouseUngrabEvent();
++    if (oldGrabber) {
++        QEvent ev(QEvent::UngrabMouse);
++        d->canvas->sendEvent(oldGrabber, &ev);
++    }
+ }
+ 
+ void QQuickItem::ungrabMouse()
+@@ -4759,7 +4761,9 @@ void QQuickItem::ungrabMouse()
+     }
+ 
+     canvasPriv->mouseGrabberItem = 0;
+-    mouseUngrabEvent();
++
++    QEvent ev(QEvent::UngrabMouse);
++    d->canvas->sendEvent(this, &ev);
+ }
+ 
+ bool QQuickItem::keepMouseGrab() const
+diff --git a/src/quick/items/qquickpathview.cpp b/src/quick/items/qquickpathview.cpp
+index f8098c8..0526187 100644
+--- a/src/quick/items/qquickpathview.cpp
++++ b/src/quick/items/qquickpathview.cpp
+@@ -1224,7 +1224,8 @@ void QQuickPathViewPrivate::handleMousePressEvent(QMouseEvent *event)
+             return;
+     }
+ 
+-    if (tl.isActive() && flicking)
++
++    if (tl.isActive() && flicking && flickDuration && qreal(tl.time())/flickDuration < 0.8)
+         stealMouse = true; // If we've been flicked then steal the click.
+     else
+         stealMouse = false;
+@@ -1335,6 +1336,7 @@ void QQuickPathViewPrivate::handleMouseReleaseEvent(QMouseEvent *)
+         } else {
+             dist = qMin(qreal(modelCount-1), qreal(v2 / (accel * 2.0)));
+         }
++        flickDuration = static_cast<int>(1000 * qAbs(velocity) / accel);
+         offsetAdj = 0.0;
+         moveOffset.setValue(offset);
+         tl.accel(moveOffset, velocity, accel, dist);
+diff --git a/src/quick/items/qquickpathview_p_p.h b/src/quick/items/qquickpathview_p_p.h
+index a80c01f..412caa6 100644
+--- a/src/quick/items/qquickpathview_p_p.h
++++ b/src/quick/items/qquickpathview_p_p.h
+@@ -81,7 +81,7 @@ public:
+         , autoHighlight(true), highlightUp(false), layoutScheduled(false)
+         , moving(false), flicking(false), requestedOnPath(false), inRequest(false)
+         , dragMargin(0), deceleration(100)
+-        , moveOffset(this, &QQuickPathViewPrivate::setAdjustedOffset)
++        , moveOffset(this, &QQuickPathViewPrivate::setAdjustedOffset), flickDuration(0)
+         , firstIndex(-1), pathItems(-1), requestedIndex(-1), requestedZ(0)
+         , moveReason(Other), moveDirection(Shortest), attType(0), highlightComponent(0), highlightItem(0)
+         , moveHighlight(this, &QQuickPathViewPrivate::setHighlightPosition)
+@@ -171,6 +171,7 @@ public:
+     qreal deceleration;
+     QQuickTimeLine tl;
+     QQuickTimeLineValueProxy<QQuickPathViewPrivate> moveOffset;
++    int flickDuration;
+     int firstIndex;
+     int pathItems;
+     int requestedIndex;

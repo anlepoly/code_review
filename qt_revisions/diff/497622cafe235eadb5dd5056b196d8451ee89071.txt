@@ -1,0 +1,133 @@
+diff --git a/src/corelib/tools/qsharedpointer.cpp b/src/corelib/tools/qsharedpointer.cpp
+index ee0aee2..77c3d1e 100644
+--- a/src/corelib/tools/qsharedpointer.cpp
++++ b/src/corelib/tools/qsharedpointer.cpp
+@@ -1226,24 +1226,22 @@ QT_BEGIN_NAMESPACE
+ /*!
+     \internal
+     This function is called for a just-created QObject \a obj, to enable
+-    the use of QSharedPointer and QWeakPointer.
++    the use of QSharedPointer and QWeakPointer in the future.
++ */
++void QtSharedPointer::ExternalRefCountData::setQObjectShared(const QObject *, bool)
++{}
+ 
+-    When QSharedPointer is active in a QObject, the object must not be deleted
+-    directly: the lifetime is managed by the QSharedPointer object. In that case,
+-    the deleteLater() and parent-child relationship in QObject only decrease
+-    the strong reference count, instead of deleting the object.
++/*!
++    \internal
++    This function is called when a QSharedPointer is created from a QWeakPointer
++
++    We check that the QWeakPointer was really created from a QSharedPointer, and
++    not from a QObject.
+ */
+-void QtSharedPointer::ExternalRefCountData::setQObjectShared(const QObject *obj, bool)
++void QtSharedPointer::ExternalRefCountData::checkQObjectShared(const QObject *)
+ {
+-    Q_ASSERT(obj);
+-    QObjectPrivate *d = QObjectPrivate::get(const_cast<QObject *>(obj));
+-
+-    if (d->sharedRefcount.load() != 0)
+-        qFatal("QSharedPointer: pointer %p already has reference counting", obj);
+-    d->sharedRefcount.store(this);
+-
+-    // QObject decreases the refcount too, so increase it up
+-    weakref.ref();
++    if (strongref.load() < 0)
++        qWarning("QSharedPointer: cannot create a QSharedPointer from a QObject-tracking QWeakPointer");
+ }
+ 
+ QtSharedPointer::ExternalRefCountData *QtSharedPointer::ExternalRefCountData::getAndRef(const QObject *obj)
+diff --git a/src/corelib/tools/qsharedpointer_impl.h b/src/corelib/tools/qsharedpointer_impl.h
+index ebab027..58010dd 100644
+--- a/src/corelib/tools/qsharedpointer_impl.h
++++ b/src/corelib/tools/qsharedpointer_impl.h
+@@ -192,7 +192,9 @@ namespace QtSharedPointer {
+ #ifndef QT_NO_QOBJECT
+         Q_CORE_EXPORT static ExternalRefCountData *getAndRef(const QObject *);
+         Q_CORE_EXPORT void setQObjectShared(const QObject *, bool enable);
++        Q_CORE_EXPORT void checkQObjectShared(const QObject *);
+ #endif
++        inline void checkQObjectShared(...) { }
+         inline void setQObjectShared(...) { }
+     };
+     // sizeof(ExternalRefCount) = 12 (32-bit) / 16 (64-bit)
+@@ -432,10 +434,12 @@ namespace QtSharedPointer {
+                     tmp = o->strongref.load();  // failed, try again
+                 }
+ 
+-                if (tmp > 0)
++                if (tmp > 0) {
+                     o->weakref.ref();
+-                else
++                } else {
++                    o->checkQObjectShared(actual);
+                     o = 0;
++                }
+             }
+ 
+             qSwap(d, o);
+diff --git a/tests/auto/corelib/tools/qsharedpointer/tst_qsharedpointer.cpp b/tests/auto/corelib/tools/qsharedpointer/tst_qsharedpointer.cpp
+index 2bae52a..6dae58a 100644
+--- a/tests/auto/corelib/tools/qsharedpointer/tst_qsharedpointer.cpp
++++ b/tests/auto/corelib/tools/qsharedpointer/tst_qsharedpointer.cpp
+@@ -76,6 +76,7 @@ private slots:
+     void upCast();
+     void qobjectWeakManagement();
+     void noSharedPointerFromWeakQObject();
++    void sharedPointerFromQObjectWithWeak();
+     void weakQObjectFromSharedPointer();
+     void objectCast();
+     void differentPointers();
+@@ -692,12 +693,34 @@ void tst_QSharedPointer::noSharedPointerFromWeakQObject()
+     QObject obj;
+     QWeakPointer<QObject> weak(&obj);
+ 
+-    QSharedPointer<QObject> strong = weak.toStrongRef();
+-    QVERIFY(strong.isNull());
++    {
++        QTest::ignoreMessage(QtWarningMsg ,  "QSharedPointer: cannot create a QSharedPointer from a QObject-tracking QWeakPointer");
++        QSharedPointer<QObject> strong = weak.toStrongRef();
++        QVERIFY(strong.isNull());
++    }
++    {
++        QTest::ignoreMessage(QtWarningMsg ,  "QSharedPointer: cannot create a QSharedPointer from a QObject-tracking QWeakPointer");
++        QSharedPointer<QObject> strong = weak;
++        QVERIFY(strong.isNull());
++    }
+ 
++    QCOMPARE(weak.data(), &obj);
+     // if something went wrong, we'll probably crash here
+ }
+ 
++void tst_QSharedPointer::sharedPointerFromQObjectWithWeak()
++{
++    QObject *ptr = new QObject;
++    QWeakPointer<QObject> weak = ptr;
++    {
++        QSharedPointer<QObject> shared(ptr);
++        QVERIFY(!weak.isNull());
++        QCOMPARE(shared.data(), ptr);
++        QCOMPARE(weak.data(), ptr);
++    }
++    QVERIFY(weak.isNull());
++}
++
+ void tst_QSharedPointer::weakQObjectFromSharedPointer()
+ {
+     // this is the inverse of the above: you're allowed to create a QWeakPointer
+@@ -1767,12 +1790,6 @@ void tst_QSharedPointer::invalidConstructs_data()
+         << "Data *ptr = 0;\n"
+            "QWeakPointer<Data> weakptr(ptr);\n";
+ 
+-    QTest::newRow("shared-pointer-from-unmanaged-qobject")
+-        << &QTest::QExternalTest::tryRunFail
+-        << "QObject *ptr = new QObject;\n"
+-           "QWeakPointer<QObject> weak = ptr;\n"    // this makes the object unmanaged
+-           "QSharedPointer<QObject> shared(ptr);\n";
+-
+     QTest::newRow("shared-pointer-implicit-from-uninitialized")
+         << &QTest::QExternalTest::tryCompileFail
+         << "Data *ptr = 0;\n"

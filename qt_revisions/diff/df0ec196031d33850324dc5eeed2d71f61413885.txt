@@ -1,0 +1,284 @@
+diff --git a/src/3rdparty/javascriptcore/JavaScriptCore/interpreter/Interpreter.cpp b/src/3rdparty/javascriptcore/JavaScriptCore/interpreter/Interpreter.cpp
+index 2164b1d..9269fdd 100644
+--- a/src/3rdparty/javascriptcore/JavaScriptCore/interpreter/Interpreter.cpp
++++ b/src/3rdparty/javascriptcore/JavaScriptCore/interpreter/Interpreter.cpp
+@@ -584,6 +584,8 @@ NEVER_INLINE HandlerInfo* Interpreter::throwException(CallFrame*& callFrame, JSV
+     }
+     if (debugger)
+         debugger->exceptionThrow(DebuggerCallFrame(callFrame, exceptionValue), codeBlock->ownerExecutable()->sourceID(), hasHandler);
++    else if (!hasHandler)
++        callFrame->globalData().clientData->uncaughtException(callFrame, bytecodeOffset, exceptionValue);
+ #endif
+ 
+     while (!(handler = codeBlock->handlerForBytecodeOffset(bytecodeOffset))) {
+diff --git a/src/3rdparty/javascriptcore/JavaScriptCore/runtime/JSGlobalData.h b/src/3rdparty/javascriptcore/JavaScriptCore/runtime/JSGlobalData.h
+index dcd3289..e38a2bc 100644
+--- a/src/3rdparty/javascriptcore/JavaScriptCore/runtime/JSGlobalData.h
++++ b/src/3rdparty/javascriptcore/JavaScriptCore/runtime/JSGlobalData.h
+@@ -89,6 +89,7 @@ namespace JSC {
+             virtual ~ClientData() = 0;
+ #ifdef QT_BUILD_SCRIPT_LIB
+             virtual void mark(MarkStack&) {}
++            virtual void uncaughtException(ExecState*, unsigned bytecodeOffset, JSValue) = 0;
+ #endif
+         };
+ 
+diff --git a/src/script/api/qscriptcontext.cpp b/src/script/api/qscriptcontext.cpp
+index 8996654..7c1cb47 100644
+--- a/src/script/api/qscriptcontext.cpp
++++ b/src/script/api/qscriptcontext.cpp
+@@ -161,8 +161,10 @@ QScriptContext::QScriptContext()
+ QScriptValue QScriptContext::throwValue(const QScriptValue &value)
+ {
+     JSC::CallFrame *frame = QScriptEnginePrivate::frameForContext(this);
+-    QScript::APIShim shim(QScript::scriptEngineFromExec(frame));
+-    JSC::JSValue jscValue = QScript::scriptEngineFromExec(frame)->scriptValueToJSCValue(value);
++    QScriptEnginePrivate *engine = QScript::scriptEngineFromExec(frame);
++    QScript::APIShim shim(engine);
++    JSC::JSValue jscValue = engine->scriptValueToJSCValue(value);
++    engine->clearCurrentException();
+     frame->setException(jscValue);
+     return value;
+ }
+@@ -184,7 +186,8 @@ QScriptValue QScriptContext::throwValue(const QScriptValue &value)
+ QScriptValue QScriptContext::throwError(Error error, const QString &text)
+ {
+     JSC::CallFrame *frame = QScriptEnginePrivate::frameForContext(this);
+-    QScript::APIShim shim(QScript::scriptEngineFromExec(frame));
++    QScriptEnginePrivate *engine = QScript::scriptEngineFromExec(frame);
++    QScript::APIShim shim(engine);
+     JSC::ErrorType jscError = JSC::GeneralError;
+     switch (error) {
+     case UnknownError:
+@@ -206,7 +209,8 @@ QScriptValue QScriptContext::throwError(Error error, const QString &text)
+         break;
+     }
+     JSC::JSObject *result = JSC::throwError(frame, jscError, text);
+-    return QScript::scriptEngineFromExec(frame)->scriptValueFromJSCValue(result);
++    engine->clearCurrentException();
++    return engine->scriptValueFromJSCValue(result);
+ }
+ 
+ /*!
+@@ -220,9 +224,11 @@ QScriptValue QScriptContext::throwError(Error error, const QString &text)
+ QScriptValue QScriptContext::throwError(const QString &text)
+ {
+     JSC::CallFrame *frame = QScriptEnginePrivate::frameForContext(this);
+-    QScript::APIShim shim(QScript::scriptEngineFromExec(frame));
++    QScriptEnginePrivate *engine = QScript::scriptEngineFromExec(frame);
++    QScript::APIShim shim(engine);
++    engine->clearCurrentException();
+     JSC::JSObject *result = JSC::throwError(frame, JSC::GeneralError, text);
+-    return QScript::scriptEngineFromExec(frame)->scriptValueFromJSCValue(result);
++    return engine->scriptValueFromJSCValue(result);
+ }
+ 
+ /*!
+diff --git a/src/script/api/qscriptcontextinfo.cpp b/src/script/api/qscriptcontextinfo.cpp
+index 0e7884f..0fe035d 100644
+--- a/src/script/api/qscriptcontextinfo.cpp
++++ b/src/script/api/qscriptcontextinfo.cpp
+@@ -145,6 +145,8 @@ QScriptContextInfoPrivate::QScriptContextInfoPrivate(const QScriptContext *conte
+         frame = rewindContext; //for retreiving the global context's "fake" frame
+         // An agent might have provided the line number.
+         lineNumber = QScript::scriptEngineFromExec(frame)->agentLineNumber;
++        if (lineNumber == -1)
++            lineNumber = QScript::scriptEngineFromExec(frame)->uncaughtExceptionLineNumber;
+     } else {
+         // rewind the stack from the top in order to find the frame from the caller where the returnPC is stored
+         while (rewindContext && QScriptEnginePrivate::contextForFrame(rewindContext->callerFrame()->removeHostCallFrameFlag()) != context)
+diff --git a/src/script/api/qscriptengine.cpp b/src/script/api/qscriptengine.cpp
+index 5dc4e2d..9965b3a 100644
+--- a/src/script/api/qscriptengine.cpp
++++ b/src/script/api/qscriptengine.cpp
+@@ -491,6 +491,12 @@ void GlobalClientData::mark(JSC::MarkStack& markStack)
+     engine->mark(markStack);
+ }
+ 
++void GlobalClientData::uncaughtException(JSC::ExecState* exec, unsigned bytecodeOffset,
++                                         JSC::JSValue value)
++{
++    engine->uncaughtException(exec, bytecodeOffset, value);
++}
++
+ class TimeoutCheckerProxy : public JSC::TimeoutChecker
+ {
+ public:
+@@ -964,7 +970,8 @@ QScriptEnginePrivate::QScriptEnginePrivate()
+       qobjectPrototype(0), qmetaobjectPrototype(0), variantPrototype(0),
+       activeAgent(0), agentLineNumber(-1),
+       registeredScriptValues(0), freeScriptValues(0), freeScriptValuesCount(0),
+-      registeredScriptStrings(0), processEventsInterval(-1), inEval(false)
++      registeredScriptStrings(0), processEventsInterval(-1), inEval(false),
++      uncaughtExceptionLineNumber(-1)
+ {
+     qMetaTypeId<QScriptValue>();
+     qMetaTypeId<QList<int> >();
+@@ -1408,6 +1415,43 @@ JSC::JSValue QScriptEnginePrivate::evaluateHelper(JSC::ExecState *exec, intptr_t
+     return result;
+ }
+ 
++// See ExceptionHelpers.cpp createStackOverflowError()
++bool QScriptEnginePrivate::isLikelyStackOverflowError(JSC::ExecState *exec, JSC::JSValue value)
++{
++    if (!isError(value))
++        return false;
++
++    JSC::JSValue name = property(exec, value, exec->propertyNames().name);
++    if (!name || !name.isString() || name.toString(exec) != "RangeError")
++        return false;
++
++    JSC::JSValue message = property(exec, value, exec->propertyNames().message);
++    if (!message || !message.isString() || message.toString(exec) != "Maximum call stack size exceeded.")
++        return false;
++
++    return true;
++}
++
++/*!
++  \internal
++  Called by the VM when an uncaught exception is detected.
++  At the time of this call, the VM stack has not yet been unwound.
++*/
++void QScriptEnginePrivate::uncaughtException(JSC::ExecState *exec, unsigned bytecodeOffset,
++                                             JSC::JSValue value)
++{
++    QScript::SaveFrameHelper saveFrame(this, exec);
++
++    uncaughtExceptionLineNumber = exec->codeBlock()->lineNumberForBytecodeOffset(exec, bytecodeOffset);
++
++    if (isLikelyStackOverflowError(exec, value)) {
++        // Don't save the backtrace, it's likely to take forever to create.
++        uncaughtExceptionBacktrace.clear();
++    } else {
++        uncaughtExceptionBacktrace = contextForFrame(exec)->backtrace();
++    }
++}
++
+ #ifndef QT_NO_QOBJECT
+ 
+ void QScriptEnginePrivate::markQObjectData(JSC::MarkStack& markStack)
+@@ -2905,32 +2949,26 @@ QScriptValue QScriptEngine::uncaughtException() const
+ */
+ int QScriptEngine::uncaughtExceptionLineNumber() const
+ {
++    Q_D(const QScriptEngine);
+     if (!hasUncaughtException())
+         return -1;
++    if (d->uncaughtExceptionLineNumber != -1)
++        return d->uncaughtExceptionLineNumber;
++
+     return uncaughtException().property(QLatin1String("lineNumber")).toInt32();
+ }
+ 
+ /*!
+   Returns a human-readable backtrace of the last uncaught exception.
+ 
+-  It is in the form \c{<function-name>()@<file-name>:<line-number>}.
++  It is in the form \c{<function-name>() at <file-name>:<line-number>}.
+ 
+   \sa uncaughtException()
+ */
+ QStringList QScriptEngine::uncaughtExceptionBacktrace() const
+ {
+-    if (!hasUncaughtException())
+-        return QStringList();
+-// ### currently no way to get a full backtrace from JSC without installing a
+-// debugger that reimplements exception() and store the backtrace there.
+-    QScriptValue value = uncaughtException();
+-    if (!value.isError())
+-        return QStringList();
+-    QStringList result;
+-    result.append(QString::fromLatin1("<anonymous>()@%0:%1")
+-                  .arg(value.property(QLatin1String("fileName")).toString())
+-                  .arg(value.property(QLatin1String("lineNumber")).toInt32()));
+-    return result;
++    Q_D(const QScriptEngine);
++    return d->uncaughtExceptionBacktrace;
+ }
+ 
+ /*!
+diff --git a/src/script/api/qscriptengine_p.h b/src/script/api/qscriptengine_p.h
+index ddd5d88..ddeccad 100644
+--- a/src/script/api/qscriptengine_p.h
++++ b/src/script/api/qscriptengine_p.h
+@@ -42,6 +42,7 @@
+ #include <QtCore/qnumeric.h>
+ #include <QtCore/qregexp.h>
+ #include <QtCore/qset.h>
++#include <QtCore/qstringlist.h>
+ #include "qscriptvalue_p.h"
+ #include "qscriptstring_p.h"
+ #include "bridge/qscriptclassobject_p.h"
+@@ -141,6 +142,8 @@ struct GlobalClientData : public JSC::JSGlobalData::ClientData
+         : engine(e) {}
+     virtual ~GlobalClientData() {}
+     virtual void mark(JSC::MarkStack& markStack);
++    virtual void uncaughtException(JSC::ExecState*, unsigned bytecodeOffset,
++                                   JSC::JSValue);
+ 
+     QScriptEnginePrivate *engine;
+ };
+@@ -270,12 +273,20 @@ public:
+ 
+     void agentDeleted(QScriptEngineAgent *agent);
+ 
++    static bool isLikelyStackOverflowError(JSC::ExecState *, JSC::JSValue);
++    void uncaughtException(JSC::ExecState *, unsigned bytecodeOffset, JSC::JSValue);
++
+     static inline void saveException(JSC::ExecState *, JSC::JSValue *);
+     static inline void restoreException(JSC::ExecState *, JSC::JSValue);
+ 
+     void setCurrentException(QScriptValue exception) { m_currentException = exception; }
+     QScriptValue currentException() const { return m_currentException; }
+-    void clearCurrentException() { m_currentException.d_ptr.reset(); }
++    void clearCurrentException()
++    {
++        m_currentException.d_ptr.reset();
++        uncaughtExceptionBacktrace.clear();
++        uncaughtExceptionLineNumber = -1;
++    }
+ 
+     static QScriptSyntaxCheckResult checkSyntax(const QString &program);
+     static bool canEvaluate(const QString &program);
+@@ -394,6 +405,8 @@ public:
+     
+     QHash<intptr_t, QScript::UStringSourceProviderWithFeedback*> loadedScripts;
+     QScriptValue m_currentException;
++    QStringList uncaughtExceptionBacktrace;
++    int uncaughtExceptionLineNumber;
+ 
+     QSet<JSC::JSObject*> visitedConversionObjects;
+ 
+diff --git a/tests/auto/qscriptengine/tst_qscriptengine.cpp b/tests/auto/qscriptengine/tst_qscriptengine.cpp
+index dc81cdb..6d7540f 100644
+--- a/tests/auto/qscriptengine/tst_qscriptengine.cpp
++++ b/tests/auto/qscriptengine/tst_qscriptengine.cpp
+@@ -3057,20 +3057,19 @@ void tst_QScriptEngine::stacktrace()
+     const QString fileName("testfile");
+ 
+     QStringList backtrace;
+-    backtrace << "foo(5)@testfile:9"
+-              << "foo(4)@testfile:7"
+-              << "foo(3)@testfile:6"
+-              << "foo(2)@testfile:5"
+-              << "foo(1)@testfile:4"
+-              << "foo(0)@testfile:3"
+-              << "<global>()@testfile:12";
++    backtrace << "foo(counter = 5) at testfile:9"
++              << "foo(counter = 4) at testfile:7"
++              << "foo(counter = 3) at testfile:6"
++              << "foo(counter = 2) at testfile:5"
++              << "foo(counter = 1) at testfile:4"
++              << "foo(counter = 0) at testfile:3"
++              << "<global>() at testfile:12";
+ 
+     QScriptEngine eng;
+     QScriptValue result = eng.evaluate(script, fileName);
+     QVERIFY(eng.hasUncaughtException());
+     QVERIFY(result.isError());
+ 
+-    QEXPECT_FAIL("", "QTBUG-6139: uncaughtExceptionBacktrace() doesn't give the full backtrace", Abort);
+     QCOMPARE(eng.uncaughtExceptionBacktrace(), backtrace);
+     QVERIFY(eng.hasUncaughtException());
+     QVERIFY(result.strictlyEquals(eng.uncaughtException()));

@@ -1,0 +1,183 @@
+diff --git a/src/widgets/kernel/qwidget_qpa.cpp b/src/widgets/kernel/qwidget_qpa.cpp
+index 7b649f6..7c84c7f 100644
+--- a/src/widgets/kernel/qwidget_qpa.cpp
++++ b/src/widgets/kernel/qwidget_qpa.cpp
+@@ -362,13 +362,22 @@ QWidget *qt_pressGrab = 0;
+ QWidget *qt_mouseGrb = 0;
+ static QWidget *keyboardGrb = 0;
+ 
++static inline QWindow *grabberWindow(const QWidget *w)
++{
++    QWindow *window = w->windowHandle();
++    if (!window)
++        if (const QWidget *nativeParent = w->nativeParentWidget())
++            window = nativeParent->windowHandle();
++    return window;
++}
++
+ void QWidget::grabMouse()
+ {
+     if (qt_mouseGrb)
+         qt_mouseGrb->releaseMouse();
+ 
+-    if (windowHandle())
+-        windowHandle()->setMouseGrabEnabled(true);
++    if (QWindow *window = grabberWindow(this))
++        window->setMouseGrabEnabled(true);
+ 
+     qt_mouseGrb = this;
+     qt_pressGrab = 0;
+@@ -378,15 +387,7 @@ void QWidget::grabMouse()
+ void QWidget::grabMouse(const QCursor &cursor)
+ {
+     Q_UNUSED(cursor);
+-
+-    if (qt_mouseGrb)
+-        qt_mouseGrb->releaseMouse();
+-
+-    if (windowHandle())
+-        windowHandle()->setMouseGrabEnabled(true);
+-
+-    qt_mouseGrb = this;
+-    qt_pressGrab = 0;
++    grabMouse();
+ }
+ #endif
+ 
+@@ -395,14 +396,15 @@ bool QWidgetPrivate::stealMouseGrab(bool grab)
+     // This is like a combination of grab/releaseMouse() but with error checking
+     // and it has no effect on the result of mouseGrabber().
+     Q_Q(QWidget);
+-    return q->windowHandle() ? q->windowHandle()->setMouseGrabEnabled(grab) : false;
++    QWindow *window = grabberWindow(q);
++    return window ? window->setMouseGrabEnabled(grab) : false;
+ }
+ 
+ void QWidget::releaseMouse()
+ {
+     if (qt_mouseGrb == this) {
+-        if (windowHandle())
+-            windowHandle()->setMouseGrabEnabled(false);
++        if (QWindow *window = grabberWindow(this))
++            window->setMouseGrabEnabled(false);
+         qt_mouseGrb = 0;
+     }
+ }
+@@ -411,8 +413,8 @@ void QWidget::grabKeyboard()
+ {
+     if (keyboardGrb)
+         keyboardGrb->releaseKeyboard();
+-    if (windowHandle())
+-        windowHandle()->setKeyboardGrabEnabled(true);
++    if (QWindow *window = grabberWindow(this))
++        window->setKeyboardGrabEnabled(true);
+     keyboardGrb = this;
+ }
+ 
+@@ -421,14 +423,15 @@ bool QWidgetPrivate::stealKeyboardGrab(bool grab)
+     // This is like a combination of grab/releaseKeyboard() but with error
+     // checking and it has no effect on the result of keyboardGrabber().
+     Q_Q(QWidget);
+-    return q->windowHandle() ? q->windowHandle()->setKeyboardGrabEnabled(grab) : false;
++    QWindow *window = grabberWindow(q);
++    return window ? window->setKeyboardGrabEnabled(grab) : false;
+ }
+ 
+ void QWidget::releaseKeyboard()
+ {
+     if (keyboardGrb == this) {
+-        if (windowHandle())
+-            windowHandle()->setKeyboardGrabEnabled(false);
++        if (QWindow *window = grabberWindow(this))
++            window->setKeyboardGrabEnabled(false);
+         keyboardGrb = 0;
+     }
+ }
+diff --git a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+index 322f978..c457d60 100644
+--- a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
++++ b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+@@ -383,6 +383,7 @@ private slots:
+ 
+     void nativeChildFocus();
+     void grab();
++    void grabMouse();
+ 
+     void touchEventSynthesizedMouseEvent();
+ 
+@@ -9333,6 +9334,75 @@ void tst_QWidget::grab()
+     }
+ }
+ 
++/* grabMouse() tests whether mouse grab for a widget without window handle works.
++ * It creates a top level widget with another nested widget inside. The inner widget grabs
++ * the mouse and a series of mouse presses moving over the top level's window is simulated.
++ * Only the inner widget should receive events. */
++
++static inline QString mouseEventLogEntry(const QString &objectName, QEvent::Type t, const QPoint &p, Qt::MouseButtons b)
++{
++    QString result;
++    QDebug(&result).nospace() << objectName << " Mouse event " << t << " at " << p << " buttons " << b;
++    return result;
++}
++
++class GrabLoggerWidget : public QWidget {
++public:
++    explicit GrabLoggerWidget(QStringList *log, QWidget *parent = 0)  : QWidget(parent), m_log(log) {}
++
++protected:
++    bool event(QEvent *e)
++    {
++        switch (e->type()) {
++        case QEvent::MouseButtonPress:
++        case QEvent::MouseMove:
++        case QEvent::MouseButtonRelease: {
++            QMouseEvent *me = static_cast<QMouseEvent *>(e);
++            m_log->push_back(mouseEventLogEntry(objectName(), me->type(), me->pos(), me->buttons()));
++            me->accept();
++            return true;
++        }
++        default:
++            break;
++        }
++        return QWidget::event(e);
++    }
++private:
++    QStringList *m_log;
++};
++
++void tst_QWidget::grabMouse()
++{
++    QStringList log;
++    GrabLoggerWidget w(&log);
++    w.setObjectName(QLatin1String("tst_qwidget_grabMouse"));
++    w.setWindowTitle(w.objectName());
++    QLayout *layout = new QVBoxLayout(&w);
++    layout->setMargin(50);
++    GrabLoggerWidget *grabber = new GrabLoggerWidget(&log, &w);
++    const QString grabberObjectName = QLatin1String("tst_qwidget_grabMouse_grabber");
++    grabber->setObjectName(grabberObjectName);
++    grabber->setMinimumSize(100, 100);
++    layout->addWidget(grabber);
++    w.show();
++    qApp->setActiveWindow(&w);
++    QVERIFY(QTest::qWaitForWindowActive(&w));
++
++    QStringList expectedLog;
++    grabber->grabMouse();
++    QPoint mousePos = QPoint(w.width() / 2, 10);
++    const int step = w.height() / 5;
++    for ( ; mousePos.y() < w.height() ; mousePos.ry() += step) {
++        QTest::mouseClick(w.windowHandle(), Qt::LeftButton, 0, mousePos);
++        // Events should go to the grabber child using its coordinates.
++        const QPoint expectedPos = grabber->mapFromParent(mousePos);
++        expectedLog.push_back(mouseEventLogEntry(grabberObjectName, QEvent::MouseButtonPress, expectedPos, Qt::LeftButton));
++        expectedLog.push_back(mouseEventLogEntry(grabberObjectName, QEvent::MouseButtonRelease, expectedPos, Qt::NoButton));
++    }
++    grabber->releaseMouse();
++    QCOMPARE(log, expectedLog);
++}
++
+ class TouchMouseWidget : public QWidget {
+ public:
+     explicit TouchMouseWidget(QWidget *parent = 0)

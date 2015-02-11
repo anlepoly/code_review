@@ -1,0 +1,225 @@
+diff --git a/src/network/access/qhttpnetworkconnection.cpp b/src/network/access/qhttpnetworkconnection.cpp
+index d9738b6..4a8d672 100644
+--- a/src/network/access/qhttpnetworkconnection.cpp
++++ b/src/network/access/qhttpnetworkconnection.cpp
+@@ -428,9 +428,23 @@ bool QHttpNetworkConnectionPrivate::handleAuthenticateChallenge(QAbstractSocket
+         if (priv->phase == QAuthenticatorPrivate::Done) {
+             pauseConnection();
+             if (!isProxy) {
++                if (channels[i].authenticationCredentialsSent) {
++                    auth->detach();
++                    priv = QAuthenticatorPrivate::getPrivate(*auth);
++                    priv->hasFailed = true;
++                    priv->phase = QAuthenticatorPrivate::Done;
++                    channels[i].authenticationCredentialsSent = false;
++                }
+                 emit reply->authenticationRequired(reply->request(), auth);
+ #ifndef QT_NO_NETWORKPROXY
+             } else {
++                if (channels[i].proxyCredentialsSent) {
++                    auth->detach();
++                    priv = QAuthenticatorPrivate::getPrivate(*auth);
++                    priv->hasFailed = true;
++                    priv->phase = QAuthenticatorPrivate::Done;
++                    channels[i].proxyCredentialsSent = false;
++                }
+                 emit reply->proxyAuthenticationRequired(networkProxy, auth);
+ #endif
+             }
+@@ -491,6 +505,7 @@ void QHttpNetworkConnectionPrivate::createAuthorization(QAbstractSocket *socket,
+             if (priv && priv->method != QAuthenticatorPrivate::None) {
+                 QByteArray response = priv->calculateResponse(request.d->methodName(), request.d->uri(false));
+                 request.setHeaderField("Authorization", response);
++                channels[i].authenticationCredentialsSent = true;
+             }
+         }
+     }
+@@ -502,6 +517,7 @@ void QHttpNetworkConnectionPrivate::createAuthorization(QAbstractSocket *socket,
+             if (priv && priv->method != QAuthenticatorPrivate::None) {
+                 QByteArray response = priv->calculateResponse(request.d->methodName(), request.d->uri(false));
+                 request.setHeaderField("Proxy-Authorization", response);
++                channels[i].proxyCredentialsSent = true;
+             }
+         }
+     }
+diff --git a/src/network/access/qhttpnetworkconnectionchannel.cpp b/src/network/access/qhttpnetworkconnectionchannel.cpp
+index ab178be..02c1cac 100644
+--- a/src/network/access/qhttpnetworkconnectionchannel.cpp
++++ b/src/network/access/qhttpnetworkconnectionchannel.cpp
+@@ -73,6 +73,8 @@ QHttpNetworkConnectionChannel::QHttpNetworkConnectionChannel()
+     , lastStatus(0)
+     , pendingEncrypt(false)
+     , reconnectAttempts(2)
++    , authenticationCredentialsSent(false)
++    , proxyCredentialsSent(false)
+     , authMethod(QAuthenticatorPrivate::None)
+     , proxyAuthMethod(QAuthenticatorPrivate::None)
+ #ifndef QT_NO_OPENSSL
+@@ -549,6 +551,14 @@ bool QHttpNetworkConnectionChannel::ensureConnection()
+ 
+         // reset state
+         pipeliningSupported = PipeliningSupportUnknown;
++        authenticationCredentialsSent = false;
++        proxyCredentialsSent = false;
++        authenticator.detach();
++        QAuthenticatorPrivate *priv = QAuthenticatorPrivate::getPrivate(authenticator);
++        priv->hasFailed = false;
++        proxyAuthenticator.detach();
++        priv = QAuthenticatorPrivate::getPrivate(proxyAuthenticator);
++        priv->hasFailed = false;
+ 
+         // This workaround is needed since we use QAuthenticator for NTLM authentication. The "phase == Done"
+         // is the usual criteria for emitting authentication signals. The "phase" is set to "Done" when the
+@@ -556,7 +566,7 @@ bool QHttpNetworkConnectionChannel::ensureConnection()
+         // check the "phase" for generating the Authorization header. NTLM authentication is a two stage
+         // process & needs the "phase". To make sure the QAuthenticator uses the current username/password
+         // the phase is reset to Start.
+-        QAuthenticatorPrivate *priv = QAuthenticatorPrivate::getPrivate(authenticator);
++        priv = QAuthenticatorPrivate::getPrivate(authenticator);
+         if (priv && priv->phase == QAuthenticatorPrivate::Done)
+             priv->phase = QAuthenticatorPrivate::Start;
+         priv = QAuthenticatorPrivate::getPrivate(proxyAuthenticator);
+diff --git a/src/network/access/qhttpnetworkconnectionchannel_p.h b/src/network/access/qhttpnetworkconnectionchannel_p.h
+index 7a4dd07..b93d002 100644
+--- a/src/network/access/qhttpnetworkconnectionchannel_p.h
++++ b/src/network/access/qhttpnetworkconnectionchannel_p.h
+@@ -113,6 +113,8 @@ public:
+     QAuthenticatorPrivate::Method proxyAuthMethod;
+     QAuthenticator authenticator;
+     QAuthenticator proxyAuthenticator;
++    bool authenticationCredentialsSent;
++    bool proxyCredentialsSent;
+ #ifndef QT_NO_OPENSSL
+     bool ignoreAllSslErrors;
+     QList<QSslError> ignoreSslErrorsList;
+diff --git a/src/network/access/qnetworkaccessmanager.cpp b/src/network/access/qnetworkaccessmanager.cpp
+index 3978bd6..2146749 100644
+--- a/src/network/access/qnetworkaccessmanager.cpp
++++ b/src/network/access/qnetworkaccessmanager.cpp
+@@ -60,7 +60,7 @@
+ #include "QtCore/qbuffer.h"
+ #include "QtCore/qurl.h"
+ #include "QtCore/qvector.h"
+-#include "QtNetwork/qauthenticator.h"
++#include "QtNetwork/private/qauthenticator_p.h"
+ #include "QtNetwork/qsslconfiguration.h"
+ #include "QtNetwork/qnetworkconfigmanager.h"
+ #include "QtNetwork/qhttpmultipart.h"
+@@ -1115,14 +1115,8 @@ void QNetworkAccessManagerPrivate::proxyAuthenticationRequired(const QNetworkPro
+                                                                QNetworkProxy *lastProxyAuthentication)
+ {
+     Q_Q(QNetworkAccessManager);
+-    // ### FIXME Tracking of successful authentications
+-    // This code is a bit broken right now for SOCKS authentication
+-    // first request: proxyAuthenticationRequired gets emitted, credentials gets saved
+-    // second request: (proxy != backend->reply->lastProxyAuthentication) does not evaluate to true,
+-    //      proxyAuthenticationRequired gets emitted again
+-    // possible solution: some tracking inside the authenticator
+-    //      or a new function proxyAuthenticationSucceeded(true|false)
+-    if (proxy != *lastProxyAuthentication) {
++    QAuthenticatorPrivate *priv = QAuthenticatorPrivate::getPrivate(*authenticator);
++    if (proxy != *lastProxyAuthentication && (!priv || !priv->hasFailed)) {
+         QNetworkAuthenticationCredential cred = authenticationManager->fetchCachedProxyCredentials(proxy);
+         if (!cred.isNull()) {
+             authenticator->setUser(cred.user);
+diff --git a/src/network/kernel/qauthenticator.cpp b/src/network/kernel/qauthenticator.cpp
+index b0d8b07..8042424 100644
+--- a/src/network/kernel/qauthenticator.cpp
++++ b/src/network/kernel/qauthenticator.cpp
+@@ -326,6 +326,7 @@ bool QAuthenticator::isNull() const
+ QAuthenticatorPrivate::QAuthenticatorPrivate()
+     : ref(0)
+     , method(None)
++    , hasFailed(false)
+     , phase(Start)
+     , nonceCount(0)
+ {
+diff --git a/src/network/kernel/qauthenticator_p.h b/src/network/kernel/qauthenticator_p.h
+index 88a3051..937f4e0 100644
+--- a/src/network/kernel/qauthenticator_p.h
++++ b/src/network/kernel/qauthenticator_p.h
+@@ -77,6 +77,7 @@ public:
+     Method method;
+     QString realm;
+     QByteArray challenge;
++    bool hasFailed; //credentials have been tried but rejected by server.
+ 
+     enum Phase {
+         Start,
+diff --git a/src/network/socket/qhttpsocketengine.cpp b/src/network/socket/qhttpsocketengine.cpp
+index fd0119b..f79795b 100644
+--- a/src/network/socket/qhttpsocketengine.cpp
++++ b/src/network/socket/qhttpsocketengine.cpp
+@@ -136,6 +136,8 @@ bool QHttpSocketEngine::connectInternal()
+ {
+     Q_D(QHttpSocketEngine);
+ 
++    d->credentialsSent = false;
++
+     // If the handshake is done, enter ConnectedState state and return true.
+     if (d->state == Connected) {
+         qWarning("QHttpSocketEngine::connectToHost: called when already connected");
+@@ -512,6 +514,7 @@ void QHttpSocketEngine::slotSocketConnected()
+     QAuthenticatorPrivate *priv = QAuthenticatorPrivate::getPrivate(d->authenticator);
+     //qDebug() << "slotSocketConnected: priv=" << priv << (priv ? (int)priv->method : -1);
+     if (priv && priv->method != QAuthenticatorPrivate::None) {
++        d->credentialsSent = true;
+         data += "Proxy-Authorization: " + priv->calculateResponse(method, path);
+         data += "\r\n";
+     }
+@@ -589,15 +592,26 @@ void QHttpSocketEngine::slotSocketReadNotification()
+     d->readBuffer.clear(); // we parsed the proxy protocol response. from now on direct socket reading will be done
+ 
+     int statusCode = responseHeader.statusCode();
++    QAuthenticatorPrivate *priv = 0;
+     if (statusCode == 200) {
+         d->state = Connected;
+         setLocalAddress(d->socket->localAddress());
+         setLocalPort(d->socket->localPort());
+         setState(QAbstractSocket::ConnectedState);
++        d->authenticator.detach();
++        priv = QAuthenticatorPrivate::getPrivate(d->authenticator);
++        priv->hasFailed = false;
+     } else if (statusCode == 407) {
+-        if (d->authenticator.isNull())
++        if (d->credentialsSent) {
++            //407 response again means the provided username/password were invalid.
++            d->authenticator = QAuthenticator(); //this is needed otherwise parseHttpResponse won't set the state, and then signal isn't emitted.
++            d->authenticator.detach();
++            priv = QAuthenticatorPrivate::getPrivate(d->authenticator);
++            priv->hasFailed = true;
++        }
++        else if (d->authenticator.isNull())
+             d->authenticator.detach();
+-        QAuthenticatorPrivate *priv = QAuthenticatorPrivate::getPrivate(d->authenticator);
++        priv = QAuthenticatorPrivate::getPrivate(d->authenticator);
+ 
+         priv->parseHttpResponse(responseHeader, true);
+ 
+@@ -637,7 +651,6 @@ void QHttpSocketEngine::slotSocketReadNotification()
+ 
+         if (priv->phase == QAuthenticatorPrivate::Done)
+             emit proxyAuthenticationRequired(d->proxy, &d->authenticator);
+-
+         // priv->phase will get reset to QAuthenticatorPrivate::Start if the authenticator got modified in the signal above.
+         if (priv->phase == QAuthenticatorPrivate::Done) {
+             setError(QAbstractSocket::ProxyAuthenticationRequiredError, tr("Authentication required"));
+@@ -794,6 +807,7 @@ QHttpSocketEnginePrivate::QHttpSocketEnginePrivate()
+     , readNotificationPending(false)
+     , writeNotificationPending(false)
+     , connectionNotificationPending(false)
++    , credentialsSent(false)
+     , pendingResponseData(0)
+ {
+     socket = 0;
+diff --git a/src/network/socket/qhttpsocketengine_p.h b/src/network/socket/qhttpsocketengine_p.h
+index d7cc7c1..476d689 100644
+--- a/src/network/socket/qhttpsocketengine_p.h
++++ b/src/network/socket/qhttpsocketengine_p.h
+@@ -182,6 +182,7 @@ public:
+     bool readNotificationPending;
+     bool writeNotificationPending;
+     bool connectionNotificationPending;
++    bool credentialsSent;
+     uint pendingResponseData;
+ };

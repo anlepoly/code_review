@@ -1,0 +1,2153 @@
+diff --git a/src/declarative/debugger/debugger.pri b/src/declarative/debugger/debugger.pri
+index 34e88ae..8e29e9f 100644
+--- a/src/declarative/debugger/debugger.pri
++++ b/src/declarative/debugger/debugger.pri
+@@ -3,7 +3,7 @@ SOURCES += \
+     $$PWD/qdeclarativedebugservice.cpp \
+     $$PWD/qdeclarativedebugclient.cpp \
+     $$PWD/qdeclarativeenginedebug.cpp \
+-    $$PWD/qdeclarativedebugtrace.cpp \
++    $$PWD/qdeclarativeprofilerservice.cpp \
+     $$PWD/qdeclarativedebughelper.cpp \
+     $$PWD/qdeclarativedebugserver.cpp \
+     $$PWD/qdeclarativeinspectorservice.cpp \
+@@ -18,7 +18,7 @@ HEADERS += \
+     $$PWD/qdeclarativedebugservice_p_p.h \
+     $$PWD/qdeclarativedebugclient_p.h \
+     $$PWD/qdeclarativeenginedebug_p.h \
+-    $$PWD/qdeclarativedebugtrace_p.h \
++    $$PWD/qdeclarativeprofilerservice_p.h \
+     $$PWD/qdeclarativedebughelper_p.h \
+     $$PWD/qdeclarativedebugserver_p.h \
+     $$PWD/qdeclarativedebugserverconnection_p.h \
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace.cpp b/src/declarative/debugger/qdeclarativedebugtrace.cpp
+deleted file mode 100644
+index 3c71860..0000000
+--- a/src/declarative/debugger/qdeclarativedebugtrace.cpp
++++ /dev/null
+@@ -1,343 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the QtDeclarative module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "qdeclarativedebugtrace_p.h"
+-
+-#include <QtCore/qdatastream.h>
+-#include <QtCore/qurl.h>
+-#include <QtCore/qtimer.h>
+-#include <QtCore/qthread.h>
+-#include <QtCore/qcoreapplication.h>
+-
+-// this contains QUnifiedTimer
+-#include <private/qabstractanimation_p.h>
+-
+-QT_BEGIN_NAMESPACE
+-
+-Q_GLOBAL_STATIC(QDeclarativeDebugTrace, traceInstance)
+-
+-QDeclarativeBindingProfiler::QDeclarativeBindingProfiler(const QString &url, int line, int column)
+-{
+-    QDeclarativeDebugTrace::startRange(QDeclarativeDebugTrace::Binding);
+-    QDeclarativeDebugTrace::rangeLocation(QDeclarativeDebugTrace::Binding, url, line, column);
+-}
+-
+-QDeclarativeBindingProfiler::~QDeclarativeBindingProfiler()
+-{
+-    QDeclarativeDebugTrace::endRange(QDeclarativeDebugTrace::Binding);
+-}
+-
+-void QDeclarativeBindingProfiler::addDetail(const QString &details)
+-{
+-    QDeclarativeDebugTrace::rangeData(QDeclarativeDebugTrace::Binding, details);
+-}
+-
+-// convert to a QByteArray that can be sent to the debug client
+-// use of QDataStream can skew results
+-//     (see tst_qdeclarativedebugtrace::trace() benchmark)
+-QByteArray QDeclarativeDebugData::toByteArray() const
+-{
+-    QByteArray data;
+-    //### using QDataStream is relatively expensive
+-    QDataStream ds(&data, QIODevice::WriteOnly);
+-    ds << time << messageType << detailType;
+-    if (messageType == (int)QDeclarativeDebugTrace::RangeData)
+-        ds << detailData;
+-    if (messageType == (int)QDeclarativeDebugTrace::RangeLocation)
+-        ds << detailData << line << column;
+-    if (messageType == (int)QDeclarativeDebugTrace::Event &&
+-            detailType == (int)QDeclarativeDebugTrace::AnimationFrame)
+-        ds << framerate << animationcount;
+-    return data;
+-}
+-
+-QDeclarativeDebugTrace::QDeclarativeDebugTrace()
+-    : QDeclarativeDebugService(QLatin1String("CanvasFrameRate"), 1),
+-      m_enabled(false), m_messageReceived(false)
+-{
+-    m_timer.start();
+-
+-    if (registerService() == Enabled) {
+-        // wait for first message indicating whether to trace or not
+-        while (!m_messageReceived)
+-            waitForMessage();
+-
+-        QUnifiedTimer::instance()->registerProfilerCallback( &animationFrame );
+-    }
+-}
+-
+-QDeclarativeDebugTrace::~QDeclarativeDebugTrace()
+-{
+-}
+-
+-void QDeclarativeDebugTrace::initialize()
+-{
+-    // just make sure that the service is properly registered
+-    traceInstance();
+-}
+-
+-bool QDeclarativeDebugTrace::startProfiling()
+-{
+-    return traceInstance()->startProfilingImpl();
+-}
+-
+-bool QDeclarativeDebugTrace::stopProfiling()
+-{
+-    return traceInstance()->stopProfilingImpl();
+-}
+-
+-void QDeclarativeDebugTrace::addEvent(EventType t)
+-{
+-    traceInstance()->addEventImpl(t);
+-}
+-
+-void QDeclarativeDebugTrace::startRange(RangeType t)
+-{
+-    traceInstance()->startRangeImpl(t);
+-}
+-
+-void QDeclarativeDebugTrace::rangeData(RangeType t, const QString &data)
+-{
+-    traceInstance()->rangeDataImpl(t, data);
+-}
+-
+-void QDeclarativeDebugTrace::rangeData(RangeType t, const QUrl &data)
+-{
+-    traceInstance()->rangeDataImpl(t, data);
+-}
+-
+-void QDeclarativeDebugTrace::rangeLocation(RangeType t, const QString &fileName, int line, int column)
+-{
+-    traceInstance()->rangeLocationImpl(t, fileName, line, column);
+-}
+-
+-void QDeclarativeDebugTrace::rangeLocation(RangeType t, const QUrl &fileName, int line, int column)
+-{
+-    traceInstance()->rangeLocationImpl(t, fileName, line, column);
+-}
+-
+-void QDeclarativeDebugTrace::endRange(RangeType t)
+-{
+-    traceInstance()->endRangeImpl(t);
+-}
+-
+-void QDeclarativeDebugTrace::animationFrame(qint64 delta)
+-{
+-    traceInstance()->animationFrameImpl(delta);
+-}
+-
+-void QDeclarativeDebugTrace::sendProfilingData()
+-{
+-    traceInstance()->sendMessages();
+-}
+-
+-bool QDeclarativeDebugTrace::startProfilingImpl()
+-{
+-    bool success = false;
+-    if (!profilingEnabled()) {
+-        setProfilingEnabled(true);
+-        addEventImpl(StartTrace);
+-        success = true;
+-    }
+-    return success;
+-}
+-
+-bool QDeclarativeDebugTrace::stopProfilingImpl()
+-{
+-    bool success = false;
+-    if (profilingEnabled()) {
+-        addEventImpl(EndTrace);
+-        setProfilingEnabled(false);
+-        success = true;
+-    }
+-    return success;
+-}
+-
+-void QDeclarativeDebugTrace::addEventImpl(EventType event)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData ed = {m_timer.nsecsElapsed(), (int)Event, (int)event, QString(), -1, -1, 0, 0};
+-    processMessage(ed);
+-}
+-
+-void QDeclarativeDebugTrace::startRangeImpl(RangeType range)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeStart, (int)range, QString(), -1, -1, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::rangeDataImpl(RangeType range, const QString &rData)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeData, (int)range, rData, -1, -1, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::rangeDataImpl(RangeType range, const QUrl &rData)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeData, (int)range, rData.toString(QUrl::FormattingOption(0x100)), -1, -1, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::rangeLocationImpl(RangeType range, const QString &fileName, int line, int column)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeLocation, (int)range, fileName, line, column, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::rangeLocationImpl(RangeType range, const QUrl &fileName, int line, int column)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeLocation, (int)range, fileName.toString(QUrl::FormattingOption(0x100)), line, column, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::endRangeImpl(RangeType range)
+-{
+-    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
+-        return;
+-
+-    QDeclarativeDebugData rd = {m_timer.nsecsElapsed(), (int)RangeEnd, (int)range, QString(), -1, -1, 0, 0};
+-    processMessage(rd);
+-}
+-
+-void QDeclarativeDebugTrace::animationFrameImpl(qint64 delta)
+-{
+-    Q_ASSERT(QDeclarativeDebugService::isDebuggingEnabled());
+-    if (!m_enabled)
+-        return;
+-
+-    int animCount = QUnifiedTimer::instance()->runningAnimationCount();
+-
+-    if (animCount > 0 && delta > 0) {
+-        // trim fps to integer
+-        int fps = 1000 / delta;
+-        QDeclarativeDebugData ed = {m_timer.nsecsElapsed(), (int)Event, (int)AnimationFrame, QString(), -1, -1, fps, animCount};
+-        processMessage(ed);
+-    }
+-}
+-
+-/*
+-    Either send the message directly, or queue up
+-    a list of messages to send later (via sendMessages)
+-*/
+-void QDeclarativeDebugTrace::processMessage(const QDeclarativeDebugData &message)
+-{
+-    QMutexLocker locker(&m_mutex);
+-    m_data.append(message);
+-}
+-
+-bool QDeclarativeDebugTrace::profilingEnabled()
+-{
+-    return m_enabled;
+-}
+-
+-void QDeclarativeDebugTrace::setProfilingEnabled(bool enable)
+-{
+-    m_enabled = enable;
+-}
+-
+-/*
+-    Send the messages queued up by processMessage
+-*/
+-void QDeclarativeDebugTrace::sendMessages()
+-{
+-    QMutexLocker locker(&m_mutex);
+-    QList<QByteArray> messages;
+-    for (int i = 0; i < m_data.count(); ++i)
+-        messages << m_data.at(i).toByteArray();
+-    m_data.clear();
+-
+-    //indicate completion
+-    QByteArray data;
+-    QDataStream ds(&data, QIODevice::WriteOnly);
+-    ds << (qint64)-1 << (int)Complete;
+-    messages << data;
+-
+-    QDeclarativeDebugService::sendMessages(messages);
+-}
+-
+-void QDeclarativeDebugTrace::stateAboutToBeChanged(QDeclarativeDebugService::State newState)
+-{
+-    if (state() == newState)
+-        return;
+-
+-    if (state() == Enabled
+-            && m_enabled) {
+-        stopProfilingImpl();
+-        sendMessages();
+-    }
+-}
+-
+-void QDeclarativeDebugTrace::messageReceived(const QByteArray &message)
+-{
+-    QByteArray rwData = message;
+-    QDataStream stream(&rwData, QIODevice::ReadOnly);
+-
+-    bool enabled;
+-    stream >> enabled;
+-
+-    m_messageReceived = true;
+-
+-    if (enabled) {
+-        startProfilingImpl();
+-    } else {
+-        if (stopProfilingImpl())
+-            sendMessages();
+-    }
+-}
+-
+-QT_END_NAMESPACE
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace_p.h b/src/declarative/debugger/qdeclarativedebugtrace_p.h
+deleted file mode 100644
+index 7e2db4d..0000000
+--- a/src/declarative/debugger/qdeclarativedebugtrace_p.h
++++ /dev/null
+@@ -1,181 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the QtDeclarative module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QDECLARATIVEDEBUGTRACE_P_H
+-#define QDECLARATIVEDEBUGTRACE_P_H
+-
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists purely as an
+-// implementation detail.  This header file may change from version to
+-// version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+-#include <private/qdeclarativedebugservice_p.h>
+-#include <QtCore/qelapsedtimer.h>
+-#include <QtCore/qmutex.h>
+-#include <QtCore/qvector.h>
+-
+-QT_BEGIN_HEADER
+-
+-QT_BEGIN_NAMESPACE
+-
+-struct Q_AUTOTEST_EXPORT QDeclarativeDebugData
+-{
+-    qint64 time;
+-    int messageType;
+-    int detailType;
+-
+-    //###
+-    QString detailData; //used by RangeData and RangeLocation
+-    int line;           //used by RangeLocation
+-    int column;         //used by RangeLocation
+-    int framerate;      //used by animation events
+-    int animationcount; //used by animation events
+-
+-    QByteArray toByteArray() const;
+-};
+-
+-Q_DECLARE_TYPEINFO(QDeclarativeDebugData, Q_MOVABLE_TYPE);
+-
+-class QUrl;
+-class QDeclarativeEngine;
+-
+-// RAII
+-class Q_AUTOTEST_EXPORT QDeclarativeBindingProfiler {
+-public:
+-    QDeclarativeBindingProfiler(const QString &url, int line, int column);
+-    ~QDeclarativeBindingProfiler();
+-    void addDetail(const QString &details);
+-};
+-
+-class Q_DECLARATIVE_EXPORT QDeclarativeDebugTrace : public QDeclarativeDebugService
+-{
+-public:
+-    enum Message {
+-        Event,
+-        RangeStart,
+-        RangeData,
+-        RangeLocation,
+-        RangeEnd,
+-        Complete, // end of transmission
+-
+-        MaximumMessage
+-    };
+-
+-    enum EventType {
+-        FramePaint,
+-        Mouse,
+-        Key,
+-        AnimationFrame,
+-        EndTrace,
+-        StartTrace,
+-
+-        MaximumEventType
+-    };
+-
+-    enum RangeType {
+-        Painting,
+-        Compiling,
+-        Creating,
+-        Binding,            //running a binding
+-        HandlingSignal,     //running a signal handler
+-
+-        MaximumRangeType
+-    };
+-
+-    static void initialize();
+-
+-    static bool startProfiling();
+-    static bool stopProfiling();
+-    static void addEvent(EventType);
+-    static void startRange(RangeType);
+-    static void rangeData(RangeType, const QString &);
+-    static void rangeData(RangeType, const QUrl &);
+-    static void rangeLocation(RangeType, const QString &, int, int);
+-    static void rangeLocation(RangeType, const QUrl &, int, int);
+-    static void endRange(RangeType);
+-    static void animationFrame(qint64);
+-
+-    static void sendProfilingData();
+-
+-    QDeclarativeDebugTrace();
+-    ~QDeclarativeDebugTrace();
+-
+-protected:
+-    virtual void stateAboutToBeChanged(State state);
+-    virtual void messageReceived(const QByteArray &);
+-
+-private:
+-    bool startProfilingImpl();
+-    bool stopProfilingImpl();
+-    void addEventImpl(EventType);
+-    void startRangeImpl(RangeType);
+-    void rangeDataImpl(RangeType, const QString &);
+-    void rangeDataImpl(RangeType, const QUrl &);
+-    void rangeLocationImpl(RangeType, const QString &, int, int);
+-    void rangeLocationImpl(RangeType, const QUrl &, int, int);
+-    void endRangeImpl(RangeType);
+-    void animationFrameImpl(qint64);
+-
+-    bool profilingEnabled();
+-    void setProfilingEnabled(bool enable);
+-    void sendMessages();
+-    void processMessage(const QDeclarativeDebugData &);
+-
+-private:
+-    QElapsedTimer m_timer;
+-    bool m_enabled;
+-    bool m_messageReceived;
+-    QVector<QDeclarativeDebugData> m_data;
+-    QMutex m_mutex;
+-};
+-
+-QT_END_NAMESPACE
+-
+-QT_END_HEADER
+-
+-#endif // QDECLARATIVEDEBUGTRACE_P_H
+-
+diff --git a/src/declarative/debugger/qdeclarativeprofilerservice.cpp b/src/declarative/debugger/qdeclarativeprofilerservice.cpp
+new file mode 100644
+index 0000000..c5b6b65
+--- /dev/null
++++ b/src/declarative/debugger/qdeclarativeprofilerservice.cpp
+@@ -0,0 +1,343 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qdeclarativeprofilerservice_p.h"
++
++#include <QtCore/qdatastream.h>
++#include <QtCore/qurl.h>
++#include <QtCore/qtimer.h>
++#include <QtCore/qthread.h>
++#include <QtCore/qcoreapplication.h>
++
++// this contains QUnifiedTimer
++#include <private/qabstractanimation_p.h>
++
++QT_BEGIN_NAMESPACE
++
++Q_GLOBAL_STATIC(QDeclarativeProfilerService, profilerInstance)
++
++QDeclarativeBindingProfiler::QDeclarativeBindingProfiler(const QString &url, int line, int column)
++{
++    QDeclarativeProfilerService::startRange(QDeclarativeProfilerService::Binding);
++    QDeclarativeProfilerService::rangeLocation(QDeclarativeProfilerService::Binding, url, line, column);
++}
++
++QDeclarativeBindingProfiler::~QDeclarativeBindingProfiler()
++{
++    QDeclarativeProfilerService::endRange(QDeclarativeProfilerService::Binding);
++}
++
++void QDeclarativeBindingProfiler::addDetail(const QString &details)
++{
++    QDeclarativeProfilerService::rangeData(QDeclarativeProfilerService::Binding, details);
++}
++
++// convert to a QByteArray that can be sent to the debug client
++// use of QDataStream can skew results
++//     (see tst_qdeclarativedebugtrace::trace() benchmark)
++QByteArray QDeclarativeProfilerData::toByteArray() const
++{
++    QByteArray data;
++    //### using QDataStream is relatively expensive
++    QDataStream ds(&data, QIODevice::WriteOnly);
++    ds << time << messageType << detailType;
++    if (messageType == (int)QDeclarativeProfilerService::RangeData)
++        ds << detailData;
++    if (messageType == (int)QDeclarativeProfilerService::RangeLocation)
++        ds << detailData << line << column;
++    if (messageType == (int)QDeclarativeProfilerService::Event &&
++            detailType == (int)QDeclarativeProfilerService::AnimationFrame)
++        ds << framerate << animationcount;
++    return data;
++}
++
++QDeclarativeProfilerService::QDeclarativeProfilerService()
++    : QDeclarativeDebugService(QLatin1String("CanvasFrameRate"), 1),
++      m_enabled(false), m_messageReceived(false)
++{
++    m_timer.start();
++
++    if (registerService() == Enabled) {
++        // wait for first message indicating whether to trace or not
++        while (!m_messageReceived)
++            waitForMessage();
++
++        QUnifiedTimer::instance()->registerProfilerCallback( &animationFrame );
++    }
++}
++
++QDeclarativeProfilerService::~QDeclarativeProfilerService()
++{
++}
++
++void QDeclarativeProfilerService::initialize()
++{
++    // just make sure that the service is properly registered
++    profilerInstance();
++}
++
++bool QDeclarativeProfilerService::startProfiling()
++{
++    return profilerInstance()->startProfilingImpl();
++}
++
++bool QDeclarativeProfilerService::stopProfiling()
++{
++    return profilerInstance()->stopProfilingImpl();
++}
++
++void QDeclarativeProfilerService::addEvent(EventType t)
++{
++    profilerInstance()->addEventImpl(t);
++}
++
++void QDeclarativeProfilerService::startRange(RangeType t)
++{
++    profilerInstance()->startRangeImpl(t);
++}
++
++void QDeclarativeProfilerService::rangeData(RangeType t, const QString &data)
++{
++    profilerInstance()->rangeDataImpl(t, data);
++}
++
++void QDeclarativeProfilerService::rangeData(RangeType t, const QUrl &data)
++{
++    profilerInstance()->rangeDataImpl(t, data);
++}
++
++void QDeclarativeProfilerService::rangeLocation(RangeType t, const QString &fileName, int line, int column)
++{
++    profilerInstance()->rangeLocationImpl(t, fileName, line, column);
++}
++
++void QDeclarativeProfilerService::rangeLocation(RangeType t, const QUrl &fileName, int line, int column)
++{
++    profilerInstance()->rangeLocationImpl(t, fileName, line, column);
++}
++
++void QDeclarativeProfilerService::endRange(RangeType t)
++{
++    profilerInstance()->endRangeImpl(t);
++}
++
++void QDeclarativeProfilerService::animationFrame(qint64 delta)
++{
++    profilerInstance()->animationFrameImpl(delta);
++}
++
++void QDeclarativeProfilerService::sendProfilingData()
++{
++    profilerInstance()->sendMessages();
++}
++
++bool QDeclarativeProfilerService::startProfilingImpl()
++{
++    bool success = false;
++    if (!profilingEnabled()) {
++        setProfilingEnabled(true);
++        addEventImpl(StartTrace);
++        success = true;
++    }
++    return success;
++}
++
++bool QDeclarativeProfilerService::stopProfilingImpl()
++{
++    bool success = false;
++    if (profilingEnabled()) {
++        addEventImpl(EndTrace);
++        setProfilingEnabled(false);
++        success = true;
++    }
++    return success;
++}
++
++void QDeclarativeProfilerService::addEventImpl(EventType event)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData ed = {m_timer.nsecsElapsed(), (int)Event, (int)event, QString(), -1, -1, 0, 0};
++    processMessage(ed);
++}
++
++void QDeclarativeProfilerService::startRangeImpl(RangeType range)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeStart, (int)range, QString(), -1, -1, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::rangeDataImpl(RangeType range, const QString &rData)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeData, (int)range, rData, -1, -1, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::rangeDataImpl(RangeType range, const QUrl &rData)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeData, (int)range, rData.toString(QUrl::FormattingOption(0x100)), -1, -1, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::rangeLocationImpl(RangeType range, const QString &fileName, int line, int column)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeLocation, (int)range, fileName, line, column, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::rangeLocationImpl(RangeType range, const QUrl &fileName, int line, int column)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeLocation, (int)range, fileName.toString(QUrl::FormattingOption(0x100)), line, column, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::endRangeImpl(RangeType range)
++{
++    if (!QDeclarativeDebugService::isDebuggingEnabled() || !m_enabled)
++        return;
++
++    QDeclarativeProfilerData rd = {m_timer.nsecsElapsed(), (int)RangeEnd, (int)range, QString(), -1, -1, 0, 0};
++    processMessage(rd);
++}
++
++void QDeclarativeProfilerService::animationFrameImpl(qint64 delta)
++{
++    Q_ASSERT(QDeclarativeDebugService::isDebuggingEnabled());
++    if (!m_enabled)
++        return;
++
++    int animCount = QUnifiedTimer::instance()->runningAnimationCount();
++
++    if (animCount > 0 && delta > 0) {
++        // trim fps to integer
++        int fps = 1000 / delta;
++        QDeclarativeProfilerData ed = {m_timer.nsecsElapsed(), (int)Event, (int)AnimationFrame, QString(), -1, -1, fps, animCount};
++        processMessage(ed);
++    }
++}
++
++/*
++    Either send the message directly, or queue up
++    a list of messages to send later (via sendMessages)
++*/
++void QDeclarativeProfilerService::processMessage(const QDeclarativeProfilerData &message)
++{
++    QMutexLocker locker(&m_mutex);
++    m_data.append(message);
++}
++
++bool QDeclarativeProfilerService::profilingEnabled()
++{
++    return m_enabled;
++}
++
++void QDeclarativeProfilerService::setProfilingEnabled(bool enable)
++{
++    m_enabled = enable;
++}
++
++/*
++    Send the messages queued up by processMessage
++*/
++void QDeclarativeProfilerService::sendMessages()
++{
++    QMutexLocker locker(&m_mutex);
++    QList<QByteArray> messages;
++    for (int i = 0; i < m_data.count(); ++i)
++        messages << m_data.at(i).toByteArray();
++    m_data.clear();
++
++    //indicate completion
++    QByteArray data;
++    QDataStream ds(&data, QIODevice::WriteOnly);
++    ds << (qint64)-1 << (int)Complete;
++    messages << data;
++
++    QDeclarativeDebugService::sendMessages(messages);
++}
++
++void QDeclarativeProfilerService::stateAboutToBeChanged(QDeclarativeDebugService::State newState)
++{
++    if (state() == newState)
++        return;
++
++    if (state() == Enabled
++            && m_enabled) {
++        stopProfilingImpl();
++        sendMessages();
++    }
++}
++
++void QDeclarativeProfilerService::messageReceived(const QByteArray &message)
++{
++    QByteArray rwData = message;
++    QDataStream stream(&rwData, QIODevice::ReadOnly);
++
++    bool enabled;
++    stream >> enabled;
++
++    m_messageReceived = true;
++
++    if (enabled) {
++        startProfilingImpl();
++    } else {
++        if (stopProfilingImpl())
++            sendMessages();
++    }
++}
++
++QT_END_NAMESPACE
+diff --git a/src/declarative/debugger/qdeclarativeprofilerservice_p.h b/src/declarative/debugger/qdeclarativeprofilerservice_p.h
+new file mode 100644
+index 0000000..f5ca8ec
+--- /dev/null
++++ b/src/declarative/debugger/qdeclarativeprofilerservice_p.h
+@@ -0,0 +1,181 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QDECLARATIVEPROFILERSERVICE_P_H
++#define QDECLARATIVEPROFILERSERVICE_P_H
++
++//
++//  W A R N I N G
++//  -------------
++//
++// This file is not part of the Qt API.  It exists purely as an
++// implementation detail.  This header file may change from version to
++// version without notice, or even be removed.
++//
++// We mean it.
++//
++
++#include <private/qdeclarativedebugservice_p.h>
++#include <QtCore/qelapsedtimer.h>
++#include <QtCore/qmutex.h>
++#include <QtCore/qvector.h>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++struct Q_AUTOTEST_EXPORT QDeclarativeProfilerData
++{
++    qint64 time;
++    int messageType;
++    int detailType;
++
++    //###
++    QString detailData; //used by RangeData and RangeLocation
++    int line;           //used by RangeLocation
++    int column;         //used by RangeLocation
++    int framerate;      //used by animation events
++    int animationcount; //used by animation events
++
++    QByteArray toByteArray() const;
++};
++
++Q_DECLARE_TYPEINFO(QDeclarativeProfilerData, Q_MOVABLE_TYPE);
++
++class QUrl;
++class QDeclarativeEngine;
++
++// RAII
++class Q_AUTOTEST_EXPORT QDeclarativeBindingProfiler {
++public:
++    QDeclarativeBindingProfiler(const QString &url, int line, int column);
++    ~QDeclarativeBindingProfiler();
++    void addDetail(const QString &details);
++};
++
++class Q_DECLARATIVE_EXPORT QDeclarativeProfilerService : public QDeclarativeDebugService
++{
++public:
++    enum Message {
++        Event,
++        RangeStart,
++        RangeData,
++        RangeLocation,
++        RangeEnd,
++        Complete, // end of transmission
++
++        MaximumMessage
++    };
++
++    enum EventType {
++        FramePaint,
++        Mouse,
++        Key,
++        AnimationFrame,
++        EndTrace,
++        StartTrace,
++
++        MaximumEventType
++    };
++
++    enum RangeType {
++        Painting,
++        Compiling,
++        Creating,
++        Binding,            //running a binding
++        HandlingSignal,     //running a signal handler
++
++        MaximumRangeType
++    };
++
++    static void initialize();
++
++    static bool startProfiling();
++    static bool stopProfiling();
++    static void addEvent(EventType);
++    static void startRange(RangeType);
++    static void rangeData(RangeType, const QString &);
++    static void rangeData(RangeType, const QUrl &);
++    static void rangeLocation(RangeType, const QString &, int, int);
++    static void rangeLocation(RangeType, const QUrl &, int, int);
++    static void endRange(RangeType);
++    static void animationFrame(qint64);
++
++    static void sendProfilingData();
++
++    QDeclarativeProfilerService();
++    ~QDeclarativeProfilerService();
++
++protected:
++    virtual void stateAboutToBeChanged(State state);
++    virtual void messageReceived(const QByteArray &);
++
++private:
++    bool startProfilingImpl();
++    bool stopProfilingImpl();
++    void addEventImpl(EventType);
++    void startRangeImpl(RangeType);
++    void rangeDataImpl(RangeType, const QString &);
++    void rangeDataImpl(RangeType, const QUrl &);
++    void rangeLocationImpl(RangeType, const QString &, int, int);
++    void rangeLocationImpl(RangeType, const QUrl &, int, int);
++    void endRangeImpl(RangeType);
++    void animationFrameImpl(qint64);
++
++    bool profilingEnabled();
++    void setProfilingEnabled(bool enable);
++    void sendMessages();
++    void processMessage(const QDeclarativeProfilerData &);
++
++private:
++    QElapsedTimer m_timer;
++    bool m_enabled;
++    bool m_messageReceived;
++    QVector<QDeclarativeProfilerData> m_data;
++    QMutex m_mutex;
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif // QDECLARATIVEPROFILERSERVICE_P_H
++
+diff --git a/src/declarative/qml/qdeclarativebinding.cpp b/src/declarative/qml/qdeclarativebinding.cpp
+index e625c7a..93d6fea 100644
+--- a/src/declarative/qml/qdeclarativebinding.cpp
++++ b/src/declarative/qml/qdeclarativebinding.cpp
+@@ -47,7 +47,7 @@
+ #include "qdeclarativeinfo.h"
+ #include "qdeclarativecompiler_p.h"
+ #include "qdeclarativedata_p.h"
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qdeclarativetrace_p.h>
+ 
+ #include <QVariant>
+diff --git a/src/declarative/qml/qdeclarativeboundsignal.cpp b/src/declarative/qml/qdeclarativeboundsignal.cpp
+index 340e78d..5d1c28b 100644
+--- a/src/declarative/qml/qdeclarativeboundsignal.cpp
++++ b/src/declarative/qml/qdeclarativeboundsignal.cpp
+@@ -49,7 +49,7 @@
+ #include "qdeclarative.h"
+ #include "qdeclarativecontext.h"
+ #include "qdeclarativeglobal_p.h"
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qv8debugservice_p.h>
+ 
+ #include <QtCore/qstringbuilder.h>
+@@ -171,9 +171,9 @@ int QDeclarativeBoundSignal::qt_metacall(QMetaObject::Call c, int id, void **a)
+         if (!m_expression)
+             return -1;
+         if (QDeclarativeDebugService::isDebuggingEnabled()) {
+-            QDeclarativeDebugTrace::startRange(QDeclarativeDebugTrace::HandlingSignal);
+-            QDeclarativeDebugTrace::rangeData(QDeclarativeDebugTrace::HandlingSignal, QLatin1String(m_signal.signature()) % QLatin1String(": ") % m_expression->expression());
+-            QDeclarativeDebugTrace::rangeLocation(QDeclarativeDebugTrace::HandlingSignal, m_expression->sourceFile(), m_expression->lineNumber(), m_expression->columnNumber());
++            QDeclarativeProfilerService::startRange(QDeclarativeProfilerService::HandlingSignal);
++            QDeclarativeProfilerService::rangeData(QDeclarativeProfilerService::HandlingSignal, QLatin1String(m_signal.signature()) % QLatin1String(": ") % m_expression->expression());
++            QDeclarativeProfilerService::rangeLocation(QDeclarativeProfilerService::HandlingSignal, m_expression->sourceFile(), m_expression->lineNumber(), m_expression->columnNumber());
+             QV8DebugService::instance()->signalEmitted(QString::fromAscii(m_signal.signature()));
+         }
+         m_isEvaluating = true;
+@@ -191,7 +191,7 @@ int QDeclarativeBoundSignal::qt_metacall(QMetaObject::Call c, int id, void **a)
+         }
+         if (m_params) m_params->clearValues();
+         m_isEvaluating = false;
+-        QDeclarativeDebugTrace::endRange(QDeclarativeDebugTrace::HandlingSignal);
++        QDeclarativeProfilerService::endRange(QDeclarativeProfilerService::HandlingSignal);
+         return -1;
+     } else {
+         return QObject::qt_metacall(c, id, a);
+diff --git a/src/declarative/qml/qdeclarativecomponent.cpp b/src/declarative/qml/qdeclarativecomponent.cpp
+index a932eb7..5bfa821 100644
+--- a/src/declarative/qml/qdeclarativecomponent.cpp
++++ b/src/declarative/qml/qdeclarativecomponent.cpp
+@@ -53,7 +53,7 @@
+ #include "qdeclarativebinding_p_p.h"
+ #include "qdeclarativeglobal_p.h"
+ #include "qdeclarativescript_p.h"
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qdeclarativeenginedebugservice_p.h>
+ #include "qdeclarativeincubator.h"
+ #include "qdeclarativeincubator_p.h"
+@@ -745,7 +745,7 @@ QDeclarativeComponentPrivate::beginCreate(QDeclarativeContextData *context)
+     state.completePending = true;
+ 
+     if (isRoot) 
+-        QDeclarativeDebugTrace::startRange(QDeclarativeDebugTrace::Creating);
++        QDeclarativeProfilerService::startRange(QDeclarativeProfilerService::Creating);
+ 
+     enginePriv->referenceScarceResources();
+     state.vme.init(context, cc, start, creationContext);
+@@ -763,11 +763,11 @@ QDeclarativeComponentPrivate::beginCreate(QDeclarativeContextData *context)
+             context->asQDeclarativeContextPrivate()->instances.append(rv);
+         QDeclarativeEngineDebugService::instance()->objectCreated(engine, rv);
+         if (isRoot) {
+-            QDeclarativeDebugTrace::rangeData(QDeclarativeDebugTrace::Creating, 
++            QDeclarativeProfilerService::rangeData(QDeclarativeProfilerService::Creating,
+                                               buildTypeNameForDebug(rv->metaObject()));
+             QDeclarativeData *data = QDeclarativeData::get(rv);
+             Q_ASSERT(data);
+-            QDeclarativeDebugTrace::rangeLocation(QDeclarativeDebugTrace::Creating, 
++            QDeclarativeProfilerService::rangeLocation(QDeclarativeProfilerService::Creating,
+                                                   cc->url, data->lineNumber, data->columnNumber);
+         }
+     }
+@@ -824,7 +824,7 @@ void QDeclarativeComponentPrivate::completeCreate()
+         QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(engine);
+         complete(ep, &state);
+ 
+-        QDeclarativeDebugTrace::endRange(QDeclarativeDebugTrace::Creating);
++        QDeclarativeProfilerService::endRange(QDeclarativeProfilerService::Creating);
+     }
+ }
+ 
+diff --git a/src/declarative/qml/qdeclarativeengine.cpp b/src/declarative/qml/qdeclarativeengine.cpp
+index 73385fe..2031bc4 100644
+--- a/src/declarative/qml/qdeclarativeengine.cpp
++++ b/src/declarative/qml/qdeclarativeengine.cpp
+@@ -66,7 +66,7 @@
+ #include "qdeclarativelist_p.h"
+ #include "qdeclarativetypenamecache_p.h"
+ #include "qdeclarativenotifier_p.h"
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qdeclarativeapplication_p.h>
+ #include <private/qv8debugservice_p.h>
+ #include <private/qdebugmessageservice_p.h>
+@@ -453,7 +453,7 @@ void QDeclarativeEnginePrivate::init()
+         QDeclarativeEngineDebugService::instance()->addEngine(q);
+         QV8DebugService::initialize(v8engine());
+         QV8ProfilerService::initialize();
+-        QDeclarativeDebugTrace::initialize();
++        QDeclarativeProfilerService::initialize();
+         QDebugMessageService::instance();
+     }
+ 
+@@ -966,12 +966,12 @@ Q_AUTOTEST_EXPORT void qmlExecuteDeferred(QObject *object)
+ 
+     if (data && data->deferredComponent) {
+         if (QDeclarativeDebugService::isDebuggingEnabled()) {
+-            QDeclarativeDebugTrace::startRange(QDeclarativeDebugTrace::Creating);
++            QDeclarativeProfilerService::startRange(QDeclarativeProfilerService::Creating);
+             QDeclarativeType *type = QDeclarativeMetaType::qmlType(object->metaObject());
+             QString typeName = type ? type->qmlTypeName() : QString::fromUtf8(object->metaObject()->className());
+-            QDeclarativeDebugTrace::rangeData(QDeclarativeDebugTrace::Creating, typeName);
++            QDeclarativeProfilerService::rangeData(QDeclarativeProfilerService::Creating, typeName);
+             if (data->outerContext)
+-                QDeclarativeDebugTrace::rangeLocation(QDeclarativeDebugTrace::Creating, data->outerContext->url, data->lineNumber, data->columnNumber);
++                QDeclarativeProfilerService::rangeLocation(QDeclarativeProfilerService::Creating, data->outerContext->url, data->lineNumber, data->columnNumber);
+         }
+         QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(data->context->engine);
+ 
+@@ -982,7 +982,7 @@ Q_AUTOTEST_EXPORT void qmlExecuteDeferred(QObject *object)
+         data->deferredComponent = 0;
+ 
+         QDeclarativeComponentPrivate::complete(ep, &state);
+-        QDeclarativeDebugTrace::endRange(QDeclarativeDebugTrace::Creating);
++        QDeclarativeProfilerService::endRange(QDeclarativeProfilerService::Creating);
+     }
+ }
+ 
+diff --git a/src/declarative/qml/qdeclarativetypeloader.cpp b/src/declarative/qml/qdeclarativetypeloader.cpp
+index 40f8e5c..7251296 100644
+--- a/src/declarative/qml/qdeclarativetypeloader.cpp
++++ b/src/declarative/qml/qdeclarativetypeloader.cpp
+@@ -46,7 +46,7 @@
+ #include <private/qdeclarativethread_p.h>
+ #include <private/qdeclarativecompiler_p.h>
+ #include <private/qdeclarativecomponent_p.h>
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ 
+ #include <QtCore/qdir.h>
+ #include <QtCore/qfile.h>
+@@ -1566,13 +1566,13 @@ void QDeclarativeTypeData::downloadProgressChanged(qreal p)
+ void QDeclarativeTypeData::compile()
+ {
+     Q_ASSERT(m_compiledData == 0);
+-    QDeclarativeDebugTrace::startRange(QDeclarativeDebugTrace::Compiling);
++    QDeclarativeProfilerService::startRange(QDeclarativeProfilerService::Compiling);
+ 
+     m_compiledData = new QDeclarativeCompiledData(typeLoader()->engine());
+     m_compiledData->url = m_imports.baseUrl();
+     m_compiledData->name = m_compiledData->url.toString();
+-    QDeclarativeDebugTrace::rangeLocation(QDeclarativeDebugTrace::Compiling, QUrl(m_compiledData->name),1,1);
+-    QDeclarativeDebugTrace::rangeData(QDeclarativeDebugTrace::Compiling, m_compiledData->name);
++    QDeclarativeProfilerService::rangeLocation(QDeclarativeProfilerService::Compiling, QUrl(m_compiledData->name),1,1);
++    QDeclarativeProfilerService::rangeData(QDeclarativeProfilerService::Compiling, m_compiledData->name);
+ 
+     QDeclarativeCompiler compiler(&scriptParser._pool);
+     if (!compiler.compile(typeLoader()->engine(), this, m_compiledData)) {
+@@ -1580,7 +1580,7 @@ void QDeclarativeTypeData::compile()
+         m_compiledData->release();
+         m_compiledData = 0;
+     }
+-    QDeclarativeDebugTrace::endRange(QDeclarativeDebugTrace::Compiling);
++    QDeclarativeProfilerService::endRange(QDeclarativeProfilerService::Compiling);
+ }
+ 
+ void QDeclarativeTypeData::resolveTypes()
+diff --git a/src/declarative/qml/v4/qv4bindings.cpp b/src/declarative/qml/v4/qv4bindings.cpp
+index eed4efc..f321628 100644
+--- a/src/declarative/qml/v4/qv4bindings.cpp
++++ b/src/declarative/qml/v4/qv4bindings.cpp
+@@ -47,7 +47,7 @@
+ #include "qv4compiler_p_p.h"
+ 
+ #include <private/qdeclarativeaccessors_p.h>
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qdeclarativemetatype_p.h>
+ #include <private/qdeclarativetrace_p.h>
+ 
+diff --git a/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp b/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
+index ef12743..3453472 100644
+--- a/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
++++ b/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
+@@ -49,7 +49,7 @@
+ #include <private/qv8engine_p.h>
+ 
+ #include <private/qv8profilerservice_p.h>
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ 
+ #include <QtCore/qstring.h>
+ #include <QtCore/qdatetime.h>
+@@ -183,7 +183,7 @@ v8::Handle<v8::Value> consoleProfile(const v8::Arguments &args)
+     Q_UNUSED(args);
+     QString title;
+ 
+-    if (QDeclarativeDebugTrace::startProfiling()) {
++    if (QDeclarativeProfilerService::startProfiling()) {
+         QV8ProfilerService::instance()->startProfiling(title);
+         qDebug("Profiling started.");
+     } else {
+@@ -201,10 +201,10 @@ v8::Handle<v8::Value> consoleProfileEnd(const v8::Arguments &args)
+     Q_UNUSED(args);
+     QString title;
+ 
+-    if (QDeclarativeDebugTrace::stopProfiling()) {
++    if (QDeclarativeProfilerService::stopProfiling()) {
+         QV8ProfilerService *profiler = QV8ProfilerService::instance();
+         profiler->stopProfiling(title);
+-        QDeclarativeDebugTrace::sendProfilingData();
++        QDeclarativeProfilerService::sendProfilingData();
+         profiler->sendProfilingData();
+         qDebug("Profiling ended.");
+     } else {
+diff --git a/src/declarative/qml/v8/qv8bindings.cpp b/src/declarative/qml/v8/qv8bindings.cpp
+index b21ddf5..daadce4 100644
+--- a/src/declarative/qml/v8/qv8bindings.cpp
++++ b/src/declarative/qml/v8/qv8bindings.cpp
+@@ -49,7 +49,7 @@
+ #include <private/qdeclarativeexpression_p.h>
+ #include <private/qobject_p.h>
+ #include <private/qdeclarativetrace_p.h>
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 6c5b223..4a166c1 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -66,7 +66,7 @@
+ #include <QtCore/qabstractanimation.h>
+ #include <QtDeclarative/qdeclarativeincubator.h>
+ 
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+diff --git a/src/quick/items/qquickview.cpp b/src/quick/items/qquickview.cpp
+index 7e3969c..76d82a4 100644
+--- a/src/quick/items/qquickview.cpp
++++ b/src/quick/items/qquickview.cpp
+@@ -46,7 +46,7 @@
+ #include "qquickitem_p.h"
+ #include "qquickitemchangelistener_p.h"
+ 
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ #include <private/qdeclarativeinspectorservice_p.h>
+ 
+ #include <QtDeclarative/qdeclarativeengine.h>
+@@ -499,35 +499,35 @@ void QQuickView::resizeEvent(QResizeEvent *e)
+ 
+ void QQuickView::keyPressEvent(QKeyEvent *e)
+ {
+-    QDeclarativeDebugTrace::addEvent(QDeclarativeDebugTrace::Key);
++    QDeclarativeProfilerService::addEvent(QDeclarativeProfilerService::Key);
+ 
+     QQuickCanvas::keyPressEvent(e);
+ }
+ 
+ void QQuickView::keyReleaseEvent(QKeyEvent *e)
+ {
+-    QDeclarativeDebugTrace::addEvent(QDeclarativeDebugTrace::Key);
++    QDeclarativeProfilerService::addEvent(QDeclarativeProfilerService::Key);
+ 
+     QQuickCanvas::keyReleaseEvent(e);
+ }
+ 
+ void QQuickView::mouseMoveEvent(QMouseEvent *e)
+ {
+-    QDeclarativeDebugTrace::addEvent(QDeclarativeDebugTrace::Mouse);
++    QDeclarativeProfilerService::addEvent(QDeclarativeProfilerService::Mouse);
+ 
+     QQuickCanvas::mouseMoveEvent(e);
+ }
+ 
+ void QQuickView::mousePressEvent(QMouseEvent *e)
+ {
+-    QDeclarativeDebugTrace::addEvent(QDeclarativeDebugTrace::Mouse);
++    QDeclarativeProfilerService::addEvent(QDeclarativeProfilerService::Mouse);
+ 
+     QQuickCanvas::mousePressEvent(e);
+ }
+ 
+ void QQuickView::mouseReleaseEvent(QMouseEvent *e)
+ {
+-    QDeclarativeDebugTrace::addEvent(QDeclarativeDebugTrace::Mouse);
++    QDeclarativeProfilerService::addEvent(QDeclarativeProfilerService::Mouse);
+ 
+     QQuickCanvas::mouseReleaseEvent(e);
+ }
+diff --git a/src/quick/scenegraph/util/qsgtexture.cpp b/src/quick/scenegraph/util/qsgtexture.cpp
+index 6ef26d1..7ccedc4 100644
+--- a/src/quick/scenegraph/util/qsgtexture.cpp
++++ b/src/quick/scenegraph/util/qsgtexture.cpp
+@@ -45,7 +45,7 @@
+ #include <qopenglfunctions.h>
+ #include <QtQuick/private/qsgcontext_p.h>
+ #include <qthread.h>
+-#include <private/qdeclarativedebugtrace_p.h>
++#include <private/qdeclarativeprofilerservice_p.h>
+ 
+ #if !defined(QT_NO_DEBUG) && (defined(Q_OS_LINUX) || defined(Q_OS_MAC))
+ #include <execinfo.h>
+diff --git a/tests/auto/declarative/debugger/debugger.pro b/tests/auto/declarative/debugger/debugger.pro
+index 6d7548c..314f0d1 100644
+--- a/tests/auto/declarative/debugger/debugger.pro
++++ b/tests/auto/declarative/debugger/debugger.pro
+@@ -6,7 +6,7 @@ PRIVATETESTS += \
+     qdeclarativedebugservice \
+     qdeclarativedebugjs \
+     qdeclarativeinspector \
+-    qdeclarativedebugtrace \
++    qdeclarativeprofilerservice \
+     qpacketprotocol \
+     qv8profilerservice \
+     qdebugmessageservice
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml b/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml
+deleted file mode 100644
+index b250524..0000000
+--- a/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-import QtQuick 2.0
+-
+-Item {
+-    Timer {
+-        running: true
+-        interval: 1
+-        onTriggered: Qt.quit();
+-    }
+-}
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/test.qml b/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/test.qml
+deleted file mode 100644
+index 9c36e13..0000000
+--- a/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/test.qml
++++ /dev/null
+@@ -1,5 +0,0 @@
+-import QtQuick 2.0
+-
+-Item {
+-
+-}
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/qdeclarativedebugtrace.pro b/tests/auto/declarative/debugger/qdeclarativedebugtrace/qdeclarativedebugtrace.pro
+deleted file mode 100644
+index 487c63a..0000000
+--- a/tests/auto/declarative/debugger/qdeclarativedebugtrace/qdeclarativedebugtrace.pro
++++ /dev/null
+@@ -1,15 +0,0 @@
+-CONFIG += testcase
+-TARGET = tst_qdeclarativedebugtrace
+-macx:CONFIG -= app_bundle
+-
+-HEADERS += ../shared/debugutil_p.h
+-
+-SOURCES += tst_qdeclarativedebugtrace.cpp \
+-           ../shared/debugutil.cpp
+-OTHER_FILES += data/test.qml
+-
+-include (../../../shared/util.pri)
+-
+-CONFIG += parallel_test declarative_debug
+-
+-QT += declarative-private testlib
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp b/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp
+deleted file mode 100644
+index f0a660c..0000000
+--- a/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp
++++ /dev/null
+@@ -1,310 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the test suite of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include <qtest.h>
+-#include <QLibraryInfo>
+-
+-#include "QtDeclarative/private/qdeclarativedebugtrace_p.h"
+-#include "../shared/debugutil_p.h"
+-#include "../../../shared/util.h"
+-
+-#define PORT 13773
+-#define STR_PORT "13773"
+-
+-class QDeclarativeDebugTraceClient : public QDeclarativeDebugClient
+-{
+-    Q_OBJECT
+-
+-public:
+-    QDeclarativeDebugTraceClient(QDeclarativeDebugConnection *connection)
+-        : QDeclarativeDebugClient(QLatin1String("CanvasFrameRate"), connection)
+-    {
+-    }
+-
+-    QList<QDeclarativeDebugData> traceMessages;
+-
+-    void setTraceState(bool enabled) {
+-        QByteArray message;
+-        QDataStream stream(&message, QIODevice::WriteOnly);
+-        stream << enabled;
+-        sendMessage(message);
+-    }
+-
+-signals:
+-    void complete();
+-
+-protected:
+-    void messageReceived(const QByteArray &message);
+-};
+-
+-class tst_QDeclarativeDebugTrace : public QDeclarativeDataTest
+-{
+-    Q_OBJECT
+-
+-public:
+-    tst_QDeclarativeDebugTrace()
+-        : m_process(0)
+-        , m_connection(0)
+-        , m_client(0)
+-    {
+-    }
+-
+-private:
+-    QDeclarativeDebugProcess *m_process;
+-    QDeclarativeDebugConnection *m_connection;
+-    QDeclarativeDebugTraceClient *m_client;
+-
+-    void connect(bool block, const QString &testFile);
+-
+-private slots:
+-    void cleanup();
+-
+-    void blockingConnectWithTraceEnabled();
+-    void blockingConnectWithTraceDisabled();
+-    void nonBlockingConnect();
+-    void profileOnExit();
+-};
+-
+-void QDeclarativeDebugTraceClient::messageReceived(const QByteArray &message)
+-{
+-    QByteArray msg = message;
+-    QDataStream stream(&msg, QIODevice::ReadOnly);
+-
+-
+-    QDeclarativeDebugData data;
+-    data.time = -2;
+-    data.messageType = -1;
+-    data.detailType = -1;
+-    data.line = -1;
+-    data.framerate = -1;
+-    data.animationcount = -1;
+-
+-    stream >> data.time >> data.messageType;
+-
+-    QVERIFY(data.time >= -1);
+-
+-    switch (data.messageType) {
+-    case (QDeclarativeDebugTrace::Event): {
+-        stream >> data.detailType;
+-
+-        switch (data.detailType) {
+-        case QDeclarativeDebugTrace::AnimationFrame: {
+-            stream >> data.framerate >> data.animationcount;
+-            QVERIFY(data.framerate != -1);
+-            QVERIFY(data.animationcount != -1);
+-            break;
+-        }
+-        case QDeclarativeDebugTrace::FramePaint:
+-        case QDeclarativeDebugTrace::Mouse:
+-        case QDeclarativeDebugTrace::Key:
+-        case QDeclarativeDebugTrace::StartTrace:
+-        case QDeclarativeDebugTrace::EndTrace:
+-            break;
+-        default: {
+-            QString failMsg = QString("Unknown event type:") + data.detailType;
+-            QFAIL(qPrintable(failMsg));
+-            break;
+-        }
+-        }
+-        break;
+-    }
+-    case QDeclarativeDebugTrace::Complete: {
+-        emit complete();
+-        return;
+-    }
+-    case QDeclarativeDebugTrace::RangeStart: {
+-        stream >> data.detailType;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeDebugTrace::MaximumRangeType);
+-        break;
+-    }
+-    case QDeclarativeDebugTrace::RangeEnd: {
+-        stream >> data.detailType;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeDebugTrace::MaximumRangeType);
+-        break;
+-    }
+-    case QDeclarativeDebugTrace::RangeData: {
+-        stream >> data.detailType >> data.detailData;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeDebugTrace::MaximumRangeType);
+-        break;
+-    }
+-    case QDeclarativeDebugTrace::RangeLocation: {
+-        stream >> data.detailType >> data.detailData >> data.line >> data.column;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeDebugTrace::MaximumRangeType);
+-        QVERIFY(data.line >= -2);
+-        break;
+-    }
+-    default:
+-        QString failMsg = QString("Unknown message type:") + data.messageType;
+-        QFAIL(qPrintable(failMsg));
+-        break;
+-    }
+-    QVERIFY(stream.atEnd());
+-    traceMessages.append(data);
+-}
+-
+-void tst_QDeclarativeDebugTrace::connect(bool block, const QString &testFile)
+-{
+-    const QString executable = QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlscene";
+-    QStringList arguments;
+-
+-    if (block)
+-        arguments << QString("-qmljsdebugger=port:"STR_PORT",block");
+-    else
+-        arguments << QString("-qmljsdebugger=port:"STR_PORT);
+-
+-    arguments << QDeclarativeDataTest::instance()->testFile(testFile);
+-
+-    m_process = new QDeclarativeDebugProcess(executable);
+-    m_process->start(QStringList() << arguments);
+-    if (!m_process->waitForSessionStart()) {
+-        QString failMsg = QString("Could not launch app '%1'.\nApplication output:\n%2").arg(
+-                    executable, m_process->output());
+-        QFAIL(qPrintable(failMsg));
+-    }
+-
+-    QDeclarativeDebugConnection *m_connection = new QDeclarativeDebugConnection();
+-    m_client = new QDeclarativeDebugTraceClient(m_connection);
+-
+-    m_connection->connectToHost(QLatin1String("127.0.0.1"), PORT);
+-}
+-
+-void tst_QDeclarativeDebugTrace::cleanup()
+-{
+-    delete m_process;
+-    delete m_connection;
+-    delete m_client;
+-}
+-
+-void tst_QDeclarativeDebugTrace::blockingConnectWithTraceEnabled()
+-{
+-    connect(true, "test.qml");
+-    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
+-
+-    m_client->setTraceState(true);
+-    m_client->setTraceState(false);
+-    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
+-        QString failMsg
+-                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
+-        QFAIL(qPrintable(failMsg));
+-    }
+-
+-    QVERIFY(m_client->traceMessages.count());
+-    // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeDebugTrace::StartTrace);
+-
+-    // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
+-}
+-
+-void tst_QDeclarativeDebugTrace::blockingConnectWithTraceDisabled()
+-{
+-    connect(true, "test.qml");
+-    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
+-
+-    m_client->setTraceState(false);
+-    m_client->setTraceState(true);
+-    m_client->setTraceState(false);
+-    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
+-        QString failMsg
+-                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
+-        QFAIL(qPrintable(failMsg));
+-    }
+-
+-    QVERIFY(m_client->traceMessages.count());
+-
+-    // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeDebugTrace::StartTrace);
+-
+-    // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
+-}
+-
+-void tst_QDeclarativeDebugTrace::nonBlockingConnect()
+-{
+-    connect(false, "test.qml");
+-    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
+-
+-    m_client->setTraceState(true);
+-    m_client->setTraceState(false);
+-    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
+-        QString failMsg
+-                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
+-        QFAIL(qPrintable(failMsg));
+-    }
+-
+-    // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeDebugTrace::StartTrace);
+-
+-    // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
+-}
+-
+-void tst_QDeclarativeDebugTrace::profileOnExit()
+-{
+-    connect(true, "exit.qml");
+-    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
+-
+-    m_client->setTraceState(true);
+-
+-    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
+-        QString failMsg
+-                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
+-        QFAIL(qPrintable(failMsg));
+-    }
+-
+-    // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeDebugTrace::StartTrace);
+-
+-    // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeDebugTrace::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
+-}
+-
+-QTEST_MAIN(tst_QDeclarativeDebugTrace)
+-
+-#include "tst_qdeclarativedebugtrace.moc"
+diff --git a/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/exit.qml b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/exit.qml
+new file mode 100644
+index 0000000..b250524
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/exit.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++
++Item {
++    Timer {
++        running: true
++        interval: 1
++        onTriggered: Qt.quit();
++    }
++}
+diff --git a/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/test.qml b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/test.qml
+new file mode 100644
+index 0000000..9c36e13
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/data/test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++
++}
+diff --git a/tests/auto/declarative/debugger/qdeclarativeprofilerservice/qdeclarativeprofilerservice.pro b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/qdeclarativeprofilerservice.pro
+new file mode 100644
+index 0000000..564945f
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/qdeclarativeprofilerservice.pro
+@@ -0,0 +1,15 @@
++CONFIG += testcase
++TARGET = tst_qdeclarativeprofilerservice
++macx:CONFIG -= app_bundle
++
++HEADERS += ../shared/debugutil_p.h
++
++SOURCES += tst_qdeclarativeprofilerservice.cpp \
++           ../shared/debugutil.cpp
++OTHER_FILES += data/test.qml
++
++include (../../../shared/util.pri)
++
++CONFIG += parallel_test declarative_debug
++
++QT += declarative-private testlib
+diff --git a/tests/auto/declarative/debugger/qdeclarativeprofilerservice/tst_qdeclarativeprofilerservice.cpp b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/tst_qdeclarativeprofilerservice.cpp
+new file mode 100644
+index 0000000..5de7b86
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qdeclarativeprofilerservice/tst_qdeclarativeprofilerservice.cpp
+@@ -0,0 +1,310 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <qtest.h>
++#include <QLibraryInfo>
++
++#include "QtDeclarative/private/qdeclarativeprofilerservice_p.h"
++#include "../shared/debugutil_p.h"
++#include "../../../shared/util.h"
++
++#define PORT 13773
++#define STR_PORT "13773"
++
++class QDeclarativeProfilerClient : public QDeclarativeDebugClient
++{
++    Q_OBJECT
++
++public:
++    QDeclarativeProfilerClient(QDeclarativeDebugConnection *connection)
++        : QDeclarativeDebugClient(QLatin1String("CanvasFrameRate"), connection)
++    {
++    }
++
++    QList<QDeclarativeProfilerData> traceMessages;
++
++    void setTraceState(bool enabled) {
++        QByteArray message;
++        QDataStream stream(&message, QIODevice::WriteOnly);
++        stream << enabled;
++        sendMessage(message);
++    }
++
++signals:
++    void complete();
++
++protected:
++    void messageReceived(const QByteArray &message);
++};
++
++class tst_QDeclarativeProfilerService : public QDeclarativeDataTest
++{
++    Q_OBJECT
++
++public:
++    tst_QDeclarativeProfilerService()
++        : m_process(0)
++        , m_connection(0)
++        , m_client(0)
++    {
++    }
++
++private:
++    QDeclarativeDebugProcess *m_process;
++    QDeclarativeDebugConnection *m_connection;
++    QDeclarativeProfilerClient *m_client;
++
++    void connect(bool block, const QString &testFile);
++
++private slots:
++    void cleanup();
++
++    void blockingConnectWithTraceEnabled();
++    void blockingConnectWithTraceDisabled();
++    void nonBlockingConnect();
++    void profileOnExit();
++};
++
++void QDeclarativeProfilerClient::messageReceived(const QByteArray &message)
++{
++    QByteArray msg = message;
++    QDataStream stream(&msg, QIODevice::ReadOnly);
++
++
++    QDeclarativeProfilerData data;
++    data.time = -2;
++    data.messageType = -1;
++    data.detailType = -1;
++    data.line = -1;
++    data.framerate = -1;
++    data.animationcount = -1;
++
++    stream >> data.time >> data.messageType;
++
++    QVERIFY(data.time >= -1);
++
++    switch (data.messageType) {
++    case (QDeclarativeProfilerService::Event): {
++        stream >> data.detailType;
++
++        switch (data.detailType) {
++        case QDeclarativeProfilerService::AnimationFrame: {
++            stream >> data.framerate >> data.animationcount;
++            QVERIFY(data.framerate != -1);
++            QVERIFY(data.animationcount != -1);
++            break;
++        }
++        case QDeclarativeProfilerService::FramePaint:
++        case QDeclarativeProfilerService::Mouse:
++        case QDeclarativeProfilerService::Key:
++        case QDeclarativeProfilerService::StartTrace:
++        case QDeclarativeProfilerService::EndTrace:
++            break;
++        default: {
++            QString failMsg = QString("Unknown event type:") + data.detailType;
++            QFAIL(qPrintable(failMsg));
++            break;
++        }
++        }
++        break;
++    }
++    case QDeclarativeProfilerService::Complete: {
++        emit complete();
++        return;
++    }
++    case QDeclarativeProfilerService::RangeStart: {
++        stream >> data.detailType;
++        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeProfilerService::MaximumRangeType);
++        break;
++    }
++    case QDeclarativeProfilerService::RangeEnd: {
++        stream >> data.detailType;
++        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeProfilerService::MaximumRangeType);
++        break;
++    }
++    case QDeclarativeProfilerService::RangeData: {
++        stream >> data.detailType >> data.detailData;
++        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeProfilerService::MaximumRangeType);
++        break;
++    }
++    case QDeclarativeProfilerService::RangeLocation: {
++        stream >> data.detailType >> data.detailData >> data.line >> data.column;
++        QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeProfilerService::MaximumRangeType);
++        QVERIFY(data.line >= -2);
++        break;
++    }
++    default:
++        QString failMsg = QString("Unknown message type:") + data.messageType;
++        QFAIL(qPrintable(failMsg));
++        break;
++    }
++    QVERIFY(stream.atEnd());
++    traceMessages.append(data);
++}
++
++void tst_QDeclarativeProfilerService::connect(bool block, const QString &testFile)
++{
++    const QString executable = QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlscene";
++    QStringList arguments;
++
++    if (block)
++        arguments << QString("-qmljsdebugger=port:"STR_PORT",block");
++    else
++        arguments << QString("-qmljsdebugger=port:"STR_PORT);
++
++    arguments << QDeclarativeDataTest::instance()->testFile(testFile);
++
++    m_process = new QDeclarativeDebugProcess(executable);
++    m_process->start(QStringList() << arguments);
++    if (!m_process->waitForSessionStart()) {
++        QString failMsg = QString("Could not launch app '%1'.\nApplication output:\n%2").arg(
++                    executable, m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    QDeclarativeDebugConnection *m_connection = new QDeclarativeDebugConnection();
++    m_client = new QDeclarativeProfilerClient(m_connection);
++
++    m_connection->connectToHost(QLatin1String("127.0.0.1"), PORT);
++}
++
++void tst_QDeclarativeProfilerService::cleanup()
++{
++    delete m_process;
++    delete m_connection;
++    delete m_client;
++}
++
++void tst_QDeclarativeProfilerService::blockingConnectWithTraceEnabled()
++{
++    connect(true, "test.qml");
++    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
++
++    m_client->setTraceState(true);
++    m_client->setTraceState(false);
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    QVERIFY(m_client->traceMessages.count());
++    // must start with "StartTrace"
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeProfilerService::StartTrace);
++
++    // must end with "EndTrace"
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeProfilerService::EndTrace);
++}
++
++void tst_QDeclarativeProfilerService::blockingConnectWithTraceDisabled()
++{
++    connect(true, "test.qml");
++    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
++
++    m_client->setTraceState(false);
++    m_client->setTraceState(true);
++    m_client->setTraceState(false);
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    QVERIFY(m_client->traceMessages.count());
++
++    // must start with "StartTrace"
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeProfilerService::StartTrace);
++
++    // must end with "EndTrace"
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeProfilerService::EndTrace);
++}
++
++void tst_QDeclarativeProfilerService::nonBlockingConnect()
++{
++    connect(false, "test.qml");
++    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
++
++    m_client->setTraceState(true);
++    m_client->setTraceState(false);
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    // must start with "StartTrace"
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeProfilerService::StartTrace);
++
++    // must end with "EndTrace"
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeProfilerService::EndTrace);
++}
++
++void tst_QDeclarativeProfilerService::profileOnExit()
++{
++    connect(true, "exit.qml");
++    QTRY_COMPARE(m_client->state(), QDeclarativeDebugClient::Enabled);
++
++    m_client->setTraceState(true);
++
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    // must start with "StartTrace"
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeProfilerService::StartTrace);
++
++    // must end with "EndTrace"
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeProfilerService::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeProfilerService::EndTrace);
++}
++
++QTEST_MAIN(tst_QDeclarativeProfilerService)
++
++#include "tst_qdeclarativeprofilerservice.moc"

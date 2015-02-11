@@ -1,0 +1,354 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 53ff4fd..cbc5b8e 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -66,6 +66,8 @@
+ #include <QtCore/qabstractanimation.h>
+ #include <QtDeclarative/qdeclarativeincubator.h>
+ 
++#include <QtQuick/private/qdeclarativepixmapcache_p.h>
++
+ #include <private/qdeclarativeprofilerservice_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -748,6 +750,21 @@ QQuickCanvas::~QQuickCanvas()
+     delete d->rootItem; d->rootItem = 0;
+ }
+ 
++
++
++/*!
++    This function tries to release redundant resources currently held by the QML scene.
++ */
++
++void QQuickCanvas::releaseResources()
++{
++    Q_D(QQuickCanvas);
++    d->windowManager->releaseResources();
++    QDeclarativePixmap::purgeCache();
++}
++
++
++
+ /*!
+   Returns the invisible root item of the scene.
+ 
+diff --git a/src/quick/items/qquickcanvas.h b/src/quick/items/qquickcanvas.h
+index 335cbf7..3246d53 100644
+--- a/src/quick/items/qquickcanvas.h
++++ b/src/quick/items/qquickcanvas.h
+@@ -124,6 +124,9 @@ Q_SIGNALS:
+     void afterRendering();
+     void clearColorChanged(const QColor &);
+ 
++public slots:
++    void releaseResources();
++
+ protected:
+     QQuickCanvas(QQuickCanvasPrivate &dd, QWindow *parent = 0);
+ 
+diff --git a/src/quick/items/qquickwindowmanager.cpp b/src/quick/items/qquickwindowmanager.cpp
+index c28b77f..916615b 100644
+--- a/src/quick/items/qquickwindowmanager.cpp
++++ b/src/quick/items/qquickwindowmanager.cpp
+@@ -164,6 +164,7 @@ public:
+         , shouldExit(false)
+         , hasExited(false)
+         , isDeferredUpdatePosted(false)
++        , runToReleaseResources(false)
+         , canvasToGrab(0)
+     {
+         sg->moveToThread(this);
+@@ -194,6 +195,8 @@ public:
+     void sync(bool guiAlreadyLocked);
+ 
+     void initialize();
++    void releaseResources();
++    void releaseResourcesInThread();
+ 
+     bool *allowMainThreadProcessing() { return &allowMainThreadProcessingFlag; }
+ 
+@@ -249,6 +252,7 @@ private:
+     uint shouldExit : 1;
+     uint hasExited : 1;
+     uint isDeferredUpdatePosted : 1;
++    uint runToReleaseResources : 1;
+ 
+     QQuickCanvas *canvasToGrab;
+     QImage grabContent;
+@@ -287,6 +291,7 @@ public:
+ 
+     void canvasDestroyed(QQuickCanvas *canvas);
+ 
++    void releaseResources();
+     void initializeGL();
+     void renderCanvas(QQuickCanvas *canvas);
+     void paint(QQuickCanvas *canvas);
+@@ -298,6 +303,7 @@ public:
+     bool *allowMainThreadProcessing();
+ 
+     QSGContext *sceneGraphContext() const;
++    QQuickCanvas *masterCanvas() const;
+ 
+     bool event(QEvent *);
+ 
+@@ -548,10 +554,18 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+ #ifdef THREAD_DEBUG
+     printf("QML Rendering Thread Started\n");
+ #endif
+-
+     lock();
+-    Q_ASSERT(!gl);
+-    initialize();
++
++    if (runToReleaseResources) {
++        releaseResourcesInThread();
++        runToReleaseResources = false;
++        unlock();
++        return;
++    }
++
++    if (!gl)
++        initialize();
++
+     // Wake GUI as it is waiting for the GL context to have appeared, as
+     // an indication that the render thread is now running.
+     wake();
+@@ -748,12 +762,6 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+     m_removed_windows << m_rendered_windows.keys();
+     handleRemovedWindows();
+ 
+-    sg->invalidate();
+-
+-    gl->doneCurrent();
+-    delete gl;
+-    gl = 0;
+-
+ #ifdef THREAD_DEBUG
+     printf("                RenderThread: render loop exited... Good Night!\n");
+ #endif
+@@ -772,6 +780,60 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+ #endif
+ }
+ 
++void QQuickRenderThreadSingleContextWindowManager::releaseResourcesInThread()
++{
++#ifdef THREAD_DEBUG
++    printf("                RenderThread: releasing resources...\n");
++#endif
++
++    QQuickCanvas *canvas = masterCanvas();
++    QWindow *tmpSurface = 0;
++
++    if (canvas) {
++        gl->makeCurrent(canvas);
++    } else {
++        tmpSurface = new QWindow();
++        tmpSurface->setSurfaceType(QSurface::OpenGLSurface);
++        tmpSurface->resize(4, 4);
++        tmpSurface->create();
++        gl->makeCurrent(tmpSurface);
++    }
++
++    sg->invalidate();
++    gl->doneCurrent();
++    delete gl;
++    gl = 0;
++
++    if (tmpSurface)
++        delete tmpSurface;
++
++    wake();
++}
++
++void QQuickRenderThreadSingleContextWindowManager::releaseResources()
++{
++#ifdef THREAD_DEBUG
++    printf("GUI: releasing resources\n");
++#endif
++
++    lockInGui();
++    if (!isRunning() && gl) {
++        runToReleaseResources = true;
++        start();
++
++        while (gl) {
++            wait();
++        }
++    }
++#ifdef THREAD_DEBUG
++    else {
++        printf("GUI: render thread running not releasing resources...\n");
++    }
++#endif
++    unlockInGui();
++
++}
++
+ bool QQuickRenderThreadSingleContextWindowManager::event(QEvent *e)
+ {
+     Q_ASSERT(QThread::currentThread() == qApp->thread());
+@@ -1003,7 +1065,6 @@ void QQuickRenderThreadSingleContextWindowManager::startRendering()
+         animationTimer = -1;
+     }
+ 
+-
+ }
+ 
+ 
+@@ -1146,17 +1207,46 @@ void QQuickTrivialWindowManager::hide(QQuickCanvas *canvas)
+     m_windows.remove(canvas);
+     QQuickCanvasPrivate *cd = QQuickCanvasPrivate::get(canvas);
+     cd->cleanupNodesOnShutdown();
++}
++
++void QQuickTrivialWindowManager::canvasDestroyed(QQuickCanvas *canvas)
++{
++    hide(canvas);
++}
+ 
++void QQuickTrivialWindowManager::releaseResources()
++{
+     if (m_windows.size() == 0) {
++        QQuickCanvas *canvas = masterCanvas();
++        QWindow *tmpSurface = 0;
++
++        if (canvas) {
++            gl->makeCurrent(canvas);
++        } else {
++            tmpSurface = new QWindow();
++            tmpSurface->setSurfaceType(QSurface::OpenGLSurface);
++            tmpSurface->resize(4, 4);
++            tmpSurface->create();
++            gl->makeCurrent(tmpSurface);
++        }
++
+         sg->invalidate();
+         delete gl;
+         gl = 0;
++
++        delete tmpSurface;
+     }
+ }
+ 
+-void QQuickTrivialWindowManager::canvasDestroyed(QQuickCanvas *canvas)
++QQuickCanvas *QQuickTrivialWindowManager::masterCanvas() const
+ {
+-    hide(canvas);
++    // Find a "proper surface" to bind...
++    for (QHash<QQuickCanvas *, CanvasData>::const_iterator it = m_windows.constBegin();
++             it != m_windows.constEnd(); ++it) {
++            if (it.key()->visible())
++                return it.key();
++    }
++    return 0;
+ }
+ 
+ void QQuickTrivialWindowManager::renderCanvas(QQuickCanvas *canvas)
+@@ -1166,30 +1256,20 @@ void QQuickTrivialWindowManager::renderCanvas(QQuickCanvas *canvas)
+ 
+     CanvasData &data = const_cast<CanvasData &>(m_windows[canvas]);
+ 
+-    QQuickCanvas *masterCanvas = 0;
+-    if (!canvas->visible()) {
+-        // Find a "proper surface" to bind...
+-        for (QHash<QQuickCanvas *, CanvasData>::const_iterator it = m_windows.constBegin();
+-             it != m_windows.constEnd() && !masterCanvas; ++it) {
+-            if (it.key()->visible())
+-                masterCanvas = it.key();
+-        }
+-    } else {
+-        masterCanvas = canvas;
+-    }
++    QQuickCanvas *window = canvas->visible() ? canvas : masterCanvas();
+ 
+-    if (!masterCanvas)
++    if (!window)
+         return;
+ 
+     if (!gl) {
+         gl = new QOpenGLContext();
+-        gl->setFormat(masterCanvas->requestedFormat());
++        gl->setFormat(window->requestedFormat());
+         gl->create();
+-        if (!gl->makeCurrent(masterCanvas))
++        if (!gl->makeCurrent(window))
+             qWarning("QQuickCanvas: makeCurrent() failed...");
+         sg->initialize(gl);
+     } else {
+-        gl->makeCurrent(masterCanvas);
++        gl->makeCurrent(window);
+     }
+ 
+     bool alsoSwap = data.updatePending;
+diff --git a/src/quick/items/qquickwindowmanager_p.h b/src/quick/items/qquickwindowmanager_p.h
+index 6134204..014b381 100644
+--- a/src/quick/items/qquickwindowmanager_p.h
++++ b/src/quick/items/qquickwindowmanager_p.h
+@@ -67,6 +67,8 @@ public:
+ 
+     virtual QSGContext *sceneGraphContext() const = 0;
+ 
++    virtual void releaseResources() = 0;
++
+     // ### make this less of a singleton
+     static QQuickWindowManager *instance();
+ };
+diff --git a/src/quick/util/qdeclarativepixmapcache.cpp b/src/quick/util/qdeclarativepixmapcache.cpp
+index 43ce334..95cbd36 100644
+--- a/src/quick/util/qdeclarativepixmapcache.cpp
++++ b/src/quick/util/qdeclarativepixmapcache.cpp
+@@ -695,6 +695,8 @@ public:
+     void unreferencePixmap(QDeclarativePixmapData *);
+     void referencePixmap(QDeclarativePixmapData *);
+ 
++    void purgeCache();
++
+ protected:
+     virtual void timerEvent(QTimerEvent *);
+ 
+@@ -827,6 +829,16 @@ void QDeclarativePixmapStore::timerEvent(QTimerEvent *)
+     }
+ }
+ 
++void QDeclarativePixmapStore::purgeCache()
++{
++    shrinkCache(m_unreferencedCost);
++}
++
++void QDeclarativePixmap::purgeCache()
++{
++    pixmapStore()->purgeCache();
++}
++
+ QDeclarativePixmapReply::QDeclarativePixmapReply(QDeclarativePixmapData *d)
+ : data(d), engineForReader(0), requestSize(d->requestSize), url(d->url), loading(false), redirectCount(0)
+ {
+diff --git a/src/quick/util/qdeclarativepixmapcache_p.h b/src/quick/util/qdeclarativepixmapcache_p.h
+index 19c3a52..69cd84c 100644
+--- a/src/quick/util/qdeclarativepixmapcache_p.h
++++ b/src/quick/util/qdeclarativepixmapcache_p.h
+@@ -126,6 +126,8 @@ public:
+     bool connectDownloadProgress(QObject *, const char *);
+     bool connectDownloadProgress(QObject *, int);
+ 
++    static void purgeCache();
++
+ private:
+     Q_DISABLE_COPY(QDeclarativePixmap)
+     QDeclarativePixmapData *d;
+diff --git a/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp b/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
+index eac0d85..8f0c4e6 100644
+--- a/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
++++ b/tests/auto/qtquick2/qquickcanvas/tst_qquickcanvas.cpp
+@@ -685,7 +685,9 @@ void tst_qquickcanvas::headless()
+ 
+     // Hide the canvas and verify signal emittion and GL context deletion
+     canvas->hide();
+-    QCOMPARE(invalidated.size(), 1);
++    canvas->releaseResources();
++
++    QTRY_COMPARE(invalidated.size(), 1);
+     QVERIFY(canvas->openglContext() == 0);
+ 
+     // Destroy the native windowing system buffers

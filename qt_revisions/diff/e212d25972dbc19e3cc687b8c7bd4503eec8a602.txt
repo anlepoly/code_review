@@ -1,0 +1,723 @@
+diff --git a/src/plugins/platforms/qnx/qnx.pro b/src/plugins/platforms/qnx/qnx.pro
+index 48738a5..c218b5e 100644
+--- a/src/plugins/platforms/qnx/qnx.pro
++++ b/src/plugins/platforms/qnx/qnx.pro
+@@ -22,7 +22,7 @@ CONFIG(blackberry) {
+ #DEFINES += QQNXBUFFER_DEBUG
+ #DEFINES += QQNXBPSEVENTFILTER_DEBUG
+ #DEFINES += QQNXCLIPBOARD_DEBUG
+-#DEFINES += QQNXEVENTTHREAD_DEBUG
++#DEFINES += QQNXSCREENEVENTTHREAD_DEBUG
+ #DEFINES += QQNXGLBACKINGSTORE_DEBUG
+ #DEFINES += QQNXGLCONTEXT_DEBUG
+ #DEFINES += QQNXINPUTCONTEXT_DEBUG
+@@ -40,7 +40,7 @@ CONFIG(blackberry) {
+ 
+ SOURCES =   main.cpp \
+             qqnxbuffer.cpp \
+-            qqnxeventthread.cpp \
++            qqnxscreeneventthread.cpp \
+             qqnxintegration.cpp \
+             qqnxscreen.cpp \
+             qqnxwindow.cpp \
+@@ -55,7 +55,7 @@ SOURCES =   main.cpp \
+ 
+ HEADERS =   main.h \
+             qqnxbuffer.h \
+-            qqnxeventthread.h \
++            qqnxscreeneventthread.h \
+             qqnxkeytranslator.h \
+             qqnxintegration.h \
+             qqnxscreen.h \
+diff --git a/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp b/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
+index d1db066..c4e6f2b 100644
+--- a/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
++++ b/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
+@@ -40,18 +40,22 @@
+ ****************************************************************************/
+ 
+ #include "qqnxbpseventfilter.h"
++#include "qqnxscreen.h"
++#include "qqnxscreeneventhandler.h"
+ 
+ #include <QAbstractEventDispatcher>
+ #include <QDebug>
+ 
+ #include <bps/event.h>
++#include <bps/screen.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ static QQnxBpsEventFilter *s_instance = 0;
+ 
+-QQnxBpsEventFilter::QQnxBpsEventFilter(QObject *parent)
++QQnxBpsEventFilter::QQnxBpsEventFilter(QQnxScreenEventHandler *screenEventHandler, QObject *parent)
+     : QObject(parent)
++    , m_screenEventHandler(screenEventHandler)
+ {
+     Q_ASSERT(s_instance == 0);
+ 
+@@ -80,6 +84,18 @@ void QQnxBpsEventFilter::installOnEventDispatcher(QAbstractEventDispatcher *disp
+     Q_UNUSED(previousEventFilter);
+ }
+ 
++void QQnxBpsEventFilter::registerForScreenEvents(QQnxScreen *screen)
++{
++    if (screen_request_events(screen->nativeContext()) != BPS_SUCCESS)
++        qWarning("QQNX: failed to register for screen events on screen %p", screen->nativeContext());
++}
++
++void QQnxBpsEventFilter::unregisterForScreenEvents(QQnxScreen *screen)
++{
++    if (screen_stop_events(screen->nativeContext()) != BPS_SUCCESS)
++        qWarning("QQNX: failed to unregister for screen events on screen %p", screen->nativeContext());
++}
++
+ bool QQnxBpsEventFilter::dispatcherEventFilter(void *message)
+ {
+ #if defined(QQNXBPSEVENTFILTER_DEBUG)
+@@ -95,12 +111,17 @@ bool QQnxBpsEventFilter::dispatcherEventFilter(void *message)
+ 
+ bool QQnxBpsEventFilter::bpsEventFilter(bps_event_t *event)
+ {
++    const int eventDomain = bps_event_get_domain(event);
++
+ #if defined(QQNXBPSEVENTFILTER_DEBUG)
+-    qDebug() << Q_FUNC_INFO << "event=" << event << "domain=" << bps_event_get_domain(event);
+-#else
+-    Q_UNUSED(event);
++    qDebug() << Q_FUNC_INFO << "event=" << event << "domain=" << eventDomain;
+ #endif
+ 
++    if (eventDomain == screen_get_domain()) {
++        screen_event_t screenEvent = screen_event_get_event(event);
++        return m_screenEventHandler->handleEvent(screenEvent);
++    }
++
+     return false;
+ }
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxbpseventfilter.h b/src/plugins/platforms/qnx/qqnxbpseventfilter.h
+index f03ea8e..1c08f13 100644
+--- a/src/plugins/platforms/qnx/qqnxbpseventfilter.h
++++ b/src/plugins/platforms/qnx/qqnxbpseventfilter.h
+@@ -49,19 +49,27 @@ struct bps_event_t;
+ QT_BEGIN_NAMESPACE
+ 
+ class QAbstractEventDispatcher;
++class QQnxScreen;
++class QQnxScreenEventHandler;
+ 
+ class QQnxBpsEventFilter : public QObject
+ {
+     Q_OBJECT
+ public:
+-    explicit QQnxBpsEventFilter(QObject *parent = 0);
++    explicit QQnxBpsEventFilter(QQnxScreenEventHandler *screenEventHandler, QObject *parent = 0);
+     ~QQnxBpsEventFilter();
+ 
+     void installOnEventDispatcher(QAbstractEventDispatcher *dispatcher);
+ 
++    void registerForScreenEvents(QQnxScreen *screen);
++    void unregisterForScreenEvents(QQnxScreen *screen);
++
+ private:
+     static bool dispatcherEventFilter(void *message);
+     bool bpsEventFilter(bps_event_t *event);
++
++private:
++    QQnxScreenEventHandler *m_screenEventHandler;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxeventthread.cpp b/src/plugins/platforms/qnx/qqnxeventthread.cpp
+deleted file mode 100644
+index 768d508..0000000
+--- a/src/plugins/platforms/qnx/qqnxeventthread.cpp
++++ /dev/null
+@@ -1,160 +0,0 @@
+-/***************************************************************************
+-**
+-** Copyright (C) 2011 - 2012 Research In Motion
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "qqnxeventthread.h"
+-#include "qqnxscreeneventhandler.h"
+-
+-#include <QtCore/QDebug>
+-
+-#include <errno.h>
+-#include <unistd.h>
+-
+-#include <cctype>
+-
+-QQnxEventThread::QQnxEventThread(screen_context_t context,
+-                                 QQnxScreenEventHandler *screenEventHandler)
+-    : QThread(),
+-      m_screenContext(context),
+-      m_screenEventHandler(screenEventHandler),
+-      m_quit(false)
+-{
+-}
+-
+-QQnxEventThread::~QQnxEventThread()
+-{
+-    // block until thread terminates
+-    shutdown();
+-}
+-
+-void QQnxEventThread::injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap)
+-{
+-    QQnxScreenEventHandler::injectKeyboardEvent(flags, sym, mod, scan, cap);
+-}
+-
+-void QQnxEventThread::run()
+-{
+-    screen_event_t event;
+-
+-    // create screen event
+-    errno = 0;
+-    int result = screen_create_event(&event);
+-    if (result)
+-        qFatal("QQNX: failed to create event, errno=%d", errno);
+-
+-#if defined(QQNXEVENTTHREAD_DEBUG)
+-    qDebug() << "QQNX: event loop started";
+-#endif
+-
+-    // loop indefinitely
+-    while (!m_quit) {
+-
+-        // block until screen event is available
+-        errno = 0;
+-        result = screen_get_event(m_screenContext, event, -1);
+-        if (result)
+-            qFatal("QQNX: failed to get event, errno=%d", errno);
+-
+-        // process received event
+-        // get the event type
+-        errno = 0;
+-        int qnxType;
+-        result = screen_get_event_property_iv(event, SCREEN_PROPERTY_TYPE, &qnxType);
+-        if (result)
+-            qFatal("QQNX: failed to query event type, errno=%d", errno);
+-
+-        if (qnxType == SCREEN_EVENT_USER) {
+-            // treat all user events as shutdown requests
+-    #if defined(QQNXEVENTTHREAD_DEBUG)
+-            qDebug() << "QQNX: QNX user event";
+-    #endif
+-            m_quit = true;
+-        } else {
+-            m_screenEventHandler->handleEvent(event, qnxType);
+-        }
+-    }
+-
+-#if defined(QQNXEVENTTHREAD_DEBUG)
+-    qDebug() << "QQNX: event loop stopped";
+-#endif
+-
+-    // cleanup
+-    screen_destroy_event(event);
+-}
+-
+-void QQnxEventThread::shutdown()
+-{
+-    screen_event_t event;
+-
+-    // create screen event
+-    errno = 0;
+-    int result = screen_create_event(&event);
+-    if (result)
+-        qFatal("QQNX: failed to create event, errno=%d", errno);
+-
+-    // set the event type as user
+-    errno = 0;
+-    int type = SCREEN_EVENT_USER;
+-    result = screen_set_event_property_iv(event, SCREEN_PROPERTY_TYPE, &type);
+-    if (result)
+-        qFatal("QQNX: failed to set event type, errno=%d", errno);
+-
+-    // NOTE: ignore SCREEN_PROPERTY_USER_DATA; treat all user events as shutdown events
+-
+-    // post event to event loop so it will wake up and die
+-    errno = 0;
+-    result = screen_send_event(m_screenContext, event, getpid());
+-    if (result)
+-        qFatal("QQNX: failed to set event type, errno=%d", errno);
+-
+-    // cleanup
+-    screen_destroy_event(event);
+-
+-#if defined(QQNXEVENTTHREAD_DEBUG)
+-    qDebug() << "QQNX: event loop shutdown begin";
+-#endif
+-
+-    // block until thread terminates
+-    wait();
+-
+-#if defined(QQNXEVENTTHREAD_DEBUG)
+-    qDebug() << "QQNX: event loop shutdown end";
+-#endif
+-}
+diff --git a/src/plugins/platforms/qnx/qqnxeventthread.h b/src/plugins/platforms/qnx/qqnxeventthread.h
+deleted file mode 100644
+index aa6186a..0000000
+--- a/src/plugins/platforms/qnx/qqnxeventthread.h
++++ /dev/null
+@@ -1,74 +0,0 @@
+-/***************************************************************************
+-**
+-** Copyright (C) 2011 - 2012 Research In Motion
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QQNXEVENTTHREAD_H
+-#define QQNXEVENTTHREAD_H
+-
+-#include <QtCore/QThread>
+-
+-#include <screen/screen.h>
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QQnxScreenEventHandler;
+-
+-class QQnxEventThread : public QThread
+-{
+-public:
+-    QQnxEventThread(screen_context_t context, QQnxScreenEventHandler *screenEventHandler);
+-    virtual ~QQnxEventThread();
+-
+-    static void injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap);
+-
+-protected:
+-    void run();
+-
+-private:
+-    void shutdown();
+-
+-    screen_context_t m_screenContext;
+-    QQnxScreenEventHandler *m_screenEventHandler;
+-    bool m_quit;
+-};
+-
+-QT_END_NAMESPACE
+-
+-#endif // QQNXEVENTTHREAD_H
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.cpp b/src/plugins/platforms/qnx/qqnxintegration.cpp
+index b3c3949..54aa311 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.cpp
++++ b/src/plugins/platforms/qnx/qqnxintegration.cpp
+@@ -40,7 +40,7 @@
+ ****************************************************************************/
+ 
+ #include "qqnxintegration.h"
+-#include "qqnxeventthread.h"
++#include "qqnxscreeneventthread.h"
+ #include "qqnxnativeinterface.h"
+ #include "qqnxrasterbackingstore.h"
+ #include "qqnxscreen.h"
+@@ -100,7 +100,7 @@ QMutex QQnxIntegration::ms_windowMapperMutex;
+ 
+ QQnxIntegration::QQnxIntegration()
+     : QPlatformIntegration()
+-    , m_eventThread(0)
++    , m_screenEventThread(0)
+     , m_navigatorEventHandler(new QQnxNavigatorEventHandler())
+     , m_virtualKeyboard(0)
+ #if defined(QQNX_PPS)
+@@ -152,8 +152,11 @@ QQnxIntegration::QQnxIntegration()
+ #endif
+ 
+     // Create/start event thread
+-    m_eventThread = new QQnxEventThread(m_screenContext, m_screenEventHandler);
+-    m_eventThread->start();
++    // Not on BlackBerry, it has specialised event dispatcher which also handles screen events
++#if !defined(Q_OS_BLACKBERRY)
++    m_screenEventThread = new QQnxScreenEventThread(m_screenContext, m_screenEventHandler);
++    m_screenEventThread->start();
++#endif
+ 
+ #if defined(QQNX_PPS)
+     // Create/start the keyboard class.
+@@ -182,7 +185,10 @@ QQnxIntegration::QQnxIntegration()
+         m_services = new QQnxServices(m_navigator);
+ 
+ #if defined(Q_OS_BLACKBERRY)
+-    m_bpsEventFilter = new QQnxBpsEventFilter;
++    m_bpsEventFilter = new QQnxBpsEventFilter(m_screenEventHandler);
++    Q_FOREACH (QQnxScreen *screen, m_screens)
++        m_bpsEventFilter->registerForScreenEvents(screen);
++
+     m_bpsEventFilter->installOnEventDispatcher(m_eventDispatcher);
+ #endif
+ 
+@@ -216,8 +222,16 @@ QQnxIntegration::~QQnxIntegration()
+ #endif
+     delete m_navigatorEventHandler;
+ 
+-    // Stop/destroy event thread
+-    delete m_eventThread;
++#if !defined(Q_OS_BLACKBERRY)
++    // Stop/destroy screen event thread
++    delete m_screenEventThread;
++#else
++    Q_FOREACH (QQnxScreen *screen, m_screens)
++        m_bpsEventFilter->unregisterForScreenEvents(screen);
++
++    delete m_bpsEventFilter;
++#endif
++
+     delete m_screenEventHandler;
+ 
+     // Destroy all displays
+@@ -237,10 +251,6 @@ QQnxIntegration::~QQnxIntegration()
+     // Destroy navigator interface
+     delete m_navigator;
+ 
+-#if defined(Q_OS_BLACKBERRY)
+-    delete m_bpsEventFilter;
+-#endif
+-
+ #if defined(QQNXINTEGRATION_DEBUG)
+     qDebug() << "QQnx: platform plugin shutdown end";
+ #endif
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.h b/src/plugins/platforms/qnx/qqnxintegration.h
+index 538892e..a3c476f 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.h
++++ b/src/plugins/platforms/qnx/qqnxintegration.h
+@@ -51,7 +51,7 @@
+ QT_BEGIN_NAMESPACE
+ 
+ class QQnxBpsEventFilter;
+-class QQnxEventThread;
++class QQnxScreenEventThread;
+ class QQnxNativeInterface;
+ class QQnxWindow;
+ class QQnxScreen;
+@@ -123,7 +123,7 @@ private:
+     static void removeWindow(screen_window_t qnxWindow);
+ 
+     screen_context_t m_screenContext;
+-    QQnxEventThread *m_eventThread;
++    QQnxScreenEventThread *m_screenEventThread;
+     QQnxNavigatorEventHandler *m_navigatorEventHandler;
+     QQnxAbstractVirtualKeyboard *m_virtualKeyboard;
+ #if defined(QQNX_PPS)
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventthread.cpp b/src/plugins/platforms/qnx/qqnxscreeneventthread.cpp
+new file mode 100644
+index 0000000..a3e50dc
+--- /dev/null
++++ b/src/plugins/platforms/qnx/qqnxscreeneventthread.cpp
+@@ -0,0 +1,159 @@
++/***************************************************************************
++**
++** Copyright (C) 2011 - 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qqnxscreeneventthread.h"
++#include "qqnxscreeneventhandler.h"
++
++#include <QtCore/QDebug>
++
++#include <errno.h>
++#include <unistd.h>
++
++#include <cctype>
++
++QQnxScreenEventThread::QQnxScreenEventThread(screen_context_t context, QQnxScreenEventHandler *screenEventHandler)
++    : QThread(),
++      m_screenContext(context),
++      m_screenEventHandler(screenEventHandler),
++      m_quit(false)
++{
++}
++
++QQnxScreenEventThread::~QQnxScreenEventThread()
++{
++    // block until thread terminates
++    shutdown();
++}
++
++void QQnxScreenEventThread::injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap)
++{
++    QQnxScreenEventHandler::injectKeyboardEvent(flags, sym, mod, scan, cap);
++}
++
++void QQnxScreenEventThread::run()
++{
++    screen_event_t event;
++
++    // create screen event
++    errno = 0;
++    int result = screen_create_event(&event);
++    if (result)
++        qFatal("QQNX: failed to create screen event, errno=%d", errno);
++
++#if defined(QQNXSCREENEVENTTHREAD_DEBUG)
++    qDebug() << "QQNX: screen event thread started";
++#endif
++
++    // loop indefinitely
++    while (!m_quit) {
++
++        // block until screen event is available
++        errno = 0;
++        result = screen_get_event(m_screenContext, event, -1);
++        if (result)
++            qFatal("QQNX: failed to get screen event, errno=%d", errno);
++
++        // process received event
++        // get the event type
++        errno = 0;
++        int qnxType;
++        result = screen_get_event_property_iv(event, SCREEN_PROPERTY_TYPE, &qnxType);
++        if (result)
++            qFatal("QQNX: failed to query screen event type, errno=%d", errno);
++
++        if (qnxType == SCREEN_EVENT_USER) {
++            // treat all user events as shutdown requests
++    #if defined(QQNXSCREENEVENTTHREAD_DEBUG)
++            qDebug() << "QQNX: QNX user screen event";
++    #endif
++            m_quit = true;
++        } else {
++            m_screenEventHandler->handleEvent(event, qnxType);
++        }
++    }
++
++#if defined(QQNXSCREENEVENTTHREAD_DEBUG)
++    qDebug() << "QQNX: screen event thread stopped";
++#endif
++
++    // cleanup
++    screen_destroy_event(event);
++}
++
++void QQnxScreenEventThread::shutdown()
++{
++    screen_event_t event;
++
++    // create screen event
++    errno = 0;
++    int result = screen_create_event(&event);
++    if (result)
++        qFatal("QQNX: failed to create screen event, errno=%d", errno);
++
++    // set the event type as user
++    errno = 0;
++    int type = SCREEN_EVENT_USER;
++    result = screen_set_event_property_iv(event, SCREEN_PROPERTY_TYPE, &type);
++    if (result)
++        qFatal("QQNX: failed to set screen event type, errno=%d", errno);
++
++    // NOTE: ignore SCREEN_PROPERTY_USER_DATA; treat all user events as shutdown events
++
++    // post event to event loop so it will wake up and die
++    errno = 0;
++    result = screen_send_event(m_screenContext, event, getpid());
++    if (result)
++        qFatal("QQNX: failed to set screen event type, errno=%d", errno);
++
++    // cleanup
++    screen_destroy_event(event);
++
++#if defined(QQNXSCREENEVENTTHREAD_DEBUG)
++    qDebug() << "QQNX: screen event thread shutdown begin";
++#endif
++
++    // block until thread terminates
++    wait();
++
++#if defined(QQNXSCREENEVENTTHREAD_DEBUG)
++    qDebug() << "QQNX: screen event thread shutdown end";
++#endif
++}
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventthread.h b/src/plugins/platforms/qnx/qqnxscreeneventthread.h
+new file mode 100644
+index 0000000..4f41e67
+--- /dev/null
++++ b/src/plugins/platforms/qnx/qqnxscreeneventthread.h
+@@ -0,0 +1,74 @@
++/***************************************************************************
++**
++** Copyright (C) 2011 - 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QQNXSCREENEVENTTHREAD_H
++#define QQNXSCREENEVENTTHREAD_H
++
++#include <QtCore/QThread>
++
++#include <screen/screen.h>
++
++QT_BEGIN_NAMESPACE
++
++class QQnxScreenEventHandler;
++
++class QQnxScreenEventThread : public QThread
++{
++public:
++    QQnxScreenEventThread(screen_context_t context, QQnxScreenEventHandler *screenEventHandler);
++    ~QQnxScreenEventThread();
++
++    static void injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap);
++
++protected:
++    void run();
++
++private:
++    void shutdown();
++
++    screen_context_t m_screenContext;
++    QQnxScreenEventHandler *m_screenEventHandler;
++    bool m_quit;
++};
++
++QT_END_NAMESPACE
++
++#endif // QQNXSCREENEVENTTHREAD_H

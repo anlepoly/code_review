@@ -1,0 +1,248 @@
+diff --git a/src/corelib/kernel/qcoreevent.h b/src/corelib/kernel/qcoreevent.h
+index 1af426e..f64e11c 100644
+--- a/src/corelib/kernel/qcoreevent.h
++++ b/src/corelib/kernel/qcoreevent.h
+@@ -275,6 +275,8 @@ public:
+ 
+         ThemeChange = 210,
+ 
++        SockClose = 211,                        // socket closed
++
+         // 512 reserved for Qt Jambi's MetaCall event
+         // 513 reserved for Qt Jambi's DeleteOnMainThread event
+ 
+diff --git a/src/corelib/kernel/qeventdispatcher_win.cpp b/src/corelib/kernel/qeventdispatcher_win.cpp
+index baacfa6..cf182c9 100644
+--- a/src/corelib/kernel/qeventdispatcher_win.cpp
++++ b/src/corelib/kernel/qeventdispatcher_win.cpp
+@@ -377,7 +377,6 @@ LRESULT QT_WIN_CALLBACK qt_internal_proc(HWND hwnd, UINT message, WPARAM wp, LPA
+         int type = -1;
+         switch (WSAGETSELECTEVENT(lp)) {
+         case FD_READ:
+-        case FD_CLOSE:
+         case FD_ACCEPT:
+             type = 0;
+             break;
+@@ -388,16 +387,24 @@ LRESULT QT_WIN_CALLBACK qt_internal_proc(HWND hwnd, UINT message, WPARAM wp, LPA
+         case FD_OOB:
+             type = 2;
+             break;
++        case FD_CLOSE:
++            type = 3;
++            break;
+         }
+         if (type >= 0) {
+             Q_ASSERT(d != 0);
+-            QSNDict *sn_vec[3] = { &d->sn_read, &d->sn_write, &d->sn_except };
++            QSNDict *sn_vec[4] = { &d->sn_read, &d->sn_write, &d->sn_except, &d->sn_read };
+             QSNDict *dict = sn_vec[type];
+ 
+             QSockNot *sn = dict ? dict->value(wp) : 0;
+             if (sn) {
+-                QEvent event(QEvent::SockAct);
+-                QCoreApplication::sendEvent(sn->obj, &event);
++                if (type < 3) {
++                    QEvent event(QEvent::SockAct);
++                    QCoreApplication::sendEvent(sn->obj, &event);
++                } else {
++                    QEvent event(QEvent::SockClose);
++                    QCoreApplication::sendEvent(sn->obj, &event);
++                }
+             }
+         }
+         return 0;
+diff --git a/src/corelib/kernel/qsocketnotifier.cpp b/src/corelib/kernel/qsocketnotifier.cpp
+index c108b96..9876109 100644
+--- a/src/corelib/kernel/qsocketnotifier.cpp
++++ b/src/corelib/kernel/qsocketnotifier.cpp
+@@ -287,7 +287,7 @@ void QSocketNotifier::setEnabled(bool enable)
+ bool QSocketNotifier::event(QEvent *e)
+ {
+     Q_D(QSocketNotifier);
+-    // Emits the activated() signal when a QEvent::SockAct is
++    // Emits the activated() signal when a QEvent::SockAct or QEvent::SockClose is
+     // received.
+     if (e->type() == QEvent::ThreadChange) {
+         if (d->snenabled) {
+@@ -297,7 +297,7 @@ bool QSocketNotifier::event(QEvent *e)
+         }
+     }
+     QObject::event(e);                        // will activate filters
+-    if (e->type() == QEvent::SockAct) {
++    if ((e->type() == QEvent::SockAct) || (e->type() == QEvent::SockClose)) {
+         emit activated(d->sockfd);
+         return true;
+     }
+diff --git a/src/network/socket/qabstractsocket.cpp b/src/network/socket/qabstractsocket.cpp
+index 6b4e48f..7c91022 100644
+--- a/src/network/socket/qabstractsocket.cpp
++++ b/src/network/socket/qabstractsocket.cpp
+@@ -746,6 +746,44 @@ bool QAbstractSocketPrivate::canReadNotification()
+ 
+ /*! \internal
+ 
++    Slot connected to the close socket notifier. It's called when the
++    socket is closed.
++*/
++void QAbstractSocketPrivate::canCloseNotification()
++{
++    Q_Q(QAbstractSocket);
++
++#if defined (QABSTRACTSOCKET_DEBUG)
++    qDebug("QAbstractSocketPrivate::canCloseNotification()");
++#endif
++
++    qint64 newBytes = 0;
++    if (isBuffered) {
++        // Try to read to the buffer, if the read fail we can close the socket.
++        newBytes = buffer.size();
++        if (!readFromSocket()) {
++            q->disconnectFromHost();
++            return;
++        }
++        newBytes = buffer.size() - newBytes;
++        if (newBytes) {
++            // If there was still some data to be read from the socket
++            // then we could get another FD_READ. The disconnect will
++            // then occur when we read from the socket again and fail
++            // in canReadNotification or by the manually created
++            // closeNotification below.
++            emit q->readyRead();
++
++            QMetaObject::invokeMethod(socketEngine, "closeNotification", Qt::QueuedConnection);
++        }
++    } else if (socketType == QAbstractSocket::TcpSocket && socketEngine) {
++        emit q->readyRead();
++    }
++}
++
++
++/*! \internal
++
+     Slot connected to the write socket notifier. It's called during a
+     delayed connect or when the socket is ready for writing.
+ */
+diff --git a/src/network/socket/qabstractsocket_p.h b/src/network/socket/qabstractsocket_p.h
+index 21d85f7..b198018 100644
+--- a/src/network/socket/qabstractsocket_p.h
++++ b/src/network/socket/qabstractsocket_p.h
+@@ -77,6 +77,7 @@ public:
+     inline void readNotification() { canReadNotification(); }
+     inline void writeNotification() { canWriteNotification(); }
+     inline void exceptionNotification() {}
++    inline void closeNotification() { canCloseNotification(); }
+     void connectionNotification();
+ #ifndef QT_NO_NETWORKPROXY
+     inline void proxyAuthenticationRequired(const QNetworkProxy &proxy, QAuthenticator *authenticator) {
+@@ -87,6 +88,7 @@ public:
+ 
+     bool canReadNotification();
+     bool canWriteNotification();
++    void canCloseNotification();
+ 
+     // slots
+     void _q_connectToNextAddress();
+diff --git a/src/network/socket/qabstractsocketengine.cpp b/src/network/socket/qabstractsocketengine.cpp
+index e9e49d4..f05fa98 100644
+--- a/src/network/socket/qabstractsocketengine.cpp
++++ b/src/network/socket/qabstractsocketengine.cpp
+@@ -168,6 +168,12 @@ void QAbstractSocketEngine::exceptionNotification()
+         receiver->exceptionNotification();
+ }
+ 
++void QAbstractSocketEngine::closeNotification()
++{
++    if (QAbstractSocketEngineReceiver *receiver = d_func()->receiver)
++        receiver->closeNotification();
++}
++
+ void QAbstractSocketEngine::connectionNotification()
+ {
+     if (QAbstractSocketEngineReceiver *receiver = d_func()->receiver)
+diff --git a/src/network/socket/qabstractsocketengine_p.h b/src/network/socket/qabstractsocketengine_p.h
+index 92d7954..5264bc4 100644
+--- a/src/network/socket/qabstractsocketengine_p.h
++++ b/src/network/socket/qabstractsocketengine_p.h
+@@ -71,6 +71,7 @@ public:
+     virtual ~QAbstractSocketEngineReceiver(){}
+     virtual void readNotification()= 0;
+     virtual void writeNotification()= 0;
++    virtual void closeNotification()= 0;
+     virtual void exceptionNotification()= 0;
+     virtual void connectionNotification()= 0;
+ #ifndef QT_NO_NETWORKPROXY
+@@ -173,6 +174,7 @@ public:
+ public Q_SLOTS:
+     void readNotification();
+     void writeNotification();
++    void closeNotification();
+     void exceptionNotification();
+     void connectionNotification();
+ #ifndef QT_NO_NETWORKPROXY
+diff --git a/src/network/socket/qnativesocketengine.cpp b/src/network/socket/qnativesocketengine.cpp
+index f2e2f69..3dca7aa 100644
+--- a/src/network/socket/qnativesocketengine.cpp
++++ b/src/network/socket/qnativesocketengine.cpp
+@@ -1142,6 +1142,9 @@ bool QReadNotifier::event(QEvent *e)
+     if (e->type() == QEvent::SockAct) {
+         engine->readNotification();
+         return true;
++    } else if (e->type() == QEvent::SockClose) {
++        engine->closeNotification();
++        return true;
+     }
+     return QSocketNotifier::event(e);
+ }
+diff --git a/src/network/socket/qtcpserver.cpp b/src/network/socket/qtcpserver.cpp
+index 4d8aad0..7955928 100644
+--- a/src/network/socket/qtcpserver.cpp
++++ b/src/network/socket/qtcpserver.cpp
+@@ -134,6 +134,7 @@ public:
+ 
+     // from QAbstractSocketEngineReceiver
+     void readNotification();
++    void closeNotification() { readNotification(); }
+     inline void writeNotification() {}
+     inline void exceptionNotification() {}
+     inline void connectionNotification() {}
+diff --git a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+index a7ac266..55fe4f4 100644
+--- a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
++++ b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+@@ -3820,11 +3820,6 @@ void tst_QNetworkReply::ioPutToFileFromSocket()
+     SocketPair socketpair;
+     QTRY_VERIFY(socketpair.create()); //QTRY_VERIFY as a workaround for QTBUG-24451
+ 
+-#ifdef Q_OS_WIN
+-    //128k and 2M tests regularly fail. Assumed same characteristics as ioPostToHttpFromSocket
+-    if (data.size() > 1000)
+-        QSKIP("unstable on windows - QTBUG-25386");
+-#endif
+     socketpair.endPoints[0]->write(data);
+     QNetworkReplyPtr reply(manager.put(QNetworkRequest(url), socketpair.endPoints[1]));
+     socketpair.endPoints[0]->close();
+@@ -4110,11 +4105,7 @@ void tst_QNetworkReply::ioPostToHttpFromSocket()
+     QFETCH(QByteArray, data);
+     QFETCH(QUrl, url);
+     QFETCH(QNetworkProxy, proxy);
+-#ifdef Q_OS_WIN
+-    //QTBUG-25386 hits one of the 128k tests 50% of the time, one of the 4k tests rarely (but at least 1%)
+-    if (data.size() > 1000)
+-        QSKIP("unstable on windows - QTBUG-25386");
+-#endif
++
+     SocketPair socketpair;
+     QTRY_VERIFY(socketpair.create()); //QTRY_VERIFY as a workaround for QTBUG-24451
+ 
+diff --git a/tests/auto/network/socket/qsocks5socketengine/tst_qsocks5socketengine.cpp b/tests/auto/network/socket/qsocks5socketengine/tst_qsocks5socketengine.cpp
+index 461ec55..cca4d13 100644
+--- a/tests/auto/network/socket/qsocks5socketengine/tst_qsocks5socketengine.cpp
++++ b/tests/auto/network/socket/qsocks5socketengine/tst_qsocks5socketengine.cpp
+@@ -108,6 +108,7 @@ protected slots:
+ private:
+     void readNotification() { }
+     void writeNotification() { }
++    void closeNotification() { }
+     void exceptionNotification() { }
+     void connectionNotification() { }
+     QTcpSocket *tcpSocketNonBlocking_socket;

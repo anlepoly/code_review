@@ -1,0 +1,620 @@
+diff --git a/src/quick/items/qquickitemview.cpp b/src/quick/items/qquickitemview.cpp
+index 516cf0c..e368d1a 100644
+--- a/src/quick/items/qquickitemview.cpp
++++ b/src/quick/items/qquickitemview.cpp
+@@ -1664,7 +1664,7 @@ void QQuickItemViewPrivate::layout()
+         for (QList<FxViewItem*>::Iterator it = releasePendingTransition.begin();
+              it != releasePendingTransition.end(); ) {
+             FxViewItem *item = *it;
+-            if (item->transitionRunning() || prepareNonVisibleItemTransition(item, viewBounds)) {
++            if (prepareNonVisibleItemTransition(item, viewBounds)) {
+                 ++it;
+             } else {
+                 releaseItem(item);
+@@ -1676,7 +1676,9 @@ void QQuickItemViewPrivate::layout()
+             visibleItems[i]->startTransition(transitioner);
+         for (int i=0; i<releasePendingTransition.count(); i++)
+             releasePendingTransition[i]->startTransition(transitioner);
++
+         transitioner->setPopulateTransitionEnabled(false);
++        transitioner->resetTargetLists();
+     }
+ 
+     runDelayedRemoveTransition = false;
+@@ -1955,36 +1957,10 @@ void QQuickItemViewPrivate::prepareVisibleItemTransitions()
+     if (!transitioner)
+         return;
+ 
+-    transitioner->addTransitionIndexes.clear();
+-    transitioner->addTransitionTargets.clear();
+-    transitioner->moveTransitionIndexes.clear();
+-    transitioner->moveTransitionTargets.clear();
+-
++    // must call for every visible item to init or discard transitions
+     QRectF viewBounds(0, position(), q->width(), q->height());
+-    for (int i=0; i<visibleItems.count(); i++) {
+-        // must call for every visible item to init or discard transitions
+-        if (!visibleItems[i]->prepareTransition(viewBounds))
+-            continue;
+-        if (visibleItems[i]->isTransitionTarget) {
+-            switch (visibleItems[i]->nextTransitionType) {
+-            case QQuickItemViewTransitioner::NoTransition:
+-                break;
+-            case QQuickItemViewTransitioner::PopulateTransition:
+-            case QQuickItemViewTransitioner::AddTransition:
+-                transitioner->addTransitionIndexes.append(visibleItems[i]->index);
+-                transitioner->addTransitionTargets.append(visibleItems[i]->item);
+-                break;
+-            case QQuickItemViewTransitioner::MoveTransition:
+-                transitioner->moveTransitionIndexes.append(visibleItems[i]->index);
+-                transitioner->moveTransitionTargets.append(visibleItems[i]->item);
+-                break;
+-            case QQuickItemViewTransitioner::RemoveTransition:
+-                // removed targets won't be in visibleItems, handle these
+-                // in prepareNonVisibleItemTransition()
+-                break;
+-            }
+-        }
+-    }
++    for (int i=0; i<visibleItems.count(); i++)
++        visibleItems[i]->prepareTransition(transitioner, viewBounds);
+ }
+ 
+ void QQuickItemViewPrivate::prepareRemoveTransitions(QHash<QQuickChangeSet::MoveKey, FxViewItem *> *removedItems)
+@@ -1992,10 +1968,8 @@ void QQuickItemViewPrivate::prepareRemoveTransitions(QHash<QQuickChangeSet::Move
+     if (!transitioner)
+         return;
+ 
+-    transitioner->removeTransitionIndexes.clear();
+-    transitioner->removeTransitionTargets.clear();
+-
+-    if (transitioner->canTransition(QQuickItemViewTransitioner::RemoveTransition, true)) {
++    if (transitioner->canTransition(QQuickItemViewTransitioner::RemoveTransition, true)
++            || transitioner->canTransition(QQuickItemViewTransitioner::RemoveTransition, false)) {
+         for (QHash<QQuickChangeSet::MoveKey, FxViewItem *>::Iterator it = removedItems->begin();
+              it != removedItems->end(); ) {
+             bool isRemove = it.key().moveId < 0;
+@@ -2024,21 +1998,12 @@ bool QQuickItemViewPrivate::prepareNonVisibleItemTransition(FxViewItem *item, co
+ 
+     if (item->nextTransitionType == QQuickItemViewTransitioner::MoveTransition)
+         repositionItemAt(item, item->index, 0);
+-    if (!item->prepareTransition(viewBounds))
+-        return false;
+ 
+-    if (item->isTransitionTarget) {
+-        if (item->nextTransitionType == QQuickItemViewTransitioner::MoveTransition) {
+-            transitioner->moveTransitionIndexes.append(item->index);
+-            transitioner->moveTransitionTargets.append(item->item);
+-        } else if (item->nextTransitionType == QQuickItemViewTransitioner::RemoveTransition) {
+-            transitioner->removeTransitionIndexes.append(item->index);
+-            transitioner->removeTransitionTargets.append(item->item);
+-        }
++    if (item->prepareTransition(transitioner, viewBounds)) {
++        item->releaseAfterTransition = true;
++        return true;
+     }
+-
+-    item->releaseAfterTransition = true;
+-    return true;
++    return false;
+ }
+ 
+ void QQuickItemViewPrivate::viewItemTransitionFinished(QQuickViewItem *i)
+diff --git a/src/quick/items/qquickitemviewtransition.cpp b/src/quick/items/qquickitemviewtransition.cpp
+index ac9375b..5669ef9 100644
+--- a/src/quick/items/qquickitemviewtransition.cpp
++++ b/src/quick/items/qquickitemviewtransition.cpp
+@@ -165,28 +165,30 @@ QQuickItemViewTransitioner::~QQuickItemViewTransitioner()
+ bool QQuickItemViewTransitioner::canTransition(QQuickItemViewTransitioner::TransitionType type, bool asTarget) const
+ {
+     if (!asTarget
+-            && type != QQuickItemViewTransitioner::NoTransition && type != QQuickItemViewTransitioner::PopulateTransition
++            && type != NoTransition && type != PopulateTransition
+             && displacedTransition && displacedTransition->enabled()) {
+         return true;
+     }
+ 
+     switch (type) {
+-    case QQuickItemViewTransitioner::NoTransition:
++    case NoTransition:
+         break;
+-    case QQuickItemViewTransitioner::PopulateTransition:
++    case PopulateTransition:
+         return usePopulateTransition
+                 && populateTransition && populateTransition->enabled();
+-    case QQuickItemViewTransitioner::AddTransition:
++    case AddTransition:
++        if (usePopulateTransition)
++            return false;
+         if (asTarget)
+             return addTransition && addTransition->enabled();
+         else
+             return addDisplacedTransition && addDisplacedTransition->enabled();
+-    case QQuickItemViewTransitioner::MoveTransition:
++    case MoveTransition:
+         if (asTarget)
+             return moveTransition && moveTransition->enabled();
+         else
+             return moveDisplacedTransition && moveDisplacedTransition->enabled();
+-    case QQuickItemViewTransitioner::RemoveTransition:
++    case RemoveTransition:
+         if (asTarget)
+             return removeTransition && removeTransition->enabled();
+         else
+@@ -197,27 +199,42 @@ bool QQuickItemViewTransitioner::canTransition(QQuickItemViewTransitioner::Trans
+ 
+ void QQuickItemViewTransitioner::transitionNextReposition(QQuickViewItem *item, QQuickItemViewTransitioner::TransitionType type, bool isTarget)
+ {
+-    bool matchedTransition = false;
+-    if (type == QQuickItemViewTransitioner::AddTransition) {
+-        // don't run add transitions for added items while populating
+-        if (usePopulateTransition)
+-            matchedTransition = false;
+-        else
+-            matchedTransition = canTransition(type, isTarget);
+-    } else {
+-        matchedTransition = canTransition(type, isTarget);
+-    }
++    item->setNextTransition(type, isTarget);
++}
+ 
+-    if (matchedTransition) {
+-        item->setNextTransition(type, isTarget);
+-    } else {
+-        // the requested transition type is not valid, but the item is scheduled/in another
+-        // transition, so cancel it to allow the item to move directly to the correct pos
+-        if (item->transitionScheduledOrRunning())
+-            item->stopTransition();
++void QQuickItemViewTransitioner::addToTargetLists(QQuickItemViewTransitioner::TransitionType type, QQuickViewItem *item, int index)
++{
++    switch (type) {
++    case NoTransition:
++        break;
++    case PopulateTransition:
++    case AddTransition:
++        addTransitionIndexes << index;
++        addTransitionTargets << item->item;
++        break;
++    case MoveTransition:
++        moveTransitionIndexes << index;
++        moveTransitionTargets << item->item;
++        break;
++    case RemoveTransition:
++        removeTransitionIndexes << index;
++        removeTransitionTargets << item->item;
++        break;
+     }
+ }
+ 
++void QQuickItemViewTransitioner::resetTargetLists()
++{
++    addTransitionIndexes.clear();
++    addTransitionTargets.clear();
++
++    removeTransitionIndexes.clear();
++    removeTransitionTargets.clear();
++
++    moveTransitionIndexes.clear();
++    moveTransitionTargets.clear();
++}
++
+ QQuickTransition *QQuickItemViewTransitioner::transitionObject(QQuickItemViewTransitioner::TransitionType type, bool asTarget)
+ {
+     if (type == QQuickItemViewTransitioner::NoTransition)
+@@ -254,14 +271,14 @@ QQuickTransition *QQuickItemViewTransitioner::transitionObject(QQuickItemViewTra
+ const QList<int> &QQuickItemViewTransitioner::targetIndexes(QQuickItemViewTransitioner::TransitionType type) const
+ {
+     switch (type) {
+-    case QQuickItemViewTransitioner::NoTransition:
++    case NoTransition:
+         break;
+-    case QQuickItemViewTransitioner::PopulateTransition:
+-    case QQuickItemViewTransitioner::AddTransition:
++    case PopulateTransition:
++    case AddTransition:
+         return addTransitionIndexes;
+-    case QQuickItemViewTransitioner::MoveTransition:
++    case MoveTransition:
+         return moveTransitionIndexes;
+-    case QQuickItemViewTransitioner::RemoveTransition:
++    case RemoveTransition:
+         return removeTransitionIndexes;
+     }
+ 
+@@ -271,14 +288,14 @@ const QList<int> &QQuickItemViewTransitioner::targetIndexes(QQuickItemViewTransi
+ const QList<QObject *> &QQuickItemViewTransitioner::targetItems(QQuickItemViewTransitioner::TransitionType type) const
+ {
+     switch (type) {
+-    case QQuickItemViewTransitioner::NoTransition:
++    case NoTransition:
+         break;
+-    case QQuickItemViewTransitioner::PopulateTransition:
+-    case QQuickItemViewTransitioner::AddTransition:
++    case PopulateTransition:
++    case AddTransition:
+         return addTransitionTargets;
+-    case QQuickItemViewTransitioner::MoveTransition:
++    case MoveTransition:
+         return moveTransitionTargets;
+-    case QQuickItemViewTransitioner::RemoveTransition:
++    case RemoveTransition:
+         return removeTransitionTargets;
+     }
+ 
+@@ -305,6 +322,7 @@ QQuickViewItem::QQuickViewItem(QQuickItem *i)
+     , index(-1)
+     , isTransitionTarget(false)
+     , nextTransitionToSet(false)
++    , prepared(false)
+ {
+ }
+ 
+@@ -373,7 +391,7 @@ bool QQuickViewItem::isPendingRemoval() const
+     return false;
+ }
+ 
+-bool QQuickViewItem::prepareTransition(const QRectF &viewBounds)
++bool QQuickViewItem::prepareTransition(QQuickItemViewTransitioner *transitioner, const QRectF &viewBounds)
+ {
+     bool doTransition = false;
+ 
+@@ -393,7 +411,8 @@ bool QQuickViewItem::prepareTransition(const QRectF &viewBounds)
+     }
+     case QQuickItemViewTransitioner::PopulateTransition:
+     {
+-        return true;
++        doTransition = true;
++        break;
+     }
+     case QQuickItemViewTransitioner::AddTransition:
+     case QQuickItemViewTransitioner::RemoveTransition:
+@@ -426,12 +445,24 @@ bool QQuickViewItem::prepareTransition(const QRectF &viewBounds)
+         break;
+     }
+ 
++    if (doTransition) {
++        // add item to target lists even if canTransition() is false for a target transition,
++        // since the target lists still need to be filled for displaced transitions
++        if (isTransitionTarget)
++            transitioner->addToTargetLists(nextTransitionType, this, index);
++        doTransition = transitioner->canTransition(nextTransitionType, isTransitionTarget);
++    }
++
+     if (!doTransition) {
++        // if transition type is not valid, the previous transition still has to be
++        // canceled so that the item can move immediately to the right position
+         if (transition)
+             transition->cancel();
+         item->setPos(nextTransitionTo);
+         resetTransitionData();
+     }
++
++    prepared = true;
+     return doTransition;
+ }
+ 
+@@ -440,6 +471,11 @@ void QQuickViewItem::startTransition(QQuickItemViewTransitioner *transitioner)
+     if (nextTransitionType == QQuickItemViewTransitioner::NoTransition)
+         return;
+ 
++    if (!prepared) {
++        qWarning("QQuickViewItem::prepareTransition() not called!");
++        return;
++    }
++
+     if (!transition || transition->m_type != nextTransitionType || transition->m_isTarget != isTransitionTarget) {
+         delete transition;
+         transition = new QQuickItemViewTransitionJob;
+@@ -452,17 +488,7 @@ void QQuickViewItem::startTransition(QQuickItemViewTransitioner *transitioner)
+ 
+     transition->startTransition(this, transitioner, nextTransitionType, nextTransitionTo, isTransitionTarget);
+     nextTransitionType = QQuickItemViewTransitioner::NoTransition;
+-}
+-
+-void QQuickViewItem::stopTransition()
+-{
+-    if (transition) {
+-        transition->cancel();
+-        delete transition;
+-        transition = 0;
+-    }
+-    resetTransitionData();
+-    finishedTransition();
++    prepared = false;
+ }
+ 
+ void QQuickViewItem::setNextTransition(QQuickItemViewTransitioner::TransitionType type, bool isTargetItem)
+diff --git a/src/quick/items/qquickitemviewtransition_p.h b/src/quick/items/qquickitemviewtransition_p.h
+index 3fb43d6..73c238e 100644
+--- a/src/quick/items/qquickitemviewtransition_p.h
++++ b/src/quick/items/qquickitemviewtransition_p.h
+@@ -82,6 +82,9 @@ public:
+     bool canTransition(QQuickItemViewTransitioner::TransitionType type, bool asTarget) const;
+     void transitionNextReposition(QQuickViewItem *item, QQuickItemViewTransitioner::TransitionType type, bool isTarget);
+ 
++    void addToTargetLists(QQuickItemViewTransitioner::TransitionType type, QQuickViewItem *item, int index);
++    void resetTargetLists();
++
+     QQuickTransition *transitionObject(QQuickItemViewTransitioner::TransitionType type, bool asTarget);
+     const QList<int> &targetIndexes(QQuickItemViewTransitioner::TransitionType type) const;
+     const QList<QObject *> &targetItems(QQuickItemViewTransitioner::TransitionType type) const;
+@@ -136,9 +139,8 @@ public:
+     bool transitionRunning() const;
+     bool isPendingRemoval() const;
+ 
+-    bool prepareTransition(const QRectF &viewBounds);
++    bool prepareTransition(QQuickItemViewTransitioner *transitioner, const QRectF &viewBounds);
+     void startTransition(QQuickItemViewTransitioner *transitioner);
+-    void stopTransition();
+ 
+     QPointF nextTransitionTo;
+     QQuickItem *item;
+@@ -147,6 +149,7 @@ public:
+     int index;
+     bool isTransitionTarget;
+     bool nextTransitionToSet;
++    bool prepared;
+ 
+ private:
+     friend class QQuickItemViewTransitioner;
+diff --git a/src/quick/items/qquickpositioners.cpp b/src/quick/items/qquickpositioners.cpp
+index e1d0457..e9a0c17 100644
+--- a/src/quick/items/qquickpositioners.cpp
++++ b/src/quick/items/qquickpositioners.cpp
+@@ -246,11 +246,8 @@ void QQuickBasePositioner::prePositioning()
+                     if (addedIndex < 0)
+                         addedIndex = posItem.index;
+                     PositionedItem *theItem = &positionedItems[positionedItems.count()-1];
+-
+                     d->transitioner->transitionNextReposition(theItem,
+                             QQuickItemViewTransitioner::AddTransition, true);
+-                    d->transitioner->addTransitionIndexes << posItem.index;
+-                    d->transitioner->addTransitionTargets << posItem.item;
+                 }
+             }
+         } else {
+@@ -273,8 +270,6 @@ void QQuickBasePositioner::prePositioning()
+                         addedIndex = item->index;
+                     d->transitioner->transitionNextReposition(&positionedItems[positionedItems.count()-1],
+                             QQuickItemViewTransitioner::AddTransition, true);
+-                    d->transitioner->addTransitionIndexes << item->index;
+-                    d->transitioner->addTransitionTargets << item->item;
+                 }
+             } else {
+                 item->isNew = false;
+@@ -307,12 +302,11 @@ void QQuickBasePositioner::prePositioning()
+ 
+     if (d->transitioner) {
+         QRectF viewBounds;
+-        for (int i=0; i<positionedItems.count(); i++) {
+-            if (positionedItems[i].prepareTransition(viewBounds))
+-                positionedItems[i].startTransition(d->transitioner);
+-        }
+-        d->transitioner->addTransitionIndexes.clear();
+-        d->transitioner->addTransitionTargets.clear();
++        for (int i=0; i<positionedItems.count(); i++)
++            positionedItems[i].prepareTransition(d->transitioner, viewBounds);
++        for (int i=0; i<positionedItems.count(); i++)
++            positionedItems[i].startTransition(d->transitioner);
++        d->transitioner->resetTargetLists();
+     }
+ 
+     d->doingPositioning = false;
+diff --git a/tests/auto/quick/qquickgridview/data/displacedTransitions.qml b/tests/auto/quick/qquickgridview/data/displacedTransitions.qml
+index d9353c0..2db0697 100644
+--- a/tests/auto/quick/qquickgridview/data/displacedTransitions.qml
++++ b/tests/auto/quick/qquickgridview/data/displacedTransitions.qml
+@@ -38,6 +38,7 @@ Rectangle {
+                 text: number
+             }
+             color: GridView.isCurrentItem ? "lightsteelblue" : "white"
++            border.width: 1
+ 
+             onXChanged: checkPos()
+             onYChanged: checkPos()
+@@ -61,6 +62,17 @@ Rectangle {
+         property int targetTransitionsDone
+         property int displaceTransitionsDone
+ 
++        property var displacedTargetIndexes: new Array()
++        property var displacedTargetItems: new Array()
++
++        // for QDeclarativeListProperty types
++        function copyList(propList) {
++            var temp = new Array()
++            for (var i=0; i<propList.length; i++)
++                temp.push(propList[i])
++            return temp
++        }
++
+         objectName: "grid"
+         focus: true
+         anchors.centerIn: parent
+@@ -80,6 +92,12 @@ Rectangle {
+             id: displaced
+             enabled: displacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        grid.displacedTargetIndexes.push(displaced.ViewTransition.targetIndexes)
++                        grid.displacedTargetItems.push(grid.copyList(displaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: displaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: displaced_transitionVia.y; duration: root.duration }
+@@ -93,6 +111,12 @@ Rectangle {
+             id: addDisplaced
+             enabled: addDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        grid.displacedTargetIndexes.push(addDisplaced.ViewTransition.targetIndexes)
++                        grid.displacedTargetItems.push(grid.copyList(addDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: addDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: addDisplaced_transitionVia.y; duration: root.duration }
+@@ -106,6 +130,12 @@ Rectangle {
+             id: moveDisplaced
+             enabled: moveDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        grid.displacedTargetIndexes.push(moveDisplaced.ViewTransition.targetIndexes)
++                        grid.displacedTargetItems.push(grid.copyList(moveDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: moveDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: moveDisplaced_transitionVia.y; duration: root.duration }
+@@ -119,6 +149,12 @@ Rectangle {
+             id: removeDisplaced
+             enabled: removeDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        grid.displacedTargetIndexes.push(removeDisplaced.ViewTransition.targetIndexes)
++                        grid.displacedTargetItems.push(grid.copyList(removeDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: removeDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: removeDisplaced_transitionVia.y; duration: root.duration }
+diff --git a/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp b/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
+index b3e79df..0171872 100644
+--- a/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
++++ b/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
+@@ -4637,11 +4637,26 @@ void tst_QQuickGridView::displacedTransitions()
+         case ListChange::SetContentY:
+             break;
+     }
++
++    QVariantList resultTargetIndexes = gridview->property("displacedTargetIndexes").toList();
++    QVariantList resultTargetItems = gridview->property("displacedTargetItems").toList();
++
+     if ((useDisplaced && displacedEnabled)
+             || (useAddDisplaced && addDisplacedEnabled)
+             || (useMoveDisplaced && moveDisplacedEnabled)
+             || (useRemoveDisplaced && removeDisplacedEnabled)) {
+         QTRY_VERIFY(gridview->property("displaceTransitionsDone").toBool());
++
++        // check the correct number of target items and indexes were received
++        QCOMPARE(resultTargetIndexes.count(), expectedDisplacedIndexes.count());
++        for (int i=0; i<resultTargetIndexes.count(); i++)
++            QCOMPARE(resultTargetIndexes[i].value<QList<int> >().count(), change.count);
++        QCOMPARE(resultTargetItems.count(), expectedDisplacedIndexes.count());
++        for (int i=0; i<resultTargetItems.count(); i++)
++            QCOMPARE(resultTargetItems[i].toList().count(), change.count);
++    } else {
++        QCOMPARE(resultTargetIndexes.count(), 0);
++        QCOMPARE(resultTargetItems.count(), 0);
+     }
+ 
+     if (change.type == ListChange::Inserted && useAddDisplaced && addDisplacedEnabled)
+diff --git a/tests/auto/quick/qquicklistview/data/displacedTransitions.qml b/tests/auto/quick/qquicklistview/data/displacedTransitions.qml
+index cc7892e..964ded1 100644
+--- a/tests/auto/quick/qquicklistview/data/displacedTransitions.qml
++++ b/tests/auto/quick/qquicklistview/data/displacedTransitions.qml
+@@ -53,6 +53,17 @@ Rectangle {
+         property int targetTransitionsDone
+         property int displaceTransitionsDone
+ 
++        property var displacedTargetIndexes: new Array()
++        property var displacedTargetItems: new Array()
++
++        // for QDeclarativeListProperty types
++        function copyList(propList) {
++            var temp = new Array()
++            for (var i=0; i<propList.length; i++)
++                temp.push(propList[i])
++            return temp
++        }
++
+         objectName: "list"
+         focus: true
+         anchors.centerIn: parent
+@@ -70,6 +81,12 @@ Rectangle {
+             id: displaced
+             enabled: displacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        list.displacedTargetIndexes.push(displaced.ViewTransition.targetIndexes)
++                        list.displacedTargetItems.push(list.copyList(displaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: displaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: displaced_transitionVia.y; duration: root.duration }
+@@ -83,6 +100,12 @@ Rectangle {
+             id: addDisplaced
+             enabled: addDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        list.displacedTargetIndexes.push(addDisplaced.ViewTransition.targetIndexes)
++                        list.displacedTargetItems.push(list.copyList(addDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: addDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: addDisplaced_transitionVia.y; duration: root.duration }
+@@ -96,6 +119,12 @@ Rectangle {
+             id: moveDisplaced
+             enabled: moveDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        list.displacedTargetIndexes.push(moveDisplaced.ViewTransition.targetIndexes)
++                        list.displacedTargetItems.push(list.copyList(moveDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: moveDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: moveDisplaced_transitionVia.y; duration: root.duration }
+@@ -109,6 +138,12 @@ Rectangle {
+             id: removeDisplaced
+             enabled: removeDisplacedEnabled
+             SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        list.displacedTargetIndexes.push(removeDisplaced.ViewTransition.targetIndexes)
++                        list.displacedTargetItems.push(list.copyList(removeDisplaced.ViewTransition.targetItems))
++                    }
++                }
+                 ParallelAnimation {
+                     NumberAnimation { properties: "x"; to: removeDisplaced_transitionVia.x; duration: root.duration }
+                     NumberAnimation { properties: "y"; to: removeDisplaced_transitionVia.y; duration: root.duration }
+diff --git a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+index 8c5c25c..32f329f 100644
+--- a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
++++ b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+@@ -5648,11 +5648,26 @@ void tst_QQuickListView::displacedTransitions()
+         case ListChange::SetContentY:
+             break;
+     }
++
++    QVariantList resultTargetIndexes = listview->property("displacedTargetIndexes").toList();
++    QVariantList resultTargetItems = listview->property("displacedTargetItems").toList();
++
+     if ((useDisplaced && displacedEnabled)
+             || (useAddDisplaced && addDisplacedEnabled)
+             || (useMoveDisplaced && moveDisplacedEnabled)
+             || (useRemoveDisplaced && removeDisplacedEnabled)) {
+         QTRY_VERIFY(listview->property("displaceTransitionsDone").toBool());
++
++        // check the correct number of target items and indexes were received
++        QCOMPARE(resultTargetIndexes.count(), expectedDisplacedIndexes.count());
++        for (int i=0; i<resultTargetIndexes.count(); i++)
++            QCOMPARE(resultTargetIndexes[i].value<QList<int> >().count(), change.count);
++        QCOMPARE(resultTargetItems.count(), expectedDisplacedIndexes.count());
++        for (int i=0; i<resultTargetItems.count(); i++)
++            QCOMPARE(resultTargetItems[i].toList().count(), change.count);
++    } else {
++        QCOMPARE(resultTargetIndexes.count(), 0);
++        QCOMPARE(resultTargetItems.count(), 0);
+     }
+ 
+     if (change.type == ListChange::Inserted && useAddDisplaced && addDisplacedEnabled)

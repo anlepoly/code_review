@@ -1,0 +1,375 @@
+diff --git a/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp b/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
+index dbd5408..12f06e6 100644
+--- a/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
++++ b/src/declarative/qml/v8/qdeclarativebuiltinfunctions.cpp
+@@ -47,6 +47,7 @@
+ #include <private/qdeclarativestringconverters_p.h>
+ #include <private/qdeclarativelocale_p.h>
+ #include <private/qv8engine_p.h>
++#include <private/qjsconverter_impl_p.h>
+ 
+ #include <private/qv8profilerservice_p.h>
+ #include <private/qdeclarativeprofilerservice_p.h>
+@@ -69,9 +70,6 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-// send more information such as file, line etc for console APIs
+-DEFINE_BOOL_CONFIG_OPTION(qmlConsoleExtended, QML_CONSOLE_EXTENDED)
+-
+ namespace QDeclarativeBuiltinFunctions {
+ 
+ enum ConsoleLogTypes {
+@@ -80,21 +78,19 @@ enum ConsoleLogTypes {
+     Error
+ };
+ 
+-static QString extendMessage(const QString &msg) {
+-    if (qmlConsoleExtended()) {
+-        v8::Local<v8::StackTrace> stackTrace = v8::StackTrace::CurrentStackTrace(1);
+-        if (stackTrace->GetFrameCount()) {
+-            v8::Local<v8::StackFrame> frame = stackTrace->GetFrame(0);
+-            int line = frame->GetLineNumber();
+-            QString scriptName = QString::fromUtf16(*v8::String::Value(frame->GetScriptName()));
+-
+-            return QString::fromLatin1("%1 (%2:%3)").arg(msg).arg(scriptName).arg(line);
+-        }
++static void jsContext(v8::Handle<v8::Value> *file, int *line, v8::Handle<v8::Value> *function) {
++    v8::Local<v8::StackTrace> stackTrace = v8::StackTrace::CurrentStackTrace(1);
++    if (stackTrace->GetFrameCount()) {
++        v8::Local<v8::StackFrame> frame = stackTrace->GetFrame(0);
++        *file = frame->GetScriptName();
++        *line = frame->GetLineNumber();
++        *function = frame->GetFunctionName();
+     }
+-    return msg;
+ }
+ 
+-static void printStack() {
++static QString jsStack() {
++    QStringList stackFrames;
++
+     //The v8 default is currently 10 stack frames.
+     v8::Handle<v8::StackTrace> stackTrace =
+         v8::StackTrace::CurrentStackTrace(10, v8::StackTrace::kOverview);
+@@ -102,15 +98,23 @@ static void printStack() {
+ 
+     for (int i = 0; i < stackCount; i++) {
+         v8::Local<v8::StackFrame> frame = stackTrace->GetFrame(i);
+-        v8::String::Utf8Value func_name(frame->GetFunctionName());
+-        v8::String::Utf8Value script_name(frame->GetScriptName());
++        v8::Handle<v8::String> function(frame->GetFunctionName());
++        v8::Handle<v8::String> script(frame->GetScriptName());
+         int lineNumber = frame->GetLineNumber();
+         int columnNumber = frame->GetColumn();
+-        qDebug("%s (%s:%d:%d)\n", *func_name, *script_name, lineNumber, columnNumber);
++
++        QString stackFrame =
++                QString::fromLatin1("%1 (%2:%3:%4)").arg(QJSConverter::toString(function),
++                                                         QJSConverter::toString(script),
++                                                         QString::number(lineNumber),
++                                                         QString::number(columnNumber));
++        stackFrames.append(stackFrame);
+     }
++    return stackFrames.join(QLatin1String("\n"));
+ }
+ 
+-v8::Handle<v8::Value> console(ConsoleLogTypes logType, const v8::Arguments &args)
++v8::Handle<v8::Value> console(ConsoleLogTypes logType, const v8::Arguments &args,
++                              bool printStack = false)
+ {
+     v8::HandleScope handleScope;
+ 
+@@ -135,17 +139,29 @@ v8::Handle<v8::Value> console(ConsoleLogTypes logType, const v8::Arguments &args
+         }
+     }
+ 
+-    result = extendMessage(result);
++    if (printStack) {
++        result.append(QLatin1String("\n"));
++        result.append(jsStack());
++    }
++
++    v8::Handle<v8::Value> fileHandle;
++    v8::Handle<v8::Value> functionHandle;
++    int line;
++
++    jsContext(&fileHandle, &line, &functionHandle);
+ 
+     switch (logType) {
+     case Log:
+-        qDebug("%s", qPrintable(result));
++        QMessageLogger(*v8::String::AsciiValue(fileHandle), line,
++                       *v8::String::AsciiValue(functionHandle)).debug("%s", qPrintable(result));
+         break;
+     case Warn:
+-        qWarning("%s", qPrintable(result));
++        QMessageLogger(*v8::String::AsciiValue(fileHandle), line,
++                       *v8::String::AsciiValue(functionHandle)).warning("%s", qPrintable(result));
+         break;
+     case Error:
+-        qCritical("%s", qPrintable(result));
++        QMessageLogger(*v8::String::AsciiValue(fileHandle), line,
++                       *v8::String::AsciiValue(functionHandle)).critical("%s", qPrintable(result));
+         break;
+     default:
+         break;
+@@ -183,11 +199,22 @@ v8::Handle<v8::Value> consoleProfile(const v8::Arguments &args)
+     Q_UNUSED(args);
+     QString title;
+ 
++
++
++    v8::Handle<v8::Value> file;
++    v8::Handle<v8::Value> function;
++    int line;
++    jsContext(&file, &line, &function);
++
+     if (QDeclarativeProfilerService::startProfiling()) {
+         QV8ProfilerService::instance()->startProfiling(title);
+-        qDebug("Profiling started.");
++
++        QMessageLogger(*v8::String::AsciiValue(file), line,
++                       *v8::String::AsciiValue(function)).debug("Profiling started.");
+     } else {
+-        qWarning("Profiling is already in progress. First, end current profiling session.");
++        QMessageLogger(*v8::String::AsciiValue(file), line,
++                       *v8::String::AsciiValue(function)).warning(
++                    "Profiling is already in progress. First, end current profiling session.");
+     }
+ 
+     return v8::Undefined();
+@@ -201,14 +228,22 @@ v8::Handle<v8::Value> consoleProfileEnd(const v8::Arguments &args)
+     Q_UNUSED(args);
+     QString title;
+ 
++    v8::Handle<v8::Value> file;
++    v8::Handle<v8::Value> function;
++    int line;
++    jsContext(&file, &line, &function);
++
+     if (QDeclarativeProfilerService::stopProfiling()) {
+         QV8ProfilerService *profiler = QV8ProfilerService::instance();
+         profiler->stopProfiling(title);
+         QDeclarativeProfilerService::sendProfilingData();
+         profiler->sendProfilingData();
+-        qDebug("Profiling ended.");
++
++        QMessageLogger(*v8::String::AsciiValue(file), line,
++                       *v8::String::AsciiValue(function)).debug("Profiling ended.");
+     } else {
+-        qWarning("Profiling was not started.");
++        QMessageLogger(*v8::String::AsciiValue(file), line,
++                       *v8::String::AsciiValue(function)).warning("Profiling was not started.");
+     }
+ 
+     return v8::Undefined();
+@@ -250,14 +285,15 @@ v8::Handle<v8::Value> consoleCount(const v8::Arguments &args)
+         v8::Local<v8::StackFrame> frame = stackTrace->GetFrame(0);
+ 
+         QString scriptName = V8ENGINE()->toString(frame->GetScriptName());
++        QString functionName = V8ENGINE()->toString(frame->GetFunctionName());
+         int line = frame->GetLineNumber();
+         int column = frame->GetColumn();
+ 
+         int value = V8ENGINE()->consoleCountHelper(scriptName, line, column);
+         QString message = name + QLatin1String(": ") + QString::number(value);
+-        if (qmlConsoleExtended())
+-            message = QString::fromLatin1("%1 (%2:%3)").arg(message).arg(scriptName).arg(line);
+-        qDebug("%s", qPrintable(message));
++
++        QMessageLogger(qPrintable(scriptName), line,
++                       qPrintable(functionName)).debug("%s", qPrintable(message));
+     }
+ 
+     return v8::Undefined();
+@@ -268,7 +304,15 @@ v8::Handle<v8::Value> consoleTrace(const v8::Arguments &args)
+     if (args.Length() != 0)
+         V8THROW_ERROR("console.trace(): Invalid arguments");
+ 
+-    printStack();
++    QString stack = jsStack();
++
++    v8::Handle<v8::Value> file;
++    v8::Handle<v8::Value> function;
++    int line;
++    jsContext(&file, &line, &function);
++
++    QMessageLogger(*v8::String::AsciiValue(file), line, *v8::String::AsciiValue(function)).debug(
++                "%s", qPrintable(stack));
+     return v8::Undefined();
+ }
+ 
+@@ -292,9 +336,16 @@ v8::Handle<v8::Value> consoleAssert(const v8::Arguments &args)
+             message.append(V8ENGINE()->toString(value->ToString()));
+         }
+ 
+-        message = extendMessage(message);
+-        qCritical("%s", qPrintable(message));
+-        printStack();
++        QString stack = jsStack();
++
++        v8::Handle<v8::Value> file;
++        v8::Handle<v8::Value> function;
++        int line;
++        jsContext(&file, &line, &function);
++
++        QMessageLogger(*v8::String::AsciiValue(file), line, *v8::String::AsciiValue(function)).critical(
++                    "%s\n%s", qPrintable(message), qPrintable(stack));
++
+     }
+     return v8::Undefined();
+ }
+@@ -303,8 +354,8 @@ v8::Handle<v8::Value> consoleException(const v8::Arguments &args)
+ {
+     if (args.Length() == 0)
+         V8THROW_ERROR("console.exception(): Missing argument");
+-    console(Error, args);
+-    printStack();
++
++    console(Error, args, true);
+ 
+     return v8::Undefined();
+ }
+diff --git a/tests/auto/declarative/debugger/qdebugmessageservice/tst_qdebugmessageservice.cpp b/tests/auto/declarative/debugger/qdebugmessageservice/tst_qdebugmessageservice.cpp
+index 07e744d..625e038 100644
+--- a/tests/auto/declarative/debugger/qdebugmessageservice/tst_qdebugmessageservice.cpp
++++ b/tests/auto/declarative/debugger/qdebugmessageservice/tst_qdebugmessageservice.cpp
+@@ -59,7 +59,7 @@ class tst_QDebugMessageService : public QDeclarativeDataTest
+ public:
+     tst_QDebugMessageService();
+ 
+-    void init(bool extendedOutput);
++    void init();
+ 
+ private slots:
+     void initTestCase();
+@@ -68,7 +68,6 @@ private slots:
+     void cleanup();
+ 
+     void retrieveDebugOutput();
+-    void retrieveDebugOutputExtended();
+ 
+ private:
+     QDeclarativeDebugProcess *m_process;
+@@ -165,14 +164,12 @@ void tst_QDebugMessageService::cleanupTestCase()
+         delete m_connection;
+ }
+ 
+-void tst_QDebugMessageService::init(bool extendedOutput)
++void tst_QDebugMessageService::init()
+ {
+     m_connection = new QDeclarativeDebugConnection();
+     m_process = new QDeclarativeDebugProcess(QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlscene");
+     m_client = new QDeclarativeDebugMsgClient(m_connection);
+ 
+-    if (extendedOutput)
+-        m_process->setEnvironment(QProcess::systemEnvironment() << "QML_CONSOLE_EXTENDED=1");
+     m_process->start(QStringList() << QLatin1String(NORMALMODE) << QDeclarativeDataTest::instance()->testFile(QMLFILE));
+     if (!m_process->waitForSessionStart()) {
+         QFAIL(QString("Could not launch app. Application output: \n%1").arg(m_process->output()).toAscii());
+@@ -204,7 +201,7 @@ void tst_QDebugMessageService::cleanup()
+ 
+ void tst_QDebugMessageService::retrieveDebugOutput()
+ {
+-    init(false);
++    init();
+ 
+     int maxTries = 2;
+     while ((m_client->logBuffer.size() < 2)
+@@ -217,27 +214,6 @@ void tst_QDebugMessageService::retrieveDebugOutput()
+     QVERIFY(m_client->logBuffer.contains(LogEntry(QtDebugMsg, QLatin1String("console.count: 1"))));
+ }
+ 
+-void tst_QDebugMessageService::retrieveDebugOutputExtended()
+-{
+-    init(true);
+-
+-    int maxTries = 2;
+-    while ((m_client->logBuffer.size() < 2)
+-           || (maxTries-- > 0))
+-        QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(debugOutput()), 1000);
+-
+-    QVERIFY(m_client->logBuffer.size() >= 2);
+-
+-    const QString path =
+-            QUrl::fromLocalFile(QDeclarativeDataTest::instance()->testFile(QMLFILE)).toString();
+-
+-    QString logMsg = QString::fromLatin1("console.log (%1:%2)").arg(path).arg(48);
+-    QString countMsg = QString::fromLatin1("console.count: 1 (%1:%2)").arg(path).arg(49);
+-
+-    QVERIFY(m_client->logBuffer.contains(LogEntry(QtDebugMsg, logMsg)));
+-    QVERIFY(m_client->logBuffer.contains(LogEntry(QtDebugMsg, countMsg)));
+-}
+-
+ QTEST_MAIN(tst_QDebugMessageService)
+ 
+ #include "tst_qdebugmessageservice.moc"
+diff --git a/tests/auto/declarative/qdeclarativeconsole/tst_qdeclarativeconsole.cpp b/tests/auto/declarative/qdeclarativeconsole/tst_qdeclarativeconsole.cpp
+index 7ab1f15..f5788dc 100644
+--- a/tests/auto/declarative/qdeclarativeconsole/tst_qdeclarativeconsole.cpp
++++ b/tests/auto/declarative/qdeclarativeconsole/tst_qdeclarativeconsole.cpp
+@@ -97,10 +97,11 @@ void tst_qdeclarativeconsole::tracing()
+ {
+     QUrl testUrl = testFileUrl("tracing.qml");
+ 
+-    QString trace1 = QString::fromLatin1("tracing (%1:%2:%3)\n").arg(testUrl.toString()).arg(50).arg(17);
+-    QString trace2 = QString::fromLatin1("onCompleted (%1:%2:%3)\n").arg(testUrl.toString()).arg(54).arg(9);
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace1));
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace2));
++    QString traceText =
++            QString::fromLatin1("tracing (%1:%2:%3)\n").arg(testUrl.toString()).arg(50).arg(17) +
++            QString::fromLatin1("onCompleted (%1:%2:%3)").arg(testUrl.toString()).arg(54).arg(9);
++
++    QTest::ignoreMessage(QtDebugMsg, qPrintable(traceText));
+ 
+     QDeclarativeComponent component(&engine, testUrl);
+     QObject *object = component.create();
+@@ -127,14 +128,15 @@ void tst_qdeclarativeconsole::assert()
+     QUrl testUrl = testFileUrl("assert.qml");
+ 
+     // assert()
+-    QTest::ignoreMessage(QtCriticalMsg, "This will fail");
+-    QTest::ignoreMessage(QtCriticalMsg, "This will fail too");
+-    QString trace1 = QString::fromLatin1("onCompleted (%1:%2:%3)\n").arg(testUrl.toString()).arg(54).arg(17);
+-    QString trace2 = QString::fromLatin1("onCompleted (%1:%2:%3)\n").arg(testUrl.toString()).arg(59).arg(9);
+-    QString trace3 = QString::fromLatin1("assertFail (%1:%2:%3)\n").arg(testUrl.toString()).arg(47).arg(17);
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace1));
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace2));
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace3));
++    QString assert1 = "This will fail\n" +
++            QString::fromLatin1("onCompleted (%1:%2:%3)").arg(testUrl.toString()).arg(54).arg(17);
++
++    QString assert2 = "This will fail too\n" +
++            QString::fromLatin1("assertFail (%1:%2:%3)\n").arg(testUrl.toString()).arg(47).arg(17) +
++            QString::fromLatin1("onCompleted (%1:%2:%3)").arg(testUrl.toString()).arg(59).arg(9);
++
++    QTest::ignoreMessage(QtCriticalMsg, qPrintable(assert1));
++    QTest::ignoreMessage(QtCriticalMsg, qPrintable(assert2));
+ 
+     QDeclarativeComponent component(&engine, testUrl);
+     QObject *object = component.create();
+@@ -147,14 +149,15 @@ void tst_qdeclarativeconsole::exception()
+     QUrl testUrl = testFileUrl("exception.qml");
+ 
+     // exception()
+-    QTest::ignoreMessage(QtCriticalMsg, "Exception 1");
+-    QTest::ignoreMessage(QtCriticalMsg, "Exception 2");
+-    QString trace1 = QString::fromLatin1("onCompleted (%1:%2:%3)\n").arg(testUrl.toString()).arg(51).arg(21);
+-    QString trace2 = QString::fromLatin1("onCompleted (%1:%2:%3)\n").arg(testUrl.toString()).arg(56).arg(9);
+-    QString trace3 = QString::fromLatin1("exceptionFail (%1:%2:%3)\n").arg(testUrl.toString()).arg(46).arg(17);
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace1));
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace2));
+-    QTest::ignoreMessage(QtDebugMsg, qPrintable(trace3));
++    QString exception1 = "Exception 1\n" +
++            QString::fromLatin1("onCompleted (%1:%2:%3)").arg(testUrl.toString()).arg(51).arg(21);
++
++    QString exception2 = "Exception 2\n" +
++            QString::fromLatin1("exceptionFail (%1:%2:%3)\n").arg(testUrl.toString()).arg(46).arg(17) +
++            QString::fromLatin1("onCompleted (%1:%2:%3)").arg(testUrl.toString()).arg(56).arg(9);
++
++    QTest::ignoreMessage(QtCriticalMsg, qPrintable(exception1));
++    QTest::ignoreMessage(QtCriticalMsg, qPrintable(exception2));
+ 
+     QDeclarativeComponent component(&engine, testUrl);
+     QObject *object = component.create();

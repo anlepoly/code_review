@@ -1,0 +1,395 @@
+diff --git a/src/quick/doc/src/whatsnew.qdoc b/src/quick/doc/src/whatsnew.qdoc
+index 813656c..954506c 100644
+--- a/src/quick/doc/src/whatsnew.qdoc
++++ b/src/quick/doc/src/whatsnew.qdoc
+@@ -321,6 +321,10 @@ the window loses focus.
+     \li New \l{PathView::}{snapMode} property controls the snap model when flicking between items
+     \li If the model is changed after the component is completed, the offset and currentIndex are
+         reset to 0.
++    \li New \l{PathView::}{positionViewAtIndex()} function allows the view to be moved to display
++        the specified index.
++    \li New \l{PathView::}{indexAt()} and \l{PathView::}{itemAt()} functions return the index or
++        item at a specified point in the view.
+     \endlist
+ \endlist
+ 
+diff --git a/src/quick/items/qquickpathview.cpp b/src/quick/items/qquickpathview.cpp
+index 272fdce..c4ee8bc 100644
+--- a/src/quick/items/qquickpathview.cpp
++++ b/src/quick/items/qquickpathview.cpp
+@@ -1214,6 +1214,8 @@ void QQuickPathView::setDelegate(QQmlComponent *delegate)
+ /*!
+   \qmlproperty int QtQuick2::PathView::pathItemCount
+   This property holds the number of items visible on the path at any one time.
++
++  Setting pathItemCount to undefined will show all items on the path.
+ */
+ int QQuickPathView::pathItemCount() const
+ {
+@@ -1236,6 +1238,18 @@ void QQuickPathView::setPathItemCount(int i)
+     emit pathItemCountChanged();
+ }
+ 
++void QQuickPathView::resetPathItemCount()
++{
++    Q_D(QQuickPathView);
++    if (-1 == d->pathItems)
++        return;
++    d->pathItems = -1;
++    d->updateMappedRange();
++    if (d->isValid() && isComponentComplete())
++        d->regenerate();
++    emit pathItemCountChanged();
++}
++
+ /*!
+     \qmlproperty enumeration QtQuick2::PathView::snapMode
+ 
+@@ -1271,6 +1285,142 @@ void QQuickPathView::setSnapMode(SnapMode mode)
+     emit snapModeChanged();
+ }
+ 
++/*!
++    \qmlmethod QtQuick2::PathView::positionViewAtIndex(int index, PositionMode mode)
++
++    Positions the view such that the \a index is at the position specified by
++    \a mode:
++
++    \list
++    \li PathView.Beginning - position item at the beginning of the path.
++    \li PathView.Center - position item in the center of the path.
++    \li PathView.End - position item at the end of the path.
++    \li PathView.Contain - ensure the item is positioned on the path.
++    \li PathView.SnapPosition - position the item at \l preferredHighlightBegin.  This mode
++    is only valid if \l highlightRangeMode is StrictlyEnforceRange or snapping is enabled
++    via \l snapMode.
++    \endlist
++
++    \b Note: methods should only be called after the Component has completed.  To position
++    the view at startup, this method should be called by Component.onCompleted.  For
++    example, to position the view at the end:
++
++    \code
++    Component.onCompleted: positionViewAtIndex(count - 1, PathView.End)
++    \endcode
++*/
++void QQuickPathView::positionViewAtIndex(int index, int mode)
++{
++    Q_D(QQuickPathView);
++    if (!d->isValid())
++        return;
++    if (mode < QQuickPathView::Beginning || mode > QQuickPathView::SnapPosition || mode == 3) // 3 is unused in PathView
++        return;
++
++    if (mode == QQuickPathView::Contain && (d->pathItems < 0 || d->modelCount <= d->pathItems))
++        return;
++
++    int count = d->pathItems == -1 ? d->modelCount : qMin(d->pathItems, d->modelCount);
++    int idx = (index+d->modelCount) % d->modelCount;
++    bool snap = d->haveHighlightRange && (d->highlightRangeMode != QQuickPathView::NoHighlightRange
++            || d->snapMode != QQuickPathView::NoSnap);
++
++    qreal beginOffset;
++    qreal endOffset;
++    if (snap) {
++        beginOffset = d->modelCount - idx - qFloor(count * d->highlightRangeStart);
++        endOffset = beginOffset + count - 1;
++    } else {
++        beginOffset = d->modelCount - idx;
++        // Small offset since the last point coincides with the first and
++        // this the only "end" position that gives the expected visual result.
++        qreal adj = sizeof(qreal) == sizeof(float) ? 0.00001f : 0.000000000001;
++        endOffset = qmlMod(beginOffset + count, d->modelCount) - adj;
++    }
++    qreal offset = d->offset;
++    switch (mode) {
++    case Beginning:
++        offset = beginOffset;
++        break;
++    case End:
++        offset = endOffset;
++        break;
++    case Center:
++        if (beginOffset < endOffset)
++            offset = (beginOffset + endOffset)/2;
++        else
++            offset = (beginOffset + (endOffset + d->modelCount))/2;
++        if (snap)
++            offset = qRound(offset);
++        break;
++    case Contain:
++        if ((beginOffset < endOffset && (d->offset < beginOffset || d->offset > endOffset))
++                || (d->offset < beginOffset && d->offset > endOffset)) {
++            qreal diff1 = qmlMod(beginOffset - d->offset + d->modelCount, d->modelCount);
++            qreal diff2 = qmlMod(d->offset - endOffset + d->modelCount, d->modelCount);
++            if (diff1 < diff2)
++                offset = beginOffset;
++            else
++                offset = endOffset;
++        }
++        break;
++    case SnapPosition:
++        offset = d->modelCount - idx;
++        break;
++    }
++
++    d->tl.clear();
++    setOffset(offset);
++}
++
++/*!
++    \qmlmethod int QtQuick2::PathView::indexAt(int x, int y)
++
++    Returns the index of the item containing the point \a x, \a y in content
++    coordinates.  If there is no item at the point specified, -1 is returned.
++
++    \b Note: methods should only be called after the Component has completed.
++*/
++int QQuickPathView::indexAt(qreal x, qreal y) const
++{
++    Q_D(const QQuickPathView);
++    if (!d->isValid())
++        return -1;
++
++    for (int idx = 0; idx < d->items.count(); ++idx) {
++        QQuickItem *item = d->items.at(idx);
++        QPointF p = item->mapFromItem(this, QPointF(x, y));
++        if (item->contains(p))
++            return (d->firstIndex + idx) % d->modelCount;
++    }
++
++    return -1;
++}
++
++/*!
++    \qmlmethod Item QtQuick2::PathView::itemAt(int x, int y)
++
++    Returns the item containing the point \a x, \a y in content
++    coordinates.  If there is no item at the point specified, null is returned.
++
++    \b Note: methods should only be called after the Component has completed.
++*/
++QQuickItem *QQuickPathView::itemAt(qreal x, qreal y) const
++{
++    Q_D(const QQuickPathView);
++    if (!d->isValid())
++        return 0;
++
++    for (int idx = 0; idx < d->items.count(); ++idx) {
++        QQuickItem *item = d->items.at(idx);
++        QPointF p = item->mapFromItem(this, QPointF(x, y));
++        if (item->contains(p))
++            return item;
++    }
++
++    return 0;
++}
++
+ QPointF QQuickPathViewPrivate::pointNear(const QPointF &point, qreal *nearPercent) const
+ {
+     qreal samples = qMin(path->path().length()/5, qreal(500.0));
+diff --git a/src/quick/items/qquickpathview_p.h b/src/quick/items/qquickpathview_p.h
+index ee24282..7f7f344 100644
+--- a/src/quick/items/qquickpathview_p.h
++++ b/src/quick/items/qquickpathview_p.h
+@@ -83,11 +83,12 @@ class Q_AUTOTEST_EXPORT QQuickPathView : public QQuickItem
+ 
+     Q_PROPERTY(int count READ count NOTIFY countChanged)
+     Q_PROPERTY(QQmlComponent *delegate READ delegate WRITE setDelegate NOTIFY delegateChanged)
+-    Q_PROPERTY(int pathItemCount READ pathItemCount WRITE setPathItemCount NOTIFY pathItemCountChanged)
++    Q_PROPERTY(int pathItemCount READ pathItemCount WRITE setPathItemCount RESET resetPathItemCount NOTIFY pathItemCountChanged)
+     Q_PROPERTY(SnapMode snapMode READ snapMode WRITE setSnapMode NOTIFY snapModeChanged)
+ 
+     Q_ENUMS(HighlightRangeMode)
+     Q_ENUMS(SnapMode)
++    Q_ENUMS(PositionMode)
+ 
+ public:
+     QQuickPathView(QQuickItem *parent=0);
+@@ -147,11 +148,17 @@ public:
+ 
+     int pathItemCount() const;
+     void setPathItemCount(int);
++    void resetPathItemCount();
+ 
+     enum SnapMode { NoSnap, SnapToItem, SnapOneItem };
+     SnapMode snapMode() const;
+     void setSnapMode(SnapMode mode);
+ 
++    enum PositionMode { Beginning, Center, End, Contain=4, SnapPosition }; // 3 == Visible in other views
++    Q_INVOKABLE void positionViewAtIndex(int index, int mode);
++    Q_INVOKABLE int indexAt(qreal x, qreal y) const;
++    Q_INVOKABLE QQuickItem *itemAt(qreal x, qreal y) const;
++
+     static QQuickPathViewAttached *qmlAttachedProperties(QObject *);
+ 
+ public Q_SLOTS:
+diff --git a/tests/auto/quick/qquickpathview/data/pathview3.qml b/tests/auto/quick/qquickpathview/data/pathview3.qml
+index ded5a39..53b4df1 100644
+--- a/tests/auto/quick/qquickpathview/data/pathview3.qml
++++ b/tests/auto/quick/qquickpathview/data/pathview3.qml
+@@ -2,8 +2,10 @@ import QtQuick 2.0
+ 
+ PathView {
+     id: photoPathView
+-    y: 100; width: 800; height: 330; pathItemCount: 4; offset: 1
++    property bool enforceRange: true
++    width: 800; height: 330; pathItemCount: 4; offset: 1
+     dragMargin: 24
++    highlightRangeMode: enforceRange ? PathView.StrictlyEnforceRange : PathView.NoHighlightRange
+     preferredHighlightBegin: 0.50
+     preferredHighlightEnd: 0.50
+ 
+@@ -48,12 +50,17 @@ PathView {
+         id: photoDelegate
+         Rectangle {
+             id: wrapper
++            objectName: "wrapper"
+             width: 85; height: 85; color: lColor
+ 
++            Text { text: index }
++
+             transform: Rotation {
+                 id: itemRotation; origin.x: wrapper.width/2; origin.y: wrapper.height/2
+                 axis.y: 1; axis.z: 0
+             }
+         }
+     }
++
++    Text { text: "Offset: " + photoPathView.offset }
+ }
+diff --git a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+index b6b6d24..c007310 100644
+--- a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
++++ b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+@@ -64,6 +64,7 @@ using namespace QQuickViewTestUtil;
+ using namespace QQuickVisualTestUtil;
+ 
+ Q_DECLARE_METATYPE(QQuickPathView::HighlightRangeMode)
++Q_DECLARE_METATYPE(QQuickPathView::PositionMode)
+ 
+ static void initStandardTreeModel(QStandardItemModel *model)
+ {
+@@ -134,6 +135,10 @@ private slots:
+     void snapToItem_data();
+     void snapOneItem();
+     void snapOneItem_data();
++    void positionViewAtIndex();
++    void positionViewAtIndex_data();
++    void indexAt_itemAt();
++    void indexAt_itemAt_data();
+ };
+ 
+ class TestObject : public QObject
+@@ -1909,6 +1914,112 @@ void tst_QQuickPathView::snapOneItem_data()
+     QTest::newRow("enforce range") << true;
+ }
+ 
++void tst_QQuickPathView::positionViewAtIndex()
++{
++    QFETCH(bool, enforceRange);
++    QFETCH(int, pathItemCount);
++    QFETCH(qreal, initOffset);
++    QFETCH(int, index);
++    QFETCH(QQuickPathView::PositionMode, mode);
++    QFETCH(qreal, offset);
++
++    QQuickView *window = createView();
++    window->setSource(testFileUrl("pathview3.qml"));
++    window->show();
++    window->requestActivateWindow();
++    QTest::qWaitForWindowShown(window);
++    QTRY_COMPARE(window, qGuiApp->focusWindow());
++
++    QQuickPathView *pathview = qobject_cast<QQuickPathView*>(window->rootObject());
++    QVERIFY(pathview != 0);
++
++    window->rootObject()->setProperty("enforceRange", enforceRange);
++    if (pathItemCount == -1)
++        pathview->resetPathItemCount();
++    else
++        pathview->setPathItemCount(pathItemCount);
++    pathview->setOffset(initOffset);
++
++    pathview->positionViewAtIndex(index, mode);
++
++    QCOMPARE(pathview->offset(), offset);
++
++    delete window;
++}
++
++void tst_QQuickPathView::positionViewAtIndex_data()
++{
++    QTest::addColumn<bool>("enforceRange");
++    QTest::addColumn<int>("pathItemCount");
++    QTest::addColumn<qreal>("initOffset");
++    QTest::addColumn<int>("index");
++    QTest::addColumn<QQuickPathView::PositionMode>("mode");
++    QTest::addColumn<qreal>("offset");
++
++    QTest::newRow("no range, all items, Beginning") << false << -1 << 0.0 << 3 << QQuickPathView::Beginning << 5.0;
++    QTest::newRow("no range, all items, Center") << false << -1 << 0.0 << 3 << QQuickPathView::Center << 1.0;
++    QTest::newRow("no range, all items, End") << false << -1 << 0.0 << 3 << QQuickPathView::End << 5.0;
++    QTest::newRow("no range, 5 items, Beginning") << false << 5 << 0.0 << 3 << QQuickPathView::Beginning << 5.0;
++    QTest::newRow("no range, 5 items, Center") << false << 5 << 0.0 << 3 << QQuickPathView::Center << 7.5;
++    QTest::newRow("no range, 5 items, End") << false << 5 << 0.0 << 3 << QQuickPathView::End << 2.0;
++    QTest::newRow("no range, 5 items, Contain") << false << 5 << 0.0 << 3 << QQuickPathView::Contain << 0.0;
++    QTest::newRow("no range, 5 items, init offset 4.0, Contain") << false << 5 << 4.0 << 3 << QQuickPathView::Contain << 5.0;
++    QTest::newRow("no range, 5 items, init offset 3.0, Contain") << false << 5 << 3.0 << 3 << QQuickPathView::Contain << 2.0;
++
++    QTest::newRow("strict range, all items, Beginning") << true << -1 << 0.0 << 3 << QQuickPathView::Beginning << 1.0;
++    QTest::newRow("strict range, all items, Center") << true << -1 << 0.0 << 3 << QQuickPathView::Center << 5.0;
++    QTest::newRow("strict range, all items, End") << true << -1 << 0.0 << 3 << QQuickPathView::End << 0.0;
++    QTest::newRow("strict range, all items, Contain") << true << -1 << 0.0 << 3 << QQuickPathView::Contain << 0.0;
++    QTest::newRow("strict range, all items, init offset 1.0, Contain") << true << -1 << 1.0 << 3 << QQuickPathView::Contain << 1.0;
++    QTest::newRow("strict range, all items, SnapPosition") << true << -1 << 0.0 << 3 << QQuickPathView::SnapPosition << 5.0;
++    QTest::newRow("strict range, 5 items, Beginning") << true << 5 << 0.0 << 3 << QQuickPathView::Beginning << 3.0;
++    QTest::newRow("strict range, 5 items, Center") << true << 5 << 0.0 << 3 << QQuickPathView::Center << 5.0;
++    QTest::newRow("strict range, 5 items, End") << true << 5 << 0.0 << 3 << QQuickPathView::End << 7.0;
++    QTest::newRow("strict range, 5 items, Contain") << true << 5 << 0.0 << 3 << QQuickPathView::Contain << 7.0;
++    QTest::newRow("strict range, 5 items, init offset 1.0, Contain") << true << 5 << 1.0 << 3 << QQuickPathView::Contain << 7.0;
++    QTest::newRow("strict range, 5 items, init offset 2.0, Contain") << true << 5 << 2.0 << 3 << QQuickPathView::Contain << 3.0;
++    QTest::newRow("strict range, 5 items, SnapPosition") << true << 5 << 0.0 << 3 << QQuickPathView::SnapPosition << 5.0;
++}
++
++void tst_QQuickPathView::indexAt_itemAt()
++{
++    QFETCH(qreal, x);
++    QFETCH(qreal, y);
++    QFETCH(int, index);
++
++    QQuickView *window = createView();
++    window->setSource(testFileUrl("pathview3.qml"));
++    window->show();
++    window->requestActivateWindow();
++    QTest::qWaitForWindowShown(window);
++    QTRY_COMPARE(window, qGuiApp->focusWindow());
++
++    QQuickPathView *pathview = qobject_cast<QQuickPathView*>(window->rootObject());
++    QVERIFY(pathview != 0);
++
++    QQuickItem *item = 0;
++    if (index >= 0) {
++        item = findItem<QQuickItem>(pathview, "wrapper", index);
++        QVERIFY(item);
++    }
++    QCOMPARE(pathview->indexAt(x,y), index);
++    QVERIFY(pathview->itemAt(x,y) == item);
++
++    delete window;
++}
++
++void tst_QQuickPathView::indexAt_itemAt_data()
++{
++    QTest::addColumn<qreal>("x");
++    QTest::addColumn<qreal>("y");
++    QTest::addColumn<int>("index");
++
++    QTest::newRow("Item 0 - 585, 95") << 585. << 95. << 0;
++    QTest::newRow("Item 0 - 660, 165") << 660. << 165. << 0;
++    QTest::newRow("No Item a - 580, 95") << 580. << 95. << -1;
++    QTest::newRow("No Item b - 585, 85") << 585. << 85. << -1;
++    QTest::newRow("Item 7 - 360, 200") << 360. << 200. << 7;
++}
+ 
+ QTEST_MAIN(tst_QQuickPathView)

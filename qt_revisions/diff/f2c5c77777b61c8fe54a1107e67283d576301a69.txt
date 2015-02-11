@@ -1,0 +1,303 @@
+diff --git a/src/declarative/qml/qdeclarativeincubator.cpp b/src/declarative/qml/qdeclarativeincubator.cpp
+index 38f172f..6d39fc7 100644
+--- a/src/declarative/qml/qdeclarativeincubator.cpp
++++ b/src/declarative/qml/qdeclarativeincubator.cpp
+@@ -376,17 +376,18 @@ void QDeclarativeIncubationController::incubateFor(int msecs)
+ 
+ /*!
+ Incubate objects while the bool pointed to by \a flag is true, or until there are no
+-more objects to incubate.
++more objects to incubate, or up to msecs if msecs is not zero.
+ 
+ Generally this method is used in conjunction with a thread or a UNIX signal that sets
+ the bool pointed to by \a flag to false when it wants incubation to be interrupted.
+ */
+-void QDeclarativeIncubationController::incubateWhile(bool *flag)
++void QDeclarativeIncubationController::incubateWhile(volatile bool *flag, int msecs)
+ {
+     if (!d || d->incubatorCount == 0)
+         return;
+ 
+-    QDeclarativeVME::Interrupt i(flag);
++    QDeclarativeVME::Interrupt i(flag, msecs * 1000000);
++    i.reset();
+     do {
+         QDeclarativeIncubatorPrivate *p = (QDeclarativeIncubatorPrivate*)d->incubatorList.first();
+         p->incubate(i);
+diff --git a/src/declarative/qml/qdeclarativeincubator.h b/src/declarative/qml/qdeclarativeincubator.h
+index cabd7e2..dca5c3a 100644
+--- a/src/declarative/qml/qdeclarativeincubator.h
++++ b/src/declarative/qml/qdeclarativeincubator.h
+@@ -110,7 +110,7 @@ public:
+     int incubatingObjectCount() const;
+ 
+     void incubateFor(int msecs);
+-    void incubateWhile(bool *flag);
++    void incubateWhile(volatile bool *flag, int msecs=0);
+ 
+ protected:
+     virtual void incubatingObjectCountChanged(int);
+diff --git a/src/declarative/qml/qdeclarativevme_p.h b/src/declarative/qml/qdeclarativevme_p.h
+index d413555..1f2f861 100644
+--- a/src/declarative/qml/qdeclarativevme_p.h
++++ b/src/declarative/qml/qdeclarativevme_p.h
+@@ -97,7 +97,7 @@ public:
+     class Interrupt {
+     public:
+         inline Interrupt();
+-        inline Interrupt(bool *runWhile);
++        inline Interrupt(volatile bool *runWhile, int nsecs=0);
+         inline Interrupt(int nsecs);
+ 
+         inline void reset();
+@@ -105,13 +105,11 @@ public:
+     private:
+         enum Mode { None, Time, Flag };
+         Mode mode;
+-        union {
+-            struct {
+-                QElapsedTimer timer;
+-                int nsecs;
+-            };
+-            bool *runWhile;
++        struct {
++            QElapsedTimer timer;
++            int nsecs;
+         };
++        volatile bool *runWhile;
+     };
+ 
+     QDeclarativeVME() : data(0), componentAttached(0) {}
+@@ -202,23 +200,23 @@ private:
+ };
+ 
+ QDeclarativeVME::Interrupt::Interrupt()
+-: mode(None)
++    : mode(None), nsecs(0), runWhile(0)
+ {
+ }
+ 
+-QDeclarativeVME::Interrupt::Interrupt(bool *runWhile)
+-: mode(Flag), runWhile(runWhile)
++QDeclarativeVME::Interrupt::Interrupt(volatile bool *runWhile, int nsecs)
++    : mode(Flag), nsecs(nsecs), runWhile(runWhile)
+ {
+ }
+ 
+ QDeclarativeVME::Interrupt::Interrupt(int nsecs)
+-: mode(Time), nsecs(nsecs)
++    : mode(Time), nsecs(nsecs), runWhile(0)
+ {
+ }
+ 
+ void QDeclarativeVME::Interrupt::reset()
+ {
+-    if (mode == Time) 
++    if (mode == Time || nsecs)
+         timer.start();
+ }
+ 
+@@ -229,7 +227,7 @@ bool QDeclarativeVME::Interrupt::shouldInterrupt() const
+     } else if (mode == Time) {
+         return timer.nsecsElapsed() > nsecs;
+     } else if (mode == Flag) {
+-        return !*runWhile;
++        return !*runWhile || (nsecs && timer.nsecsElapsed() > nsecs);
+     } else {
+         return false;
+     }
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 6b0eb5b..e6a3e87 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -94,11 +94,10 @@ protected:
+     {
+         if (e->type() == QEvent::User) {
+             Q_ASSERT(m_eventSent);
+-
+-            bool *amtp = m_canvas->windowManager->allowMainThreadProcessing();
++            volatile bool *amtp = m_canvas->windowManager->allowMainThreadProcessing();
+             while (incubatingObjectCount()) {
+                 if (amtp)
+-                    incubateWhile(amtp);
++                    incubateWhile(amtp, 2);
+                 else
+                     incubateFor(5);
+                 QCoreApplication::processEvents();
+@@ -115,6 +114,8 @@ protected:
+             m_eventSent = true;
+             QCoreApplication::postEvent(this, new QEvent(QEvent::User));
+         }
++        // If no animations are running, the renderer may be waiting
++        m_canvas->windowManager->wakeup();
+     }
+ 
+ private:
+diff --git a/src/quick/items/qquickitemview.cpp b/src/quick/items/qquickitemview.cpp
+index f62fa94..d5ce567 100644
+--- a/src/quick/items/qquickitemview.cpp
++++ b/src/quick/items/qquickitemview.cpp
+@@ -2162,6 +2162,12 @@ void QQuickItemViewPrivate::clear()
+     createHighlight();
+     trackedItem = 0;
+ 
++    if (requestedIndex >= 0 && requestedAsync) {
++        if (model)
++            model->cancel(requestedIndex);
++        requestedIndex = -1;
++    }
++
+     markExtentsDirty();
+     itemCount = 0;
+ }
+diff --git a/src/quick/items/qquickvisualdatamodel.cpp b/src/quick/items/qquickvisualdatamodel.cpp
+index 4fdcc98..0bdf0cb 100644
+--- a/src/quick/items/qquickvisualdatamodel.cpp
++++ b/src/quick/items/qquickvisualdatamodel.cpp
+@@ -450,6 +450,21 @@ QQuickVisualDataModel::ReleaseFlags QQuickVisualDataModel::release(QQuickItem *i
+     return stat;
+ }
+ 
++// Cancel a requested async item
++void QQuickVisualDataModel::cancel(int index)
++{
++    Q_D(QQuickVisualDataModel);
++    if (!d->m_delegate || index < 0 || index >= d->m_compositor.count(d->m_compositorGroup)) {
++        qWarning() << "VisualDataModel::cancel: index out range" << index << d->m_compositor.count(d->m_compositorGroup);
++        return;
++    }
++
++    Compositor::iterator it = d->m_compositor.find(d->m_compositorGroup, index);
++    QQuickVisualDataModelItem *cacheItem = it->inCache() ? d->m_cache.at(it.cacheIndex) : 0;
++    if (cacheItem && cacheItem->incubationTask)
++        d->releaseIncubator(cacheItem->incubationTask);
++}
++
+ void QQuickVisualDataModelPrivate::group_append(
+         QDeclarativeListProperty<QQuickVisualDataGroup> *property, QQuickVisualDataGroup *group)
+ {
+@@ -708,8 +723,10 @@ void QQuickVisualDataModelPrivate::incubatorStatusChanged(QVDMIncubationTask *in
+         incubationTask->incubatingContext = 0;
+         if (!cacheItem->isReferenced()) {
+             int cidx = m_cache.indexOf(cacheItem);
+-            m_compositor.clearFlags(Compositor::Cache, cidx, 1, Compositor::CacheFlag);
+-            m_cache.removeAt(cidx);
++            if (cidx >= 0) {
++                m_compositor.clearFlags(Compositor::Cache, cidx, 1, Compositor::CacheFlag);
++                m_cache.removeAt(cidx);
++            }
+             delete cacheItem;
+             Q_ASSERT(m_cache.count() == m_compositor.count(Compositor::Cache));
+         }
+diff --git a/src/quick/items/qquickvisualdatamodel_p.h b/src/quick/items/qquickvisualdatamodel_p.h
+index 54cc16d..043fcfd 100644
+--- a/src/quick/items/qquickvisualdatamodel_p.h
++++ b/src/quick/items/qquickvisualdatamodel_p.h
+@@ -106,6 +106,7 @@ public:
+     bool isValid() const { return delegate() != 0; }
+     QQuickItem *item(int index, bool asynchronous=false);
+     ReleaseFlags release(QQuickItem *item);
++    void cancel(int index);
+     virtual QString stringValue(int index, const QString &role);
+     virtual void setWatchedRoles(QList<QByteArray> roles);
+ 
+diff --git a/src/quick/items/qquickvisualitemmodel_p.h b/src/quick/items/qquickvisualitemmodel_p.h
+index f1c9d06..7d2b79f 100644
+--- a/src/quick/items/qquickvisualitemmodel_p.h
++++ b/src/quick/items/qquickvisualitemmodel_p.h
+@@ -69,6 +69,7 @@ public:
+     virtual bool isValid() const = 0;
+     virtual QQuickItem *item(int index, bool asynchronous=false) = 0;
+     virtual ReleaseFlags release(QQuickItem *item) = 0;
++    virtual void cancel(int) {}
+     virtual QString stringValue(int, const QString &) = 0;
+     virtual void setWatchedRoles(QList<QByteArray> roles) = 0;
+ 
+diff --git a/src/quick/items/qquickwindowmanager.cpp b/src/quick/items/qquickwindowmanager.cpp
+index 16b6d92..79fd266 100644
+--- a/src/quick/items/qquickwindowmanager.cpp
++++ b/src/quick/items/qquickwindowmanager.cpp
+@@ -193,6 +193,7 @@ public:
+     void resize(QQuickCanvas *canvas, const QSize &size);
+     void handleDeferredUpdate();
+     void maybeUpdate(QQuickCanvas *canvas);
++    void wakeup();
+ 
+     void startRendering();
+     void stopRendering();
+@@ -202,7 +203,7 @@ public:
+ 
+     void initialize();
+ 
+-    bool *allowMainThreadProcessing() { return &allowMainThreadProcessingFlag; }
++    volatile bool *allowMainThreadProcessing() { return &allowMainThreadProcessingFlag; }
+ 
+     bool event(QEvent *);
+ 
+@@ -243,7 +244,7 @@ private:
+     QMutex mutex;
+     QWaitCondition condition;
+ 
+-    bool allowMainThreadProcessingFlag;
++    volatile bool allowMainThreadProcessingFlag;
+ 
+     int isGuiLocked;
+     uint animationRunning: 1;
+@@ -299,12 +300,13 @@ public:
+     void paint(QQuickCanvas *canvas);
+     QImage grab(QQuickCanvas *canvas);
+     void resize(QQuickCanvas *canvas, const QSize &size);
++    void wakeup();
+ 
+     void maybeUpdate(QQuickCanvas *canvas);
+ 
+     void releaseResources() { }
+ 
+-    bool *allowMainThreadProcessing();
++    volatile bool *allowMainThreadProcessing();
+ 
+     QSGContext *sceneGraphContext() const;
+ 
+@@ -1129,6 +1131,14 @@ void QQuickRenderThreadSingleContextWindowManager::maybeUpdate(QQuickCanvas *)
+ 
+ }
+ 
++void QQuickRenderThreadSingleContextWindowManager::wakeup()
++{
++    lockInGui();
++    if (isRenderBlocked)
++        wake();
++    unlockInGui();
++}
++
+ QQuickTrivialWindowManager::QQuickTrivialWindowManager()
+     : gl(0)
+     , eventPending(false)
+@@ -1268,9 +1278,11 @@ void QQuickTrivialWindowManager::maybeUpdate(QQuickCanvas *canvas)
+     }
+ }
+ 
++void QQuickTrivialWindowManager::wakeup()
++{
++}
+ 
+-
+-bool *QQuickTrivialWindowManager::allowMainThreadProcessing()
++volatile bool *QQuickTrivialWindowManager::allowMainThreadProcessing()
+ {
+     return 0;
+ }
+diff --git a/src/quick/items/qquickwindowmanager_p.h b/src/quick/items/qquickwindowmanager_p.h
+index 8631265..a0bdf08 100644
+--- a/src/quick/items/qquickwindowmanager_p.h
++++ b/src/quick/items/qquickwindowmanager_p.h
+@@ -64,8 +64,9 @@ public:
+     virtual void resize(QQuickCanvas *canvas, const QSize &size) = 0;
+ 
+     virtual void maybeUpdate(QQuickCanvas *canvas) = 0;
++    virtual void wakeup() = 0;
+ 
+-    virtual bool *allowMainThreadProcessing() = 0;
++    virtual volatile bool *allowMainThreadProcessing() = 0;
+ 
+     virtual QSGContext *sceneGraphContext() const = 0;

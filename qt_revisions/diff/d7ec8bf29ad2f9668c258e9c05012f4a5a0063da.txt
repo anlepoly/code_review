@@ -1,0 +1,527 @@
+diff --git a/src/corelib/io/qfilesystemwatcher.cpp b/src/corelib/io/qfilesystemwatcher.cpp
+index 580239d..85b27c9 100644
+--- a/src/corelib/io/qfilesystemwatcher.cpp
++++ b/src/corelib/io/qfilesystemwatcher.cpp
+@@ -220,14 +220,10 @@ QFileSystemWatcher::~QFileSystemWatcher()
+ {
+     Q_D(QFileSystemWatcher);
+     if (d->native) {
+-        d->native->stop();
+-        d->native->wait();
+         delete d->native;
+         d->native = 0;
+     }
+     if (d->poller) {
+-        d->poller->stop();
+-        d->poller->wait();
+         delete d->poller;
+         d->poller = 0;
+     }
+diff --git a/src/corelib/io/qfilesystemwatcher_inotify.cpp b/src/corelib/io/qfilesystemwatcher_inotify.cpp
+index 79d7d7c..c1314e6 100644
+--- a/src/corelib/io/qfilesystemwatcher_inotify.cpp
++++ b/src/corelib/io/qfilesystemwatcher_inotify.cpp
+@@ -226,10 +226,10 @@ QInotifyFileSystemWatcherEngine *QInotifyFileSystemWatcherEngine::create()
+ 
+ QInotifyFileSystemWatcherEngine::QInotifyFileSystemWatcherEngine(int fd)
+     : inotifyFd(fd)
++    , notifier(fd, QSocketNotifier::Read, this)
+ {
+     fcntl(inotifyFd, F_SETFD, FD_CLOEXEC);
+-
+-    moveToThread(this);
++    connect(&notifier, SIGNAL(activated(int)), SLOT(readFromInotify()));
+ }
+ 
+ QInotifyFileSystemWatcherEngine::~QInotifyFileSystemWatcherEngine()
+@@ -240,13 +240,6 @@ QInotifyFileSystemWatcherEngine::~QInotifyFileSystemWatcherEngine()
+     ::close(inotifyFd);
+ }
+ 
+-void QInotifyFileSystemWatcherEngine::run()
+-{
+-    QSocketNotifier sn(inotifyFd, QSocketNotifier::Read, this);
+-    connect(&sn, SIGNAL(activated(int)), SLOT(readFromInotify()));
+-    (void) exec();
+-}
+-
+ QStringList QInotifyFileSystemWatcherEngine::addPaths(const QStringList &paths,
+                                                       QStringList *files,
+                                                       QStringList *directories)
+@@ -302,8 +295,6 @@ QStringList QInotifyFileSystemWatcherEngine::addPaths(const QStringList &paths,
+         idToPath.insert(id, path);
+     }
+ 
+-    start();
+-
+     return p;
+ }
+ 
+@@ -337,11 +328,6 @@ QStringList QInotifyFileSystemWatcherEngine::removePaths(const QStringList &path
+     return p;
+ }
+ 
+-void QInotifyFileSystemWatcherEngine::stop()
+-{
+-    quit();
+-}
+-
+ void QInotifyFileSystemWatcherEngine::readFromInotify()
+ {
+     QMutexLocker locker(&mutex);
+diff --git a/src/corelib/io/qfilesystemwatcher_inotify_p.h b/src/corelib/io/qfilesystemwatcher_inotify_p.h
+index 7d45711..24fc88f 100644
+--- a/src/corelib/io/qfilesystemwatcher_inotify_p.h
++++ b/src/corelib/io/qfilesystemwatcher_inotify_p.h
+@@ -57,8 +57,9 @@
+ 
+ #ifndef QT_NO_FILESYSTEMWATCHER
+ 
+-#include <qhash.h>
+-#include <qmutex.h>
++#include <QtCore/qhash.h>
++#include <QtCore/qmutex.h>
++#include <QtCore/qsocketnotifier.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -71,13 +72,9 @@ public:
+ 
+     static QInotifyFileSystemWatcherEngine *create();
+ 
+-    void run();
+-
+     QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories);
+     QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories);
+ 
+-    void stop();
+-
+ private Q_SLOTS:
+     void readFromInotify();
+ 
+@@ -87,6 +84,7 @@ private:
+     QMutex mutex;
+     QHash<QString, int> pathToID;
+     QHash<int, QString> idToPath;
++    QSocketNotifier notifier;
+ };
+ 
+ 
+diff --git a/src/corelib/io/qfilesystemwatcher_kqueue.cpp b/src/corelib/io/qfilesystemwatcher_kqueue.cpp
+index 7379c69..2f62176 100644
+--- a/src/corelib/io/qfilesystemwatcher_kqueue.cpp
++++ b/src/corelib/io/qfilesystemwatcher_kqueue.cpp
+@@ -77,39 +77,16 @@ QKqueueFileSystemWatcherEngine *QKqueueFileSystemWatcherEngine::create()
+ 
+ QKqueueFileSystemWatcherEngine::QKqueueFileSystemWatcherEngine(int kqfd)
+     : kqfd(kqfd)
++    , notifier(kqfd, QSocketNotifier::Read, this)
+ {
+-    fcntl(kqfd, F_SETFD, FD_CLOEXEC);
++    connect(&notifier, SIGNAL(activated(int)), SLOT(readFromKqueue()));
+ 
+-    if (pipe(kqpipe) == -1) {
+-        perror("QKqueueFileSystemWatcherEngine: cannot create pipe");
+-        kqpipe[0] = kqpipe[1] = -1;
+-        return;
+-    }
+-    fcntl(kqpipe[0], F_SETFD, FD_CLOEXEC);
+-    fcntl(kqpipe[1], F_SETFD, FD_CLOEXEC);
+-
+-    struct kevent kev;
+-    EV_SET(&kev,
+-           kqpipe[0],
+-           EVFILT_READ,
+-           EV_ADD | EV_ENABLE,
+-           0,
+-           0,
+-           0);
+-    if (kevent(kqfd, &kev, 1, 0, 0, 0) == -1) {
+-        perror("QKqueueFileSystemWatcherEngine: cannot watch pipe, kevent returned");
+-        return;
+-    }
++    fcntl(kqfd, F_SETFD, FD_CLOEXEC);
+ }
+ 
+ QKqueueFileSystemWatcherEngine::~QKqueueFileSystemWatcherEngine()
+ {
+-    stop();
+-    wait();
+-
+     close(kqfd);
+-    close(kqpipe[0]);
+-    close(kqpipe[1]);
+ 
+     foreach (int id, pathToID)
+         ::close(id < 0 ? -id : id);
+@@ -192,11 +169,6 @@ QStringList QKqueueFileSystemWatcherEngine::addPaths(const QStringList &paths,
+         }
+     }
+ 
+-    if (!isRunning())
+-        start();
+-    else
+-        write(kqpipe[1], "@", 1);
+-
+     return p;
+ }
+ 
+@@ -230,102 +202,66 @@ QStringList QKqueueFileSystemWatcherEngine::removePaths(const QStringList &paths
+         isEmpty = pathToID.isEmpty();
+     }
+ 
+-    if (isEmpty) {
+-        stop();
+-        wait();
+-    } else {
+-        write(kqpipe[1], "@", 1);
+-    }
+-
+     return p;
+ }
+ 
+-void QKqueueFileSystemWatcherEngine::stop()
+-{
+-    write(kqpipe[1], "q", 1);
+-}
+-
+-void QKqueueFileSystemWatcherEngine::run()
++void QKqueueFileSystemWatcherEngine::readFromKqueue()
+ {
+     forever {
++        DEBUG() << "QKqueueFileSystemWatcherEngine: polling for changes";
+         int r;
+         struct kevent kev;
+-        DEBUG() << "QKqueueFileSystemWatcherEngine: waiting for kevents...";
+-        EINTR_LOOP(r, kevent(kqfd, 0, 0, &kev, 1, 0));
++        struct timespec ts = { 0, 0 }; // 0 ts, because we want to poll
++        EINTR_LOOP(r, kevent(kqfd, 0, 0, &kev, 1, &ts));
+         if (r < 0) {
+             perror("QKqueueFileSystemWatcherEngine: error during kevent wait");
+             return;
++        } else if (r == 0) {
++            // polling returned no events, so stop
++            break;
+         } else {
+             int fd = kev.ident;
+ 
+             DEBUG() << "QKqueueFileSystemWatcherEngine: processing kevent" << kev.ident << kev.filter;
+-            if (fd == kqpipe[0]) {
+-                // read all pending data from the pipe
+-                QByteArray ba;
+-                ba.resize(kev.data);
+-                if (read(kqpipe[0], ba.data(), ba.size()) != ba.size()) {
+-                    perror("QKqueueFileSystemWatcherEngine: error reading from pipe");
+-                    return;
+-                }
+-                // read the command from the buffer (but break and return on 'q')
+-                char cmd = 0;
+-                for (int i = 0; i < ba.size(); ++i) {
+-                    cmd = ba.constData()[i];
+-                    if (cmd == 'q')
+-                        break;
+-                }
+-                // handle the command
+-                switch (cmd) {
+-                case 'q':
+-                    DEBUG() << "QKqueueFileSystemWatcherEngine: thread received 'q', exiting...";
+-                    return;
+-                case '@':
+-                    DEBUG() << "QKqueueFileSystemWatcherEngine: thread received '@', continuing...";
+-                    break;
+-                default:
+-                    DEBUG() << "QKqueueFileSystemWatcherEngine: thread received unknow message" << cmd;
+-                    break;
+-                }
+-            } else {
+-                QMutexLocker locker(&mutex);
+-
+-                int id = fd;
+-                QString path = idToPath.value(id);
++            QMutexLocker locker(&mutex);
++
++            int id = fd;
++            QString path = idToPath.value(id);
++            if (path.isEmpty()) {
++                // perhaps a directory?
++                id = -id;
++                path = idToPath.value(id);
+                 if (path.isEmpty()) {
+-                    // perhaps a directory?
+-                    id = -id;
+-                    path = idToPath.value(id);
+-                    if (path.isEmpty()) {
+-                        DEBUG() << "QKqueueFileSystemWatcherEngine: received a kevent for a file we're not watching";
+-                        continue;
+-                    }
+-                }
+-                if (kev.filter != EVFILT_VNODE) {
+-                    DEBUG() << "QKqueueFileSystemWatcherEngine: received a kevent with the wrong filter";
++                    DEBUG() << "QKqueueFileSystemWatcherEngine: received a kevent for a file we're not watching";
+                     continue;
+                 }
++            }
++            if (kev.filter != EVFILT_VNODE) {
++                DEBUG() << "QKqueueFileSystemWatcherEngine: received a kevent with the wrong filter";
++                continue;
++            }
+ 
+-                if ((kev.fflags & (NOTE_DELETE | NOTE_REVOKE | NOTE_RENAME)) != 0) {
+-                    DEBUG() << path << "removed, removing watch also";
++            if ((kev.fflags & (NOTE_DELETE | NOTE_REVOKE | NOTE_RENAME)) != 0) {
++                DEBUG() << path << "removed, removing watch also";
+ 
+-                    pathToID.remove(path);
+-                    idToPath.remove(id);
+-                    ::close(fd);
++                pathToID.remove(path);
++                idToPath.remove(id);
++                ::close(fd);
+ 
+-                    if (id < 0)
+-                        emit directoryChanged(path, true);
+-                    else
+-                        emit fileChanged(path, true);
+-                } else {
+-                    DEBUG() << path << "changed";
+-
+-                    if (id < 0)
+-                        emit directoryChanged(path, false);
+-                    else
+-                        emit fileChanged(path, false);
+-                }
++                if (id < 0)
++                    emit directoryChanged(path, true);
++                else
++                    emit fileChanged(path, true);
++            } else {
++                DEBUG() << path << "changed";
++
++                if (id < 0)
++                    emit directoryChanged(path, false);
++                else
++                    emit fileChanged(path, false);
+             }
+         }
++
+     }
+ }
+ 
+diff --git a/src/corelib/io/qfilesystemwatcher_kqueue_p.h b/src/corelib/io/qfilesystemwatcher_kqueue_p.h
+index 13c72d1..6e36bcd 100644
+--- a/src/corelib/io/qfilesystemwatcher_kqueue_p.h
++++ b/src/corelib/io/qfilesystemwatcher_kqueue_p.h
+@@ -59,6 +59,7 @@
+ #include <QtCore/qmutex.h>
+ #include <QtCore/qthread.h>
+ #include <QtCore/qvector.h>
++#include <QtCore/qsocketnotifier.h>
+ 
+ #ifndef QT_NO_FILESYSTEMWATCHER
+ struct kevent;
+@@ -76,19 +77,18 @@ public:
+     QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories);
+     QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories);
+ 
+-    void stop();
++private Q_SLOTS:
++    void readFromKqueue();
+ 
+ private:
+     QKqueueFileSystemWatcherEngine(int kqfd);
+ 
+-    void run();
+-
+     int kqfd;
+-    int kqpipe[2];
+ 
+     QMutex mutex;
+     QHash<QString, int> pathToID;
+     QHash<int, QString> idToPath;
++    QSocketNotifier notifier;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/corelib/io/qfilesystemwatcher_p.h b/src/corelib/io/qfilesystemwatcher_p.h
+index cf0f283..0f1032c 100644
+--- a/src/corelib/io/qfilesystemwatcher_p.h
++++ b/src/corelib/io/qfilesystemwatcher_p.h
+@@ -60,19 +60,16 @@
+ #include <private/qobject_p.h>
+ 
+ #include <QtCore/qstringlist.h>
+-#include <QtCore/qthread.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QFileSystemWatcherEngine : public QThread
++class QFileSystemWatcherEngine : public QObject
+ {
+     Q_OBJECT
+ 
+ protected:
+-    inline QFileSystemWatcherEngine(bool move = true)
++    inline QFileSystemWatcherEngine()
+     {
+-        if (move)
+-            moveToThread(this);
+     }
+ 
+ public:
+@@ -88,8 +85,6 @@ public:
+                                     QStringList *files,
+                                     QStringList *directories) = 0;
+ 
+-    virtual void stop() = 0;
+-
+ Q_SIGNALS:
+     void fileChanged(const QString &path, bool removed);
+     void directoryChanged(const QString &path, bool removed);
+diff --git a/src/corelib/io/qfilesystemwatcher_polling.cpp b/src/corelib/io/qfilesystemwatcher_polling.cpp
+index 54bdfaf..3d55c6d 100644
+--- a/src/corelib/io/qfilesystemwatcher_polling.cpp
++++ b/src/corelib/io/qfilesystemwatcher_polling.cpp
+@@ -45,18 +45,9 @@
+ QT_BEGIN_NAMESPACE
+ 
+ QPollingFileSystemWatcherEngine::QPollingFileSystemWatcherEngine()
++    : timer(this)
+ {
+-#ifndef QT_NO_THREAD
+-    moveToThread(this);
+-#endif
+-}
+-
+-void QPollingFileSystemWatcherEngine::run()
+-{
+-    QTimer timer;
+     connect(&timer, SIGNAL(timeout()), SLOT(timeout()));
+-    timer.start(PollingInterval);
+-    (void) exec();
+ }
+ 
+ QStringList QPollingFileSystemWatcherEngine::addPaths(const QStringList &paths,
+@@ -84,7 +75,13 @@ QStringList QPollingFileSystemWatcherEngine::addPaths(const QStringList &paths,
+         }
+         it.remove();
+     }
+-    start();
++
++    if ((!this->files.isEmpty() ||
++         !this->directories.isEmpty()) &&
++        !timer.isActive()) {
++        timer.start(PollingInterval);
++    }
++
+     return p;
+ }
+ 
+@@ -105,17 +102,13 @@ QStringList QPollingFileSystemWatcherEngine::removePaths(const QStringList &path
+             it.remove();
+         }
+     }
+-    if (this->files.isEmpty() && this->directories.isEmpty()) {
+-        locker.unlock();
+-        stop();
+-        wait();
++
++    if (this->files.isEmpty() &&
++        this->directories.isEmpty()) {
++        timer.stop();
+     }
+-    return p;
+-}
+ 
+-void QPollingFileSystemWatcherEngine::stop()
+-{
+-    quit();
++    return p;
+ }
+ 
+ void QPollingFileSystemWatcherEngine::timeout()
+diff --git a/src/corelib/io/qfilesystemwatcher_polling_p.h b/src/corelib/io/qfilesystemwatcher_polling_p.h
+index 740dcc2..1fae542 100644
+--- a/src/corelib/io/qfilesystemwatcher_polling_p.h
++++ b/src/corelib/io/qfilesystemwatcher_polling_p.h
+@@ -57,6 +57,7 @@
+ #include <QtCore/qmutex.h>
+ #include <QtCore/qdatetime.h>
+ #include <QtCore/qdir.h>
++#include <QtCore/qtimer.h>
+ 
+ #include "qfilesystemwatcher_p.h"
+ 
+@@ -110,15 +111,14 @@ class QPollingFileSystemWatcherEngine : public QFileSystemWatcherEngine
+ public:
+     QPollingFileSystemWatcherEngine();
+ 
+-    void run();
+-
+     QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories);
+     QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories);
+ 
+-    void stop();
+-
+ private Q_SLOTS:
+     void timeout();
++
++private:
++    QTimer timer;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/corelib/io/qfilesystemwatcher_win.cpp b/src/corelib/io/qfilesystemwatcher_win.cpp
+index 270ed31..4f2ff93 100644
+--- a/src/corelib/io/qfilesystemwatcher_win.cpp
++++ b/src/corelib/io/qfilesystemwatcher_win.cpp
+@@ -53,22 +53,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-void QWindowsFileSystemWatcherEngine::stop()
+-{
+-    foreach(QWindowsFileSystemWatcherEngineThread *thread, threads)
+-        thread->stop();
+-}
+-
+-QWindowsFileSystemWatcherEngine::QWindowsFileSystemWatcherEngine()
+-    : QFileSystemWatcherEngine(false)
+-{
+-}
+-
+ QWindowsFileSystemWatcherEngine::~QWindowsFileSystemWatcherEngine()
+ {
+-    if (threads.isEmpty())
+-        return;
+-
+     foreach(QWindowsFileSystemWatcherEngineThread *thread, threads) {
+         thread->stop();
+         thread->wait();
+diff --git a/src/corelib/io/qfilesystemwatcher_win_p.h b/src/corelib/io/qfilesystemwatcher_win_p.h
+index e0b0b0b..4da29bb 100644
+--- a/src/corelib/io/qfilesystemwatcher_win_p.h
++++ b/src/corelib/io/qfilesystemwatcher_win_p.h
+@@ -60,6 +60,7 @@
+ #include <qt_windows.h>
+ 
+ #include <QtCore/qdatetime.h>
++#include <QtCore/qthread.h>
+ #include <QtCore/qfile.h>
+ #include <QtCore/qfileinfo.h>
+ #include <QtCore/qhash.h>
+@@ -78,15 +79,11 @@ class QWindowsFileSystemWatcherEngine : public QFileSystemWatcherEngine
+ {
+     Q_OBJECT
+ public:
+-    QWindowsFileSystemWatcherEngine();
+     ~QWindowsFileSystemWatcherEngine();
+ 
+     QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories);
+     QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories);
+ 
+-    void stop();
+-
+-
+     class Handle
+     {
+     public:

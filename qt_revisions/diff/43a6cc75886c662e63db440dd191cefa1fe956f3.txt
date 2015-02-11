@@ -1,0 +1,3383 @@
+diff --git a/src/qml/qml/ftw/qqmlrefcount_p.h b/src/qml/qml/ftw/qqmlrefcount_p.h
+index 497f4ec..ce94f1a 100644
+--- a/src/qml/qml/ftw/qqmlrefcount_p.h
++++ b/src/qml/qml/ftw/qqmlrefcount_p.h
+@@ -68,6 +68,7 @@ public:
+     inline virtual ~QQmlRefCount();
+     inline void addref();
+     inline void release();
++    inline int count() const;
+ 
+ protected:
+     inline virtual void destroy();
+@@ -124,6 +125,11 @@ void QQmlRefCount::release()
+         destroy(); 
+ }
+ 
++int QQmlRefCount::count() const
++{
++    return refCount.load();
++}
++
+ void QQmlRefCount::destroy() 
+ { 
+     delete this; 
+diff --git a/src/qml/qml/qqmlbinding.cpp b/src/qml/qml/qqmlbinding.cpp
+index 1e25c15..2c2c801 100644
+--- a/src/qml/qml/qqmlbinding.cpp
++++ b/src/qml/qml/qqmlbinding.cpp
+@@ -65,21 +65,21 @@ QQmlBinding::createBinding(Identifier id, QObject *obj, QQmlContext *ctxt,
+     if (id < 0)
+         return 0;
+ 
+-    QQmlContextData *ctxtdata = QQmlContextData::get(ctxt);
++    QQmlBinding *rv = 0;
+ 
++    QQmlContextData *ctxtdata = QQmlContextData::get(ctxt);
+     QQmlEnginePrivate *engine = QQmlEnginePrivate::get(ctxt->engine());
+-    QQmlCompiledData *cdata = 0;
+-    QQmlTypeData *typeData = 0;
+     if (engine && ctxtdata && !ctxtdata->url.isEmpty()) {
+-        typeData = engine->typeLoader.get(ctxtdata->url);
+-        cdata = typeData->compiledData();
+-    }
+-    QQmlBinding *rv = cdata ? new QQmlBinding(cdata->primitives.at(id), true, obj, ctxtdata,
+-                                              url, lineNumber, 0) : 0;
+-    if (cdata)
+-        cdata->release();
+-    if (typeData)
++        QQmlTypeData *typeData = engine->typeLoader.getType(ctxtdata->url);
++        Q_ASSERT(typeData);
++
++        if (QQmlCompiledData *cdata = typeData->compiledData()) {
++            rv = new QQmlBinding(cdata->primitives.at(id), true, obj, ctxtdata, url, lineNumber, 0);
++        }
++
+         typeData->release();
++    }
++
+     return rv;
+ }
+ 
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index 2275b55..c423d93 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -807,6 +807,7 @@ bool QQmlCompiler::compile(QQmlEngine *engine,
+ 
+         } else if (tref.typeData) {
+             ref.component = tref.typeData->compiledData();
++            ref.component->addref();
+         }
+         out->types << ref;
+     }
+@@ -921,7 +922,7 @@ void QQmlCompiler::compileTree(QQmlScript::Object *tree)
+         output->root = &output->rootData;
+     }
+     if (!tree->metadata.isEmpty()) 
+-        enginePrivate->registerCompositeType(output);
++        enginePrivate->registerCompositeType(output->root);
+ }
+ 
+ static bool QStringList_contains(const QStringList &list, const QHashedStringRef &string)
+@@ -2878,13 +2879,10 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+                     COMPILE_EXCEPTION(p, tr("Invalid property type"));
+ 
+                 if (!qmltype) {
+-                    QQmlTypeData *tdata = enginePrivate->typeLoader.get(QUrl(url));
++                    QQmlTypeData *tdata = enginePrivate->typeLoader.getType(QUrl(url));
+                     Q_ASSERT(tdata);
+                     Q_ASSERT(tdata->isComplete());
+-
+-                    QQmlCompiledData *data = tdata->compiledData();
+-                    customTypeName = data->root->className();
+-                    data->release();
++                    customTypeName = tdata->compiledData()->root->className();
+                     tdata->release();
+                 } else {
+                     customTypeName = qmltype->typeName();
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index ffa08c3..f82f1d2 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -327,6 +327,7 @@ void QQmlComponentPrivate::fromTypeData(QQmlTypeData *data)
+         state.errors = data->errors();
+     } else {
+         cc = c;
++        cc->addref();
+     }
+ 
+     data->release();
+@@ -573,7 +574,7 @@ void QQmlComponent::setData(const QByteArray &data, const QUrl &url)
+ 
+     d->url = url;
+ 
+-    QQmlTypeData *typeData = QQmlEnginePrivate::get(d->engine)->typeLoader.get(data, url);
++    QQmlTypeData *typeData = QQmlEnginePrivate::get(d->engine)->typeLoader.getType(data, url);
+     
+     if (typeData->isCompleteOrError()) {
+         d->fromTypeData(typeData);
+@@ -652,7 +653,7 @@ void QQmlComponentPrivate::loadUrl(const QUrl &newUrl, QQmlComponent::Compilatio
+             ? QQmlDataLoader::Asynchronous
+             : QQmlDataLoader::PreferSynchronous;
+ 
+-    QQmlTypeData *data = QQmlEnginePrivate::get(engine)->typeLoader.get(url, loaderMode);
++    QQmlTypeData *data = QQmlEnginePrivate::get(engine)->typeLoader.getType(url, loaderMode);
+ 
+     if (data->isCompleteOrError()) {
+         fromTypeData(data);
+@@ -982,7 +983,8 @@ void QQmlComponent::create(QQmlIncubator &i, QQmlContext *context,
+ 
+     QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(d->engine);
+ 
+-    p->component = d->cc; p->component->addref();
++    p->compiledData = d->cc;
++    p->compiledData->addref();
+     p->vme.init(contextData, d->cc, d->start, d->creationContext);
+ 
+     enginePriv->incubate(i, forContextData);
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 12344e3..f7180b9 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -81,7 +81,7 @@ public:
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+           hasTaintedV8Object(false), isQueuedForDeletion(false), rootObjectInCreation(false), notifyList(0), context(0), outerContext(0),
+           bindings(0), signalHandlers(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+-          lineNumber(0), columnNumber(0), deferredComponent(0), deferredIdx(0), v8objectid(0), 
++          lineNumber(0), columnNumber(0), compiledData(0), deferredIdx(0), v8objectid(0),
+           propertyCache(0), guards(0), extendedData(0) {
+         init();
+     }
+@@ -162,7 +162,7 @@ public:
+     ushort lineNumber;
+     ushort columnNumber;
+ 
+-    QQmlCompiledData *deferredComponent; // Can't this be found from the context?
++    QQmlCompiledData *compiledData;
+     unsigned int deferredIdx;
+ 
+     quint32 v8objectid;
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 788d5ed..d3ca1b3 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -429,8 +429,6 @@ QQmlEnginePrivate::~QQmlEnginePrivate()
+     delete rootContext;
+     rootContext = 0;
+ 
+-    for(QHash<int, QQmlCompiledData*>::ConstIterator iter = m_compositeTypes.constBegin(); iter != m_compositeTypes.constEnd(); ++iter)
+-        (*iter)->release();
+     for(QHash<const QMetaObject *, QQmlPropertyCache *>::Iterator iter = propertyCache.begin(); iter != propertyCache.end(); ++iter)
+         (*iter)->release();
+     for(QHash<QPair<QQmlType *, int>, QQmlPropertyCache *>::Iterator iter = typePropertyCache.begin(); iter != typePropertyCache.end(); ++iter)
+@@ -716,11 +714,31 @@ QQmlEngine::~QQmlEngine()
+ 
+   Once the component cache has been cleared, components must be loaded before
+   any new objects can be created.
++
++  \sa trimComponentCache()
+  */
+ void QQmlEngine::clearComponentCache()
+ {
+     Q_D(QQmlEngine);
+-    d->typeLoader.clearCache();
++    d->clearCache();
++}
++
++/*!
++  Trims the engine's internal component cache.
++
++  This function causes the property metadata of any loaded components which are
++  not currently in use to be destroyed.
++
++  A component is considered to be in use if there are any extant instances of
++  the component itself, any instances of other components that use the component,
++  or any objects instantiated by any of those components.
++
++  \sa clearComponentCache()
++ */
++void QQmlEngine::trimComponentCache()
++{
++    Q_D(QQmlEngine);
++    d->trimCache();
+ }
+ 
+ /*!
+@@ -1074,7 +1092,7 @@ Q_AUTOTEST_EXPORT void qmlExecuteDeferred(QObject *object)
+ {
+     QQmlData *data = QQmlData::get(object);
+ 
+-    if (data && data->deferredComponent) {
++    if (data && data->compiledData && data->deferredIdx) {
+         QQmlObjectCreatingProfiler prof;
+         if (prof.enabled) {
+             QQmlType *type = QQmlMetaType::qmlType(object->metaObject());
+@@ -1088,8 +1106,9 @@ Q_AUTOTEST_EXPORT void qmlExecuteDeferred(QObject *object)
+         QQmlComponentPrivate::ConstructionState state;
+         QQmlComponentPrivate::beginDeferred(ep, object, &state);
+ 
+-        data->deferredComponent->release();
+-        data->deferredComponent = 0;
++        // Release the reference for the deferral action (we still have one from construction)
++        data->compiledData->release();
++        data->compiledData = 0;
+ 
+         QQmlComponentPrivate::complete(ep, &state);
+     }
+@@ -1267,9 +1286,6 @@ QHash<int, QObject *> *QQmlData::attachedProperties() const
+ 
+ void QQmlData::destroyed(QObject *object)
+ {
+-    if (deferredComponent)
+-        deferredComponent->release();
+-
+     if (nextContextObject)
+         nextContextObject->prevContextObject = prevContextObject;
+     if (prevContextObject)
+@@ -1284,6 +1300,11 @@ void QQmlData::destroyed(QObject *object)
+         binding = next;
+     }
+ 
++    if (compiledData) {
++        compiledData->release();
++        compiledData = 0;
++    }
++
+     QQmlAbstractBoundSignal *signalHandler = signalHandlers;
+     while (signalHandler) {
+         QQmlAbstractBoundSignal *next = signalHandler->m_nextSignal;
+@@ -1835,9 +1856,9 @@ int QQmlEnginePrivate::listType(int t) const
+ const QMetaObject *QQmlEnginePrivate::rawMetaObjectForType(int t) const
+ {
+     Locker locker(this);
+-    QHash<int, QQmlCompiledData*>::ConstIterator iter = m_compositeTypes.find(t);
++    QHash<int, const QMetaObject *>::ConstIterator iter = m_compositeTypes.find(t);
+     if (iter != m_compositeTypes.end()) {
+-        return (*iter)->root;
++        return *iter;
+     } else {
+         QQmlType *type = QQmlMetaType::qmlType(t);
+         return type?type->baseMetaObject():0;
+@@ -1847,18 +1868,18 @@ const QMetaObject *QQmlEnginePrivate::rawMetaObjectForType(int t) const
+ const QMetaObject *QQmlEnginePrivate::metaObjectForType(int t) const
+ {
+     Locker locker(this);
+-    QHash<int, QQmlCompiledData*>::ConstIterator iter = m_compositeTypes.find(t);
++    QHash<int, const QMetaObject *>::ConstIterator iter = m_compositeTypes.find(t);
+     if (iter != m_compositeTypes.end()) {
+-        return (*iter)->root;
++        return *iter;
+     } else {
+         QQmlType *type = QQmlMetaType::qmlType(t);
+         return type?type->metaObject():0;
+     }
+ }
+ 
+-void QQmlEnginePrivate::registerCompositeType(QQmlCompiledData *data)
++void QQmlEnginePrivate::registerCompositeType(const QMetaObject *mo)
+ {
+-    QByteArray name = data->root->className();
++    QByteArray name = mo->className();
+ 
+     QByteArray ptr = name + '*';
+     QByteArray lst = "QQmlListProperty<" + name + '>';
+@@ -1870,7 +1891,7 @@ void QQmlEnginePrivate::registerCompositeType(QQmlCompiledData *data)
+                                                      qMetaTypeConstructHelper<QObject*>,
+                                                      sizeof(QObject*),
+                                                      static_cast<QFlags<QMetaType::TypeFlag> >(QtPrivate::QMetaTypeTypeFlags<QObject*>::Flags),
+-                                                     data->root);
++                                                     mo);
+     int lst_type = QMetaType::registerNormalizedType(lst,
+                                                      qMetaTypeDeleteHelper<QQmlListProperty<QObject> >,
+                                                      qMetaTypeCreateHelper<QQmlListProperty<QObject> >,
+@@ -1880,11 +1901,49 @@ void QQmlEnginePrivate::registerCompositeType(QQmlCompiledData *data)
+                                                      static_cast<QFlags<QMetaType::TypeFlag> >(QtPrivate::QMetaTypeTypeFlags<QQmlListProperty<QObject> >::Flags),
+                                                      static_cast<QMetaObject*>(0));
+ 
+-    data->addref();
+-
+     Locker locker(this);
+     m_qmlLists.insert(lst_type, ptr_type);
+-    m_compositeTypes.insert(ptr_type, data);
++    m_compositeTypes.insert(ptr_type, mo);
++}
++
++void QQmlEnginePrivate::unregisterCompositeType(const QMetaObject *mo)
++{
++    QByteArray name = mo->className();
++
++    QByteArray ptr = name + '*';
++    QByteArray lst = "QQmlListProperty<" + name + '>';
++
++    int ptr_type = QMetaType::type(ptr.constData());
++    int lst_type = QMetaType::type(lst.constData());
++
++    Locker locker(this);
++    m_qmlLists.remove(lst_type);
++    m_compositeTypes.remove(ptr_type);
++}
++
++void QQmlEnginePrivate::clearCache()
++{
++    typeLoader.clearCache(this, &QQmlEnginePrivate::typeUnloaded);
++}
++
++void QQmlEnginePrivate::trimCache()
++{
++    typeLoader.trimCache(this, &QQmlEnginePrivate::typeUnloaded);
++}
++
++void QQmlEnginePrivate::typeUnloaded(QQmlTypeData *typeData)
++{
++    unregisterCompositeType(typeData->compiledData()->root);
++}
++
++bool QQmlEnginePrivate::isTypeLoaded(const QUrl &url) const
++{
++    return typeLoader.isTypeLoaded(url);
++}
++
++bool QQmlEnginePrivate::isScriptLoaded(const QUrl &url) const
++{
++    return typeLoader.isScriptLoaded(url);
+ }
+ 
+ bool QQml_isFileCaseCorrect(const QString &fileName)
+diff --git a/src/qml/qml/qqmlengine.h b/src/qml/qml/qqmlengine.h
+index 8640f1a..f2b7f29 100644
+--- a/src/qml/qml/qqmlengine.h
++++ b/src/qml/qml/qqmlengine.h
+@@ -102,6 +102,7 @@ public:
+     QQmlContext *rootContext() const;
+ 
+     void clearComponentCache();
++    void trimComponentCache();
+ 
+     QStringList importPathList() const;
+     void setImportPathList(const QStringList &paths);
+diff --git a/src/qml/qml/qqmlengine_p.h b/src/qml/qml/qqmlengine_p.h
+index 4c6b3b5..d3e7bc2 100644
+--- a/src/qml/qml/qqmlengine_p.h
++++ b/src/qml/qml/qqmlengine_p.h
+@@ -239,7 +239,14 @@ public:
+     int listType(int) const;
+     const QMetaObject *rawMetaObjectForType(int) const;
+     const QMetaObject *metaObjectForType(int) const;
+-    void registerCompositeType(QQmlCompiledData *);
++    void registerCompositeType(const QMetaObject *);
++    void unregisterCompositeType(const QMetaObject *);
++
++    void clearCache();
++    void trimCache();
++
++    bool isTypeLoaded(const QUrl &url) const;
++    bool isScriptLoaded(const QUrl &url) const;
+ 
+     inline void setDebugChangesCache(const QHash<QUrl, QByteArray> &changes);
+     inline QHash<QUrl, QByteArray> debugChangesCache();
+@@ -295,13 +302,15 @@ private:
+     QQmlPropertyCache *createCache(const QMetaObject *);
+     QQmlPropertyCache *createCache(QQmlType *, int, QQmlError &error);
+ 
++    void typeUnloaded(QQmlTypeData *typeData);
++
+     // These members must be protected by a QQmlEnginePrivate::Locker as they are required by
+     // the threaded loader.  Only access them through their respective accessor methods.
+     QHash<QQmlMetaType::ModuleApi, QQmlMetaType::ModuleApiInstance *> moduleApiInstances;
+     QHash<const QMetaObject *, QQmlPropertyCache *> propertyCache;
+     QHash<QPair<QQmlType *, int>, QQmlPropertyCache *> typePropertyCache;
+     QHash<int, int> m_qmlLists;
+-    QHash<int, QQmlCompiledData *> m_compositeTypes;
++    QHash<int, const QMetaObject *> m_compositeTypes;
+     QHash<QUrl, QByteArray> debugChangesHash;
+ 
+     // These members is protected by the full QQmlEnginePrivate::mutex mutex
+diff --git a/src/qml/qml/qqmlexpression.cpp b/src/qml/qml/qqmlexpression.cpp
+index 89aa6b3..d2842f7 100644
+--- a/src/qml/qml/qqmlexpression.cpp
++++ b/src/qml/qml/qqmlexpression.cpp
+@@ -220,32 +220,24 @@ QQmlExpression::QQmlExpression(const QQmlScriptString &script, QObject *parent)
+     if (!script.context()->isValid())
+         return;
+ 
+-    bool defaultConstruction = false;
++    bool defaultConstruction = true;
+ 
+     int id = script.d.data()->bindingId;
+-    if (id < 0) {
+-        defaultConstruction = true;
+-    } else {
++    if (id >= 0) {
+         QQmlContextData *ctxtdata = QQmlContextData::get(script.context());
+-
+         QQmlEnginePrivate *engine = QQmlEnginePrivate::get(script.context()->engine());
+-        QQmlCompiledData *cdata = 0;
+-        QQmlTypeData *typeData = 0;
+         if (engine && ctxtdata && !ctxtdata->url.isEmpty()) {
+-            typeData = engine->typeLoader.get(ctxtdata->url);
+-            cdata = typeData->compiledData();
+-        }
++            QQmlTypeData *typeData = engine->typeLoader.getType(ctxtdata->url);
++            Q_ASSERT(typeData);
+ 
+-        if (cdata)
+-            d->init(ctxtdata, cdata->primitives.at(id), true, script.scopeObject(),
+-                    cdata->name, script.d.data()->lineNumber, script.d.data()->columnNumber);
+-        else
+-           defaultConstruction = true;
++            if (QQmlCompiledData *cdata = typeData->compiledData()) {
++                defaultConstruction = false;
++                d->init(ctxtdata, cdata->primitives.at(id), true, script.scopeObject(),
++                        cdata->name, script.d.data()->lineNumber, script.d.data()->columnNumber);
++            }
+ 
+-        if (cdata)
+-            cdata->release();
+-        if (typeData)
+             typeData->release();
++        }
+     }
+ 
+     if (defaultConstruction)
+diff --git a/src/qml/qml/qqmlincubator.cpp b/src/qml/qml/qqmlincubator.cpp
+index 3cd03a9..12a48a2 100644
+--- a/src/qml/qml/qqmlincubator.cpp
++++ b/src/qml/qml/qqmlincubator.cpp
+@@ -135,7 +135,7 @@ QQmlIncubationController *QQmlEngine::incubationController() const
+ QQmlIncubatorPrivate::QQmlIncubatorPrivate(QQmlIncubator *q, 
+                                                            QQmlIncubator::IncubationMode m)
+ : q(q), status(QQmlIncubator::Null), mode(m), isAsynchronous(false), progress(Execute),
+-  result(0), component(0), vme(this), waitingOnMe(0)
++  result(0), compiledData(0), vme(this), waitingOnMe(0)
+ {
+ }
+ 
+@@ -147,17 +147,17 @@ void QQmlIncubatorPrivate::clear()
+ {
+     if (next.isInList()) {
+         next.remove();
+-        Q_ASSERT(component);
+-        QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(component->engine);
+-        component->release();
+-        component = 0;
++        Q_ASSERT(compiledData);
++        QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(compiledData->engine);
++        compiledData->release();
++        compiledData = 0;
+         enginePriv->incubatorCount--;
+         QQmlIncubationController *controller = enginePriv->incubationController;
+         if (controller)
+             controller->incubatingObjectCountChanged(enginePriv->incubatorCount);
+-    } else if (component) {
+-        component->release();
+-        component = 0;
++    } else if (compiledData) {
++        compiledData->release();
++        compiledData = 0;
+     }
+     if (!rootContext.isNull()) {
+         rootContext->activeVMEData = 0;
+@@ -258,14 +258,14 @@ void QQmlIncubationController::incubatingObjectCountChanged(int incubatingObject
+ 
+ void QQmlIncubatorPrivate::incubate(QQmlVME::Interrupt &i)
+ {
+-    if (!component)
++    if (!compiledData)
+         return;
+-    QML_MEMORY_SCOPE_URL(component->url);
++    QML_MEMORY_SCOPE_URL(compiledData->url);
+ 
+     typedef QQmlIncubatorPrivate IP;
+     QRecursionWatcher<IP, &IP::recursion> watcher(this);
+ 
+-    QQmlEngine *engine = component->engine;
++    QQmlEngine *engine = compiledData->engine;
+     QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(engine);
+ 
+     bool guardOk = vmeGuard.isOK();
+@@ -273,7 +273,7 @@ void QQmlIncubatorPrivate::incubate(QQmlVME::Interrupt &i)
+ 
+     if (!guardOk) {
+         QQmlError error;
+-        error.setUrl(component->url);
++        error.setUrl(compiledData->url);
+         error.setDescription(QQmlComponent::tr("Object destroyed during incubation"));
+         errors << error;
+         progress = QQmlIncubatorPrivate::Completed;
+@@ -539,8 +539,8 @@ void QQmlIncubator::clear()
+ 
+     QQmlEnginePrivate *enginePriv = 0;
+     if (s == Loading) {
+-        Q_ASSERT(d->component);
+-        enginePriv = QQmlEnginePrivate::get(d->component->engine);
++        Q_ASSERT(d->compiledData);
++        enginePriv = QQmlEnginePrivate::get(d->compiledData->engine);
+         if (d->result) d->result->deleteLater();
+         d->result = 0;
+     }
+@@ -554,7 +554,7 @@ void QQmlIncubator::clear()
+     d->vme.reset();
+     d->vmeGuard.clear();
+ 
+-    Q_ASSERT(d->component == 0);
++    Q_ASSERT(d->compiledData == 0);
+     Q_ASSERT(d->waitingOnMe == 0);
+     Q_ASSERT(d->waitingFor.isEmpty());
+     Q_ASSERT(!d->nextWaitingFor.isInList());
+@@ -698,7 +698,7 @@ QQmlIncubator::Status QQmlIncubatorPrivate::calculateStatus() const
+     else if (result && progress == QQmlIncubatorPrivate::Completed && 
+              waitingFor.isEmpty()) 
+         return QQmlIncubator::Ready;
+-    else if (component) 
++    else if (compiledData)
+         return QQmlIncubator::Loading;
+     else 
+         return QQmlIncubator::Null;
+diff --git a/src/qml/qml/qqmlincubator_p.h b/src/qml/qml/qqmlincubator_p.h
+index 0dec34a..f5effe3 100644
+--- a/src/qml/qml/qqmlincubator_p.h
++++ b/src/qml/qml/qqmlincubator_p.h
+@@ -85,7 +85,7 @@ public:
+ 
+     QQmlGuard<QObject> result;
+     QQmlGuardedContextData rootContext;
+-    QQmlCompiledData *component;
++    QQmlCompiledData *compiledData;
+     QQmlVME vme;
+     QQmlVMEGuard vmeGuard;
+ 
+diff --git a/src/qml/qml/qqmltypeloader.cpp b/src/qml/qml/qqmltypeloader.cpp
+index a766ee7..d550a19 100644
+--- a/src/qml/qml/qqmltypeloader.cpp
++++ b/src/qml/qml/qqmltypeloader.cpp
+@@ -98,6 +98,17 @@ DEFINE_BOOL_CONFIG_OPTION(dumpErrors, QML_DUMP_ERRORS);
+ 
+ QT_BEGIN_NAMESPACE
+ 
++namespace {
++
++    template<typename LockType>
++    struct LockHolder
++    {
++        LockType& lock;
++        LockHolder(LockType *l) : lock(*l) { lock.lock(); }
++        ~LockHolder() { lock.unlock(); }
++    };
++}
++
+ // This is a lame object that we need to ensure that slots connected to
+ // QNetworkReply get called in the correct thread (the loader thread).  
+ // As QQmlDataLoader lives in the main thread, and we can't use
+@@ -1204,7 +1215,7 @@ loaded files.
+ */
+ QQmlTypeLoader::~QQmlTypeLoader()
+ {
+-    clearCache();
++    clearCache(0, 0);
+ }
+ 
+ /*!
+@@ -1221,13 +1232,13 @@ This enum defines the options that control the way type data is handled.
+ /*!
+ Returns a QQmlTypeData for the specified \a url.  The QQmlTypeData may be cached.
+ */
+-QQmlTypeData *QQmlTypeLoader::get(const QUrl &url, Mode mode)
++QQmlTypeData *QQmlTypeLoader::getType(const QUrl &url, Mode mode)
+ {
+     Q_ASSERT(!url.isRelative() && 
+             (QQmlFile::urlToLocalFileOrQrc(url).isEmpty() ||
+              !QDir::isRelativePath(QQmlFile::urlToLocalFileOrQrc(url))));
+ 
+-    lock();
++    LockHolder<QQmlTypeLoader> holder(this);
+     
+     QQmlTypeData *typeData = m_typeCache.value(url);
+ 
+@@ -1239,8 +1250,6 @@ QQmlTypeData *QQmlTypeLoader::get(const QUrl &url, Mode mode)
+ 
+     typeData->addref();
+ 
+-    unlock();
+-
+     return typeData;
+ }
+ 
+@@ -1250,15 +1259,13 @@ QQmlTypeData will not be cached.
+ 
+ The specified \a options control how the loader handles type data.
+ */
+-QQmlTypeData *QQmlTypeLoader::get(const QByteArray &data, const QUrl &url, Options options)
++QQmlTypeData *QQmlTypeLoader::getType(const QByteArray &data, const QUrl &url, Options options)
+ {
+-    lock();
++    LockHolder<QQmlTypeLoader> holder(this);
+ 
+     QQmlTypeData *typeData = new QQmlTypeData(url, options, this);
+     QQmlDataLoader::loadWithStaticData(typeData, data);
+ 
+-    unlock();
+-
+     return typeData;
+ }
+ 
+@@ -1271,7 +1278,7 @@ QQmlScriptBlob *QQmlTypeLoader::getScript(const QUrl &url)
+             (QQmlFile::urlToLocalFileOrQrc(url).isEmpty() ||
+              !QDir::isRelativePath(QQmlFile::urlToLocalFileOrQrc(url))));
+ 
+-    lock();
++    LockHolder<QQmlTypeLoader> holder(this);
+ 
+     QQmlScriptBlob *scriptBlob = m_scriptCache.value(url);
+ 
+@@ -1283,8 +1290,6 @@ QQmlScriptBlob *QQmlTypeLoader::getScript(const QUrl &url)
+ 
+     scriptBlob->addref();
+ 
+-    unlock();
+-
+     return scriptBlob;
+ }
+ 
+@@ -1297,7 +1302,7 @@ QQmlQmldirData *QQmlTypeLoader::getQmldir(const QUrl &url)
+             (QQmlFile::urlToLocalFileOrQrc(url).isEmpty() ||
+              !QDir::isRelativePath(QQmlFile::urlToLocalFileOrQrc(url))));
+ 
+-    lock();
++    LockHolder<QQmlTypeLoader> holder(this);
+ 
+     QQmlQmldirData *qmldirData = m_qmldirCache.value(url);
+ 
+@@ -1309,8 +1314,6 @@ QQmlQmldirData *QQmlTypeLoader::getQmldir(const QUrl &url)
+ 
+     qmldirData->addref();
+ 
+-    unlock();
+-
+     return qmldirData;
+ }
+ 
+@@ -1562,10 +1565,14 @@ const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+ Clears cached information about loaded files, including any type data, scripts
+ and qmldir information.
+ */
+-void QQmlTypeLoader::clearCache()
++void QQmlTypeLoader::clearCache(void (*callback)(void *, QQmlTypeData *), void *arg)
+ {
+-    for (TypeCache::Iterator iter = m_typeCache.begin(); iter != m_typeCache.end(); ++iter) 
++    for (TypeCache::Iterator iter = m_typeCache.begin(); iter != m_typeCache.end(); ++iter) {
++        if (callback)
++            (*callback)(arg, iter.value());
++
+         (*iter)->release();
++    }
+     for (ScriptCache::Iterator iter = m_scriptCache.begin(); iter != m_scriptCache.end(); ++iter) 
+         (*iter)->release();
+     for (QmldirCache::Iterator iter = m_qmldirCache.begin(); iter != m_qmldirCache.end(); ++iter) 
+@@ -1580,6 +1587,48 @@ void QQmlTypeLoader::clearCache()
+     m_importQmlDirCache.clear();
+ }
+ 
++void QQmlTypeLoader::trimCache(void (*callback)(void *, QQmlTypeData *), void *arg)
++{
++    while (true) {
++        QList<TypeCache::Iterator> unneededTypes;
++        for (TypeCache::Iterator iter = m_typeCache.begin(); iter != m_typeCache.end(); ++iter)  {
++            QQmlTypeData *typeData = iter.value();
++            if (typeData->m_compiledData && typeData->m_compiledData->count() == 1) {
++                // There are no live objects of this type
++                unneededTypes.append(iter);
++            }
++        }
++
++        if (unneededTypes.isEmpty())
++            break;
++
++        while (!unneededTypes.isEmpty()) {
++            TypeCache::Iterator iter = unneededTypes.last();
++            unneededTypes.removeLast();
++
++            if (callback)
++                (*callback)(arg, iter.value());
++
++            m_typeCache.erase(iter);
++            iter.value()->release();
++        }
++    }
++
++    // TODO: release any scripts which are no longer referenced by any types
++}
++
++bool QQmlTypeLoader::isTypeLoaded(const QUrl &url) const
++{
++    LockHolder<QQmlTypeLoader> holder(const_cast<QQmlTypeLoader *>(this));
++    return m_typeCache.contains(url);
++}
++
++bool QQmlTypeLoader::isScriptLoaded(const QUrl &url) const
++{
++    LockHolder<QQmlTypeLoader> holder(const_cast<QQmlTypeLoader *>(this));
++    return m_scriptCache.contains(url);
++}
++
+ 
+ QQmlTypeData::QQmlTypeData(const QUrl &url, QQmlTypeLoader::Options options, 
+                                            QQmlTypeLoader *manager)
+@@ -1632,9 +1681,6 @@ const QSet<QString> &QQmlTypeData::namespaces() const
+ 
+ QQmlCompiledData *QQmlTypeData::compiledData() const
+ {
+-    if (m_compiledData) 
+-        m_compiledData->addref();
+-
+     return m_compiledData;
+ }
+ 
+@@ -1899,7 +1945,7 @@ void QQmlTypeData::resolveTypes()
+             ref.majorVersion = majorVersion;
+             ref.minorVersion = minorVersion;
+         } else {
+-            ref.typeData = typeLoader()->get(QUrl(url));
++            ref.typeData = typeLoader()->getType(QUrl(url));
+             addDependency(ref.typeData);
+         }
+ 
+diff --git a/src/qml/qml/qqmltypeloader_p.h b/src/qml/qml/qqmltypeloader_p.h
+index 66f4fd5..ab70080 100644
+--- a/src/qml/qml/qqmltypeloader_p.h
++++ b/src/qml/qml/qqmltypeloader_p.h
+@@ -268,9 +268,8 @@ public:
+     };
+     Q_DECLARE_FLAGS(Options, Option)
+ 
+-    QQmlTypeData *get(const QUrl &url, Mode mode = PreferSynchronous);
+-    QQmlTypeData *get(const QByteArray &, const QUrl &url, Options = None);
+-    void clearCache();
++    QQmlTypeData *getType(const QUrl &url, Mode mode = PreferSynchronous);
++    QQmlTypeData *getType(const QByteArray &, const QUrl &url, Options = None);
+ 
+     QQmlScriptBlob *getScript(const QUrl &);
+     QQmlQmldirData *getQmldir(const QUrl &);
+@@ -283,10 +282,44 @@ public:
+     bool directoryExists(const QString &path);
+     const QQmlDirParser *qmlDirParser(const QString &filePath, const QString &uriHint, QString *outUrl);
+ 
++    template<typename T>
++    void clearCache(T *o, void (T::*callback)(QQmlTypeData *)) {
++        TypedCallback<T> cb(o, callback);
++        clearCache(&TypedCallback<T>::redirect, &cb);
++    }
++
++    template<typename T>
++    void trimCache(T *o, void (T::*callback)(QQmlTypeData *)) {
++        TypedCallback<T> cb(o, callback);
++        trimCache(&TypedCallback<T>::redirect, &cb);
++    }
++
++    bool isTypeLoaded(const QUrl &url) const;
++    bool isScriptLoaded(const QUrl &url) const;
++
+ private:
+     void addBundleNoLock(const QString &, const QString &);
+     QString bundleIdForQmldir(const QString &qmldir, const QString &uriHint);
+ 
++    template<typename T>
++    struct TypedCallback
++    {
++        TypedCallback(T *object, void (T::*func)(QQmlTypeData *)) : o(object), mf(func) {}
++
++        static void redirect(void *arg, QQmlTypeData *type)
++        {
++            TypedCallback<T> *self = reinterpret_cast<TypedCallback<T> *>(arg);
++            ((self->o)->*(self->mf))(type);
++        }
++
++    private:
++        T *o;
++        void (T::*mf)(QQmlTypeData *);
++    };
++
++    void clearCache(void (*callback)(void *, QQmlTypeData *), void *);
++    void trimCache(void (*callback)(void *, QQmlTypeData *), void *);
++
+     struct DirParser : public QQmlDirParser { QString adjustedUrl; };
+ 
+     typedef QHash<QUrl, QQmlTypeData *> TypeCache;
+@@ -332,7 +365,12 @@ public:
+         QQmlScriptBlob *script;
+     };
+ 
++private:
++    friend class QQmlTypeLoader;
++
+     QQmlTypeData(const QUrl &, QQmlTypeLoader::Options, QQmlTypeLoader *);
++
++public:
+     ~QQmlTypeData();
+ 
+     QQmlTypeLoader *typeLoader() const;
+@@ -397,8 +435,12 @@ private:
+ // only created and destroyed in the main thread :)
+ class Q_AUTOTEST_EXPORT QQmlScriptData : public QQmlCleanup, public QQmlRefCount
+ {
+-public:
++private:
++    friend class QQmlTypeLoader;
++
+     QQmlScriptData();
++
++public:
+     ~QQmlScriptData();
+ 
+     QUrl url;
+@@ -425,8 +467,12 @@ private:
+ 
+ class Q_AUTOTEST_EXPORT QQmlScriptBlob : public QQmlDataBlob
+ {
+-public:
++private:
++    friend class QQmlTypeLoader;
++
+     QQmlScriptBlob(const QUrl &, QQmlTypeLoader *);
++
++public:
+     ~QQmlScriptBlob();
+ 
+     struct ScriptReference
+@@ -463,9 +509,12 @@ private:
+ 
+ class Q_AUTOTEST_EXPORT QQmlQmldirData : public QQmlDataBlob
+ {
+-public:
++private:
++    friend class QQmlTypeLoader;
++
+     QQmlQmldirData(const QUrl &);
+ 
++public:
+     const QQmlDirComponents &dirComponents() const;
+ 
+ protected:
+@@ -473,7 +522,6 @@ protected:
+ 
+ private:
+     QQmlDirComponents m_components;
+-
+ };
+ 
+ QQmlDataBlob::Data::Data()
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 852a682..ba0f202 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -133,11 +133,11 @@ bool QQmlVME::initDeferred(QObject *object)
+ {
+     QQmlData *data = QQmlData::get(object);
+ 
+-    if (!data || !data->context || !data->deferredComponent)
++    if (!data || !data->context || !data->compiledData)
+         return false;
+ 
+     QQmlContextData *ctxt = data->context;
+-    QQmlCompiledData *comp = data->deferredComponent;
++    QQmlCompiledData *comp = data->compiledData;
+     int start = data->deferredIdx;
+ 
+     State initState;
+@@ -444,7 +444,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 CTXT->setIdPropertyData(COMP->contextCaches.at(instr.contextCache));
+             if (instr.compiledBinding != -1) {
+                 const char *v4data = DATAS.at(instr.compiledBinding).constData();
+-                CTXT->v4bindings = new QV4Bindings(v4data, CTXT, COMP);
++                CTXT->v4bindings = new QV4Bindings(v4data, CTXT);
+             }
+             if (states.count() == 1) {
+                 rootContext = CTXT;
+@@ -515,6 +515,15 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             QQmlData *ddata = QQmlData::get(o);
+             Q_ASSERT(ddata);
+ 
++            if (states.count() == 1) {
++                // Keep a reference to the compiled data we rely on.
++                // Only the top-level component instance needs to add a reference - higher-level
++                // components add a reference to the components they depend on, so an instance
++                // of the top-level component keeps them all referenced.
++                ddata->compiledData = states[0].compiledData;
++                ddata->compiledData->addref();
++            }
++
+             if (instr.isRoot) {
+                 if (ddata->context) {
+                     Q_ASSERT(ddata->context != CTXT);
+@@ -563,6 +572,12 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 VME_EXCEPTION(tr("Unable to create object of type %1").arg(type.type->elementName()),
+                               instr.line);
+ 
++            if (states.count() == 1) {
++                // Keep a reference to the compiled data we rely on
++                ddata->compiledData = states[0].compiledData;
++                ddata->compiledData->addref();
++            }
++
+             if (instr.isRoot) {
+                 if (ddata->context) {
+                     Q_ASSERT(ddata->context != CTXT);
+@@ -649,6 +664,12 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+ 
+             CTXT->addObject(qcomp);
+ 
++            if (states.count() == 1) {
++                // Keep a reference to the compiled data we rely on
++                ddata->compiledData = states[0].compiledData;
++                ddata->compiledData->addref();
++            }
++
+             if (instr.isRoot)
+                 ddata->ownContext = true;
+ 
+@@ -673,7 +694,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             const QQmlVMEMetaData *data = 
+                 (const QQmlVMEMetaData *)DATAS.at(instr.aliasData).constData();
+ 
+-            (void)new QQmlVMEMetaObject(target, &mo, data, COMP);
++            (void)new QQmlVMEMetaObject(target, &mo, data);
+ 
+             if (instr.propertyCache != -1) {
+                 QQmlData *ddata = QQmlData::get(target, true);
+@@ -1000,11 +1021,11 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+         QML_BEGIN_INSTR(Defer)
+             if (instr.deferCount) {
+                 QObject *target = objects.top();
+-                QQmlData *data = 
+-                    QQmlData::get(target, true);
+-                COMP->addref();
+-                data->deferredComponent = COMP;
++                QQmlData *data = QQmlData::get(target, true);
++                data->compiledData = COMP;
++                data->compiledData->addref(); // Keep this data referenced until we're initialized
+                 data->deferredIdx = INSTRUCTIONSTREAM - COMP->bytecode.constData();
++                Q_ASSERT(data->deferredIdx != 0);
+                 INSTRUCTIONSTREAM += instr.deferCount;
+             }
+         QML_END_INSTR(Defer)
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index 01a4737..4d531b3 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -480,17 +480,12 @@ void QQmlVMEMetaObjectEndpoint::tryConnect()
+     }
+ }
+ 
+-QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
+-                                                     const QMetaObject *other, 
+-                                                     const QQmlVMEMetaData *meta,
+-                                                     QQmlCompiledData *cdata)
+-: QV8GCCallback::Node(GcPrologueCallback), object(obj), compiledData(cdata),
++QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj, const QMetaObject *other, const QQmlVMEMetaData *meta)
++: QV8GCCallback::Node(GcPrologueCallback), object(obj),
+   ctxt(QQmlData::get(obj, true)->outerContext), metaData(meta), data(0),
+   aliasEndpoints(0), firstVarPropertyIndex(-1), varPropertiesInitialized(false),
+   interceptors(0), v8methods(0), parent(0)
+ {
+-    compiledData->addref();
+-
+     *static_cast<QMetaObject *>(this) = *other;
+     this->d.superdata = obj->metaObject();
+ 
+@@ -523,7 +518,6 @@ QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
+ 
+ QQmlVMEMetaObject::~QQmlVMEMetaObject()
+ {
+-    compiledData->release();
+     delete parent;
+     delete [] data;
+     delete [] aliasEndpoints;
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 53fe34d..1f44c63 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -156,8 +156,7 @@ class Q_AUTOTEST_EXPORT QQmlVMEMetaObject : public QAbstractDynamicMetaObject,
+                                                     public QV8GCCallback::Node
+ {
+ public:
+-    QQmlVMEMetaObject(QObject *obj, const QMetaObject *other, const QQmlVMEMetaData *data,
+-                     QQmlCompiledData *compiledData);
++    QQmlVMEMetaObject(QObject *obj, const QMetaObject *other, const QQmlVMEMetaData *data);
+     ~QQmlVMEMetaObject();
+ 
+     bool aliasTarget(int index, QObject **target, int *coreIndex, int *valueTypeIndex) const;
+@@ -178,7 +177,6 @@ private:
+     friend class QQmlVMEVariantQObjectPtr;
+ 
+     QObject *object;
+-    QQmlCompiledData *compiledData;
+     QQmlGuardedContextData ctxt;
+ 
+     const QQmlVMEMetaData *metaData;
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 2c60883..6ab1e00 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -251,15 +251,10 @@ void Register::init(Type type)
+ 
+ } // end of anonymous namespace
+ 
+-QV4Bindings::QV4Bindings(const char *programData, 
+-                                               QQmlContextData *context, 
+-                                               QQmlRefCount *ref)
+-: subscriptions(0), program(0), dataRef(0), bindings(0)
++QV4Bindings::QV4Bindings(const char *programData, QQmlContextData *context)
++: subscriptions(0), program(0), bindings(0)
+ {
+     program = (QV4Program *)programData;
+-    dataRef = ref;
+-    if (dataRef) dataRef->addref();
+-
+     if (program) {
+         subscriptions = new Subscription[program->subscriptions];
+         bindings = new Binding[program->bindings];
+@@ -270,9 +265,8 @@ QV4Bindings::QV4Bindings(const char *programData,
+ 
+ QV4Bindings::~QV4Bindings()
+ {
+-    delete [] bindings;
++    delete [] bindings; bindings = 0;
+     delete [] subscriptions; subscriptions = 0;
+-    if (dataRef) dataRef->release();
+ }
+ 
+ QQmlAbstractBinding *QV4Bindings::configBinding(int index, QObject *target, 
+@@ -727,7 +721,7 @@ void **QV4Bindings::getDecodeInstrTable()
+ {
+     static void **decode_instr;
+     if (!decode_instr) {
+-        QV4Bindings *dummy = new QV4Bindings(0, 0, 0);
++        QV4Bindings *dummy = new QV4Bindings(0, 0);
+         quint32 executedBlocks = 0;
+         dummy->run(0, executedBlocks, 0, 0, 0, 0, 
+                    QQmlPropertyPrivate::BypassInterceptor, 
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index cb483d1..be58e02 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -68,8 +68,7 @@ class QV4Bindings : public QQmlAbstractExpression,
+ {
+     Q_DECLARE_TR_FUNCTIONS(QV4Bindings)
+ public:
+-    QV4Bindings(const char *program, QQmlContextData *context,
+-                           QQmlRefCount *);
++    QV4Bindings(const char *program, QQmlContextData *context);
+     virtual ~QV4Bindings();
+ 
+     QQmlAbstractBinding *configBinding(int index, QObject *target, 
+@@ -131,7 +130,6 @@ private:
+     void run(Binding *, QQmlPropertyPrivate::WriteFlags flags);
+ 
+     QV4Program *program;
+-    QQmlRefCount *dataRef;
+     Binding *bindings;
+ 
+     void init();
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index 31780a3..c92b87a 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -199,8 +199,6 @@ QV8Bindings::QV8Bindings(QQmlCompiledData::V8Program *program,
+                          QQmlContextData *context)
+ : program(program), bindings(0), refCount(1)
+ {
+-    program->cdata->addref();
+-
+     QV8Engine *engine = QQmlEnginePrivate::getV8Engine(context->engine);
+ 
+     if (program->bindings.IsEmpty()) {
+@@ -247,7 +245,6 @@ QV8Bindings::QV8Bindings(QQmlCompiledData::V8Program *program,
+ 
+ QV8Bindings::~QV8Bindings()
+ {
+-    program->cdata->release();
+     program = 0;
+ 
+     delete [] bindings;
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyAggregateEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyAggregateEmptyComponent.qml
+new file mode 100644
+index 0000000..76a0e32
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyAggregateEmptyComponent.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++Item {
++    EmptyComponent {
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyAggregateVMEComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyAggregateVMEComponent.qml
+new file mode 100644
+index 0000000..7e6821e
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyAggregateVMEComponent.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++Item {
++    VMEComponent {
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyComponent.qml
+new file mode 100644
+index 0000000..459c82a
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyComponent.qml
+@@ -0,0 +1,4 @@
++import QtQuick 2.0
++
++Item {
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyExtendEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyExtendEmptyComponent.qml
+new file mode 100644
+index 0000000..728b8e7
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyExtendEmptyComponent.qml
+@@ -0,0 +1,4 @@
++import QtQuick 2.0
++
++EmptyComponent {
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyExtendVMEComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyExtendVMEComponent.qml
+new file mode 100644
+index 0000000..88efc73
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyExtendVMEComponent.qml
+@@ -0,0 +1,4 @@
++import QtQuick 2.0
++
++VMEComponent {
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyPropertyEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyPropertyEmptyComponent.qml
+new file mode 100644
+index 0000000..293a8e7
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyPropertyEmptyComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property EmptyComponent p: EmptyComponent {}
++}
+diff --git a/tests/auto/qml/qqmlengine/data/EmptyPropertyVMEComponent.qml b/tests/auto/qml/qqmlengine/data/EmptyPropertyVMEComponent.qml
+new file mode 100644
+index 0000000..8444edc
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/EmptyPropertyVMEComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property VMEComponent p: VMEComponent {}
++}
+diff --git a/tests/auto/qml/qqmlengine/data/NestedEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/NestedEmptyComponent.qml
+new file mode 100644
+index 0000000..728b8e7
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/NestedEmptyComponent.qml
+@@ -0,0 +1,4 @@
++import QtQuick 2.0
++
++EmptyComponent {
++}
+diff --git a/tests/auto/qml/qqmlengine/data/NestedVMEComponent.qml b/tests/auto/qml/qqmlengine/data/NestedVMEComponent.qml
+new file mode 100644
+index 0000000..fd4f154
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/NestedVMEComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++VMEComponent {
++    property real pi: 3.1415927
++}
+diff --git a/tests/auto/qml/qqmlengine/data/ScriptComponent.qml b/tests/auto/qml/qqmlengine/data/ScriptComponent.qml
+new file mode 100644
+index 0000000..3fb9a10
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/ScriptComponent.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++import "script.js" as JS
++
++VMEExtendVMEComponent {
++    function getSomething() { return JS.getSomething() }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/TopLevelComponent.qml b/tests/auto/qml/qqmlengine/data/TopLevelComponent.qml
+new file mode 100644
+index 0000000..dea8a9c
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/TopLevelComponent.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++Component {
++    VMEExtendVMEComponent {
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEAggregateEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/VMEAggregateEmptyComponent.qml
+new file mode 100644
+index 0000000..a34a036
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEAggregateEmptyComponent.qml
+@@ -0,0 +1,8 @@
++import QtQuick 2.0
++
++Item {
++    property string bar: 'baz'
++
++    EmptyComponent {
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEAggregateVMEComponent.qml b/tests/auto/qml/qqmlengine/data/VMEAggregateVMEComponent.qml
+new file mode 100644
+index 0000000..4bacdf8
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEAggregateVMEComponent.qml
+@@ -0,0 +1,8 @@
++import QtQuick 2.0
++
++Item {
++    property string foo: 'bar'
++
++    VMEComponent {
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEComponent.qml b/tests/auto/qml/qqmlengine/data/VMEComponent.qml
+new file mode 100644
+index 0000000..0a43a08
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string foo: 'bar'
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEExtendEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/VMEExtendEmptyComponent.qml
+new file mode 100644
+index 0000000..df81f6b
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEExtendEmptyComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++EmptyComponent {
++    property string bar: 'baz'
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEExtendVMEComponent.qml b/tests/auto/qml/qqmlengine/data/VMEExtendVMEComponent.qml
+new file mode 100644
+index 0000000..bf7a2ec
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEExtendVMEComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++VMEComponent {
++    property string bar: 'baz'
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEPropertyEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/VMEPropertyEmptyComponent.qml
+new file mode 100644
+index 0000000..4ead1e0
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEPropertyEmptyComponent.qml
+@@ -0,0 +1,7 @@
++import QtQuick 2.0
++
++Item {
++    property string foo: 'bar'
++
++    property EmptyComponent p: EmptyComponent {}
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMEPropertyVMEComponent.qml b/tests/auto/qml/qqmlengine/data/VMEPropertyVMEComponent.qml
+new file mode 100644
+index 0000000..88867f2
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMEPropertyVMEComponent.qml
+@@ -0,0 +1,7 @@
++import QtQuick 2.0
++
++Item {
++    property string foo: 'bar'
++
++    property VMEComponent p: VMEComponent {}
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMETransientEmptyComponent.qml b/tests/auto/qml/qqmlengine/data/VMETransientEmptyComponent.qml
+new file mode 100644
+index 0000000..487025f
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMETransientEmptyComponent.qml
+@@ -0,0 +1,15 @@
++import QtQuick 2.0
++
++Item {
++    property var p: null
++
++    Component.onCompleted: {
++        var c = Qt.createComponent('EmptyComponent.qml')
++        p = c.createObject()
++        c.destroy()
++    }
++
++    Component.onDestruction: {
++        p.destroy()
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/VMETransientVMEComponent.qml b/tests/auto/qml/qqmlengine/data/VMETransientVMEComponent.qml
+new file mode 100644
+index 0000000..8f29b53
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/VMETransientVMEComponent.qml
+@@ -0,0 +1,15 @@
++import QtQuick 2.0
++
++Item {
++    property var p: null
++
++    Component.onCompleted: {
++        var c = Qt.createComponent('VMEComponent.qml')
++        p = c.createObject()
++        c.destroy()
++    }
++
++    Component.onDestruction: {
++        p.destroy()
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/script.js b/tests/auto/qml/qqmlengine/data/script.js
+new file mode 100644
+index 0000000..616de3d
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/script.js
+@@ -0,0 +1 @@
++function getSomething() { return 'https://example.org/' }
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.1.qml
+new file mode 100644
+index 0000000..812242f
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.1.qml
+@@ -0,0 +1,38 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyAggregateEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.2.qml
+new file mode 100644
+index 0000000..a171ee6
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyAggregateEmptyComponent.2.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyAggregateEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 3')
++        if (obj.x == undefined) return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyAggregateEmptyComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.1.qml
+new file mode 100644
+index 0000000..de40284
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyAggregateVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.2.qml
+new file mode 100644
+index 0000000..4939087
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyAggregateVMEComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyAggregateVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.x == undefined) return reportError('Invalid object 5')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyAggregateVMEComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyComponent.1.qml
+new file mode 100644
+index 0000000..5cee034
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyComponent.1.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyComponent.2.qml
+new file mode 100644
+index 0000000..2a13822
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyComponent.2.qml
+@@ -0,0 +1,36 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 3')
++        if (obj.x == undefined) return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.1.qml
+new file mode 100644
+index 0000000..2f23817
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.1.qml
+@@ -0,0 +1,38 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyExtendEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.2.qml
+new file mode 100644
+index 0000000..d36e95f
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyExtendEmptyComponent.2.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyExtendEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 3')
++        if (obj.x == undefined) return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyExtendEmptyComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.1.qml
+new file mode 100644
+index 0000000..53dd5a1
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.foo != 'bar') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.2.qml
+new file mode 100644
+index 0000000..e5cd7d6
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyExtendVMEComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.foo != 'bar') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.x == undefined) return reportError('Invalid object 5')
++        if (obj.foo != 'bar') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyExtendVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.1.qml
+new file mode 100644
+index 0000000..d98aef2
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.1.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyPropertyEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.2.qml
+new file mode 100644
+index 0000000..7f438aa
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyPropertyEmptyComponent.2.qml
+@@ -0,0 +1,44 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('EmptyPropertyEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.x == undefined) return reportError('Invalid object 6')
++        if (obj.p == undefined) return reportError('Invalid object 7')
++        if (obj.p.x == undefined) return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyPropertyEmptyComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.1.qml
+new file mode 100644
+index 0000000..83d6226
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.1.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyPropertyVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.2.qml
+new file mode 100644
+index 0000000..98dfb72
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testEmptyPropertyVMEComponent.2.qml
+@@ -0,0 +1,44 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('EmptyPropertyVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.x == undefined) return reportError('Invalid object 6')
++        if (obj.p == undefined) return reportError('Invalid object 7')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testEmptyPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('EmptyPropertyVMEComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testIncubatedComponent.qml b/tests/auto/qml/qqmlengine/data/testIncubatedComponent.qml
+new file mode 100644
+index 0000000..50af9c4
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testIncubatedComponent.qml
+@@ -0,0 +1,51 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testIncubatedComponent.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var c = Qt.createComponent('VMEExtendVMEComponent.qml')
++        var i = c.incubateObject(null, {}, Qt.Asynchronous)
++
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testIncubatedComponent.qml')) return reportError('Test component unloaded 1')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        c.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testIncubatedComponent.qml')) return reportError('Test component unloaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        i.onStatusChanged = function(status) {
++            if (status != Component.Ready) return;
++            if (i.object == null) return reportError('Extend component not created')
++            if (i.object.foo != 'bar') return reportError('Invalid object')
++            if (i.object.bar != 'baz') return reportError('Invalid object 2')
++
++            componentCache.trim()
++            if (!componentCache.isTypeLoaded('testIncubatedComponent.qml')) return reportError('Test component unloaded 3')
++            if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded 2')
++            if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded 2')
++
++            i.object.destroy()
++            componentCache.trim()
++            if (!componentCache.isTypeLoaded('testIncubatedComponent.qml')) return reportError('Test component unloaded 4')
++            if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++            if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++            success = true
++        }
++
++        componentCache.beginIncubation()
++        componentCache.waitForIncubation();
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testLoaderComponent.qml b/tests/auto/qml/qqmlengine/data/testLoaderComponent.qml
+new file mode 100644
+index 0000000..a04ca41
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testLoaderComponent.qml
+@@ -0,0 +1,62 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testLoaderComponent.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        loader.source = 'VMEExtendVMEComponent.qml'
++    }
++
++    Loader {
++        id: loader
++
++        property bool previouslyLoaded: false
++        onLoaded: {
++            if (!previouslyLoaded) {
++                componentCache.trim()
++                if (!componentCache.isTypeLoaded('testLoaderComponent.qml')) return reportError('Test component not loaded 2')
++                if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++                if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++                if (!item) return reportError('Invalid item')
++                if (item.foo != 'bar') return reportError('Invalid item 2')
++                if (item.bar != 'baz') return reportError('Invalid item 3')
++
++                loader.source = ''
++                componentCache.trim()
++                if (!componentCache.isTypeLoaded('testLoaderComponent.qml')) return reportError('Test component not loaded 3')
++                if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++                if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++                if (item) return reportError('Item not invalidated')
++
++                previouslyLoaded = true
++                loader.source = 'VMEExtendVMEComponent.qml'
++            } else {
++                componentCache.trim()
++                if (!componentCache.isTypeLoaded('testLoaderComponent.qml')) return reportError('Test component not loaded 4')
++                if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not reloaded')
++                if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not reloaded')
++
++                if (!item) return reportError('Invalid item 4')
++                if (item.foo != 'bar') return reportError('Invalid item 5')
++                if (item.bar != 'baz') return reportError('Invalid item 6')
++
++                loader.source = ''
++                componentCache.trim()
++                if (!componentCache.isTypeLoaded('testLoaderComponent.qml')) return reportError('Test component not loaded 5')
++                if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded 2')
++                if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded 2')
++                if (item) return reportError('Item not invalidated 2')
++
++                success = true
++            }
++        }
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testReloadComponent.qml b/tests/auto/qml/qqmlengine/data/testReloadComponent.qml
+new file mode 100644
+index 0000000..7444210
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testReloadComponent.qml
+@@ -0,0 +1,52 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testReloadComponent.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testReloadComponent.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        obj.destroy()
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testReloadComponent.qml')) return reportError('Test component not loaded 3')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testReloadComponent.qml')) return reportError('Test component not loaded 4')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not reloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not reloaded')
++
++        obj = comp.createObject()
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.foo != 'bar') return reportError('Invalid object 5')
++        if (obj.bar != 'baz') return reportError('Invalid object 6')
++
++        obj.destroy()
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testReloadComponent.qml')) return reportError('Test component not loaded 5')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded 2')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded 2')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testScriptComponent.qml b/tests/auto/qml/qqmlengine/data/testScriptComponent.qml
+new file mode 100644
+index 0000000..b33eb48
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testScriptComponent.qml
+@@ -0,0 +1,43 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testScriptComponent.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('ScriptComponent.qml')) return reportError('Script component already loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++        if (componentCache.isScriptLoaded('script.js')) return reportError('Script file already loaded')
++
++        var comp = Qt.createComponent('ScriptComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testScriptComponent.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('ScriptComponent.qml')) return reportError('Script component not loaded')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++        if (!componentCache.isScriptLoaded('script.js')) return reportError('Script file not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++        if (obj.getSomething() != 'https://example.org/') return reportError('Invalid object 4')
++
++        obj.destroy()
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testScriptComponent.qml')) return reportError('Test component not loaded 3')
++        if (componentCache.isTypeLoaded('ScriptComponent.qml')) return reportError('Script component not unloaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        // Script unloading is not currently implemented
++        //if (componentCache.isScriptLoaded('script.js')) return reportError('Script file already loaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testTopLevelComponent.qml b/tests/auto/qml/qqmlengine/data/testTopLevelComponent.qml
+new file mode 100644
+index 0000000..6cf8ec4
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testTopLevelComponent.qml
+@@ -0,0 +1,50 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTopLevelComponent.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('TopLevelComponent.qml')) return reportError('Top-level component already loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('TopLevelComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTopLevelComponent.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('TopLevelComponent.qml')) return reportError('Top-level component not loaded')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var internalComp = comp.createObject()
++        if (!internalComp) return reportError('Invalid component')
++
++        var obj = internalComp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        internalComp.destroy()
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTopLevelComponent.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('TopLevelComponent.qml')) return reportError('Top-level component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.foo != 'bar') return reportError('Invalid object 5')
++        if (obj.bar != 'baz') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTopLevelComponent.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('TopLevelComponent.qml')) return reportError('Top-level component not unloaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testTransientComponent.1.qml b/tests/auto/qml/qqmlengine/data/testTransientComponent.1.qml
+new file mode 100644
+index 0000000..d3e6ffd
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testTransientComponent.1.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return
++        if (obj.foo != 'bar') return reportError('Invalid object')
++        if (obj.bar != 'baz') return reportError('Invalid object 2')
++
++        obj.destroy()
++        if (!componentCache.isTypeLoaded('testTransientComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testTransientComponent.2.qml b/tests/auto/qml/qqmlengine/data/testTransientComponent.2.qml
+new file mode 100644
+index 0000000..acb0113
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testTransientComponent.2.qml
+@@ -0,0 +1,36 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return
++        if (obj.foo != 'bar') return reportError('Invalid object')
++        if (obj.bar != 'baz') return reportError('Invalid object 2')
++
++        comp.destroy()
++        if (!componentCache.isTypeLoaded('testTransientComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component already unloaded')
++        if (obj.foo != 'bar') return reportError('Invalid object 3')
++        if (obj.bar != 'baz') return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testTransientComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Transient component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.1.qml
+new file mode 100644
+index 0000000..a5beede
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEAggregateEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.children[0].x == undefined) return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.2.qml
+new file mode 100644
+index 0000000..4c8e52f
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEAggregateEmptyComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEAggregateEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.children[0].x == undefined) return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.children[0].x == undefined) return reportError('Invalid object 5')
++        if (obj.bar != 'baz') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEAggregateEmptyComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.1.qml
+new file mode 100644
+index 0000000..983d6e8
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEAggregateVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.2.qml
+new file mode 100644
+index 0000000..fc8e5a0
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEAggregateVMEComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Aggregate component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEAggregateVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object r4')
++        if (obj.foo != 'bar') return reportError('Invalid object 5')
++        if (obj.children[0].foo != 'bar') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEAggregateVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEAggregateVMEComponent.qml')) return reportError('Aggregate component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEComponent.1.qml
+new file mode 100644
+index 0000000..fcfd05c
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEComponent.1.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEComponent.2.qml
+new file mode 100644
+index 0000000..f434406
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEComponent.2.qml
+@@ -0,0 +1,36 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 3')
++        if (obj.foo != 'bar') return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.1.qml
+new file mode 100644
+index 0000000..1dcaec9
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.2.qml
+new file mode 100644
+index 0000000..fd7d7e4
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEExtendEmptyComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.x == undefined) return reportError('Invalid object 5')
++        if (obj.bar != 'baz') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendEmptyComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.1.qml
+new file mode 100644
+index 0000000..d2dab32
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.1.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.2.qml
+new file mode 100644
+index 0000000..813e438
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEExtendVMEComponent.2.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEExtendVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.bar != 'baz') return reportError('Invalid object 3')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 4')
++        if (obj.foo != 'bar') return reportError('Invalid object 5')
++        if (obj.bar != 'baz') return reportError('Invalid object 6')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEExtendVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEExtendVMEComponent.qml')) return reportError('Extend component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.1.qml
+new file mode 100644
+index 0000000..c6f0b79
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.1.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEPropertyEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.2.qml
+new file mode 100644
+index 0000000..2551385
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEPropertyEmptyComponent.2.qml
+@@ -0,0 +1,44 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMEPropertyEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.foo != 'bar') return reportError('Invalid object 6')
++        if (obj.p == undefined) return reportError('Invalid object 7')
++        if (obj.p.x == undefined) return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEPropertyEmptyComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.1.qml
+new file mode 100644
+index 0000000..0ad59b3
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.1.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEPropertyVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.2.qml
+new file mode 100644
+index 0000000..60f72a9
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMEPropertyVMEComponent.2.qml
+@@ -0,0 +1,44 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMEPropertyVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component not loaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.foo != 'bar') return reportError('Invalid object 2')
++        if (obj.p == undefined) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.foo != 'bar') return reportError('Invalid object 6')
++        if (obj.p == undefined) return reportError('Invalid object 7')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMEPropertyVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMEPropertyVMEComponent.qml')) return reportError('Property component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.1.qml
+new file mode 100644
+index 0000000..6c7f959
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.1.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMETransientEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component not loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (!obj.p) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component already unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded 2')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.2.qml
+new file mode 100644
+index 0000000..86060c3
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMETransientEmptyComponent.2.qml
+@@ -0,0 +1,45 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component already loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var comp = Qt.createComponent('VMETransientEmptyComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component not loaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (!obj.p) return reportError('Invalid object 3')
++        if (obj.p.x == undefined) return reportError('Invalid object 4')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not loaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component already unloaded')
++        if (!componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.x == undefined) return reportError('Invalid object 6')
++        if (!obj.p) return reportError('Invalid object 7')
++        if (obj.p.x == undefined) return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientEmptyComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMETransientEmptyComponent.qml')) return reportError('Transient component not unloaded')
++        if (componentCache.isTypeLoaded('EmptyComponent.qml')) return reportError('Empty component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.1.qml b/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.1.qml
+new file mode 100644
+index 0000000..c50fd70
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.1.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.1.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMETransientVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.1.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component not loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (!obj.p) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.1.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component already unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.1.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded 2')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.2.qml b/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.2.qml
+new file mode 100644
+index 0000000..120d249
+--- /dev/null
++++ b/tests/auto/qml/qqmlengine/data/testVMETransientVMEComponent.2.qml
+@@ -0,0 +1,45 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    function reportError(s) { console.warn(s) }
++
++    Component.onCompleted: {
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.2.qml')) return reportError('Test component not loaded')
++        if (componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component already loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var comp = Qt.createComponent('VMETransientVMEComponent.qml')
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.2.qml')) return reportError('Test component not loaded 2')
++        if (!componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component not loaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already loaded')
++
++        var obj = comp.createObject()
++        if (!obj) return reportError('Invalid object')
++        if (obj.x == undefined) return reportError('Invalid object 2')
++        if (!obj.p) return reportError('Invalid object 3')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 4')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not loaded')
++
++        comp.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.2.qml')) return reportError('Test component not loaded 3')
++        if (!componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component already unloaded')
++        if (!componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component already unloaded')
++        if (!obj) return reportError('Invalid object 5')
++        if (obj.x == undefined) return reportError('Invalid object 6')
++        if (!obj.p) return reportError('Invalid object 7')
++        if (obj.p.foo != 'bar') return reportError('Invalid object 8')
++
++        obj.destroy()
++        componentCache.trim()
++        if (!componentCache.isTypeLoaded('testVMETransientVMEComponent.2.qml')) return reportError('Test component not loaded 4')
++        if (componentCache.isTypeLoaded('VMETransientVMEComponent.qml')) return reportError('Transient component not unloaded')
++        if (componentCache.isTypeLoaded('VMEComponent.qml')) return reportError('VME component not unloaded')
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlengine/qqmlengine.pro b/tests/auto/qml/qqmlengine/qqmlengine.pro
+index e87b4e3..87e2814 100644
+--- a/tests/auto/qml/qqmlengine/qqmlengine.pro
++++ b/tests/auto/qml/qqmlengine/qqmlengine.pro
+@@ -2,8 +2,10 @@ CONFIG += testcase
+ TARGET = tst_qqmlengine
+ macx:CONFIG -= app_bundle
+ 
++include (../../shared/util.pri)
++
+ SOURCES += tst_qqmlengine.cpp 
+ 
+ CONFIG += parallel_test
+ 
+-QT += core-private gui-private qml-private network testlib
++QT += core-private gui-private qml-private v8-private network testlib
+diff --git a/tests/auto/qml/qqmlengine/tst_qqmlengine.cpp b/tests/auto/qml/qqmlengine/tst_qqmlengine.cpp
+index ab18cdd..727635e 100644
+--- a/tests/auto/qml/qqmlengine/tst_qqmlengine.cpp
++++ b/tests/auto/qml/qqmlengine/tst_qqmlengine.cpp
+@@ -39,7 +39,7 @@
+ **
+ ****************************************************************************/
+ 
+-#include <qtest.h>
++#include "../../shared/util.h"
+ #include <QQmlEngine>
+ #include <QQmlContext>
+ #include <QNetworkAccessManager>
+@@ -51,8 +51,10 @@
+ #include <QQmlComponent>
+ #include <QQmlNetworkAccessManagerFactory>
+ #include <QQmlExpression>
++#include <QQmlIncubationController>
++#include <private/qqmlengine_p.h>
+ 
+-class tst_qqmlengine : public QObject
++class tst_qqmlengine : public QQmlDataTest
+ {
+     Q_OBJECT
+ public:
+@@ -65,6 +67,8 @@ private slots:
+     void contextForObject();
+     void offlineStoragePath();
+     void clearComponentCache();
++    void trimComponentCache();
++    void trimComponentCache_data();
+     void outputWarningsToStandardError();
+     void objectOwnership();
+     void multipleEngines();
+@@ -252,6 +256,122 @@ void tst_qqmlengine::clearComponentCache()
+     }
+ }
+ 
++struct ComponentCacheFunctions : public QObject, public QQmlIncubationController
++{
++    Q_OBJECT
++public:
++    QQmlEngine *engine;
++
++    ComponentCacheFunctions(QQmlEngine &e) : engine(&e) {}
++
++    Q_INVOKABLE void trim()
++    {
++        // Wait for any pending deletions to occur
++        QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++        QCoreApplication::processEvents();
++
++        engine->trimComponentCache();
++    }
++
++    Q_INVOKABLE bool isTypeLoaded(QString file)
++    {
++        return QQmlEnginePrivate::get(engine)->isTypeLoaded(tst_qqmlengine::instance()->testFileUrl(file));
++    }
++
++    Q_INVOKABLE bool isScriptLoaded(QString file)
++    {
++        return QQmlEnginePrivate::get(engine)->isScriptLoaded(tst_qqmlengine::instance()->testFileUrl(file));
++    }
++
++    Q_INVOKABLE void beginIncubation()
++    {
++        startTimer(0);
++    }
++
++    Q_INVOKABLE void waitForIncubation()
++    {
++        while (incubatingObjectCount() > 0) {
++            QCoreApplication::processEvents();
++        }
++    }
++
++private:
++    virtual void timerEvent(QTimerEvent *)
++    {
++        incubateFor(1000);
++    }
++};
++
++void tst_qqmlengine::trimComponentCache()
++{
++    QFETCH(QString, file);
++
++    QQmlEngine engine;
++    ComponentCacheFunctions componentCache(engine);
++    engine.rootContext()->setContextProperty("componentCache", &componentCache);
++    engine.setIncubationController(&componentCache);
++
++    QQmlComponent component(&engine, testFileUrl(file));
++    QVERIFY(component.isReady());
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++    QCOMPARE(object->property("success").toBool(), true);
++}
++
++void tst_qqmlengine::trimComponentCache_data()
++{
++    QTest::addColumn<QString>("file");
++
++    // The various tests here are for two types of components: those that are
++    // empty apart from their inherited elements, and those that define new properties.
++    // For each there are five types of composition: extension, aggregation,
++    // aggregation via component, property and object-created-via-transient-component.
++    foreach (const QString &test, (QStringList() << "EmptyComponent"
++                                                 << "VMEComponent"
++                                                 << "EmptyExtendEmptyComponent"
++                                                 << "VMEExtendEmptyComponent"
++                                                 << "EmptyExtendVMEComponent"
++                                                 << "VMEExtendVMEComponent"
++                                                 << "EmptyAggregateEmptyComponent"
++                                                 << "VMEAggregateEmptyComponent"
++                                                 << "EmptyAggregateVMEComponent"
++                                                 << "VMEAggregateVMEComponent"
++                                                 << "EmptyPropertyEmptyComponent"
++                                                 << "VMEPropertyEmptyComponent"
++                                                 << "EmptyPropertyVMEComponent"
++                                                 << "VMEPropertyVMEComponent"
++                                                 << "VMETransientEmptyComponent"
++                                                 << "VMETransientVMEComponent")) {
++        // For these cases, we first test that the component instance keeps the components
++        // referenced, and then that the instantiated object keeps the components referenced
++        for (int i = 1; i <= 2; ++i) {
++            QString name(QString("%1-%2").arg(test).arg(i));
++            QString file(QString("test%1.%2.qml").arg(test).arg(i));
++            QTest::newRow(name.toLatin1().constData()) << file;
++        }
++    }
++
++    // Test that a transient component is correctly referenced
++    QTest::newRow("TransientComponent-1") << "testTransientComponent.1.qml";
++    QTest::newRow("TransientComponent-2") << "testTransientComponent.2.qml";
++
++    // Test that components can be reloaded after unloading
++    QTest::newRow("ReloadComponent") << "testReloadComponent.qml";
++
++    // Test that components are correctly referenced when dynamically loaded
++    QTest::newRow("LoaderComponent") << "testLoaderComponent.qml";
++
++    // Test that components are correctly referenced when incubated
++    QTest::newRow("IncubatedComponent") << "testIncubatedComponent.qml";
++
++    // Test that a top-level omponents is correctly referenced
++    QTest::newRow("TopLevelComponent") << "testTopLevelComponent.qml";
++
++    // TODO:
++    // Test that scripts are unloaded when no longer referenced
++    QTest::newRow("ScriptComponent") << "testScriptComponent.qml";
++}
++
+ static QStringList warnings;
+ static void msgHandler(QtMsgType, const char *warning)
+ {

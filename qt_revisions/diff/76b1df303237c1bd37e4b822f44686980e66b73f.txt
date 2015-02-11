@@ -1,0 +1,264 @@
+diff --git a/src/gui/kernel/qplatformdrag.h b/src/gui/kernel/qplatformdrag.h
+index 10d539b..3920704 100644
+--- a/src/gui/kernel/qplatformdrag.h
++++ b/src/gui/kernel/qplatformdrag.h
+@@ -104,7 +104,7 @@ public:
+     virtual Qt::DropAction drag(QDrag *m_drag) = 0;
+     void updateAction(Qt::DropAction action);
+ 
+-    Qt::DropAction defaultAction(Qt::DropActions possibleActions, Qt::KeyboardModifiers modifiers) const;
++    virtual Qt::DropAction defaultAction(Qt::DropActions possibleActions, Qt::KeyboardModifiers modifiers) const;
+ 
+     static QPixmap defaultPixmap();
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoadrag.h b/src/plugins/platforms/cocoa/qcocoadrag.h
+index 5a0a3fa..cb8a71e 100644
+--- a/src/plugins/platforms/cocoa/qcocoadrag.h
++++ b/src/plugins/platforms/cocoa/qcocoadrag.h
+@@ -51,10 +51,29 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QCocoaDrag : public QSimpleDrag
++class QCocoaDrag : public QPlatformDrag
+ {
+ public:
++    QCocoaDrag();
++
++    virtual QMimeData *platformDropData();
++    virtual Qt::DropAction drag(QDrag *m_drag);
++
++    virtual Qt::DropAction defaultAction(Qt::DropActions possibleActions,
++                                               Qt::KeyboardModifiers modifiers) const;
++
++    /**
++    * to meet NSView dragImage:at guarantees, we need to record the original
++    * event and view when handling an event in QNSView
++    */
++    void setLastMouseEvent(NSEvent *event, NSView *view);
++
++    void setAcceptedAction(Qt::DropAction act);
+ private:
++    QDrag *m_drag;
++    NSEvent *m_lastEvent;
++    NSView *m_lastView;
++    Qt::DropAction m_executed_drop_action;
+ };
+ 
+ class QCocoaDropData : public QInternalMimeData
+diff --git a/src/plugins/platforms/cocoa/qcocoadrag.mm b/src/plugins/platforms/cocoa/qcocoadrag.mm
+index c596e3f..59db986 100644
+--- a/src/plugins/platforms/cocoa/qcocoadrag.mm
++++ b/src/plugins/platforms/cocoa/qcocoadrag.mm
+@@ -42,9 +42,114 @@
+ #include "qcocoadrag.h"
+ #include "qmacmime.h"
+ #include "qmacclipboard.h"
++#include "qcocoahelpers.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
++QCocoaDrag::QCocoaDrag() :
++    m_drag(0)
++{
++    m_lastEvent = 0;
++    m_lastView = 0;
++}
++
++void QCocoaDrag::setLastMouseEvent(NSEvent *event, NSView *view)
++{
++    m_lastEvent = event;
++    m_lastView = view;
++}
++
++QMimeData *QCocoaDrag::platformDropData()
++{
++    if (m_drag)
++        return m_drag->mimeData();
++
++    return 0;
++}
++
++Qt::DropAction QCocoaDrag::defaultAction(Qt::DropActions possibleActions,
++                                           Qt::KeyboardModifiers modifiers) const
++{
++    Qt::DropAction default_action = Qt::IgnoreAction;
++
++    if (currentDrag()) {
++        default_action = currentDrag()->defaultAction();
++        possibleActions = currentDrag()->supportedActions();
++    }
++
++    if (default_action == Qt::IgnoreAction) {
++        //This means that the drag was initiated by QDrag::start and we need to
++        //preserve the old behavior
++        default_action = Qt::CopyAction;
++    }
++
++    if (modifiers & Qt::ControlModifier && modifiers & Qt::AltModifier)
++        default_action = Qt::LinkAction;
++    else if (modifiers & Qt::AltModifier)
++        default_action = Qt::CopyAction;
++    else if (modifiers & Qt::ControlModifier)
++        default_action = Qt::MoveAction;
++
++#ifdef QDND_DEBUG
++    qDebug("possible actions : %s", dragActionsToString(possibleActions).latin1());
++#endif
++
++    // Check if the action determined is allowed
++    if (!(possibleActions & default_action)) {
++        if (possibleActions & Qt::CopyAction)
++            default_action = Qt::CopyAction;
++        else if (possibleActions & Qt::MoveAction)
++            default_action = Qt::MoveAction;
++        else if (possibleActions & Qt::LinkAction)
++            default_action = Qt::LinkAction;
++        else
++            default_action = Qt::IgnoreAction;
++    }
++
++#ifdef QDND_DEBUG
++    qDebug("default action : %s", dragActionsToString(default_action).latin1());
++#endif
++
++    return default_action;
++}
++
++
++Qt::DropAction QCocoaDrag::drag(QDrag *o)
++{
++    m_drag = o;
++    m_executed_drop_action = Qt::IgnoreAction;
++
++    NSImage *nsimage = static_cast<NSImage *>(qt_mac_create_nsimage(m_drag->pixmap()));
++
++    QMacPasteboard dragBoard((CFStringRef) NSDragPboard, QMacPasteboardMime::MIME_DND);
++    m_drag->mimeData()->setData(QLatin1String("application/x-qt-mime-type-name"), QByteArray("dummy"));
++    dragBoard.setMimeData(m_drag->mimeData());
++
++    NSPoint event_location = [m_lastEvent locationInWindow];
++    NSPoint local_point = [m_lastView convertPoint:event_location fromView:nil];
++    local_point.x -= m_drag->hotSpot().x();
++    CGFloat flippedY = m_drag->pixmap().height() - m_drag->hotSpot().y();
++    local_point.y += flippedY;
++    NSSize mouseOffset = NSMakeSize(0.0, 0.0);
++    NSPasteboard *pboard = [NSPasteboard pasteboardWithName:NSDragPboard];
++
++    [m_lastView dragImage:nsimage
++        at:local_point
++        offset:mouseOffset
++        event:m_lastEvent
++        pasteboard:pboard
++        source:m_lastView
++        slideBack:YES];
++
++    m_drag = 0;
++    return m_executed_drop_action;
++}
++
++void QCocoaDrag::setAcceptedAction(Qt::DropAction act)
++{
++    m_executed_drop_action = act;
++}
++
+ QCocoaDropData::QCocoaDropData(NSPasteboard *pasteboard)
+ {
+     dropPasteboard = reinterpret_cast<CFStringRef>(const_cast<const NSString *>([pasteboard name]));
+diff --git a/src/plugins/platforms/cocoa/qcocoahelpers.mm b/src/plugins/platforms/cocoa/qcocoahelpers.mm
+index 8b09570..3e79ea4 100644
+--- a/src/plugins/platforms/cocoa/qcocoahelpers.mm
++++ b/src/plugins/platforms/cocoa/qcocoahelpers.mm
+@@ -354,7 +354,11 @@ Qt::DropAction qt_mac_mapNSDragOperation(NSDragOperation nsActions)
+ Qt::DropActions qt_mac_mapNSDragOperations(NSDragOperation nsActions)
+ {
+     Qt::DropActions actions = Qt::IgnoreAction;
++
+     for (int i=0; dnd_enums[i].mac_code; i++) {
++        if ((dnd_enums[i].mac_code == NSDragOperationEvery))
++            continue;
++
+         if (nsActions & dnd_enums[i].mac_code)
+             actions |= dnd_enums[i].qt_code;
+     }
+diff --git a/src/plugins/platforms/cocoa/qnsview.mm b/src/plugins/platforms/cocoa/qnsview.mm
+index 718af1e..4e54105 100644
+--- a/src/plugins/platforms/cocoa/qnsview.mm
++++ b/src/plugins/platforms/cocoa/qnsview.mm
+@@ -49,10 +49,12 @@
+ #include "qcocoaautoreleasepool.h"
+ #include "qmultitouch_mac_p.h"
+ #include "qcocoadrag.h"
++#include <qpa/qplatformintegration.h>
+ 
+ #include <qpa/qwindowsysteminterface.h>
+ #include <QtGui/QTextFormat>
+ #include <QtCore/QDebug>
++#include <private/qguiapplication_p.h>
+ 
+ #ifdef QT_COCOA_ENABLE_ACCESSIBILITY_INSPECTOR
+ #include <accessibilityinspector.h>
+@@ -301,6 +303,10 @@ static QTouchDevice *touchDevice = 0;
+         qtScreenPoint = QPoint(screenPoint.x, qt_mac_flipYCoordinate(screenPoint.y));
+     }
+     ulong timestamp = [theEvent timestamp] * 1000;
++
++    QCocoaDrag* nativeDrag = static_cast<QCocoaDrag *>(QGuiApplicationPrivate::platformIntegration()->drag());
++    nativeDrag->setLastMouseEvent(theEvent, self);
++
+     QWindowSystemInterface::handleMouseEvent(m_window, timestamp, qtWindowPoint, qtScreenPoint, m_buttons);
+ }
+ 
+@@ -980,6 +986,18 @@ static QTouchDevice *touchDevice = 0;
+     }
+ }
+ 
++- (NSDragOperation) draggingSourceOperationMaskForLocal:(BOOL)isLocal
++{
++    Q_UNUSED(isLocal);
++    QCocoaDrag* nativeDrag = static_cast<QCocoaDrag *>(QGuiApplicationPrivate::platformIntegration()->drag());
++    return qt_mac_mapDropActions(nativeDrag->currentDrag()->supportedActions());
++}
++
++- (BOOL) ignoreModifierKeysWhileDragging
++{
++    return NO;
++}
++
+ - (NSDragOperation)draggingEntered:(id <NSDraggingInfo>)sender
+ {
+     return [self handleDrag : sender];
+@@ -998,6 +1016,9 @@ static QTouchDevice *touchDevice = 0;
+     Qt::DropActions qtAllowed = qt_mac_mapNSDragOperations([sender draggingSourceOperationMask]);
+     QCocoaDropData mimeData([sender draggingPasteboard]);
+ 
++    // update these so selecting move/copy/link works
++    QGuiApplicationPrivate::modifier_buttons = [self convertKeyModifiers: [[NSApp currentEvent] modifierFlags]];
++
+     QPlatformDragQtResponse response = QWindowSystemInterface::handleDrag(m_window, &mimeData, qt_windowPoint, qtAllowed);
+     return qt_mac_mapDropAction(response.acceptedAction());
+ }
+@@ -1023,4 +1044,23 @@ static QTouchDevice *touchDevice = 0;
+     return response.isAccepted();
+ }
+ 
++- (void)draggedImage:(NSImage*) img endedAt:(NSPoint) point operation:(NSDragOperation) operation
++{
++    QCocoaDrag* nativeDrag = static_cast<QCocoaDrag *>(QGuiApplicationPrivate::platformIntegration()->drag());
++    nativeDrag->setAcceptedAction(qt_mac_mapNSDragOperation(operation));
++
++// keep our state, and QGuiApplication state (buttons member) in-sync,
++// or future mouse events will be processed incorrectly
++    m_buttons &= QFlag(~int(Qt::LeftButton));
++
++    NSPoint windowPoint = [self convertPoint: point fromView: nil];
++    QPoint qtWindowPoint(point.x, point.y);
++
++    NSWindow *window = [self window];
++    NSPoint screenPoint = [window convertBaseToScreen :point];
++    QPoint qtScreenPoint = QPoint(screenPoint.x, qt_mac_flipYCoordinate(screenPoint.y));
++
++    QWindowSystemInterface::handleMouseEvent(m_window, qtWindowPoint, qtScreenPoint, m_buttons);
++}
++
+ @end

@@ -1,0 +1,1156 @@
+diff --git a/src/quick/items/qquickanimatedimage.cpp b/src/quick/items/qquickanimatedimage.cpp
+index b4c1bd4..72b24a7 100644
+--- a/src/quick/items/qquickanimatedimage.cpp
++++ b/src/quick/items/qquickanimatedimage.cpp
+@@ -131,6 +131,8 @@ QQuickAnimatedImage::QQuickAnimatedImage(QQuickItem *parent)
+ QQuickAnimatedImage::~QQuickAnimatedImage()
+ {
+     Q_D(QQuickAnimatedImage);
++    if (d->reply)
++        d->reply->deleteLater();
+     delete d->_movie;
+ }
+ 
+@@ -233,14 +235,16 @@ void QQuickAnimatedImage::setSource(const QUrl &url)
+     if (url == d->url)
+         return;
+ 
+-    delete d->_movie;
+-    d->_movie = 0;
+-
+     if (d->reply) {
+         d->reply->deleteLater();
+         d->reply = 0;
+     }
+ 
++    if (d->_movie) {
++        delete d->_movie;
++        d->_movie = 0;
++    }
++
+     d->url = url;
+     emit sourceChanged(d->url);
+ 
+@@ -252,64 +256,43 @@ void QQuickAnimatedImage::load()
+ {
+     Q_D(QQuickAnimatedImage);
+ 
+-    QQuickImageBase::Status oldStatus = d->status;
+-    qreal oldProgress = d->progress;
+-
+     if (d->url.isEmpty()) {
+-        delete d->_movie;
++        if (d->progress != 0) {
++            d->progress = 0;
++            emit progressChanged(d->progress);
++        }
++
+         d->setImage(QImage());
+-        d->progress = 0;
+         d->status = Null;
+-        if (d->status != oldStatus)
+-            emit statusChanged(d->status);
+-        if (d->progress != oldProgress)
+-            emit progressChanged(d->progress);
++        emit statusChanged(d->status);
++
++        if (sourceSize() != d->oldSourceSize) {
++            d->oldSourceSize = sourceSize();
++            emit sourceSizeChanged();
++        }
+     } else {
+         QString lf = QQmlFile::urlToLocalFileOrQrc(d->url);
+         if (!lf.isEmpty()) {
+-            //### should be unified with movieRequestFinished
+             d->_movie = new QMovie(lf);
+-            if (!d->_movie->isValid()){
+-                qmlInfo(this) << "Error Reading Animated Image File " << d->url.toString();
+-                delete d->_movie;
+-                d->_movie = 0;
+-                d->status = Error;
+-                if (d->status != oldStatus)
+-                    emit statusChanged(d->status);
+-                return;
+-            }
+-            connect(d->_movie, SIGNAL(stateChanged(QMovie::MovieState)),
+-                    this, SLOT(playingStatusChanged()));
+-            connect(d->_movie, SIGNAL(frameChanged(int)),
+-                    this, SLOT(movieUpdate()));
+-            d->_movie->setCacheMode(QMovie::CacheAll);
+-            if (d->playing)
+-                d->_movie->start();
+-            else
+-                d->_movie->jumpToFrame(0);
+-            if (d->paused)
+-                d->_movie->setPaused(true);
+-            d->setImage(d->_movie->currentPixmap().toImage());
+-            d->status = Ready;
+-            d->progress = 1.0;
+-            if (d->status != oldStatus)
++            movieRequestFinished();
++        } else {
++            if (d->status != Loading) {
++                d->status = Loading;
+                 emit statusChanged(d->status);
+-            if (d->progress != oldProgress)
++            }
++            if (d->progress != 0) {
++                d->progress = 0;
+                 emit progressChanged(d->progress);
+-            return;
++            }
++            QNetworkRequest req(d->url);
++            req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
++
++            d->reply = qmlEngine(this)->networkAccessManager()->get(req);
++            QObject::connect(d->reply, SIGNAL(finished()),
++                            this, SLOT(movieRequestFinished()));
++            QObject::connect(d->reply, SIGNAL(downloadProgress(qint64,qint64)),
++                            this, SLOT(requestProgress(qint64,qint64)));
+         }
+-
+-        d->status = Loading;
+-        d->progress = 0;
+-        emit statusChanged(d->status);
+-        emit progressChanged(d->progress);
+-        QNetworkRequest req(d->url);
+-        req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
+-        d->reply = qmlEngine(this)->networkAccessManager()->get(req);
+-        QObject::connect(d->reply, SIGNAL(finished()),
+-                         this, SLOT(movieRequestFinished()));
+-        QObject::connect(d->reply, SIGNAL(downloadProgress(qint64,qint64)),
+-                         this, SLOT(requestProgress(qint64,qint64)));
+     }
+ }
+ 
+@@ -319,58 +302,85 @@ void QQuickAnimatedImage::movieRequestFinished()
+ {
+     Q_D(QQuickAnimatedImage);
+ 
+-    d->redirectCount++;
+-    if (d->redirectCount < ANIMATEDIMAGE_MAXIMUM_REDIRECT_RECURSION) {
+-        QVariant redirect = d->reply->attribute(QNetworkRequest::RedirectionTargetAttribute);
+-        if (redirect.isValid()) {
+-            QUrl url = d->reply->url().resolved(redirect.toUrl());
+-            d->reply->deleteLater();
+-            d->reply = 0;
+-            setSource(url);
+-            return;
++    if (d->reply) {
++        d->redirectCount++;
++        if (d->redirectCount < ANIMATEDIMAGE_MAXIMUM_REDIRECT_RECURSION) {
++            QVariant redirect = d->reply->attribute(QNetworkRequest::RedirectionTargetAttribute);
++            if (redirect.isValid()) {
++                QUrl url = d->reply->url().resolved(redirect.toUrl());
++                d->reply->deleteLater();
++                setSource(url);
++                return;
++            }
+         }
++
++        d->redirectCount=0;
++        d->_movie = new QMovie(d->reply);
+     }
+-    d->redirectCount=0;
+ 
+-    d->_movie = new QMovie(d->reply);
+-    if (!d->_movie->isValid()){
+-#ifndef QT_NO_DEBUG_STREAM
+-        qmlInfo(this) << "Error Reading Animated Image File " << d->url;
+-#endif
++    if (!d->_movie->isValid()) {
++        qmlInfo(this) << "Error Reading Animated Image File " << d->url.toString();
+         delete d->_movie;
+         d->_movie = 0;
++        d->setImage(QImage());
++        if (d->progress != 0) {
++            d->progress = 0;
++            emit progressChanged(d->progress);
++        }
+         d->status = Error;
+         emit statusChanged(d->status);
++
++        if (sourceSize() != d->oldSourceSize) {
++            d->oldSourceSize = sourceSize();
++            emit sourceSizeChanged();
++        }
+         return;
+     }
++
+     connect(d->_movie, SIGNAL(stateChanged(QMovie::MovieState)),
+             this, SLOT(playingStatusChanged()));
+     connect(d->_movie, SIGNAL(frameChanged(int)),
+             this, SLOT(movieUpdate()));
+     d->_movie->setCacheMode(QMovie::CacheAll);
++
++    d->status = Ready;
++    emit statusChanged(d->status);
++
++    if (d->progress != 1.0) {
++        d->progress = 1.0;
++        emit progressChanged(d->progress);
++    }
+     if (d->playing)
+         d->_movie->start();
++
++    if (d->paused)
++        d->_movie->setPaused(true);
+     if (d->paused || !d->playing) {
+         d->_movie->jumpToFrame(d->preset_currentframe);
+         d->preset_currentframe = 0;
+     }
+-    if (d->paused)
+-        d->_movie->setPaused(true);
+     d->setImage(d->_movie->currentPixmap().toImage());
+-    d->status = Ready;
+-    emit statusChanged(d->status);
++
++    if (sourceSize() != d->oldSourceSize) {
++        d->oldSourceSize = sourceSize();
++        emit sourceSizeChanged();
++    }
+ }
+ 
+ void QQuickAnimatedImage::movieUpdate()
+ {
+     Q_D(QQuickAnimatedImage);
+-    d->setImage(d->_movie->currentPixmap().toImage());
+-    emit frameChanged();
++
++    if (d->_movie) {
++        d->setImage(d->_movie->currentPixmap().toImage());
++        emit frameChanged();
++    }
+ }
+ 
+ void QQuickAnimatedImage::playingStatusChanged()
+ {
+     Q_D(QQuickAnimatedImage);
++
+     if ((d->_movie->state() != QMovie::NotRunning) != d->playing) {
+         d->playing = (d->_movie->state() != QMovie::NotRunning);
+         emit playingChanged();
+@@ -381,16 +391,19 @@ void QQuickAnimatedImage::playingStatusChanged()
+     }
+ }
+ 
++QSize QQuickAnimatedImage::sourceSize()
++{
++    Q_D(QQuickAnimatedImage);
++    if (!d->_movie)
++        return QSize(0, 0);
++    return QSize(d->_movie->currentPixmap().size());
++}
++
+ void QQuickAnimatedImage::componentComplete()
+ {
+     Q_D(QQuickAnimatedImage);
+     QQuickItem::componentComplete(); // NOT QQuickImage
+-    if (d->url.isValid())
+-        load();
+-    if (!d->reply) {
+-        setCurrentFrame(d->preset_currentframe);
+-        d->preset_currentframe = 0;
+-    }
++    load();
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickanimatedimage_p.h b/src/quick/items/qquickanimatedimage_p.h
+index 8691019..0841683 100644
+--- a/src/quick/items/qquickanimatedimage_p.h
++++ b/src/quick/items/qquickanimatedimage_p.h
+@@ -80,8 +80,9 @@ public:
+ 
+     int frameCount() const;
+ 
+-    // Extends QQuickImage's src property*/
++    // Extends QQuickImage's src property
+     virtual void setSource(const QUrl&);
++    virtual QSize sourceSize();
+ 
+ Q_SIGNALS:
+     void playingChanged();
+diff --git a/src/quick/items/qquickborderimage.cpp b/src/quick/items/qquickborderimage.cpp
+index 889877a..6c0387f 100644
+--- a/src/quick/items/qquickborderimage.cpp
++++ b/src/quick/items/qquickborderimage.cpp
+@@ -293,34 +293,42 @@ void QQuickBorderImage::setSource(const QUrl &url)
+ void QQuickBorderImage::load()
+ {
+     Q_D(QQuickBorderImage);
+-    if (d->progress != 0.0) {
+-        d->progress = 0.0;
+-        emit progressChanged(d->progress);
+-    }
+ 
+     if (d->url.isEmpty()) {
+         d->pix.clear(this);
+         d->status = Null;
+         setImplicitSize(0, 0);
+         emit statusChanged(d->status);
++        if (d->progress != 0.0) {
++            d->progress = 0.0;
++            emit progressChanged(d->progress);
++        }
++        if (sourceSize() != d->oldSourceSize) {
++            d->oldSourceSize = sourceSize();
++            emit sourceSizeChanged();
++        }
+         update();
+         return;
+     } else {
+-        d->status = Loading;
+         if (d->url.path().endsWith(QLatin1String("sci"))) {
+             QString lf = QQmlFile::urlToLocalFileOrQrc(d->url);
+             if (!lf.isEmpty()) {
+                 QFile file(lf);
+                 file.open(QIODevice::ReadOnly);
+                 setGridScaledImage(QQuickGridScaledImage(&file));
++                return;
+             } else {
++                if (d->progress != 0.0) {
++                    d->progress = 0.0;
++                    emit progressChanged(d->progress);
++                }
++                d->status = Loading;
+                 QNetworkRequest req(d->url);
+                 d->sciReply = qmlEngine(this)->networkAccessManager()->get(req);
+                 qmlobject_connect(d->sciReply, QNetworkReply, SIGNAL(finished()),
+                                   this, QQuickBorderImage, SLOT(sciRequestFinished()))
+             }
+         } else {
+-
+             QQuickPixmap::Options options;
+             if (d->async)
+                 options |= QQuickPixmap::Asynchronous;
+@@ -330,23 +338,15 @@ void QQuickBorderImage::load()
+             d->pix.load(qmlEngine(this), d->url, options);
+ 
+             if (d->pix.isLoading()) {
++                if (d->progress != 0.0) {
++                    d->progress = 0.0;
++                    emit progressChanged(d->progress);
++                }
++                d->status = Loading;
+                 d->pix.connectFinished(this, SLOT(requestFinished()));
+                 d->pix.connectDownloadProgress(this, SLOT(requestProgress(qint64,qint64)));
+             } else {
+-                QSize impsize = d->pix.implicitSize();
+-                setImplicitSize(impsize.width(), impsize.height());
+-
+-                if (d->pix.isReady()) {
+-                    d->status = Ready;
+-                } else {
+-                    d->status = Error;
+-                    qmlInfo(this) << d->pix.error();
+-                }
+-
+-                d->progress = 1.0;
+-                emit statusChanged(d->status);
+-                emit progressChanged(d->progress);
+-                update();
++                requestFinished();
+                 return;
+             }
+         }
+@@ -462,6 +462,14 @@ void QQuickBorderImage::setGridScaledImage(const QQuickGridScaledImage& sci)
+         d->pix.load(qmlEngine(this), d->sciurl, options);
+ 
+         if (d->pix.isLoading()) {
++            if (d->progress != 0.0) {
++                d->progress = 0.0;
++                emit progressChanged(d->progress);
++            }
++            if (d->status != Loading) {
++                d->status = Loading;
++                emit statusChanged(d->status);
++            }
+             static int thisRequestProgress = -1;
+             static int thisRequestFinished = -1;
+             if (thisRequestProgress == -1) {
+@@ -475,22 +483,7 @@ void QQuickBorderImage::setGridScaledImage(const QQuickGridScaledImage& sci)
+             d->pix.connectDownloadProgress(this, thisRequestProgress);
+ 
+         } else {
+-
+-            QSize impsize = d->pix.implicitSize();
+-            setImplicitSize(impsize.width(), impsize.height());
+-
+-            if (d->pix.isReady()) {
+-                d->status = Ready;
+-            } else {
+-                d->status = Error;
+-                qmlInfo(this) << d->pix.error();
+-            }
+-
+-            d->progress = 1.0;
+-            emit statusChanged(d->status);
+-            emit progressChanged(1.0);
+-            update();
+-
++            requestFinished();
+         }
+     }
+ }
+@@ -503,18 +496,25 @@ void QQuickBorderImage::requestFinished()
+     if (d->pix.isError()) {
+         d->status = Error;
+         qmlInfo(this) << d->pix.error();
++        if (d->progress != 0) {
++            d->progress = 0;
++            emit progressChanged(d->progress);
++        }
+     } else {
+         d->status = Ready;
++        if (d->progress != 1.0) {
++            d->progress = 1.0;
++            emit progressChanged(d->progress);
++        }
+     }
+ 
+     setImplicitSize(impsize.width(), impsize.height());
+-
+-    if (d->sourcesize.width() != d->pix.width() || d->sourcesize.height() != d->pix.height())
++    emit statusChanged(d->status);
++    if (sourceSize() != d->oldSourceSize) {
++        d->oldSourceSize = sourceSize();
+         emit sourceSizeChanged();
++    }
+ 
+-    d->progress = 1.0;
+-    emit statusChanged(d->status);
+-    emit progressChanged(1.0);
+     update();
+ }
+ 
+diff --git a/src/quick/items/qquickimagebase.cpp b/src/quick/items/qquickimagebase.cpp
+index 798050d..e42b0ee 100644
+--- a/src/quick/items/qquickimagebase.cpp
++++ b/src/quick/items/qquickimagebase.cpp
+@@ -187,27 +187,37 @@ void QQuickImageBase::load()
+ 
+     if (d->url.isEmpty()) {
+         d->pix.clear(this);
+-        d->status = Null;
+-        d->progress = 0.0;
++        if (d->progress != 0.0) {
++            d->progress = 0.0;
++            emit progressChanged(d->progress);
++        }
+         pixmapChange();
+-        emit progressChanged(d->progress);
++        d->status = Null;
+         emit statusChanged(d->status);
++
++        if (sourceSize() != d->oldSourceSize) {
++            d->oldSourceSize = sourceSize();
++            emit sourceSizeChanged();
++        }
+         update();
++
+     } else {
+         QQuickPixmap::Options options;
+         if (d->async)
+             options |= QQuickPixmap::Asynchronous;
+         if (d->cache)
+             options |= QQuickPixmap::Cache;
+-        d->pix.clear(this);
+-        pixmapChange();
+         d->pix.load(qmlEngine(this), d->url, d->sourcesize, options);
+ 
+         if (d->pix.isLoading()) {
+-            d->progress = 0.0;
+-            d->status = Loading;
+-            emit progressChanged(d->progress);
+-            emit statusChanged(d->status);
++            if (d->progress != 0.0) {
++                d->progress = 0.0;
++                emit progressChanged(d->progress);
++            }
++            if (d->status != Loading) {
++                d->status = Loading;
++                emit statusChanged(d->status);
++            }
+ 
+             static int thisRequestProgress = -1;
+             static int thisRequestFinished = -1;
+@@ -231,28 +241,27 @@ void QQuickImageBase::requestFinished()
+ {
+     Q_D(QQuickImageBase);
+ 
+-    QQuickImageBase::Status oldStatus = d->status;
+-    qreal oldProgress = d->progress;
+-
+     if (d->pix.isError()) {
+-        d->status = Error;
+         qmlInfo(this) << d->pix.error();
++        d->pix.clear(this);
++        d->status = Error;
++        if (d->progress != 0.0) {
++            d->progress = 0.0;
++            emit progressChanged(d->progress);
++        }
+     } else {
+         d->status = Ready;
++        if (d->progress != 1.0) {
++            d->progress = 1.0;
++            emit progressChanged(d->progress);
++        }
+     }
+-
+-    d->progress = 1.0;
+-
+     pixmapChange();
+-
+-    if (d->sourcesize.width() != d->pix.width() || d->sourcesize.height() != d->pix.height())
++    emit statusChanged(d->status);
++    if (sourceSize() != d->oldSourceSize) {
++        d->oldSourceSize = sourceSize();
+         emit sourceSizeChanged();
+-
+-    if (d->status != oldStatus)
+-        emit statusChanged(d->status);
+-    if (d->progress != oldProgress)
+-        emit progressChanged(d->progress);
+-
++    }
+     update();
+ }
+ 
+diff --git a/src/quick/items/qquickimagebase_p_p.h b/src/quick/items/qquickimagebase_p_p.h
+index 6e45238..5708e6d 100644
+--- a/src/quick/items/qquickimagebase_p_p.h
++++ b/src/quick/items/qquickimagebase_p_p.h
+@@ -80,6 +80,7 @@ public:
+     QUrl url;
+     qreal progress;
+     QSize sourcesize;
++    QSize oldSourceSize;
+     bool async : 1;
+     bool cache : 1;
+     bool mirror: 1;
+diff --git a/tests/auto/quick/qquickanimatedimage/data/hearts_copy.gif b/tests/auto/quick/qquickanimatedimage/data/hearts_copy.gif
+new file mode 100644
+index 0000000..cfb55f2
+Binary files /dev/null and b/tests/auto/quick/qquickanimatedimage/data/hearts_copy.gif differ
+diff --git a/tests/auto/quick/qquickanimatedimage/tst_qquickanimatedimage.cpp b/tests/auto/quick/qquickanimatedimage/tst_qquickanimatedimage.cpp
+index 7775e39..690d5c1 100644
+--- a/tests/auto/quick/qquickanimatedimage/tst_qquickanimatedimage.cpp
++++ b/tests/auto/quick/qquickanimatedimage/tst_qquickanimatedimage.cpp
+@@ -60,6 +60,7 @@ public:
+     tst_qquickanimatedimage() {}
+ 
+ private slots:
++    void cleanup();
+     void play();
+     void pause();
+     void stopped();
+@@ -71,13 +72,19 @@ private slots:
+     void remote();
+     void remote_data();
+     void sourceSize();
++    void sourceSizeChanges();
+     void sourceSizeReadOnly();
+     void invalidSource();
+     void qtbug_16520();
+     void progressAndStatusChanges();
+-
+ };
+ 
++void tst_qquickanimatedimage::cleanup()
++{
++    QQuickCanvas canvas;
++    canvas.releaseResources();
++}
++
+ void tst_qquickanimatedimage::play()
+ {
+     QQmlEngine engine;
+@@ -95,8 +102,9 @@ void tst_qquickanimatedimage::pause()
+     QQmlComponent component(&engine, testFileUrl("stickmanpause.qml"));
+     QQuickAnimatedImage *anim = qobject_cast<QQuickAnimatedImage *>(component.create());
+     QVERIFY(anim);
+-    QVERIFY(anim->isPlaying());
+-    QVERIFY(anim->isPaused());
++
++    QTRY_VERIFY(anim->isPaused());
++    QTRY_VERIFY(anim->isPlaying());
+ 
+     delete anim;
+ }
+@@ -180,6 +188,8 @@ void tst_qquickanimatedimage::mirror_running()
+ 
+     QCOMPARE(frame0_flipped, frame0_expected);
+     QCOMPARE(frame1_flipped, frame1_expected);
++
++    delete anim;
+ }
+ 
+ void tst_qquickanimatedimage::mirror_notRunning()
+@@ -207,13 +217,14 @@ void tst_qquickanimatedimage::mirror_notRunning()
+     anim->setProperty("mirror", true);
+     screenshot = QPixmap::fromImage(canvas.grabFrameBuffer());
+ 
+-    QSKIP("Skip while QTBUG-19351 and QTBUG-19252 are not resolved");
+     QCOMPARE(screenshot, expected);
+ 
+     // mirroring should not change the current frame or playing status
+     QCOMPARE(anim->currentFrame(), frame);
+     QCOMPARE(anim->isPlaying(), playing);
+     QCOMPARE(anim->isPaused(), paused);
++
++    delete anim;
+ }
+ 
+ void tst_qquickanimatedimage::mirror_notRunning_data()
+@@ -224,6 +235,15 @@ void tst_qquickanimatedimage::mirror_notRunning_data()
+     QTest::newRow("stopped") << testFileUrl("stickmanstopped.qml");
+ }
+ 
++void tst_qquickanimatedimage::remote_data()
++{
++    QTest::addColumn<QString>("fileName");
++    QTest::addColumn<bool>("paused");
++
++    QTest::newRow("playing") << "stickman.qml" << false;
++    QTest::newRow("paused") << "stickmanpause.qml" << true;
++}
++
+ void tst_qquickanimatedimage::remote()
+ {
+     QFETCH(QString, fileName);
+@@ -271,15 +291,6 @@ void tst_qquickanimatedimage::sourceSizeReadOnly()
+     QCOMPARE(component.errors().at(0).description(), QString("Invalid property assignment: \"sourceSize\" is a read-only property"));
+ }
+ 
+-void tst_qquickanimatedimage::remote_data()
+-{
+-    QTest::addColumn<QString>("fileName");
+-    QTest::addColumn<bool>("paused");
+-
+-    QTest::newRow("playing") << "stickman.qml" << false;
+-    QTest::newRow("paused") << "stickmanpause.qml" << true;
+-}
+-
+ void tst_qquickanimatedimage::invalidSource()
+ {
+     QQmlEngine engine;
+@@ -297,6 +308,74 @@ void tst_qquickanimatedimage::invalidSource()
+     QCOMPARE(anim->currentFrame(), 0);
+     QCOMPARE(anim->frameCount(), 0);
+     QTRY_VERIFY(anim->status() == 3);
++
++    delete anim;
++}
++
++void tst_qquickanimatedimage::sourceSizeChanges()
++{
++    TestHTTPServer server(14449);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlEngine engine;
++    QQmlComponent component(&engine);
++    component.setData("import QtQuick 2.0\nAnimatedImage { source: srcImage }", QUrl::fromLocalFile(""));
++    QTRY_VERIFY(component.isReady());
++    QQmlContext *ctxt = engine.rootContext();
++    ctxt->setContextProperty("srcImage", "");
++    QQuickAnimatedImage *anim = qobject_cast<QQuickAnimatedImage*>(component.create());
++    QVERIFY(anim != 0);
++
++    QSignalSpy sourceSizeSpy(anim, SIGNAL(sourceSizeChanged()));
++
++    // Local
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Null);
++    QTRY_VERIFY(sourceSizeSpy.count() == 0);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("hearts.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("hearts.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("hearts_copy.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("colors.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 2);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Null);
++    QTRY_VERIFY(sourceSizeSpy.count() == 3);
++
++    // Remote
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/hearts.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/hearts.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/hearts_copy.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/colors.gif"));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Ready);
++    QTRY_VERIFY(sourceSizeSpy.count() == 5);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(anim->status(), QQuickAnimatedImage::Null);
++    QTRY_VERIFY(sourceSizeSpy.count() == 6);
++
++    delete anim;
+ }
+ 
+ void tst_qquickanimatedimage::qtbug_16520()
+@@ -312,13 +391,14 @@ void tst_qquickanimatedimage::qtbug_16520()
+     QQuickRectangle *root = qobject_cast<QQuickRectangle *>(component.create());
+     QVERIFY(root);
+     QQuickAnimatedImage *anim = root->findChild<QQuickAnimatedImage*>("anim");
++    QVERIFY(anim != 0);
+ 
+     anim->setProperty("source", "http://127.0.0.1:14449/stickman.gif");
+-
+     QTRY_VERIFY(anim->opacity() == 0);
+     QTRY_VERIFY(anim->opacity() == 1);
+ 
+     delete anim;
++    delete root;
+ }
+ 
+ void tst_qquickanimatedimage::progressAndStatusChanges()
+@@ -343,13 +423,21 @@ void tst_qquickanimatedimage::progressAndStatusChanges()
+     QSignalSpy progressSpy(obj, SIGNAL(progressChanged(qreal)));
+     QSignalSpy statusSpy(obj, SIGNAL(statusChanged(QQuickImageBase::Status)));
+ 
++    // Same image
++    ctxt->setContextProperty("srcImage", testFileUrl("stickman.gif"));
++    QTRY_VERIFY(obj->status() == QQuickImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 0);
++    QTRY_COMPARE(progressSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 0);
++
+     // Loading local file
+     ctxt->setContextProperty("srcImage", testFileUrl("colors.gif"));
+     QTRY_VERIFY(obj->status() == QQuickImage::Ready);
+     QTRY_VERIFY(obj->progress() == 1.0);
+     QTRY_COMPARE(sourceSpy.count(), 1);
+     QTRY_COMPARE(progressSpy.count(), 0);
+-    QTRY_COMPARE(statusSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 1);
+ 
+     // Loading remote file
+     ctxt->setContextProperty("srcImage", "http://127.0.0.1:14449/stickman.gif");
+@@ -359,14 +447,16 @@ void tst_qquickanimatedimage::progressAndStatusChanges()
+     QTRY_VERIFY(obj->progress() == 1.0);
+     QTRY_COMPARE(sourceSpy.count(), 2);
+     QTRY_VERIFY(progressSpy.count() > 1);
+-    QTRY_COMPARE(statusSpy.count(), 2);
++    QTRY_COMPARE(statusSpy.count(), 3);
+ 
+     ctxt->setContextProperty("srcImage", "");
+     QTRY_VERIFY(obj->status() == QQuickImage::Null);
+     QTRY_VERIFY(obj->progress() == 0.0);
+     QTRY_COMPARE(sourceSpy.count(), 3);
+     QTRY_VERIFY(progressSpy.count() > 2);
+-    QTRY_COMPARE(statusSpy.count(), 3);
++    QTRY_COMPARE(statusSpy.count(), 4);
++
++    delete obj;
+ }
+ 
+ QTEST_MAIN(tst_qquickanimatedimage)
+diff --git a/tests/auto/quick/qquickborderimage/data/heart200_copy.png b/tests/auto/quick/qquickborderimage/data/heart200_copy.png
+new file mode 100644
+index 0000000..5a31ae8
+Binary files /dev/null and b/tests/auto/quick/qquickborderimage/data/heart200_copy.png differ
+diff --git a/tests/auto/quick/qquickborderimage/tst_qquickborderimage.cpp b/tests/auto/quick/qquickborderimage/tst_qquickborderimage.cpp
+index 9bffdbc..7e32ca0 100644
+--- a/tests/auto/quick/qquickborderimage/tst_qquickborderimage.cpp
++++ b/tests/auto/quick/qquickborderimage/tst_qquickborderimage.cpp
+@@ -71,6 +71,7 @@ public:
+     tst_qquickborderimage();
+ 
+ private slots:
++    void cleanup();
+     void noSource();
+     void imageSource();
+     void imageSource_data();
+@@ -86,14 +87,22 @@ private slots:
+     void validSciFiles();
+     void pendingRemoteRequest();
+     void pendingRemoteRequest_data();
+-
+     void statusChanges();
+     void statusChanges_data();
++    void sourceSizeChanges();
++    void progressAndStatusChanges();
+ 
+ private:
+     QQmlEngine engine;
+ };
+ 
++void tst_qquickborderimage::cleanup()
++{
++    QQuickCanvas canvas;
++    canvas.releaseResources();
++    engine.clearComponentCache();
++}
++
+ tst_qquickborderimage::tst_qquickborderimage()
+ {
+ }
+@@ -189,6 +198,8 @@ void tst_qquickborderimage::clearSource()
+     QVERIFY(obj->status() == QQuickBorderImage::Null);
+     QCOMPARE(obj->width(), 0.);
+     QCOMPARE(obj->height(), 0.);
++
++    delete obj;
+ }
+ 
+ void tst_qquickborderimage::resized()
+@@ -447,6 +458,130 @@ void tst_qquickborderimage::statusChanges()
+     delete server;
+ }
+ 
++void tst_qquickborderimage::sourceSizeChanges()
++{
++    TestHTTPServer server(14449);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlEngine engine;
++    QQmlComponent component(&engine);
++    component.setData("import QtQuick 2.0\nBorderImage { source: srcImage }", QUrl::fromLocalFile(""));
++    QTRY_VERIFY(component.isReady());
++    QQmlContext *ctxt = engine.rootContext();
++    ctxt->setContextProperty("srcImage", "");
++    QQuickBorderImage *obj = qobject_cast<QQuickBorderImage*>(component.create());
++    QVERIFY(obj != 0);
++
++    QSignalSpy sourceSizeSpy(obj, SIGNAL(sourceSizeChanged()));
++
++    // Local
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 0);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart200.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart200.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart200_copy.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("colors.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 2);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 3);
++
++    // Remote
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart200.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart200.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart200_copy.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/colors.png"));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 5);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(obj->status(), QQuickBorderImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 6);
++
++    delete obj;
++}
++
++void tst_qquickborderimage::progressAndStatusChanges()
++{
++    TestHTTPServer server(14449);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlEngine engine;
++    QString componentStr = "import QtQuick 2.0\nBorderImage { source: srcImage }";
++    QQmlContext *ctxt = engine.rootContext();
++    ctxt->setContextProperty("srcImage", testFileUrl("heart200.png"));
++    QQmlComponent component(&engine);
++    component.setData(componentStr.toLatin1(), QUrl::fromLocalFile(""));
++    QQuickBorderImage *obj = qobject_cast<QQuickBorderImage*>(component.create());
++    QVERIFY(obj != 0);
++    QVERIFY(obj->status() == QQuickBorderImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++
++    qRegisterMetaType<QQuickBorderImage::Status>();
++    QSignalSpy sourceSpy(obj, SIGNAL(sourceChanged(const QUrl &)));
++    QSignalSpy progressSpy(obj, SIGNAL(progressChanged(qreal)));
++    QSignalSpy statusSpy(obj, SIGNAL(statusChanged(QQuickImageBase::Status)));
++
++    // Same file
++    ctxt->setContextProperty("srcImage", testFileUrl("heart200.png"));
++    QTRY_VERIFY(obj->status() == QQuickBorderImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 0);
++    QTRY_COMPARE(progressSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 0);
++
++    // Loading local file
++    ctxt->setContextProperty("srcImage", testFileUrl("colors.png"));
++    QTRY_VERIFY(obj->status() == QQuickBorderImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 1);
++    QTRY_COMPARE(progressSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 1);
++
++    // Loading remote file
++    ctxt->setContextProperty("srcImage", "http://127.0.0.1:14449/heart200.png");
++    QTRY_VERIFY(obj->status() == QQuickBorderImage::Loading);
++    QTRY_VERIFY(obj->progress() == 0.0);
++    QTRY_VERIFY(obj->status() == QQuickBorderImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 2);
++    QTRY_VERIFY(progressSpy.count() > 1);
++    QTRY_COMPARE(statusSpy.count(), 3);
++
++    ctxt->setContextProperty("srcImage", "");
++    QTRY_VERIFY(obj->status() == QQuickBorderImage::Null);
++    QTRY_VERIFY(obj->progress() == 0.0);
++    QTRY_COMPARE(sourceSpy.count(), 3);
++    QTRY_VERIFY(progressSpy.count() > 2);
++    QTRY_COMPARE(statusSpy.count(), 4);
++
++    delete obj;
++}
++
+ QTEST_MAIN(tst_qquickborderimage)
+ 
+ #include "tst_qquickborderimage.moc"
+diff --git a/tests/auto/quick/qquickimage/data/heart_copy.png b/tests/auto/quick/qquickimage/data/heart_copy.png
+new file mode 100644
+index 0000000..abe97fe
+Binary files /dev/null and b/tests/auto/quick/qquickimage/data/heart_copy.png differ
+diff --git a/tests/auto/quick/qquickimage/tst_qquickimage.cpp b/tests/auto/quick/qquickimage/tst_qquickimage.cpp
+index 5e55793..0ff825c 100644
+--- a/tests/auto/quick/qquickimage/tst_qquickimage.cpp
++++ b/tests/auto/quick/qquickimage/tst_qquickimage.cpp
+@@ -55,6 +55,7 @@
+ #include <QtTest/QSignalSpy>
+ #include <QtGui/QPainter>
+ #include <QtGui/QImageReader>
++#include <QQuickCanvas>
+ 
+ #include "../../shared/util.h"
+ #include "../../shared/testhttpserver.h"
+@@ -75,6 +76,7 @@ public:
+     tst_qquickimage();
+ 
+ private slots:
++    void cleanup();
+     void noSource();
+     void imageSource();
+     void imageSource_data();
+@@ -98,6 +100,8 @@ private slots:
+     void imageCrash_QTBUG_22125();
+     void sourceSize_data();
+     void sourceSize();
++    void progressAndStatusChanges();
++    void sourceSizeChanges();
+ 
+ private:
+     QQmlEngine engine;
+@@ -107,6 +111,13 @@ tst_qquickimage::tst_qquickimage()
+ {
+ }
+ 
++void tst_qquickimage::cleanup()
++{
++    QQuickCanvas canvas;
++    canvas.releaseResources();
++    engine.clearComponentCache();
++}
++
+ void tst_qquickimage::noSource()
+ {
+     QString componentStr = "import QtQuick 2.0\nImage { source: \"\" }";
+@@ -536,7 +547,7 @@ void tst_qquickimage::noLoading()
+     QTRY_VERIFY(obj->progress() == 1.0);
+     QTRY_COMPARE(sourceSpy.count(), 1);
+     QTRY_COMPARE(progressSpy.count(), 0);
+-    QTRY_COMPARE(statusSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 1);
+ 
+     // Loading remote file
+     ctxt->setContextProperty("srcImage", QString(SERVER_ADDR) + "/rect.png");
+@@ -546,7 +557,7 @@ void tst_qquickimage::noLoading()
+     QTRY_VERIFY(obj->progress() == 1.0);
+     QTRY_COMPARE(sourceSpy.count(), 2);
+     QTRY_COMPARE(progressSpy.count(), 2);
+-    QTRY_COMPARE(statusSpy.count(), 2);
++    QTRY_COMPARE(statusSpy.count(), 3);
+ 
+     // Loading remote file again - should not go through 'Loading' state.
+     ctxt->setContextProperty("srcImage", testFileUrl("green.png"));
+@@ -555,7 +566,7 @@ void tst_qquickimage::noLoading()
+     QTRY_VERIFY(obj->progress() == 1.0);
+     QTRY_COMPARE(sourceSpy.count(), 4);
+     QTRY_COMPARE(progressSpy.count(), 2);
+-    QTRY_COMPARE(statusSpy.count(), 2);
++    QTRY_COMPARE(statusSpy.count(), 5);
+ 
+     delete obj;
+ }
+@@ -741,6 +752,130 @@ void tst_qquickimage::sourceSize()
+     delete canvas;
+ }
+ 
++void tst_qquickimage::sourceSizeChanges()
++{
++    TestHTTPServer server(14449);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlEngine engine;
++    QQmlComponent component(&engine);
++    component.setData("import QtQuick 2.0\nImage { source: srcImage }", QUrl::fromLocalFile(""));
++    QTRY_VERIFY(component.isReady());
++    QQmlContext *ctxt = engine.rootContext();
++    ctxt->setContextProperty("srcImage", "");
++    QQuickImage *img = qobject_cast<QQuickImage*>(component.create());
++    QVERIFY(img != 0);
++
++    QSignalSpy sourceSizeSpy(img, SIGNAL(sourceSizeChanged()));
++
++    // Local
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(img->status(), QQuickImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 0);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("heart_copy.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 1);
++
++    ctxt->setContextProperty("srcImage", testFileUrl("colors.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 2);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(img->status(), QQuickImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 3);
++
++    // Remote
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/heart_copy.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 4);
++
++    ctxt->setContextProperty("srcImage", QUrl("http://127.0.0.1:14449/colors.png"));
++    QTRY_COMPARE(img->status(), QQuickImage::Ready);
++    QTRY_COMPARE(sourceSizeSpy.count(), 5);
++
++    ctxt->setContextProperty("srcImage", QUrl(""));
++    QTRY_COMPARE(img->status(), QQuickImage::Null);
++    QTRY_COMPARE(sourceSizeSpy.count(), 6);
++
++    delete img;
++}
++
++void tst_qquickimage::progressAndStatusChanges()
++{
++    TestHTTPServer server(14449);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlEngine engine;
++    QString componentStr = "import QtQuick 2.0\nImage { source: srcImage }";
++    QQmlContext *ctxt = engine.rootContext();
++    ctxt->setContextProperty("srcImage", testFileUrl("heart.png"));
++    QQmlComponent component(&engine);
++    component.setData(componentStr.toLatin1(), QUrl::fromLocalFile(""));
++    QQuickImage *obj = qobject_cast<QQuickImage*>(component.create());
++    QVERIFY(obj != 0);
++    QVERIFY(obj->status() == QQuickImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++
++    qRegisterMetaType<QQuickImageBase::Status>();
++    QSignalSpy sourceSpy(obj, SIGNAL(sourceChanged(const QUrl &)));
++    QSignalSpy progressSpy(obj, SIGNAL(progressChanged(qreal)));
++    QSignalSpy statusSpy(obj, SIGNAL(statusChanged(QQuickImageBase::Status)));
++
++    // Same image
++    ctxt->setContextProperty("srcImage", testFileUrl("heart.png"));
++    QTRY_VERIFY(obj->status() == QQuickImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 0);
++    QTRY_COMPARE(progressSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 0);
++
++    // Loading local file
++    ctxt->setContextProperty("srcImage", testFileUrl("colors.png"));
++    QTRY_VERIFY(obj->status() == QQuickImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 1);
++    QTRY_COMPARE(progressSpy.count(), 0);
++    QTRY_COMPARE(statusSpy.count(), 1);
++
++    // Loading remote file
++    ctxt->setContextProperty("srcImage", "http://127.0.0.1:14449/heart.png");
++    QTRY_VERIFY(obj->status() == QQuickImage::Loading);
++    QTRY_VERIFY(obj->progress() == 0.0);
++    QTRY_VERIFY(obj->status() == QQuickImage::Ready);
++    QTRY_VERIFY(obj->progress() == 1.0);
++    QTRY_COMPARE(sourceSpy.count(), 2);
++    QTRY_VERIFY(progressSpy.count() > 1);
++    QTRY_COMPARE(statusSpy.count(), 3);
++
++    ctxt->setContextProperty("srcImage", "");
++    QTRY_VERIFY(obj->status() == QQuickImage::Null);
++    QTRY_VERIFY(obj->progress() == 0.0);
++    QTRY_COMPARE(sourceSpy.count(), 3);
++    QTRY_VERIFY(progressSpy.count() > 2);
++    QTRY_COMPARE(statusSpy.count(), 4);
++
++    delete obj;
++}
++
+ QTEST_MAIN(tst_qquickimage)
+ 
+ #include "tst_qquickimage.moc"

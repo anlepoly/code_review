@@ -1,0 +1,3800 @@
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index a73fe7c..6cd5cf6c 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -280,6 +280,16 @@ static inline QString buildTypeNameForDebug(const QMetaObject *metaObject)
+     \value Error An error has occurred.  Call errors() to retrieve a list of \{QQmlError}{errors}.
+ */
+ 
++/*!
++    \enum QQmlComponent::CompilationMode
++
++    Specifies whether the QQmlComponent should load the component immediately, or asynchonously.
++
++    \value PreferSynchronous Prefer loading/compiling the component immediately, blocking the thread.
++    This is not always possible, e.g. remote URLs will always load asynchronously.
++    \value Asynchronous Load/compile the component in a background thread.
++*/
++
+ void QQmlComponentPrivate::typeDataReady(QQmlTypeData *)
+ {
+     Q_Q(QQmlComponent);
+@@ -288,8 +298,10 @@ void QQmlComponentPrivate::typeDataReady(QQmlTypeData *)
+ 
+     fromTypeData(typeData);
+     typeData = 0;
++    progress = 1.0;
+ 
+     emit q->statusChanged(q->status());
++    emit q->progressChanged(progress);
+ }
+ 
+ void QQmlComponentPrivate::typeDataProgress(QQmlTypeData *, qreal p)
+@@ -476,7 +488,24 @@ QQmlComponent::QQmlComponent(QQmlEngine *engine, const QUrl &url, QObject *paren
+ {
+     Q_D(QQmlComponent);
+     d->engine = engine;
+-    loadUrl(url);
++    d->loadUrl(url);
++}
++
++/*!
++    Create a QQmlComponent from the given \a url and give it the
++    specified \a parent and \a engine.  If \a mode is \l Asynchronous,
++    the component will be loaded and compiled asynchronously.
++
++    Ensure that the URL provided is full and correct, in particular, use
++    \l QUrl::fromLocalFile() when loading a file from the local filesystem.
++
++    \sa loadUrl()
++*/QQmlComponent::QQmlComponent(QQmlEngine *engine, const QUrl &url, CompilationMode mode, QObject *parent)
++: QObject(*(new QQmlComponentPrivate), parent)
++{
++    Q_D(QQmlComponent);
++    d->engine = engine;
++    d->loadUrl(url, mode);
+ }
+ 
+ /*!
+@@ -491,7 +520,23 @@ QQmlComponent::QQmlComponent(QQmlEngine *engine, const QString &fileName,
+ {
+     Q_D(QQmlComponent);
+     d->engine = engine;
+-    loadUrl(d->engine->baseUrl().resolved(QUrl::fromLocalFile(fileName)));
++    d->loadUrl(d->engine->baseUrl().resolved(QUrl::fromLocalFile(fileName)));
++}
++
++/*!
++    Create a QQmlComponent from the given \a fileName and give it the specified
++    \a parent and \a engine.  If \a mode is \l Asynchronous,
++    the component will be loaded and compiled asynchronously.
++
++    \sa loadUrl()
++*/
++QQmlComponent::QQmlComponent(QQmlEngine *engine, const QString &fileName,
++                           CompilationMode mode, QObject *parent)
++: QObject(*(new QQmlComponentPrivate), parent)
++{
++    Q_D(QQmlComponent);
++    d->engine = engine;
++    d->loadUrl(d->engine->baseUrl().resolved(QUrl::fromLocalFile(fileName)), mode);
+ }
+ 
+ /*!
+@@ -558,35 +603,63 @@ QQmlContext *QQmlComponent::creationContext() const
+ void QQmlComponent::loadUrl(const QUrl &url)
+ {
+     Q_D(QQmlComponent);
++    d->loadUrl(url);
++}
+ 
+-    d->clear();
++/*!
++    Load the QQmlComponent from the provided \a url.
++    If \a mode is \l Asynchronous, the component will be loaded and compiled asynchronously.
++
++    Ensure that the URL provided is full and correct, in particular, use
++    \l QUrl::fromLocalFile() when loading a file from the local filesystem.
++*/
++void QQmlComponent::loadUrl(const QUrl &url, QQmlComponent::CompilationMode mode)
++{
++    Q_D(QQmlComponent);
++    d->loadUrl(url, mode);
++}
++
++void QQmlComponentPrivate::loadUrl(const QUrl &newUrl, QQmlComponent::CompilationMode mode)
++{
++    Q_Q(QQmlComponent);
++    clear();
+ 
+-    if ((url.isRelative() && !url.isEmpty())
+-    || url.scheme() == QLatin1String("file")) // Workaround QTBUG-11929
+-        d->url = d->engine->baseUrl().resolved(url);
++    if ((newUrl.isRelative() && !newUrl.isEmpty())
++    || newUrl.scheme() == QLatin1String("file")) // Workaround QTBUG-11929
++        url = engine->baseUrl().resolved(newUrl);
+     else
+-        d->url = url;
++        url = newUrl;
+ 
+-    if (url.isEmpty()) {
++    if (newUrl.isEmpty()) {
+         QQmlError error;
+-        error.setDescription(tr("Invalid empty URL"));
+-        d->state.errors << error;
++        error.setDescription(q->tr("Invalid empty URL"));
++        state.errors << error;
+         return;
+     }
+ 
+-    QQmlTypeData *data = QQmlEnginePrivate::get(d->engine)->typeLoader.get(d->url);
++    if (progress != 0.0) {
++        progress = 0.0;
++        emit q->progressChanged(progress);
++    }
++
++    QQmlDataLoader::Mode loaderMode = (mode == QQmlComponent::Asynchronous)
++            ? QQmlDataLoader::Asynchronous
++            : QQmlDataLoader::PreferSynchronous;
++
++    QQmlTypeData *data = QQmlEnginePrivate::get(engine)->typeLoader.get(url, loaderMode);
+ 
+     if (data->isCompleteOrError()) {
+-        d->fromTypeData(data);
+-        d->progress = 1.0;
++        fromTypeData(data);
++        progress = 1.0;
+     } else {
+-        d->typeData = data;
+-        d->typeData->registerCallback(d);
+-        d->progress = data->progress();
++        typeData = data;
++        typeData->registerCallback(this);
++        progress = data->progress();
+     }
+ 
+-    emit statusChanged(status());
+-    emit progressChanged(d->progress);
++    emit q->statusChanged(q->status());
++    if (progress != 0.0)
++        emit q->progressChanged(progress);
+ }
+ 
+ /*!
+diff --git a/src/qml/qml/qqmlcomponent.h b/src/qml/qml/qqmlcomponent.h
+index 1265fb1..9fc9388 100644
+--- a/src/qml/qml/qqmlcomponent.h
++++ b/src/qml/qml/qqmlcomponent.h
+@@ -73,10 +73,15 @@ class Q_QML_EXPORT QQmlComponent : public QObject
+     Q_PROPERTY(QUrl url READ url CONSTANT)
+ 
+ public:
++    Q_ENUMS(CompilationMode)
++    enum CompilationMode { PreferSynchronous, Asynchronous };
++
+     QQmlComponent(QObject *parent = 0);
+     QQmlComponent(QQmlEngine *, QObject *parent=0);
+     QQmlComponent(QQmlEngine *, const QString &fileName, QObject *parent = 0);
++    QQmlComponent(QQmlEngine *, const QString &fileName, CompilationMode mode, QObject *parent = 0);
+     QQmlComponent(QQmlEngine *, const QUrl &url, QObject *parent = 0);
++    QQmlComponent(QQmlEngine *, const QUrl &url, CompilationMode mode, QObject *parent = 0);
+     virtual ~QQmlComponent();
+ 
+     Q_ENUMS(Status)
+@@ -108,6 +113,7 @@ public:
+ 
+ public Q_SLOTS:
+     void loadUrl(const QUrl &url);
++    void loadUrl(const QUrl &url, CompilationMode mode);
+     void setData(const QByteArray &, const QUrl &baseUrl);
+ 
+ Q_SIGNALS:
+diff --git a/src/qml/qml/qqmlcomponent_p.h b/src/qml/qml/qqmlcomponent_p.h
+index dda5bd0..9e220b5 100644
+--- a/src/qml/qml/qqmlcomponent_p.h
++++ b/src/qml/qml/qqmlcomponent_p.h
+@@ -86,6 +86,8 @@ class Q_QML_PRIVATE_EXPORT QQmlComponentPrivate : public QObjectPrivate, public
+ public:
+     QQmlComponentPrivate() : typeData(0), progress(0.), start(-1), cc(0), engine(0), creationContext(0), profiler(0) {}
+ 
++    void loadUrl(const QUrl &newUrl, QQmlComponent::CompilationMode mode = QQmlComponent::PreferSynchronous);
++
+     QObject *beginCreate(QQmlContextData *);
+     void completeCreate();
+     void initializeObjectWithInitialProperties(v8::Handle<v8::Object> qmlGlobal, v8::Handle<v8::Object> valuemap, QObject *toCreate);
+diff --git a/src/qml/qml/qqmltypeloader.cpp b/src/qml/qml/qqmltypeloader.cpp
+index 0082d55..36ba530 100644
+--- a/src/qml/qml/qqmltypeloader.cpp
++++ b/src/qml/qml/qqmltypeloader.cpp
+@@ -1171,7 +1171,7 @@ This enum defines the options that control the way type data is handled.
+ /*!
+ Returns a QQmlTypeData for the specified \a url.  The QQmlTypeData may be cached.
+ */
+-QQmlTypeData *QQmlTypeLoader::get(const QUrl &url)
++QQmlTypeData *QQmlTypeLoader::get(const QUrl &url, Mode mode)
+ {
+     Q_ASSERT(!url.isRelative() && 
+             (QQmlEnginePrivate::urlToLocalFileOrQrc(url).isEmpty() || 
+@@ -1184,7 +1184,7 @@ QQmlTypeData *QQmlTypeLoader::get(const QUrl &url)
+     if (!typeData) {
+         typeData = new QQmlTypeData(url, None, this);
+         m_typeCache.insert(url, typeData);
+-        QQmlDataLoader::load(typeData);
++        QQmlDataLoader::load(typeData, mode);
+     }
+ 
+     typeData->addref();
+diff --git a/src/qml/qml/qqmltypeloader_p.h b/src/qml/qml/qqmltypeloader_p.h
+index 0dd7ade..c8c2756 100644
+--- a/src/qml/qml/qqmltypeloader_p.h
++++ b/src/qml/qml/qqmltypeloader_p.h
+@@ -236,7 +236,7 @@ public:
+     };
+     Q_DECLARE_FLAGS(Options, Option)
+ 
+-    QQmlTypeData *get(const QUrl &url);
++    QQmlTypeData *get(const QUrl &url, Mode mode = PreferSynchronous);
+     QQmlTypeData *get(const QByteArray &, const QUrl &url, Options = None);
+     void clearCache();
+ 
+diff --git a/src/qml/qml/v8/qqmlbuiltinfunctions.cpp b/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
+index 11a233d..b9f2b62 100644
+--- a/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
++++ b/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
+@@ -1120,7 +1120,7 @@ v8::Handle<v8::Value> createQmlObject(const v8::Arguments &args)
+ }
+ 
+ /*!
+-\qmlmethod object Qt::createComponent(url)
++\qmlmethod object Qt::createComponent(url, mode)
+ 
+ Returns a \l Component object created using the QML file at the specified \a url,
+ or \c null if an empty string was given.
+@@ -1129,6 +1129,12 @@ The returned component's \l Component::status property indicates whether the
+ component was successfully created. If the status is \c Component.Error,
+ see \l Component::errorString() for an error description.
+ 
++If the optional \a mode parameter is set to \c Component.Asynchronous, the
++component will be loaded in a background thread.  The Component::status property
++will be \c Component.Loading while it is loading.  The status will change to
++\c Component.Ready if the component loads successfully, or \c Component.Error
++if loading fails.
++
+ Call \l {Component::createObject()}{Component.createObject()} on the returned
+ component to create an object instance of the component.
+ 
+@@ -1143,8 +1149,9 @@ use \l{QML:Qt::createQmlObject()}{Qt.createQmlObject()}.
+ */
+ v8::Handle<v8::Value> createComponent(const v8::Arguments &args)
+ {
+-    if (args.Length() != 1)
+-        V8THROW_ERROR("Qt.createComponent(): Invalid arguments");
++    const char *invalidArgs = "Qt.createComponent(): Invalid arguments";
++    if (args.Length() < 1 || args.Length() > 2)
++        V8THROW_ERROR(invalidArgs);
+ 
+     QV8Engine *v8engine = V8ENGINE();
+     QQmlEngine *engine = v8engine->engine();
+@@ -1159,8 +1166,20 @@ v8::Handle<v8::Value> createComponent(const v8::Arguments &args)
+     if (arg.isEmpty())
+         return v8::Null();
+ 
++    QQmlComponent::CompilationMode compileMode = QQmlComponent::PreferSynchronous;
++    if (args.Length() == 2) {
++        if (args[1]->IsInt32()) {
++            int mode = args[1]->Int32Value();
++            if (mode != int(QQmlComponent::PreferSynchronous) && mode != int(QQmlComponent::Asynchronous))
++                V8THROW_ERROR(invalidArgs);
++            compileMode = QQmlComponent::CompilationMode(mode);
++        } else {
++            V8THROW_ERROR(invalidArgs);
++        }
++    }
++
+     QUrl url = context->resolvedUrl(QUrl(arg));
+-    QQmlComponent *c = new QQmlComponent(engine, url, engine);
++    QQmlComponent *c = new QQmlComponent(engine, url, compileMode, engine);
+     QQmlComponentPrivate::get(c)->creationContext = effectiveContext;
+     QQmlData::get(c, true)->setImplicitDestructible();
+     return v8engine->newQObject(c);
+diff --git a/src/quick/items/qquickloader.cpp b/src/quick/items/qquickloader.cpp
+index 8877385..59cb37c 100644
+--- a/src/quick/items/qquickloader.cpp
++++ b/src/quick/items/qquickloader.cpp
+@@ -344,7 +344,8 @@ void QQuickLoader::loadFromSource()
+     }
+ 
+     if (isComponentComplete()) {
+-        d->component = new QQmlComponent(qmlEngine(this), d->source, this);
++        QQmlComponent::CompilationMode mode = d->asynchronous ? QQmlComponent::Asynchronous : QQmlComponent::PreferSynchronous;
++        d->component = new QQmlComponent(qmlEngine(this), d->source, mode, this);
+         d->load();
+     }
+ }
+@@ -711,7 +712,8 @@ void QQuickLoader::componentComplete()
+     QQuickItem::componentComplete();
+     if (active()) {
+         if (d->loadingFromSource) {
+-            d->component = new QQmlComponent(qmlEngine(this), d->source, this);
++            QQmlComponent::CompilationMode mode = d->asynchronous ? QQmlComponent::Asynchronous : QQmlComponent::PreferSynchronous;
++            d->component = new QQmlComponent(qmlEngine(this), d->source, mode, this);
+         }
+         d->load();
+     }
+@@ -752,6 +754,9 @@ qreal QQuickLoader::progress() const
+ 
+ This property holds whether the component will be instantiated asynchronously.
+ 
++When used in conjunction with the \l source property, loading and compilation
++will also be performed in a background thread.
++
+ Loading asynchronously creates the objects declared by the component
+ across multiple frames, and reduces the
+ likelihood of glitches in animation.  When loading asynchronously the status
+diff --git a/tests/auto/qml/qqmlcomponent/data/TestComponent.2.qml b/tests/auto/qml/qqmlcomponent/data/TestComponent.2.qml
+new file mode 100644
+index 0000000..fca43fe
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/TestComponent.2.qml
+@@ -0,0 +1,591 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    objectName: "root"
++    property int zero: 0
++
++    Item {
++        id: c1
++        objectName: "c1"
++        property int one: zero + 1
++
++        Item {
++            id: c1c1
++            objectName: "c1c1"
++            property bool two: c2c1c1.two
++        }
++
++        Item {
++            id: c1c2
++            objectName: "c1c2"
++            property string three: "three"
++
++            Rectangle {
++                id: c1c2c3
++                objectName: "c1c2c3"
++                property alias othercolor: c2c1.color
++                color: if (c2c1.color == Qt.rgba(0,0,1)) Qt.rgba(1,0,0); else Qt.rgba(0,1,0);
++            }
++        }
++    }
++
++    Item {
++        id: c2
++        objectName: "c2"
++        property string two: "two"
++
++        Rectangle {
++            id: c2c1
++            objectName: "c2c1"
++            property string three: "2" + c1c2.three
++            color: "blue"
++
++            MouseArea {
++                id: c2c1c1
++                objectName: "c2c1c1"
++                property bool two: false
++                onClicked: two = !two
++            }
++
++            Item {
++                id: c2c1c2
++                objectName: "c2c1c2"
++                property string three: "1" + parent.three
++            }
++        }
++    }
++
++    Item {
++        id: c3
++        objectName: "c3"
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++    }
++
++    property bool success: true
++    Component.onCompleted: {
++        // test state after initial bindings evaluation
++        if (zero != 0) success = false;
++        if (c1.one != 1) success = false;
++        if (c1c1.two != false) success = false;
++        if (c1c2.three != "three") success = false;
++        if (c1c2c3.color != Qt.rgba(1,0,0)) success = false;
++        if (c2.two != "two") success = false;
++        if (c2c1.three != "2three") success = false;
++        if (c2c1.color != Qt.rgba(0,0,1)) success = false;
++        if (c2c1c1.two != false) success = false;
++        if (c2c1c2.three != "12three") success = false;
++        if (c3.children.length != 500) success = false;
++
++        // now retrigger bindings evaluation
++        root.zero = 5;
++        if (c1.one != 6) success = false;
++        c2c1c1.two = true;
++        if (c1c1.two != true) success = false;
++        c1c2.three = "3";
++        if (c2c1.three != "23") success = false;
++        if (c2c1c2.three != "123") success = false;
++        c2c1.color = Qt.rgba(1,0,0);
++        if (c1c2c3.color != Qt.rgba(0,1,0)) success = false;
++        if (c1c2c3.othercolor != Qt.rgba(1,0,0)) success = false;
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/data/TestComponent.qml b/tests/auto/qml/qqmlcomponent/data/TestComponent.qml
+new file mode 100644
+index 0000000..64cec1c
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/TestComponent.qml
+@@ -0,0 +1,534 @@
++import QtQuick 2.0
++
++Item {
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++}
+diff --git a/tests/auto/qml/qqmlcomponent/qqmlcomponent.pro b/tests/auto/qml/qqmlcomponent/qqmlcomponent.pro
+index cf1c398..6667513 100644
+--- a/tests/auto/qml/qqmlcomponent/qqmlcomponent.pro
++++ b/tests/auto/qml/qqmlcomponent/qqmlcomponent.pro
+@@ -2,7 +2,11 @@ CONFIG += testcase
+ TARGET = tst_qqmlcomponent
+ macx:CONFIG -= app_bundle
+ 
+-SOURCES += tst_qqmlcomponent.cpp
++INCLUDEPATH += ../../shared/
++SOURCES += tst_qqmlcomponent.cpp \
++            ../../shared/testhttpserver.cpp
++
++HEADERS += ../../shared/testhttpserver.h
+ 
+ include (../../shared/util.pri)
+ 
+@@ -10,4 +14,4 @@ TESTDATA = data/*
+ 
+ CONFIG += parallel_test
+ 
+-QT += core-private gui-private qml-private network testlib
++QT += core-private gui-private qml-private quick-private network testlib
+diff --git a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+index 603c091..10181aa 100644
+--- a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
++++ b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+@@ -45,8 +45,14 @@
+ #include <QtQml/qqmlcomponent.h>
+ #include <QtQml/qqmlproperty.h>
+ #include <QtQml/qqmlincubator.h>
++#include <QtQuick>
++#include <QtQuick/private/qquickrectangle_p.h>
++#include <QtQuick/private/qquickmousearea_p.h>
+ #include <qcolor.h>
+ #include "../../shared/util.h"
++#include "testhttpserver.h"
++
++#define SERVER_PORT 14450
+ 
+ class MyIC : public QObject, public QQmlIncubationController
+ {
+@@ -59,6 +65,37 @@ protected:
+     }
+ };
+ 
++class ComponentWatcher : public QObject
++{
++    Q_OBJECT
++public:
++    ComponentWatcher(QQmlComponent *comp) : loading(0), error(0), ready(0) {
++        connect(comp, SIGNAL(statusChanged(QQmlComponent::Status)),
++                this, SLOT(statusChanged(QQmlComponent::Status)));
++    }
++
++    int loading;
++    int error;
++    int ready;
++
++public slots:
++    void statusChanged(QQmlComponent::Status status) {
++        switch (status) {
++        case QQmlComponent::Loading:
++            ++loading;
++            break;
++        case QQmlComponent::Error:
++            ++error;
++            break;
++        case QQmlComponent::Ready:
++            ++ready;
++            break;
++        default:
++            break;
++        }
++    }
++};
++
+ class tst_qqmlcomponent : public QQmlDataTest
+ {
+     Q_OBJECT
+@@ -72,6 +109,8 @@ private slots:
+     void qmlCreateObjectWithProperties();
+     void qmlIncubateObject();
+     void qmlCreateParentReference();
++    void async();
++    void asyncHierarchy();
+ 
+ private:
+     QQmlEngine engine;
+@@ -213,6 +252,68 @@ void tst_qqmlcomponent::qmlCreateParentReference()
+     QCOMPARE(warnings.count(), 0);
+ }
+ 
++void tst_qqmlcomponent::async()
++{
++    TestHTTPServer server(SERVER_PORT);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    QQmlComponent component(&engine);
++    ComponentWatcher watcher(&component);
++    component.loadUrl(QUrl("http://127.0.0.1:14450/TestComponent.qml"), QQmlComponent::Asynchronous);
++    QCOMPARE(watcher.loading, 1);
++    QTRY_VERIFY(component.isReady());
++    QCOMPARE(watcher.ready, 1);
++    QCOMPARE(watcher.error, 0);
++
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++
++    delete object;
++}
++
++void tst_qqmlcomponent::asyncHierarchy()
++{
++    TestHTTPServer server(SERVER_PORT);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory());
++
++    // ensure that the item hierarchy is compiled correctly.
++    QQmlComponent component(&engine);
++    ComponentWatcher watcher(&component);
++    component.loadUrl(QUrl("http://127.0.0.1:14450/TestComponent.2.qml"), QQmlComponent::Asynchronous);
++    QCOMPARE(watcher.loading, 1);
++    QTRY_VERIFY(component.isReady());
++    QCOMPARE(watcher.ready, 1);
++    QCOMPARE(watcher.error, 0);
++
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    // ensure that the parent-child relationship hierarchy is correct
++    QQuickItem *c1 = root->findChild<QQuickItem*>("c1", Qt::FindDirectChildrenOnly);
++    QVERIFY(c1);
++    QQuickItem *c1c1 = c1->findChild<QQuickItem*>("c1c1", Qt::FindDirectChildrenOnly);
++    QVERIFY(c1c1);
++    QQuickItem *c1c2 = c1->findChild<QQuickItem*>("c1c2", Qt::FindDirectChildrenOnly);
++    QVERIFY(c1c2);
++    QQuickRectangle *c1c2c3 = c1c2->findChild<QQuickRectangle*>("c1c2c3", Qt::FindDirectChildrenOnly);
++    QVERIFY(c1c2c3);
++    QQuickItem *c2 = root->findChild<QQuickItem*>("c2", Qt::FindDirectChildrenOnly);
++    QVERIFY(c2);
++    QQuickRectangle *c2c1 = c2->findChild<QQuickRectangle*>("c2c1", Qt::FindDirectChildrenOnly);
++    QVERIFY(c2c1);
++    QQuickMouseArea *c2c1c1 = c2c1->findChild<QQuickMouseArea*>("c2c1c1", Qt::FindDirectChildrenOnly);
++    QVERIFY(c2c1c1);
++    QQuickItem *c2c1c2 = c2c1->findChild<QQuickItem*>("c2c1c2", Qt::FindDirectChildrenOnly);
++    QVERIFY(c2c1c2);
++
++    // ensure that values and bindings are assigned correctly
++    QVERIFY(root->property("success").toBool());
++
++    delete root;
++}
++
+ QTEST_MAIN(tst_qqmlcomponent)
+ 
+ #include "tst_qqmlcomponent.moc"
+diff --git a/tests/auto/qml/qqmlqt/data/TestComponent.2.qml b/tests/auto/qml/qqmlqt/data/TestComponent.2.qml
+new file mode 100644
+index 0000000..d6e9902
+--- /dev/null
++++ b/tests/auto/qml/qqmlqt/data/TestComponent.2.qml
+@@ -0,0 +1,592 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    objectName: "root"
++    property int zero: 0
++
++    Item {
++        id: c1
++        objectName: "c1"
++        property int one: zero + 1
++
++        Item {
++            id: c1c1
++            objectName: "c1c1"
++            property bool two: c2c1c1.two
++        }
++
++        Item {
++            id: c1c2
++            objectName: "c1c2"
++            property string three: "three"
++
++            Rectangle {
++                id: c1c2c3
++                objectName: "c1c2c3"
++                property alias othercolor: c2c1.color
++                color: if (c2c1.color == Qt.rgba(0,0,1)) Qt.rgba(1,0,0); else Qt.rgba(0,1,0);
++            }
++        }
++    }
++
++    Item {
++        id: c2
++        objectName: "c2"
++        property string two: "two"
++
++        Rectangle {
++            id: c2c1
++            objectName: "c2c1"
++            property string three: "2" + c1c2.three
++            color: "blue"
++
++            MouseArea {
++                id: c2c1c1
++                objectName: "c2c1c1"
++                property bool two: false
++                onClicked: two = !two
++            }
++
++            Item {
++                id: c2c1c2
++                objectName: "c2c1c2"
++                property string three: "1" + parent.three
++            }
++        }
++    }
++
++    Item {
++        id: c3
++        objectName: "c3"
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++    }
++
++    property alias c1one: c1.one
++    property bool success: true
++    Component.onCompleted: {
++        // test state after initial bindings evaluation
++        if (zero != 0) success = false;
++        if (c1.one != 1) success = false;
++        if (c1c1.two != false) success = false;
++        if (c1c2.three != "three") success = false;
++        if (c1c2c3.color != Qt.rgba(1,0,0)) success = false;
++        if (c2.two != "two") success = false;
++        if (c2c1.three != "2three") success = false;
++        if (c2c1.color != Qt.rgba(0,0,1)) success = false;
++        if (c2c1c1.two != false) success = false;
++        if (c2c1c2.three != "12three") success = false;
++        if (c3.children.length != 500) success = false;
++
++        // now retrigger bindings evaluation
++        root.zero = 5;
++        if (c1.one != 6) success = false;
++        c2c1c1.two = true;
++        if (c1c1.two != true) success = false;
++        c1c2.three = "3";
++        if (c2c1.three != "23") success = false;
++        if (c2c1c2.three != "123") success = false;
++        c2c1.color = Qt.rgba(1,0,0);
++        if (c1c2c3.color != Qt.rgba(0,1,0)) success = false;
++        if (c1c2c3.othercolor != Qt.rgba(1,0,0)) success = false;
++    }
++}
+diff --git a/tests/auto/qml/qqmlqt/data/TestComponent.3.qml b/tests/auto/qml/qqmlqt/data/TestComponent.3.qml
+new file mode 100644
+index 0000000..81ea07c
+--- /dev/null
++++ b/tests/auto/qml/qqmlqt/data/TestComponent.3.qml
+@@ -0,0 +1,89 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    objectName: "root"
++    property int zero: 0
++    property int one: 1
++
++    Item {
++        id: c1
++        objectName: "c1"
++        property int one: zero + parent.one
++
++        Item {
++            id: c1c1
++            objectName: "c1c1"
++            property bool two: c2c1c1.two
++        }
++
++        Item {
++            id: c1c2
++            objectName: "c1c2"
++            property string three: "three"
++
++            Rectangle {
++                id: c1c2c3
++                objectName: "c1c2c3"
++                property alias othercolor: c2c1.color
++                color: if (c2c1.color == Qt.rgba(0,0,1)) Qt.rgba(1,0,0); else Qt.rgba(0,1,0);
++            }
++        }
++    }
++
++    Item {
++        id: c2
++        objectName: "c2"
++        property string two: "two"
++
++        Rectangle {
++            id: c2c1
++            objectName: "c2c1"
++            property string three: "2" + c1c2.three
++            color: "blue"
++
++            MouseArea {
++                id: c2c1c1
++                objectName: "c2c1c1"
++                property bool two: false
++                onClicked: two = !two
++            }
++
++            Item {
++                id: c2c1c2
++                objectName: "c2c1c2"
++                property string three: "1" + parent.three
++            }
++        }
++    }
++
++    property alias c1one: c1.one
++    property bool success: true
++    Component.onCompleted: {
++        // test state after initial bindings evaluation
++        if (zero != 0) success = false;
++        if (c1.one != 1) success = false;
++        if (c1c1.two != false) success = false;
++        if (c1c2.three != "three") success = false;
++        if (c1c2c3.color != Qt.rgba(1,0,0)) success = false;
++        if (c2.two != "two") success = false;
++        if (c2c1.three != "2three") success = false;
++        if (c2c1.color != Qt.rgba(0,0,1)) success = false;
++        if (c2c1c1.two != false) success = false;
++        if (c2c1c2.three != "12three") success = false;
++
++        // now retrigger bindings evaluation
++        root.zero = 5;
++        if (c1.one != 6) success = false;
++        root.one = 50;
++        if (c1.one != 55) success = false;
++        c2c1c1.two = true;
++        if (c1c1.two != true) success = false;
++        c1c2.three = "3";
++        if (c2c1.three != "23") success = false;
++        if (c2c1c2.three != "123") success = false;
++        c2c1.color = Qt.rgba(1,0,0);
++        if (c1c2c3.color != Qt.rgba(0,1,0)) success = false;
++        if (c1c2c3.othercolor != Qt.rgba(1,0,0)) success = false;
++    }
++}
+diff --git a/tests/auto/qml/qqmlqt/data/TestComponent.qml b/tests/auto/qml/qqmlqt/data/TestComponent.qml
+new file mode 100644
+index 0000000..64cec1c
+--- /dev/null
++++ b/tests/auto/qml/qqmlqt/data/TestComponent.qml
+@@ -0,0 +1,534 @@
++import QtQuick 2.0
++
++Item {
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++    Item {}
++}
+diff --git a/tests/auto/qml/qqmlqt/data/createComponent.2.qml b/tests/auto/qml/qqmlqt/data/createComponent.2.qml
+new file mode 100644
+index 0000000..36e2b23
+--- /dev/null
++++ b/tests/auto/qml/qqmlqt/data/createComponent.2.qml
+@@ -0,0 +1,27 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++    property var syncComponent
++    property var asyncComponent
++
++    function asyncStatusChanged() {
++        if (asyncComponent.status == Component.Ready && syncComponent.status == Component.Ready) {
++            success = true;
++            var ao = asyncComponent.createObject();
++            var so = syncComponent.createObject();
++            if (ao.c1one != 6) success = false;
++            if (so.c1one != 55) success = false;
++            ao.destroy();
++            so.destroy();
++        }
++    }
++
++    Component.onCompleted: {
++        asyncComponent = Qt.createComponent("TestComponent.2.qml", Component.Asynchronous);
++        if (asyncComponent.status != Component.Loading)
++            return;
++        asyncComponent.statusChanged.connect(asyncStatusChanged);
++        syncComponent = Qt.createComponent("TestComponent.3.qml", Component.PreferSynchronous);
++    }
++}
+diff --git a/tests/auto/qml/qqmlqt/data/createComponent.qml b/tests/auto/qml/qqmlqt/data/createComponent.qml
+index 3ebc9f1..01b6490 100644
+--- a/tests/auto/qml/qqmlqt/data/createComponent.qml
++++ b/tests/auto/qml/qqmlqt/data/createComponent.qml
+@@ -9,6 +9,14 @@ QtObject {
+     property QtObject incorectArgCount1: Qt.createComponent()
+     property QtObject incorectArgCount2: Qt.createComponent("main.qml", 10)
+ 
++    property bool asyncResult: false
++    property var asyncComponent
++
++    function asyncStatusChanged() {
++        if (asyncComponent.status == Component.Ready)
++            asyncResult = true;
++    }
++
+     Component.onCompleted: {
+         emptyArg = (Qt.createComponent("") == null);
+         var r = Qt.createComponent("createComponentData.qml");
+@@ -16,5 +24,10 @@ QtObject {
+ 
+         var a = Qt.createComponent("http://www.example.com/test.qml");
+         absoluteUrl = a.url;
++
++        asyncComponent = Qt.createComponent("TestComponent.qml", Component.Asynchronous);
++        if (asyncComponent.status != Component.Loading)
++            return;
++        asyncComponent.statusChanged.connect(asyncStatusChanged);
+     }
+ }
+diff --git a/tests/auto/qml/qqmlqt/tst_qqmlqt.cpp b/tests/auto/qml/qqmlqt/tst_qqmlqt.cpp
+index a679188..d3dc3e7 100644
+--- a/tests/auto/qml/qqmlqt/tst_qqmlqt.cpp
++++ b/tests/auto/qml/qqmlqt/tst_qqmlqt.cpp
+@@ -395,6 +395,7 @@ void tst_qqmlqt::md5()
+ 
+ void tst_qqmlqt::createComponent()
+ {
++    {
+     QQmlComponent component(&engine, testFileUrl("createComponent.qml"));
+ 
+     QString warning1 = component.url().toString() + ":9: Error: Qt.createComponent(): Invalid arguments";
+@@ -408,7 +409,19 @@ void tst_qqmlqt::createComponent()
+     QCOMPARE(object->property("absoluteUrl").toString(), QString("http://www.example.com/test.qml"));
+     QCOMPARE(object->property("relativeUrl").toString(), testFileUrl("createComponentData.qml").toString());
+ 
++    QTRY_VERIFY(object->property("asyncResult").toBool());
++
+     delete object;
++    }
++
++    // simultaneous sync and async compilation
++    {
++    QQmlComponent component(&engine, testFileUrl("createComponent.2.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QTRY_VERIFY(object->property("success").toBool());
++    delete object;
++    }
+ }
+ 
+ void tst_qqmlqt::createComponent_pragmaLibrary()
+diff --git a/tests/auto/quick/qquickloader/data/TestComponent.2.qml b/tests/auto/quick/qquickloader/data/TestComponent.2.qml
+new file mode 100644
+index 0000000..d6e9902
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/TestComponent.2.qml
+@@ -0,0 +1,592 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    objectName: "root"
++    property int zero: 0
++
++    Item {
++        id: c1
++        objectName: "c1"
++        property int one: zero + 1
++
++        Item {
++            id: c1c1
++            objectName: "c1c1"
++            property bool two: c2c1c1.two
++        }
++
++        Item {
++            id: c1c2
++            objectName: "c1c2"
++            property string three: "three"
++
++            Rectangle {
++                id: c1c2c3
++                objectName: "c1c2c3"
++                property alias othercolor: c2c1.color
++                color: if (c2c1.color == Qt.rgba(0,0,1)) Qt.rgba(1,0,0); else Qt.rgba(0,1,0);
++            }
++        }
++    }
++
++    Item {
++        id: c2
++        objectName: "c2"
++        property string two: "two"
++
++        Rectangle {
++            id: c2c1
++            objectName: "c2c1"
++            property string three: "2" + c1c2.three
++            color: "blue"
++
++            MouseArea {
++                id: c2c1c1
++                objectName: "c2c1c1"
++                property bool two: false
++                onClicked: two = !two
++            }
++
++            Item {
++                id: c2c1c2
++                objectName: "c2c1c2"
++                property string three: "1" + parent.three
++            }
++        }
++    }
++
++    Item {
++        id: c3
++        objectName: "c3"
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++        Item {}
++    }
++
++    property alias c1one: c1.one
++    property bool success: true
++    Component.onCompleted: {
++        // test state after initial bindings evaluation
++        if (zero != 0) success = false;
++        if (c1.one != 1) success = false;
++        if (c1c1.two != false) success = false;
++        if (c1c2.three != "three") success = false;
++        if (c1c2c3.color != Qt.rgba(1,0,0)) success = false;
++        if (c2.two != "two") success = false;
++        if (c2c1.three != "2three") success = false;
++        if (c2c1.color != Qt.rgba(0,0,1)) success = false;
++        if (c2c1c1.two != false) success = false;
++        if (c2c1c2.three != "12three") success = false;
++        if (c3.children.length != 500) success = false;
++
++        // now retrigger bindings evaluation
++        root.zero = 5;
++        if (c1.one != 6) success = false;
++        c2c1c1.two = true;
++        if (c1c1.two != true) success = false;
++        c1c2.three = "3";
++        if (c2c1.three != "23") success = false;
++        if (c2c1c2.three != "123") success = false;
++        c2c1.color = Qt.rgba(1,0,0);
++        if (c1c2c3.color != Qt.rgba(0,1,0)) success = false;
++        if (c1c2c3.othercolor != Qt.rgba(1,0,0)) success = false;
++    }
++}
+diff --git a/tests/auto/quick/qquickloader/data/TestComponent.qml b/tests/auto/quick/qquickloader/data/TestComponent.qml
+new file mode 100644
+index 0000000..81ea07c
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/TestComponent.qml
+@@ -0,0 +1,89 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    objectName: "root"
++    property int zero: 0
++    property int one: 1
++
++    Item {
++        id: c1
++        objectName: "c1"
++        property int one: zero + parent.one
++
++        Item {
++            id: c1c1
++            objectName: "c1c1"
++            property bool two: c2c1c1.two
++        }
++
++        Item {
++            id: c1c2
++            objectName: "c1c2"
++            property string three: "three"
++
++            Rectangle {
++                id: c1c2c3
++                objectName: "c1c2c3"
++                property alias othercolor: c2c1.color
++                color: if (c2c1.color == Qt.rgba(0,0,1)) Qt.rgba(1,0,0); else Qt.rgba(0,1,0);
++            }
++        }
++    }
++
++    Item {
++        id: c2
++        objectName: "c2"
++        property string two: "two"
++
++        Rectangle {
++            id: c2c1
++            objectName: "c2c1"
++            property string three: "2" + c1c2.three
++            color: "blue"
++
++            MouseArea {
++                id: c2c1c1
++                objectName: "c2c1c1"
++                property bool two: false
++                onClicked: two = !two
++            }
++
++            Item {
++                id: c2c1c2
++                objectName: "c2c1c2"
++                property string three: "1" + parent.three
++            }
++        }
++    }
++
++    property alias c1one: c1.one
++    property bool success: true
++    Component.onCompleted: {
++        // test state after initial bindings evaluation
++        if (zero != 0) success = false;
++        if (c1.one != 1) success = false;
++        if (c1c1.two != false) success = false;
++        if (c1c2.three != "three") success = false;
++        if (c1c2c3.color != Qt.rgba(1,0,0)) success = false;
++        if (c2.two != "two") success = false;
++        if (c2c1.three != "2three") success = false;
++        if (c2c1.color != Qt.rgba(0,0,1)) success = false;
++        if (c2c1c1.two != false) success = false;
++        if (c2c1c2.three != "12three") success = false;
++
++        // now retrigger bindings evaluation
++        root.zero = 5;
++        if (c1.one != 6) success = false;
++        root.one = 50;
++        if (c1.one != 55) success = false;
++        c2c1c1.two = true;
++        if (c1c1.two != true) success = false;
++        c1c2.three = "3";
++        if (c2c1.three != "23") success = false;
++        if (c2c1c2.three != "123") success = false;
++        c2c1.color = Qt.rgba(1,0,0);
++        if (c1c2c3.color != Qt.rgba(0,1,0)) success = false;
++        if (c1c2c3.othercolor != Qt.rgba(1,0,0)) success = false;
++    }
++}
+diff --git a/tests/auto/quick/qquickloader/data/simultaneous.qml b/tests/auto/quick/qquickloader/data/simultaneous.qml
+new file mode 100644
+index 0000000..cab6498
+--- /dev/null
++++ b/tests/auto/quick/qquickloader/data/simultaneous.qml
+@@ -0,0 +1,22 @@
++import QtQuick 2.0
++
++Rectangle {
++    width: 400; height: 400
++
++    function loadComponents() {
++        asyncLoader.source = "TestComponent.2.qml"
++        syncLoader.source = "TestComponent.qml"
++    }
++
++    Loader {
++        id: asyncLoader
++        objectName: "asyncLoader"
++        asynchronous: true
++    }
++
++    Loader {
++        id: syncLoader
++        objectName: "syncLoader"
++        asynchronous: false
++    }
++}
+diff --git a/tests/auto/quick/qquickloader/tst_qquickloader.cpp b/tests/auto/quick/qquickloader/tst_qquickloader.cpp
+index 77d0c29..b388243 100644
+--- a/tests/auto/quick/qquickloader/tst_qquickloader.cpp
++++ b/tests/auto/quick/qquickloader/tst_qquickloader.cpp
+@@ -56,13 +56,21 @@ class PeriodicIncubationController : public QObject,
+ {
+ public:
+     PeriodicIncubationController() {
++        incubated = false;
+         startTimer(16);
+     }
+ 
++    bool incubated;
++
+ protected:
+     virtual void timerEvent(QTimerEvent *) {
+         incubateFor(15);
+     }
++
++    virtual void incubatingObjectCountChanged(int count) {
++        if (count)
++            incubated = true;
++    }
+ };
+ 
+ class tst_QQuickLoader : public QQmlDataTest
+@@ -102,6 +110,7 @@ private slots:
+     void asynchronous_data();
+     void asynchronous();
+     void asynchronous_clear();
++    void simultaneousSyncAsync();
+ 
+     void parented();
+     void sizeBound();
+@@ -481,7 +490,7 @@ void tst_QQuickLoader::failNetworkRequest()
+     QTRY_VERIFY(loader->status() == QQuickLoader::Error);
+ 
+     QVERIFY(loader->item() == 0);
+-    QCOMPARE(loader->progress(), 0.0);
++    QCOMPARE(loader->progress(), 1.0);
+     QCOMPARE(loader->property("did_load").toInt(), 123);
+     QCOMPARE(static_cast<QQuickItem*>(loader)->childItems().count(), 0);
+ 
+@@ -856,7 +865,7 @@ void tst_QQuickLoader::asynchronous_data()
+     QTest::newRow("Valid component") << testFileUrl("BigComponent.qml")
+             << QStringList();
+ 
+-    QTest::newRow("Non-existant component") << testFileUrl("IDoNotExist.qml")
++    QTest::newRow("Non-existent component") << testFileUrl("IDoNotExist.qml")
+             << (QStringList() << QString(testFileUrl("IDoNotExist.qml").toString() + ": File not found"));
+ 
+     QTest::newRow("Invalid component") << testFileUrl("InvalidSourceComponent.qml")
+@@ -870,6 +879,8 @@ void tst_QQuickLoader::asynchronous()
+ 
+     if (!engine.incubationController())
+         engine.setIncubationController(new PeriodicIncubationController);
++    PeriodicIncubationController *controller = static_cast<PeriodicIncubationController*>(engine.incubationController());
++    controller->incubated = false;
+     QQmlComponent component(&engine, testFileUrl("asynchronous.qml"));
+     QQuickItem *root = qobject_cast<QQuickItem*>(component.create());
+     QVERIFY(root);
+@@ -881,19 +892,20 @@ void tst_QQuickLoader::asynchronous()
+         QTest::ignoreMessage(QtWarningMsg, warning.toUtf8().constData());
+ 
+     QVERIFY(!loader->item());
++    QCOMPARE(loader->progress(), 0.0);
+     root->setProperty("comp", qmlFile.toString());
+     QMetaObject::invokeMethod(root, "loadComponent");
+     QVERIFY(!loader->item());
+ 
+     if (expectedWarnings.isEmpty()) {
+         QCOMPARE(loader->status(), QQuickLoader::Loading);
+-        QCOMPARE(engine.incubationController()->incubatingObjectCount(), 1);
+-
++        QVERIFY(!controller->incubated); // asynchronous compilation means not immediately compiled/incubating.
++        QTRY_VERIFY(controller->incubated); // but should start incubating once compilation is complete.
+         QTRY_VERIFY(loader->item());
+         QCOMPARE(loader->progress(), 1.0);
+         QCOMPARE(loader->status(), QQuickLoader::Ready);
+     } else {
+-        QCOMPARE(loader->progress(), 1.0);
++        QTRY_COMPARE(loader->progress(), 1.0);
+         QTRY_COMPARE(loader->status(), QQuickLoader::Error);
+     }
+ 
+@@ -943,6 +955,37 @@ void tst_QQuickLoader::asynchronous_clear()
+     QCOMPARE(static_cast<QQuickItem*>(loader)->childItems().count(), 1);
+ }
+ 
++void tst_QQuickLoader::simultaneousSyncAsync()
++{
++    if (!engine.incubationController())
++        engine.setIncubationController(new PeriodicIncubationController);
++    PeriodicIncubationController *controller = static_cast<PeriodicIncubationController*>(engine.incubationController());
++    controller->incubated = false;
++    QQmlComponent component(&engine, testFileUrl("simultaneous.qml"));
++    QQuickItem *root = qobject_cast<QQuickItem*>(component.create());
++    QVERIFY(root);
++
++    QQuickLoader *asyncLoader = root->findChild<QQuickLoader*>("asyncLoader");
++    QQuickLoader *syncLoader = root->findChild<QQuickLoader*>("syncLoader");
++    QVERIFY(asyncLoader);
++    QVERIFY(syncLoader);
++
++    QVERIFY(!asyncLoader->item());
++    QVERIFY(!syncLoader->item());
++    QMetaObject::invokeMethod(root, "loadComponents");
++    QVERIFY(!asyncLoader->item());
++    QVERIFY(syncLoader->item());
++
++    QCOMPARE(asyncLoader->status(), QQuickLoader::Loading);
++    QVERIFY(!controller->incubated); // asynchronous compilation means not immediately compiled/incubating.
++    QTRY_VERIFY(controller->incubated); // but should start incubating once compilation is complete.
++    QTRY_VERIFY(asyncLoader->item());
++    QCOMPARE(asyncLoader->progress(), 1.0);
++    QCOMPARE(asyncLoader->status(), QQuickLoader::Ready);
++
++    delete root;
++}
++
+ void tst_QQuickLoader::parented()
+ {
+     QQmlComponent component(&engine, testFileUrl("parented.qml"));

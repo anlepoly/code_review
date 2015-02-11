@@ -1,0 +1,783 @@
+diff --git a/configure b/configure
+index 1be0a5b..f912e74 100755
+--- a/configure
++++ b/configure
+@@ -4648,22 +4648,20 @@ if [ "$CFG_XCB" != "no" ]; then
+             QT_CONFIG="$QT_CONFIG xcb-xlib"
+         fi
+ 
+-        if [ "$XPLATFORM_MAEMO" = "yes" ]; then
+-            # auto-detect XInput2/Xinput support
+-            if [ "$CFG_XINPUT2" != "no" ]; then
+-                if "$unixtests/compile.test" "$XQMAKESPEC" "$QMAKE_CONFIG" $OPT_VERBOSE "$relpath" "$outpath" config.tests/x11/xinput2 "XInput2" $L_FLAGS $I_FLAGS $D_FLAGS $l_FLAGS; then
+-                    CFG_XINPUT2=yes
+-                    CFG_XINPUT=no
++        # auto-detect XInput2 support. Needed by xcb too.
++        if [ "$CFG_XINPUT2" != "no" ]; then
++            if "$unixtests/compile.test" "$XQMAKESPEC" "$QMAKE_CONFIG" $OPT_VERBOSE "$relpath" "$outpath" config.tests/x11/xinput2 "XInput2" $L_FLAGS $I_FLAGS $D_FLAGS $l_FLAGS; then
++                CFG_XINPUT2=yes
++                CFG_XINPUT=no
++            else
++                if [ "$CFG_XINPUT2" = "yes" ] && [ "$CFG_CONFIGURE_EXIT_ON_ERROR" = "yes" ]; then
++                    echo "XInput2 support cannot be enabled due to functionality tests!"
++                    echo " Turn on verbose messaging (-v) to $0 to see the final report."
++                    echo " If you believe this message is in error you may use the continue"
++                    echo " switch (-continue) to $0 to continue."
++                    exit 101
+                 else
+-                    if [ "$CFG_XINPUT2" = "yes" ] && [ "$CFG_CONFIGURE_EXIT_ON_ERROR" = "yes" ]; then
+-                        echo "XInput2 support cannot be enabled due to functionality tests!"
+-                        echo " Turn on verbose messaging (-v) to $0 to see the final report."
+-                        echo " If you believe this message is in error you may use the continue"
+-                        echo " switch (-continue) to $0 to continue."
+-                        exit 101
+-                    else
+-                        CFG_XINPUT2=no
+-                    fi
++                    CFG_XINPUT2=no
+                 fi
+             fi
+         fi
+@@ -6052,6 +6050,7 @@ echo "Xcursor support ........ $CFG_XCURSOR"
+ echo "Xfixes support ......... $CFG_XFIXES"
+ echo "Xrandr support ......... $CFG_XRANDR"
+ echo "Xi support ............. $CFG_XINPUT"
++echo "Xi2 support ............ $CFG_XINPUT2"
+ echo "MIT-SHM support ........ $CFG_MITSHM"
+ echo "FontConfig support ..... $CFG_FONTCONFIG"
+ echo "XKB Support ............ $CFG_XKB"
+diff --git a/src/plugins/platforms/xcb/qxcbconnection.cpp b/src/plugins/platforms/xcb/qxcbconnection.cpp
+index 679f3e7..3b2e2bb 100644
+--- a/src/plugins/platforms/xcb/qxcbconnection.cpp
++++ b/src/plugins/platforms/xcb/qxcbconnection.cpp
+@@ -87,6 +87,11 @@ extern "C" {
+ #include <EGL/eglext.h>
+ #endif
+ 
++#if defined(XCB_USE_XINPUT2) || defined(XCB_USE_XINPUT2_MAEMO)
++#include <X11/extensions/XInput2.h>
++#include <X11/extensions/XI2proto.h>
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ #ifdef XCB_USE_XLIB
+@@ -185,7 +190,10 @@ QXcbConnection::QXcbConnection(QXcbNativeInterface *nativeInterface, const char
+ 
+     initializeXFixes();
+     initializeXRender();
++    m_xi2Enabled = false;
+ #ifdef XCB_USE_XINPUT2_MAEMO
++    initializeXInput2Maemo();
++#elif defined(XCB_USE_XINPUT2)
+     initializeXInput2();
+ #endif
+     initializeXShape();
+@@ -218,6 +226,8 @@ QXcbConnection::~QXcbConnection()
+         delete m_screens.takeLast();
+ 
+ #ifdef XCB_USE_XINPUT2_MAEMO
++    finalizeXInput2Maemo();
++#elif defined(XCB_USE_XINPUT2)
+     finalizeXInput2();
+ #endif
+ 
+@@ -602,11 +612,16 @@ void QXcbConnection::handleXcbEvent(xcb_generic_event_t *event)
+         case XCB_PROPERTY_NOTIFY:
+             HANDLE_PLATFORM_WINDOW_EVENT(xcb_property_notify_event_t, window, handlePropertyNotifyEvent);
+             break;
+-    #ifdef XCB_USE_XINPUT2_MAEMO
++#ifdef XCB_USE_XINPUT2_MAEMO
++        case GenericEvent:
++            handleGenericEventMaemo((xcb_ge_event_t*)event);
++            break;
++#elif defined(XCB_USE_XINPUT2)
+         case GenericEvent:
+-            handleGenericEvent((xcb_ge_event_t*)event);
++            if (m_xi2Enabled)
++                xi2HandleEvent(reinterpret_cast<xcb_ge_event_t *>(event));
+             break;
+-    #endif
++#endif
+         default:
+             handled = false;
+             break;
+@@ -951,15 +966,6 @@ static const char * xcb_atomnames = {
+     "_XEMBED\0"
+     "_XEMBED_INFO\0"
+ 
+-    // Wacom old. (before version 0.10)
+-    "Wacom Stylus\0"
+-    "Wacom Cursor\0"
+-    "Wacom Eraser\0"
+-
+-    // Tablet
+-    "STYLUS\0"
+-    "ERASER\0"
+-
+     // XInput2
+     "Button Left\0"
+     "Button Middle\0"
+@@ -975,6 +981,16 @@ static const char * xcb_atomnames = {
+     "Abs MT Pressure\0"
+     "Abs MT Tracking ID\0"
+     "Max Contacts\0"
++    // XInput2 tablet
++    "Abs X\0"
++    "Abs Y\0"
++    "Abs Pressure\0"
++    "Abs Tilt X\0"
++    "Abs Tilt Y\0"
++    "Abs Wheel\0"
++    "Abs Distance\0"
++    "Wacom Serial IDs\0"
++    "INTEGER\0"
+ #if XCB_USE_MAEMO_WINDOW_PROPERTIES
+     "_MEEGOTOUCH_ORIENTATION_ANGLE\0"
+ #endif
+@@ -1245,4 +1261,53 @@ bool QXcbConnection::hasSupportForDri2() const
+ }
+ #endif //XCB_USE_DRI2
+ 
++#if defined(XCB_USE_XINPUT2) || defined(XCB_USE_XINPUT2_MAEMO)
++// Borrowed from libXi.
++int QXcbConnection::xi2CountBits(unsigned char *ptr, int len)
++{
++    int bits = 0;
++    int i;
++    unsigned char x;
++
++    for (i = 0; i < len; i++) {
++        x = ptr[i];
++        while (x > 0) {
++            bits += (x & 0x1);
++            x >>= 1;
++        }
++    }
++    return bits;
++}
++
++bool QXcbConnection::xi2GetValuatorValueIfSet(void *event, int valuatorNum, double *value)
++{
++    xXIDeviceEvent *xideviceevent = static_cast<xXIDeviceEvent *>(event);
++    unsigned char *buttonsMaskAddr = (unsigned char*)&xideviceevent[1];
++    unsigned char *valuatorsMaskAddr = buttonsMaskAddr + xideviceevent->buttons_len * 4;
++    FP3232 *valuatorsValuesAddr = (FP3232*)(valuatorsMaskAddr + xideviceevent->valuators_len * 4);
++    int numValuatorValues = xi2CountBits(valuatorsMaskAddr, xideviceevent->valuators_len * 4);
++    // This relies on all bit being set until a certain number i.e. it doesn't support only bit 0 and 5 being set in the mask.
++    // Just like the original code, works for now.
++    if (valuatorNum >= numValuatorValues)
++        return false;
++    *value = valuatorsValuesAddr[valuatorNum].integral;
++    *value += ((double)valuatorsValuesAddr[valuatorNum].frac / (1 << 16) / (1 << 16));
++    return true;
++}
++
++bool QXcbConnection::xi2PrepareXIGenericDeviceEvent(xcb_ge_event_t *event, int opCode)
++{
++    // xGenericEvent has "extension" on the second byte, xcb_ge_event_t has "pad0".
++    if (event->pad0 == opCode) {
++        // xcb event structs contain stuff that wasn't on the wire, the full_sequence field
++        // adds an extra 4 bytes and generic events cookie data is on the wire right after the standard 32 bytes.
++        // Move this data back to have the same layout in memory as it was on the wire
++        // and allow casting, overwriting the full_sequence field.
++        memmove((char*) event + 32, (char*) event + 36, event->length * 4);
++        return true;
++    }
++    return false;
++}
++#endif // defined(XCB_USE_XINPUT2) || defined(XCB_USE_XINPUT2_MAEMO)
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/xcb/qxcbconnection.h b/src/plugins/platforms/xcb/qxcbconnection.h
+index 3b17f93..2c7b11f 100644
+--- a/src/plugins/platforms/xcb/qxcbconnection.h
++++ b/src/plugins/platforms/xcb/qxcbconnection.h
+@@ -52,8 +52,12 @@
+ #include <QVector>
+ #include <QVarLengthArray>
+ 
++#ifndef QT_NO_TABLETEVENT
++#include <QTabletEvent>
++#endif
++
+ #ifdef XCB_USE_XINPUT2_MAEMO
+-struct XInput2Data;
++struct XInput2MaemoData;
+ #endif
+ 
+ //#define Q_XCB_DEBUG
+@@ -222,13 +226,6 @@ namespace QXcbAtom {
+         _XEMBED,
+         _XEMBED_INFO,
+ 
+-        XWacomStylus,
+-        XWacomCursor,
+-        XWacomEraser,
+-
+-        XTabletStylus,
+-        XTabletEraser,
+-
+         // XInput2
+         ButtonLeft,
+         ButtonMiddle,
+@@ -244,6 +241,16 @@ namespace QXcbAtom {
+         AbsMTPressure,
+         AbsMTTrackingID,
+         MaxContacts,
++        // XInput2 tablet
++        AbsX,
++        AbsY,
++        AbsPressure,
++        AbsTiltX,
++        AbsTiltY,
++        AbsWheel,
++        AbsDistance,
++        WacomSerialIDs,
++        INTEGER,
+ 
+ #if XCB_USE_MAEMO_WINDOW_PROPERTIES
+         MeegoTouchOrientationAngle,
+@@ -335,7 +342,9 @@ public:
+     void *egl_display() const { return m_egl_display; }
+ #endif
+ #ifdef XCB_USE_XINPUT2_MAEMO
+-    bool isUsingXInput2();
++    bool isUsingXInput2Maemo();
++#elif defined(XCB_USE_XINPUT2)
++    void xi2Select(xcb_window_t window);
+ #endif
+ 
+     void sync();
+@@ -377,11 +386,48 @@ private:
+     void initializeDri2();
+ #endif
+ #ifdef XCB_USE_XINPUT2_MAEMO
++    void initializeXInput2Maemo();
++    void finalizeXInput2Maemo();
++    void handleGenericEventMaemo(xcb_ge_event_t *event);
++#endif
++    void handleClientMessageEvent(const xcb_client_message_event_t *event);
++
++    bool m_xi2Enabled;
++    int m_xi2Minor;
++#ifdef XCB_USE_XINPUT2
+     void initializeXInput2();
+     void finalizeXInput2();
+-    void handleGenericEvent(xcb_ge_event_t *event);
++    void xi2HandleEvent(xcb_ge_event_t *event);
++    int m_xiOpCode, m_xiEventBase, m_xiErrorBase;
++#ifndef QT_NO_TABLETEVENT
++    struct TabletData {
++        TabletData() : deviceId(0), down(false), serialId(0), inProximity(false) { }
++        int deviceId;
++        QTabletEvent::PointerType pointerType;
++        bool down;
++        qint64 serialId;
++        bool inProximity;
++        struct ValuatorClassInfo {
++            ValuatorClassInfo() : minVal(0), maxVal(0) { }
++            double minVal;
++            double maxVal;
++            int number;
++        };
++        QHash<int, ValuatorClassInfo> valuatorInfo;
++    };
++    void xi2QueryTabletData(void *dev, TabletData *tabletData); // use no XI stuff in headers
++    void xi2SetupTabletDevices();
++    void xi2HandleTabletEvent(void *event, TabletData *tabletData);
++    void xi2ReportTabletEvent(const TabletData &tabletData, void *event);
++    QVector<TabletData> m_tabletData;
++#endif
++#endif // XCB_USE_XINPUT2
++
++#if defined(XCB_USE_XINPUT2) || defined(XCB_USE_XINPUT2_MAEMO)
++    static int xi2CountBits(unsigned char *ptr, int len);
++    static bool xi2GetValuatorValueIfSet(void *event, int valuatorNum, double *value);
++    static bool xi2PrepareXIGenericDeviceEvent(xcb_ge_event_t *event, int opCode);
+ #endif
+-    void handleClientMessageEvent(const xcb_client_message_event_t *event);
+ 
+     xcb_connection_t *m_connection;
+     const xcb_setup_t *m_setup;
+@@ -412,7 +458,7 @@ private:
+ #endif
+     QXcbEventReader *m_reader;
+ #ifdef XCB_USE_XINPUT2_MAEMO
+-    XInput2Data *m_xinputData;
++    XInput2MaemoData *m_xinputData;
+ #endif
+ #ifdef XCB_USE_DRI2
+     uint32_t m_dri2_major;
+diff --git a/src/plugins/platforms/xcb/qxcbconnection_maemo.cpp b/src/plugins/platforms/xcb/qxcbconnection_maemo.cpp
+index 1339df7..463e119 100644
+--- a/src/plugins/platforms/xcb/qxcbconnection_maemo.cpp
++++ b/src/plugins/platforms/xcb/qxcbconnection_maemo.cpp
+@@ -53,8 +53,8 @@ QT_BEGIN_NAMESPACE
+ 
+ // Define it here to work around XLib defining Bool and stuff.
+ // We can't declare those variables in the header without facing include order headaches.
+-struct XInput2Data {
+-    XInput2Data()
++struct XInput2MaemoData {
++    XInput2MaemoData()
+     : use_xinput(false)
+     , xinput_opcode(0)
+     , xinput_eventbase(0)
+@@ -78,15 +78,15 @@ struct XInput2Data {
+     QTouchDevice *qtTouchDevice;
+ };
+ 
+-bool QXcbConnection::isUsingXInput2()
++bool QXcbConnection::isUsingXInput2Maemo()
+ {
+     return m_xinputData && m_xinputData->use_xinput && m_xinputData->xiMaxContacts != 0;
+ }
+ 
+-void QXcbConnection::initializeXInput2()
++void QXcbConnection::initializeXInput2Maemo()
+ {
+     Q_ASSERT(!m_xinputData);
+-    m_xinputData = new XInput2Data;
++    m_xinputData = new XInput2MaemoData;
+     m_xinputData->use_xinput = XQueryExtension((Display *)m_xlib_display, "XInputExtension", &m_xinputData->xinput_opcode,
+                                       &m_xinputData->xinput_eventbase, &m_xinputData->xinput_errorbase);
+     if (m_xinputData->use_xinput) {
+@@ -156,7 +156,7 @@ void QXcbConnection::initializeXInput2()
+     }
+ }
+ 
+-void QXcbConnection::finalizeXInput2()
++void QXcbConnection::finalizeXInput2Maemo()
+ {
+     if (m_xinputData && m_xinputData->xideviceinfo) {
+         XIFreeDeviceInfo(m_xinputData->xideviceinfo);
+@@ -164,49 +164,9 @@ void QXcbConnection::finalizeXInput2()
+     delete m_xinputData;
+ }
+ 
+-// Borrowed from libXi.
+-static int count_bits(unsigned char* ptr, int len)
++void QXcbConnection::handleGenericEventMaemo(xcb_ge_event_t *event)
+ {
+-    int bits = 0;
+-    int i;
+-    unsigned char x;
+-
+-    for (i = 0; i < len; i++)
+-    {
+-        x = ptr[i];
+-        while (x > 0)
+-        {
+-            bits += (x & 0x1);
+-            x >>= 1;
+-        }
+-    }
+-    return bits;
+-}
+-
+-static bool getValuatorValueIfSet(xXIDeviceEvent *xideviceevent, int valuatorNum, double *value)
+-{
+-    unsigned char *buttonsMaskAddr = (unsigned char*)&xideviceevent[1];
+-    unsigned char *valuatorsMaskAddr = buttonsMaskAddr + xideviceevent->buttons_len * 4;
+-    FP3232 *valuatorsValuesAddr = (FP3232*)(valuatorsMaskAddr + xideviceevent->valuators_len * 4);
+-    int numValuatorValues = count_bits(valuatorsMaskAddr, xideviceevent->valuators_len * 4);
+-    // This relies on all bit being set until a certain number i.e. it doesn't support only bit 0 and 5 being set in the mask.
+-    // Just like the original code, works for now.
+-    if (valuatorNum >= numValuatorValues)
+-        return false;
+-    *value = valuatorsValuesAddr[valuatorNum].integral;
+-    *value += ((double)valuatorsValuesAddr[valuatorNum].frac / (1 << 16) / (1 << 16));
+-    return true;
+-}
+-
+-void QXcbConnection::handleGenericEvent(xcb_ge_event_t *event)
+-{
+-    // xGenericEvent has "extension" on the second byte, xcb_ge_event_t has "pad0".
+-    if (m_xinputData->use_xinput && event->pad0 == m_xinputData->xinput_opcode) {
+-        // xcb event structs contain stuff that wasn't on the wire, the full_sequence field
+-        // adds an extra 4 bytes and generic events cookie data is on the wire right after the standard 32 bytes.
+-        // Move this data back to have the same layout in memory as it was on the wire
+-        // and allow casting, overwritting the full_sequence field.
+-        memmove((char*)event + 32, (char*)event + 36, event->length * 4);
++    if (m_xinputData->use_xinput && xi2PrepareXIGenericDeviceEvent(event, m_xinputData->xinput_opcode)) {
+         xXIGenericDeviceEvent* xievent = (xXIGenericDeviceEvent*)event;
+ 
+         // On Harmattan XInput2 is hacked to give touch points updates into standard mouse button press/motion events.
+@@ -235,7 +195,7 @@ void QXcbConnection::handleGenericEvent(xcb_ge_event_t *event)
+                     XIValuatorClassInfo *valuatorclassinfo = reinterpret_cast<XIValuatorClassInfo *>(classinfo);
+                     int n = valuatorclassinfo->number;
+                     double value;
+-                    if (!getValuatorValueIfSet(xideviceevent, n, &value))
++                    if (!xi2GetValuatorValueIfSet(xideviceevent, n, &value))
+                         continue;
+ 
+                     if (valuatorclassinfo->label == atom(QXcbAtom::AbsMTPositionX)) {
+@@ -306,4 +266,3 @@ QT_END_NAMESPACE
+ 
+ #endif // XCB_USE_XINPUT2_MAEMO
+ 
+-
+diff --git a/src/plugins/platforms/xcb/qxcbconnection_xi2.cpp b/src/plugins/platforms/xcb/qxcbconnection_xi2.cpp
+new file mode 100644
+index 0000000..026fd8c
+--- /dev/null
++++ b/src/plugins/platforms/xcb/qxcbconnection_xi2.cpp
+@@ -0,0 +1,310 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qxcbconnection.h"
++#include "qxcbwindow.h"
++#include <QtGui/QWindowSystemInterface>
++
++#ifdef XCB_USE_XINPUT2
++
++#include <X11/extensions/XInput2.h>
++#include <X11/extensions/XI2proto.h>
++
++#ifndef QT_NO_TABLETEVENT
++static inline bool q_xi2_is_tablet(XIDeviceInfo *dev)
++{
++    QByteArray name(dev->name);
++    name = name.toLower();
++    // Cannot just check for "wacom" because that would also pick up the touch and tablet-button devices.
++    return name.contains("stylus") || name.contains("eraser");
++}
++#endif // QT_NO_TABLETEVENT
++
++void QXcbConnection::initializeXInput2()
++{
++    Display *xDisplay = static_cast<Display *>(m_xlib_display);
++    if (XQueryExtension(xDisplay, "XInputExtension", &m_xiOpCode, &m_xiEventBase, &m_xiErrorBase)) {
++        int xiMajor = 2;
++        m_xi2Minor = 2; // try 2.2 first, needed for TouchBegin/Update/End
++        if (XIQueryVersion(xDisplay, &xiMajor, &m_xi2Minor) == BadRequest) {
++            m_xi2Minor = 0; // for tablet support 2.0 is enough
++            m_xi2Enabled = XIQueryVersion(xDisplay, &xiMajor, &m_xi2Minor) != BadRequest;
++        } else {
++            m_xi2Enabled = true;
++        }
++
++        if (m_xi2Enabled) {
++#ifndef QT_NO_TABLETEVENT
++            // Tablet support: Figure out the stylus-related devices. We will
++            // only select events on this device. Press, motion, etc. events
++            // must never be selected for _all_ devices as that would render
++            // the standard XCB_MOTION_NOTIFY and similar handlers useless and
++            // we have no intention to infect all the pure xcb code with
++            // Xlib-based XI2.
++            xi2SetupTabletDevices();
++#endif // QT_NO_TABLETEVENT
++        }
++    }
++}
++
++void QXcbConnection::finalizeXInput2()
++{
++}
++
++void QXcbConnection::xi2Select(xcb_window_t window)
++{
++    if (!m_xi2Enabled)
++        return;
++
++#ifndef QT_NO_TABLETEVENT
++    // Tablets.
++    if (!m_tabletData.isEmpty()) {
++        Display *xDisplay = static_cast<Display *>(m_xlib_display);
++        QVector<XIEventMask> xiEventMask(m_tabletData.count());
++        unsigned int bitMask = 0;
++        unsigned char *xiBitMask = reinterpret_cast<unsigned char *>(&bitMask);
++        bitMask |= XI_ButtonPressMask;
++        bitMask |= XI_ButtonReleaseMask;
++        bitMask |= XI_MotionMask;
++        bitMask |= XI_PropertyEventMask;
++        for (int i = 0; i < m_tabletData.count(); ++i) {
++            xiEventMask[i].deviceid = m_tabletData.at(i).deviceId;
++            xiEventMask[i].mask_len = sizeof(bitMask);
++            xiEventMask[i].mask = xiBitMask;
++        }
++        XISelectEvents(xDisplay, window, xiEventMask.data(), m_tabletData.count());
++    }
++#endif // QT_NO_TABLETEVENT
++}
++
++void QXcbConnection::xi2HandleEvent(xcb_ge_event_t *event)
++{
++    if (xi2PrepareXIGenericDeviceEvent(event, m_xiOpCode)) {
++        xXIGenericDeviceEvent *xiEvent = reinterpret_cast<xXIGenericDeviceEvent *>(event);
++#ifndef QT_NO_TABLETEVENT
++        for (int i = 0; i < m_tabletData.count(); ++i) {
++            if (m_tabletData.at(i).deviceId == xiEvent->deviceid) {
++                xi2HandleTabletEvent(xiEvent, &m_tabletData[i]);
++                return;
++            }
++        }
++#endif // QT_NO_TABLETEVENT
++    }
++}
++
++#ifndef QT_NO_TABLETEVENT
++void QXcbConnection::xi2QueryTabletData(void *dev, TabletData *tabletData)
++{
++    XIDeviceInfo *device = static_cast<XIDeviceInfo *>(dev);
++    tabletData->deviceId = device->deviceid;
++
++    tabletData->pointerType = QTabletEvent::Pen;
++    if (QByteArray(device->name).toLower().contains("eraser"))
++        tabletData->pointerType = QTabletEvent::Eraser;
++
++    for (int i = 0; i < device->num_classes; ++i) {
++        switch (device->classes[i]->type) {
++        case XIValuatorClass: {
++            XIValuatorClassInfo *vci = reinterpret_cast<XIValuatorClassInfo *>(device->classes[i]);
++            int val = 0;
++            if (vci->label == atom(QXcbAtom::AbsX))
++                val = QXcbAtom::AbsX;
++            else if (vci->label == atom(QXcbAtom::AbsY))
++                val = QXcbAtom::AbsY;
++            else if (vci->label == atom(QXcbAtom::AbsPressure))
++                val = QXcbAtom::AbsPressure;
++            else if (vci->label == atom(QXcbAtom::AbsTiltX))
++                val = QXcbAtom::AbsTiltX;
++            else if (vci->label == atom(QXcbAtom::AbsTiltY))
++                val = QXcbAtom::AbsTiltY;
++            else if (vci->label == atom(QXcbAtom::AbsWheel))
++                val = QXcbAtom::AbsWheel;
++            else if (vci->label == atom(QXcbAtom::AbsDistance))
++                val = QXcbAtom::AbsDistance;
++            if (val) {
++                TabletData::ValuatorClassInfo info;
++                info.minVal = vci->min;
++                info.maxVal = vci->max;
++                info.number = vci->number;
++                tabletData->valuatorInfo[val] = info;
++            }
++        }
++            break;
++        default:
++            break;
++        }
++    }
++}
++
++void QXcbConnection::xi2SetupTabletDevices()
++{
++    Display *xDisplay = static_cast<Display *>(m_xlib_display);
++    m_tabletData.clear();
++    int deviceCount = 0;
++    XIDeviceInfo *devices = XIQueryDevice(xDisplay, XIAllDevices, &deviceCount);
++    if (devices) {
++        for (int i = 0; i < deviceCount; ++i) {
++            int unused = 0;
++            XIDeviceInfo *dev = XIQueryDevice(xDisplay, devices[i].deviceid, &unused);
++            if (dev) {
++                if (q_xi2_is_tablet(dev)) {
++                    TabletData tabletData;
++                    xi2QueryTabletData(dev, &tabletData);
++                    m_tabletData.append(tabletData);
++                }
++                XIFreeDeviceInfo(dev);
++            }
++        }
++        XIFreeDeviceInfo(devices);
++    }
++}
++
++void QXcbConnection::xi2HandleTabletEvent(void *event, TabletData *tabletData)
++{
++    Display *xDisplay = static_cast<Display *>(m_xlib_display);
++    xXIGenericDeviceEvent *xiEvent = static_cast<xXIGenericDeviceEvent *>(event);
++    switch (xiEvent->evtype) {
++    case XI_ButtonPress: // stylus down
++        if (reinterpret_cast<xXIDeviceEvent *>(event)->detail == 1) { // ignore the physical buttons on the stylus
++            tabletData->down = true;
++            xi2ReportTabletEvent(*tabletData, xiEvent);
++        }
++        break;
++    case XI_ButtonRelease: // stylus up
++        if (reinterpret_cast<xXIDeviceEvent *>(event)->detail == 1) {
++            tabletData->down = false;
++            xi2ReportTabletEvent(*tabletData, xiEvent);
++        }
++        break;
++    case XI_Motion:
++        // Report TabletMove only when the stylus is touching the tablet.
++        // No possiblity to report proximity motion (no suitable Qt event exists yet).
++        if (tabletData->down)
++            xi2ReportTabletEvent(*tabletData, xiEvent);
++        break;
++    case XI_PropertyEvent: {
++        xXIPropertyEvent *ev = reinterpret_cast<xXIPropertyEvent *>(event);
++        if (ev->what == XIPropertyModified) {
++            if (ev->property == atom(QXcbAtom::WacomSerialIDs)) {
++                Atom propType;
++                int propFormat;
++                unsigned long numItems, bytesAfter;
++                unsigned char *data;
++                if (XIGetProperty(xDisplay, tabletData->deviceId, ev->property, 0, 100,
++                                  0, AnyPropertyType, &propType, &propFormat,
++                                  &numItems, &bytesAfter, &data) == Success) {
++                    if (propType == atom(QXcbAtom::INTEGER) && propFormat == 32) {
++                        int *ptr = reinterpret_cast<int *>(data);
++                        for (unsigned long i = 0; i < numItems; ++i)
++                            tabletData->serialId |= qint64(ptr[i]) << (i * 32);
++                    }
++                    XFree(data);
++                }
++                // With recent-enough X drivers this property change event seems to come always
++                // when entering and leaving proximity. Due to the lack of other options hook up
++                // the enter/leave events to it.
++                if (tabletData->inProximity) {
++                    tabletData->inProximity = false;
++                    QWindowSystemInterface::handleTabletLeaveProximityEvent(QTabletEvent::Stylus,
++                                                                            tabletData->pointerType,
++                                                                            tabletData->serialId);
++                } else {
++                    tabletData->inProximity = true;
++                    QWindowSystemInterface::handleTabletEnterProximityEvent(QTabletEvent::Stylus,
++                                                                            tabletData->pointerType,
++                                                                            tabletData->serialId);
++                }
++            }
++        }
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++void QXcbConnection::xi2ReportTabletEvent(const TabletData &tabletData, void *event)
++{
++    xXIDeviceEvent *ev = reinterpret_cast<xXIDeviceEvent *>(event);
++    QXcbWindow *xcbWindow = platformWindowFromId(ev->event);
++    if (!xcbWindow)
++        return;
++    QWindow *window = xcbWindow->window();
++    const double scale = 65536.0;
++    QPointF local(ev->event_x / scale, ev->event_y / scale);
++    QPointF global(ev->root_x / scale, ev->root_y / scale);
++    double pressure = 0, rotation = 0;
++    int xTilt = 0, yTilt = 0;
++
++    for (QHash<int, TabletData::ValuatorClassInfo>::const_iterator it = tabletData.valuatorInfo.constBegin(),
++            ite = tabletData.valuatorInfo.constEnd(); it != ite; ++it) {
++        int valuator = it.key();
++        const TabletData::ValuatorClassInfo &classInfo(it.value());
++        double value;
++        if (xi2GetValuatorValueIfSet(event, classInfo.number, &value)) {
++            double normalizedValue = (value - classInfo.minVal) / double(classInfo.maxVal - classInfo.minVal);
++            switch (valuator) {
++            case QXcbAtom::AbsPressure:
++                pressure = normalizedValue;
++                break;
++            case QXcbAtom::AbsTiltX:
++                xTilt = value;
++                break;
++            case QXcbAtom::AbsTiltY:
++                yTilt = value;
++                break;
++            case QXcbAtom::AbsWheel:
++                rotation = value / 64.0;
++                break;
++            default:
++                break;
++            }
++        }
++    }
++
++    QWindowSystemInterface::handleTabletEvent(window, tabletData.down, local, global,
++                                              QTabletEvent::Stylus, tabletData.pointerType,
++                                              pressure, xTilt, yTilt, 0,
++                                              rotation, 0, tabletData.serialId);
++}
++#endif // QT_NO_TABLETEVENT
++
++#endif // XCB_USE_XINPUT2
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.cpp b/src/plugins/platforms/xcb/qxcbwindow.cpp
+index 4cc4d6f..249c6cf 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.cpp
++++ b/src/plugins/platforms/xcb/qxcbwindow.cpp
+@@ -103,7 +103,7 @@
+ #endif // QT_NO_SHAPE
+ #endif
+ 
+-#ifdef XCB_USE_XINPUT2_MAEMO
++#if defined(XCB_USE_XINPUT2_MAEMO) || defined(XCB_USE_XINPUT2)
+ #include <X11/extensions/XInput2.h>
+ #endif
+ 
+@@ -359,7 +359,7 @@ void QXcbWindow::create()
+                                    1, &leader));
+ 
+ #ifdef XCB_USE_XINPUT2_MAEMO
+-    if (connection()->isUsingXInput2()) {
++    if (connection()->isUsingXInput2Maemo()) {
+         XIEventMask xieventmask;
+         uchar bitmask[2] = { 0, 0 };
+ 
+@@ -373,6 +373,8 @@ void QXcbWindow::create()
+ 
+         XISelectEvents(DISPLAY_FROM_XCB(this), m_window, &xieventmask, 1);
+     }
++#elif defined(XCB_USE_XINPUT2)
++    connection()->xi2Select(m_window);
+ #endif
+ 
+     setWindowFlags(window()->windowFlags());
+diff --git a/src/plugins/platforms/xcb/xcb.pro b/src/plugins/platforms/xcb/xcb.pro
+index 8e6fbc6..70992fc 100644
+--- a/src/plugins/platforms/xcb/xcb.pro
++++ b/src/plugins/platforms/xcb/xcb.pro
+@@ -56,6 +56,12 @@ contains(QT_CONFIG, xcb-xlib) {
+             LIBS += -lXi
+         }
+         DEFINES += XCB_USE_MAEMO_WINDOW_PROPERTIES
++    } else {
++        contains(QT_CONFIG, xinput2) {
++            DEFINES += XCB_USE_XINPUT2
++            SOURCES += qxcbconnection_xi2.cpp
++            LIBS += -lXi
++        }
+     }
+ }

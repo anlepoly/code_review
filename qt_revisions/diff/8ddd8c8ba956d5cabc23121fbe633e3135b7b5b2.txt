@@ -1,0 +1,142 @@
+diff --git a/src/corelib/tools/qstringbuilder.cpp b/src/corelib/tools/qstringbuilder.cpp
+index a044cca..2fe5560 100644
+--- a/src/corelib/tools/qstringbuilder.cpp
++++ b/src/corelib/tools/qstringbuilder.cpp
+@@ -108,12 +108,24 @@ void QAbstractConcatenable::convertFromAscii(const char *a, int len, QChar *&out
+     if (len == -1) {
+         if (!a)
+             return;
+-        while (*a)
++        while (*a && uchar(*a) < 0x80U)
+             *out++ = QLatin1Char(*a++);
++        if (!*a)
++            return;
+     } else {
+-        for (int i = 0; i < len; ++i)
++        int i;
++        for (i = 0; i < len && uchar(a[i]) < 0x80U; ++i)
+             *out++ = QLatin1Char(a[i]);
++        if (i == len)
++            return;
++        a += i;
++        len -= i;
+     }
++
++    // we need to complement with UTF-8 appending
++    QString tmp = QString::fromUtf8(a, len);
++    memcpy(out, reinterpret_cast<const char *>(tmp.constData()), sizeof(QChar) * tmp.size());
++    out += tmp.size();
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/corelib/tools/qstringbuilder.h b/src/corelib/tools/qstringbuilder.h
+index 9b1cd1e..6b258eb 100644
+--- a/src/corelib/tools/qstringbuilder.h
++++ b/src/corelib/tools/qstringbuilder.h
+@@ -381,15 +381,11 @@ operator+(const A &a, const B &b)
+ }
+ #endif
+ 
++namespace QtStringBuilder {
+ template <typename A, typename B>
+-QByteArray &operator+=(QByteArray &a, const QStringBuilder<A, B> &b)
++QByteArray &appendToByteArray(QByteArray &a, const QStringBuilder<A, B> &b, char)
+ {
+-#ifndef QT_NO_CAST_TO_ASCII
+-    if (sizeof(typename QConcatenable< QStringBuilder<A, B> >::ConvertTo::value_type) == sizeof(QChar)) {
+-        //it is not save to optimize as in utf8 it is not possible to compute the size
+-        return a += QString(b);
+-    }
+-#endif
++    // append 8-bit data to a byte array
+     int len = a.size() + QConcatenable< QStringBuilder<A, B> >::size(b);
+     a.reserve(len);
+     char *it = a.data() + a.size();
+@@ -398,6 +394,23 @@ QByteArray &operator+=(QByteArray &a, const QStringBuilder<A, B> &b)
+     return a;
+ }
+ 
++#ifndef QT_NO_CAST_TO_ASCII
++template <typename A, typename B>
++QByteArray &appendToByteArray(QByteArray &a, const QStringBuilder<A, B> &b, QChar)
++{
++    // append UTF-16 data to the byte array
++    return a += QString(b);
++}
++#endif
++}
++
++template <typename A, typename B>
++QByteArray &operator+=(QByteArray &a, const QStringBuilder<A, B> &b)
++{
++    return QtStringBuilder::appendToByteArray(a, b,
++                                              typename QConcatenable< QStringBuilder<A, B> >::ConvertTo::value_type());
++}
++
+ template <typename A, typename B>
+ QString &operator+=(QString &a, const QStringBuilder<A, B> &b)
+ {
+diff --git a/tests/auto/corelib/tools/qstringbuilder/qstringbuilder1/stringbuilder.cpp b/tests/auto/corelib/tools/qstringbuilder/qstringbuilder1/stringbuilder.cpp
+index d0f82a3..8955da9 100644
+--- a/tests/auto/corelib/tools/qstringbuilder/qstringbuilder1/stringbuilder.cpp
++++ b/tests/auto/corelib/tools/qstringbuilder/qstringbuilder1/stringbuilder.cpp
+@@ -45,7 +45,7 @@
+ #define LITERAL_LEN (sizeof(LITERAL)-1)
+ #define LITERAL_EXTRA "some literal" "EXTRA"
+ 
+-// "some literal", but replacing all vocals by their umlauted UTF-8 string :)
++// "some literal", but replacing all vowels by their umlauted UTF-8 string :)
+ #define UTF8_LITERAL "s\xc3\xb6m\xc3\xab l\xc3\xaft\xc3\xabr\xc3\xa4l"
+ #define UTF8_LITERAL_LEN (sizeof(UTF8_LITERAL)-1)
+ #define UTF8_LITERAL_EXTRA "s\xc3\xb6m\xc3\xab l\xc3\xaft\xc3\xabr\xc3\xa4l" "EXTRA"
+@@ -131,14 +131,6 @@ void runScenario()
+     r = string P ba;
+     QCOMPARE(r, r2);
+ 
+-#if 0
+-    // now test with codec for C strings set
+-    // TODO: to be re-enabled once strings default to utf8, in place of the
+-    // latin1 code above.
+-    QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
+-    QVERIFY(QTextCodec::codecForCStrings());
+-    QCOMPARE(QTextCodec::codecForCStrings()->name(), QByteArray("UTF-8"));
+-
+     string = QString::fromUtf8(UTF8_LITERAL);
+     ba = UTF8_LITERAL;
+ 
+@@ -157,7 +149,6 @@ void runScenario()
+     QCOMPARE(r, r3);
+     r = string P ba;
+     QCOMPARE(r, r3);
+-#endif
+ 
+     ba = QByteArray(); // empty
+     r = ba P string;
+@@ -217,12 +208,9 @@ void runScenario()
+         str +=  QLatin1String(LITERAL) P str;
+         QCOMPARE(str, QString::fromUtf8(UTF8_LITERAL LITERAL UTF8_LITERAL));
+ #ifndef QT_NO_CAST_FROM_ASCII
+-#if 0
+-        // TODO: this relies on strings defaulting to utf8, so disable this for now.
+         str = (QString::fromUtf8(UTF8_LITERAL) += QLatin1String(LITERAL) P UTF8_LITERAL);
+         QCOMPARE(str, QString::fromUtf8(UTF8_LITERAL LITERAL UTF8_LITERAL));
+ #endif
+-#endif
+     }
+ 
+     //operator QByteArray  +=
+@@ -237,14 +225,11 @@ void runScenario()
+         ba2 += ba2 P withZero;
+         QCOMPARE(ba2, QByteArray(withZero + withZero + withZero));
+ #ifndef QT_NO_CAST_TO_ASCII
+-#if 0
+-        // TODO: this relies on strings defaulting to utf8, so disable this for now.
+         ba = UTF8_LITERAL;
+         ba2 = (ba += QLatin1String(LITERAL) + QString::fromUtf8(UTF8_LITERAL));
+         QCOMPARE(ba2, ba);
+         QCOMPARE(ba, QByteArray(UTF8_LITERAL LITERAL UTF8_LITERAL));
+ #endif
+-#endif
+     }
+ 
+ }

@@ -1,0 +1,690 @@
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 166ffe8..7195e8a 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -5366,8 +5366,11 @@ QSGTextureProvider *QQuickItem::textureProvider() const
+ 
+ QQuickItemLayer *QQuickItemPrivate::layer() const
+ {
+-    if (!_layer)
++    if (!_layer) {
+         _layer = new QQuickItemLayer(const_cast<QQuickItem *>(q_func()));
++        if (!componentComplete)
++            _layer->classBegin();
++    }
+     return _layer;
+ }
+ 
+@@ -5426,11 +5429,14 @@ void QQuickItemLayer::setEnabled(bool e)
+ 
+ void QQuickItemLayer::classBegin()
+ {
++    Q_ASSERT(!m_effectSource);
++    Q_ASSERT(!m_effect);
+     m_componentComplete = false;
+ }
+ 
+ void QQuickItemLayer::componentComplete()
+ {
++    Q_ASSERT(!m_componentComplete);
+     m_componentComplete = true;
+     if (m_enabled)
+         activate();
+@@ -5438,16 +5444,15 @@ void QQuickItemLayer::componentComplete()
+ 
+ void QQuickItemLayer::activate()
+ {
+-    QQuickItem *parentItem = m_item->parentItem();
+-    if (!m_effectSource)
+-        m_effectSource = new QQuickShaderEffectSource();
++    Q_ASSERT(!m_effectSource);
++    m_effectSource = new QQuickShaderEffectSource();
+ 
++    QQuickItem *parentItem = m_item->parentItem();
+     if (parentItem) {
+         m_effectSource->setParentItem(parentItem);
+         m_effectSource->stackAfter(m_item);
+     }
+ 
+-    m_effectSource->setVisible(!m_effectComponent && m_item->isVisible());
+     m_effectSource->setSourceItem(m_item);
+     m_effectSource->setHideSource(true);
+     m_effectSource->setSmooth(m_smooth);
+@@ -5457,25 +5462,10 @@ void QQuickItemLayer::activate()
+     m_effectSource->setWrapMode(m_wrapMode);
+     m_effectSource->setFormat(m_format);
+ 
+-    if (m_effectComponent) {
+-        if (!m_effect) {
+-            QObject *created = m_effectComponent->create();
+-            m_effect = qobject_cast<QQuickShaderEffect *>(created);
+-            if (!m_effect) {
+-                qWarning("Item: layer.effect is not a shader effect");
+-                delete created;
+-            }
+-        }
+-        if (m_effect) {
+-            if (parentItem) {
+-                m_effect->setParentItem(parentItem);
+-                m_effect->stackAfter(m_effectSource);
+-            }
+-            m_effect->setVisible(m_item->isVisible());
+-            m_effect->setProperty(m_name.toLatin1(), qVariantFromValue<QObject *>(m_effectSource));
+-            m_effect->update();
+-        }
+-    }
++    if (m_effectComponent)
++        activateEffect();
++
++    m_effectSource->setVisible(m_item->isVisible() && !m_effect);
+ 
+     updateZ();
+     updateGeometry();
+@@ -5488,16 +5478,48 @@ void QQuickItemLayer::activate()
+ 
+ void QQuickItemLayer::deactivate()
+ {
++    Q_ASSERT(m_effectSource);
++
++    if (m_effectComponent)
++        deactivateEffect();
++
+     delete m_effectSource;
+     m_effectSource = 0;
+ 
+-    delete m_effect;
+-    m_effect = 0;
+-
+     QQuickItemPrivate *id = QQuickItemPrivate::get(m_item);
+     id->removeItemChangeListener(this,  QQuickItemPrivate::Geometry | QQuickItemPrivate::Opacity | QQuickItemPrivate::Parent | QQuickItemPrivate::Visibility | QQuickItemPrivate::SiblingOrder);
+ }
+ 
++void QQuickItemLayer::activateEffect()
++{
++    Q_ASSERT(m_effectSource);
++    Q_ASSERT(m_effectComponent);
++    Q_ASSERT(!m_effect);
++
++    QObject *created = m_effectComponent->create();
++    m_effect = qobject_cast<QQuickShaderEffect *>(created);
++    if (!m_effect) {
++        qWarning("Item: layer.effect is not a ShaderEffect.");
++        delete created;
++        return;
++    }
++    QQuickItem *parentItem = m_item->parentItem();
++    if (parentItem) {
++        m_effect->setParentItem(parentItem);
++        m_effect->stackAfter(m_effectSource);
++    }
++    m_effect->setVisible(m_item->isVisible());
++    m_effect->setProperty(m_name.toLatin1(), qVariantFromValue<QObject *>(m_effectSource));
++}
++
++void QQuickItemLayer::deactivateEffect()
++{
++    Q_ASSERT(m_effectSource);
++    Q_ASSERT(m_effectComponent);
++
++    delete m_effect;
++    m_effect = 0;
++}
+ 
+ 
+ /*!
+@@ -5506,21 +5528,35 @@ void QQuickItemLayer::deactivate()
+     Holds the effect that is applied to this layer.
+ 
+     The effect must be a \l ShaderEffect.
++
++    \sa samplerName
+  */
+ 
+ void QQuickItemLayer::setEffect(QDeclarativeComponent *component)
+ {
+     if (component == m_effectComponent)
+         return;
++
++    bool updateNeeded = false;
++    if (m_effectSource && m_effectComponent) {
++        deactivateEffect();
++        updateNeeded = true;
++    }
++
+     m_effectComponent = component;
+ 
+-    if (m_effect) {
+-        delete m_effect;
+-        m_effect = 0;
++    if (m_effectSource && m_effectComponent) {
++        activateEffect();
++        updateNeeded = true;
+     }
+ 
+-    if (m_effectSource)
+-        activate();
++    if (updateNeeded) {
++        updateZ();
++        updateGeometry();
++        updateOpacity();
++        updateMatrix();
++        m_effectSource->setVisible(m_item->isVisible() && !m_effect);
++    }
+ 
+     emit effectChanged(component);
+ }
+@@ -5676,6 +5712,27 @@ void QQuickItemLayer::setWrapMode(QQuickShaderEffectSource::WrapMode mode)
+     emit wrapModeChanged(mode);
+ }
+ 
++/*!
++    \qmlproperty string QtQuick2::Item::layer.samplerName
++
++    Holds the name of the effect's source texture property.
++
++    samplerName needs to match the name of the effect's source texture property
++    so that the Item can pass the layer's offscreen surface to the effect correctly.
++
++    \sa effect, ShaderEffect
++ */
++
++void QQuickItemLayer::setName(const QString &name) {
++    if (m_name == name)
++        return;
++    if (m_effect) {
++        m_effect->setProperty(m_name.toLatin1(), QVariant());
++        m_effect->setProperty(name.toLatin1(), qVariantFromValue<QObject *>(m_effectSource));
++    }
++    m_name = name;
++    emit nameChanged(name);
++}
+ 
+ void QQuickItemLayer::itemOpacityChanged(QQuickItem *item)
+ {
+@@ -5691,8 +5748,9 @@ void QQuickItemLayer::itemGeometryChanged(QQuickItem *, const QRectF &, const QR
+ void QQuickItemLayer::itemParentChanged(QQuickItem *item, QQuickItem *parent)
+ {
+     Q_UNUSED(item)
+-    if (parent == m_effectSource || parent == m_effect)
+-        return;
++    Q_ASSERT(item == m_item);
++    Q_ASSERT(parent != m_effectSource);
++    Q_ASSERT(parent == 0 || parent != m_effect);
+ 
+     m_effectSource->setParentItem(parent);
+     if (parent)
+@@ -5715,24 +5773,30 @@ void QQuickItemLayer::itemSiblingOrderChanged(QQuickItem *)
+ void QQuickItemLayer::itemVisibilityChanged(QQuickItem *)
+ {
+     QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    Q_ASSERT(l);
+     l->setVisible(m_item->isVisible());
+ }
+ 
+ void QQuickItemLayer::updateZ()
+ {
++    if (!m_componentComplete || !m_enabled)
++        return;
+     QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    Q_ASSERT(l);
+     l->setZ(m_item->z());
+ }
+ 
+ void QQuickItemLayer::updateOpacity()
+ {
+     QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    Q_ASSERT(l);
+     l->setOpacity(m_item->opacity());
+ }
+ 
+ void QQuickItemLayer::updateGeometry()
+ {
+     QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    Q_ASSERT(l);
+     QRectF bounds = m_item->boundingRect();
+     l->setWidth(bounds.width());
+     l->setHeight(bounds.height());
+@@ -5747,6 +5811,7 @@ void QQuickItemLayer::updateMatrix()
+     if (!m_componentComplete || !m_enabled)
+         return;
+     QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    Q_ASSERT(l);
+     QQuickItemPrivate *ld = QQuickItemPrivate::get(l);
+     l->setScale(m_item->scale());
+     l->setRotation(m_item->rotation());
+diff --git a/src/quick/items/qquickitem_p.h b/src/quick/items/qquickitem_p.h
+index 08cdd57..2383ae1 100644
+--- a/src/quick/items/qquickitem_p.h
++++ b/src/quick/items/qquickitem_p.h
+@@ -157,7 +157,7 @@ public:
+     void classBegin();
+     void componentComplete();
+ 
+-    bool enabled() const { return m_effectSource != 0; }
++    bool enabled() const { return m_enabled; }
+     void setEnabled(bool enabled);
+ 
+     bool mipmap() const { return m_mipmap; }
+@@ -179,12 +179,7 @@ public:
+     void setWrapMode(QQuickShaderEffectSource::WrapMode mode);
+ 
+     QString name() const { return m_name; }
+-    void setName(const QString &name) {
+-        if (m_name == name)
+-            return;
+-        m_name = name;
+-        emit nameChanged(name);
+-    }
++    void setName(const QString &name);
+ 
+     QDeclarativeComponent *effect() const { return m_effectComponent; }
+     void setEffect(QDeclarativeComponent *effect);
+@@ -216,6 +211,8 @@ signals:
+ private:
+     void activate();
+     void deactivate();
++    void activateEffect();
++    void deactivateEffect();
+ 
+     QQuickItem *m_item;
+     bool m_enabled;
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/DisableLayer.qml b/tests/auto/qtquick2/qquickitemlayer/data/DisableLayer.qml
+new file mode 100644
+index 0000000..70fc05e
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/DisableLayer.qml
+@@ -0,0 +1,18 @@
++import QtQuick 2.0
++
++Item {
++    width: 200
++    height: 200
++    Rectangle {
++        width: 100
++        height: 100
++        color: "red"
++        layer.enabled: true
++        Component.onCompleted: {
++            layer.enabled = false
++            visible = false
++            width = 120
++            x = 10
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/SamplerNameChange.qml b/tests/auto/qtquick2/qquickitemlayer/data/SamplerNameChange.qml
+new file mode 100644
+index 0000000..a4c2ebf
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/SamplerNameChange.qml
+@@ -0,0 +1,18 @@
++import QtQuick 2.0
++
++Rectangle {
++    width: 200
++    height: 200
++    color: "blue"
++    layer.enabled: true
++    layer.effect: ShaderEffect {
++        fragmentShader: "
++            uniform sampler2D foo;
++            uniform lowp float qt_Opacity;
++            varying highp vec2 qt_TexCoord0;
++            void main() {
++                gl_FragColor = texture2D(foo, qt_TexCoord0) * qt_Opacity;
++            }"
++    }
++    Component.onCompleted: layer.samplerName = "foo"
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/ToggleLayerAndEffect.qml b/tests/auto/qtquick2/qquickitemlayer/data/ToggleLayerAndEffect.qml
+new file mode 100644
+index 0000000..174b669
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/ToggleLayerAndEffect.qml
+@@ -0,0 +1,23 @@
++import QtQuick 2.0
++
++Item {
++    width: 200
++    height: 200
++    Rectangle {
++        width: 100
++        height: 100
++        color: "red"
++        Component.onCompleted: {
++            layer.enabled = true
++            layer.effect = effectComponent
++            layer.enabled = false
++            visible = false
++            width = 120
++            x = 10
++        }
++    }
++    Component {
++        id: effectComponent
++        ShaderEffect { }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/ZOrderChange.qml b/tests/auto/qtquick2/qquickitemlayer/data/ZOrderChange.qml
+new file mode 100644
+index 0000000..ebbd3b7
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/ZOrderChange.qml
+@@ -0,0 +1,50 @@
++import QtQuick 2.0
++
++Item {
++    width: 200
++    height: 200
++    property bool layerEffect: false
++    property bool layerEnabled: false
++    property real layerZ: 0
++    Rectangle {
++        anchors.fill: parent
++        color: "#00ffff"
++    }
++    Rectangle {
++        id: foo
++        anchors.fill: parent
++        color: "#ffff00"
++        Rectangle {
++            width: 100
++            height: 100
++            color: "#00ffff"
++        }
++        layer.enabled: parent.layerEnabled
++        layer.effect: parent.layerEffect ? effectComponent : null
++        opacity: 0.5
++        z: layerZ
++    }
++    Rectangle {
++        width: 100
++        height: 100
++        x: 100
++        color: "#ff0000"
++    }
++    Rectangle {
++        width: 100
++        height: 100
++        y: 100
++        color: "#0000ff"
++        z: 1
++    }
++    Component {
++        id: effectComponent
++        ShaderEffect {
++            fragmentShader: "
++                uniform sampler2D source;
++                uniform lowp float qt_Opacity;
++                varying highp vec2 qt_TexCoord0;
++                void main() { gl_FragColor = texture2D(source, qt_TexCoord0).xzyw * qt_Opacity; }"
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro b/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro
+index bf22d04..5c34dec 100644
+--- a/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro
++++ b/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro
+@@ -21,7 +21,11 @@ OTHER_FILES += \
+     data/SourceRect.qml \
+     data/TextureProvider.qml \
+     data/Visible.qml \
+-    data/ZOrder.qml
++    data/ZOrder.qml \
++    data/ZOrderChange.qml \
++    data/ToggleLayerAndEffect.qml \
++    data/DisableLayer.qml \
++    data/SamplerNameChange.qml
+ 
+ 
+ 
+diff --git a/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp b/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp
+index 09c92f6..1e55924 100644
+--- a/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp
++++ b/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp
+@@ -43,6 +43,7 @@
+ 
+ #include <QtQuick/qquickitem.h>
+ #include <QtQuick/qquickview.h>
++#include <QtGui/qopenglcontext.h>
+ 
+ #include "../../shared/util.h"
+ 
+@@ -74,25 +75,64 @@ private slots:
+ 
+     void layerSourceRect();
+ 
+-
+     void layerZOrder_data();
+     void layerZOrder();
+ 
+     void layerIsTextureProvider();
++
++    void changeZOrder_data();
++    void changeZOrder();
++
++    void toggleLayerAndEffect();
++    void disableLayer();
++    void changeSamplerName();
++
++private:
++    bool m_isMesaSoftwareRasterizer;
++    int m_mesaVersion;
+ };
+ 
+ tst_QQuickItemLayer::tst_QQuickItemLayer()
++    : m_mesaVersion(0)
+ {
++    QWindow window;
++    QOpenGLContext context;
++    window.setSurfaceType(QWindow::OpenGLSurface);
++    window.create();
++    context.create();
++    context.makeCurrent(&window);
++    const char *vendor = (const char *)glGetString(GL_VENDOR);
++    const char *renderer = (const char *)glGetString(GL_RENDERER);
++    m_isMesaSoftwareRasterizer = strcmp(vendor, "Mesa Project") == 0
++            && strcmp(renderer, "Software Rasterizer") == 0;
++    if (m_isMesaSoftwareRasterizer) {
++        // Expects format: <OpenGL version> Mesa <Mesa version>[-devel] [...]
++        const char *version = (const char *)glGetString(GL_VERSION);
++        QList<QByteArray> list = QByteArray(version).split(' ');
++        if (list.size() >= 3) {
++            list = list.at(2).split('-').at(0).split('.');
++            int major = 0;
++            int minor = 0;
++            int patch = 0;
++            if (list.size() >= 1)
++                major = list.at(0).toInt();
++            if (list.size() >= 2)
++                minor = list.at(1).toInt();
++            if (list.size() >= 3)
++                patch = list.at(2).toInt();
++            m_mesaVersion = QT_VERSION_CHECK(major, minor, patch);
++        }
++    }
+ }
+ 
+-
+-
+ // The test draws a red and a blue box next to each other and tests that the
+ // output is still red and blue on the left and right and a combination of
+ // the two in the middle.
+ 
+ void tst_QQuickItemLayer::layerSmooth()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
+     QImage fb = runTest(testFile("Smooth.qml"));
+     QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
+     QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0, 0xff));
+@@ -110,6 +150,8 @@ void tst_QQuickItemLayer::layerSmooth()
+ 
+ void tst_QQuickItemLayer::layerEnabled()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
+     QImage fb = runTest(testFile("Enabled.qml"));
+     // Verify the banding
+     QCOMPARE(fb.pixel(0, 0), fb.pixel(0, 1));
+@@ -124,6 +166,8 @@ void tst_QQuickItemLayer::layerEnabled()
+ 
+ void tst_QQuickItemLayer::layerMipmap()
+ {
++    if (m_isMesaSoftwareRasterizer)
++        QSKIP("Mipmapping does not work with the Mesa Software Rasterizer.");
+     QImage fb = runTest(testFile("Mipmap.qml"));
+     QVERIFY(fb.pixel(0, 0) != 0xff000000);
+     QVERIFY(fb.pixel(0, 0) != 0xffffffff);
+@@ -136,6 +180,8 @@ void tst_QQuickItemLayer::layerMipmap()
+ 
+ void tst_QQuickItemLayer::layerEffect()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
+     QImage fb = runTest(testFile("Effect.qml"));
+     QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
+     QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0xff, 0));
+@@ -148,6 +194,9 @@ void tst_QQuickItemLayer::layerEffect()
+ // a shader that pads transparent to blue. Everything else is red.
+ void tst_QQuickItemLayer::layerSourceRect()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
++
+     QImage fb = runTest(testFile("SourceRect.qml"));
+ 
+     // Check that the edges are converted to blue
+@@ -166,6 +215,8 @@ void tst_QQuickItemLayer::layerSourceRect()
+ // directly in a stand alone ShaderEffect
+ void tst_QQuickItemLayer::layerIsTextureProvider()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
+     QImage fb = runTest(testFile("TextureProvider.qml"));
+     QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
+     QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0xff, 0));
+@@ -196,6 +247,9 @@ void tst_QQuickItemLayer::layerVisibility_data()
+ 
+ void tst_QQuickItemLayer::layerVisibility()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
++
+     QFETCH(bool, visible);
+     QFETCH(bool, effect);
+     QFETCH(qreal, opacity);
+@@ -241,6 +295,9 @@ void tst_QQuickItemLayer::layerZOrder_data()
+ 
+ void tst_QQuickItemLayer::layerZOrder()
+ {
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
++
+     QFETCH(bool, effect);
+ 
+     QQuickView view;
+@@ -260,7 +317,91 @@ void tst_QQuickItemLayer::layerZOrder()
+ 
+ }
+ 
++void tst_QQuickItemLayer::changeZOrder_data()
++{
++    QTest::addColumn<bool>("layered");
++    QTest::addColumn<bool>("effect");
++
++    QTest::newRow("layered, effect") << true << true;
++    QTest::newRow("layered, !effect") << true << false;
++    QTest::newRow("!layered") << false << false;
++}
++
++void tst_QQuickItemLayer::changeZOrder()
++{
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
++
++    QFETCH(bool, layered);
++    QFETCH(bool, effect);
++
++    QQuickView view;
++    view.setSource(testFile("ZOrderChange.qml"));
++
++    QQuickItem *child = view.rootItem()->childItems().at(0);
++    child->setProperty("layerEnabled", layered);
++    child->setProperty("layerEffect", effect);
++    child->setProperty("layerZ", 1);
+ 
++    view.show();
++
++    QTest::qWaitForWindowShown(&view);
++
++    QImage fb = view.grabFrameBuffer();
++
++    QRgb topLeft = fb.pixel(50, 50);
++    QRgb topRight = fb.pixel(150, 50);
++    QRgb bottomLeft = fb.pixel(50, 150);
++    QRgb bottomRight = fb.pixel(150, 150);
++
++    QCOMPARE(bottomLeft, qRgb(0, 0, 0xff));
++
++    if (layered) {
++        QCOMPARE(topLeft, qRgb(0, 0xff, 0xff));
++    } else {
++        QCOMPARE(qGreen(topLeft), 0xff);
++        QVERIFY(qAbs(qRed(topLeft) - 0x3f) < 4);
++        QVERIFY(qAbs(qBlue(topLeft) - 0xbf) < 4);
++    }
++
++    if (layered && effect) {
++        QCOMPARE(qRed(topRight), 0xff);
++        QCOMPARE(qGreen(topRight), 0x00);
++        QVERIFY(qAbs(qBlue(topRight) - 0x7f) < 4);
++
++        QVERIFY(qAbs(qRed(bottomRight) - 0x7f) < 4);
++        QCOMPARE(qBlue(bottomRight), 0xff);
++        QVERIFY(qAbs(qGreen(bottomRight) - 0x7f) < 4);
++    } else {
++        QCOMPARE(qRed(topRight), 0xff);
++        QCOMPARE(qBlue(topRight), 0x00);
++        QVERIFY(qAbs(qGreen(topRight) - 0x7f) < 4);
++
++        QVERIFY(qAbs(qRed(bottomRight) - 0x7f) < 4);
++        QCOMPARE(qGreen(bottomRight), 0xff);
++        QVERIFY(qAbs(qBlue(bottomRight) - 0x7f) < 4);
++    }
++}
++
++void tst_QQuickItemLayer::toggleLayerAndEffect()
++{
++    // This test passes if it doesn't crash.
++    runTest(testFile("ToggleLayerAndEffect.qml"));
++}
++
++void tst_QQuickItemLayer::disableLayer()
++{
++    // This test passes if it doesn't crash.
++    runTest(testFile("DisableLayer.qml"));
++}
++
++void tst_QQuickItemLayer::changeSamplerName()
++{
++    if (m_isMesaSoftwareRasterizer && m_mesaVersion < QT_VERSION_CHECK(7, 11, 0))
++        QSKIP("Mesa Software Rasterizer below version 7.11 does not render this test correctly.");
++    QImage fb = runTest(testFile("SamplerNameChange.qml"));
++    QCOMPARE(fb.pixel(0, 0), qRgb(0, 0, 0xff));
++}
+ 
+ QTEST_MAIN(tst_QQuickItemLayer)
+ 
+diff --git a/tests/auto/qtquick2/qtquick2.pro b/tests/auto/qtquick2/qtquick2.pro
+index 0722fd3..7066446 100644
+--- a/tests/auto/qtquick2/qtquick2.pro
++++ b/tests/auto/qtquick2/qtquick2.pro
+@@ -41,6 +41,7 @@ QUICKTESTS =  \
+     qquickimage \
+     qquickitem \
+     qquickitem2 \
++    qquickitemlayer \
+     qquicklistview \
+     qquickloader \
+     qquickmousearea \

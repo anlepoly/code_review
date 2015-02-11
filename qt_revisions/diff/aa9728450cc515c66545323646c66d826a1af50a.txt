@@ -1,0 +1,1700 @@
+diff --git a/tests/baselineserver/shared/baselineprotocol.cpp b/tests/baselineserver/shared/baselineprotocol.cpp
+index b8e1413..e800b76 100644
+--- a/tests/baselineserver/shared/baselineprotocol.cpp
++++ b/tests/baselineserver/shared/baselineprotocol.cpp
+@@ -50,6 +50,7 @@
+ #include <QTime>
+ #include <QPointer>
+ 
++const QString PI_Project(QLS("Project"));
+ const QString PI_TestCase(QLS("TestCase"));
+ const QString PI_HostName(QLS("HostName"));
+ const QString PI_HostAddress(QLS("HostAddress"));
+@@ -357,9 +358,13 @@ BaselineProtocol::BaselineProtocol()
+ 
+ BaselineProtocol::~BaselineProtocol()
+ {
++    disconnect();
++}
++
++bool BaselineProtocol::disconnect()
++{
+     socket.close();
+-    if (socket.state() != QTcpSocket::UnconnectedState)
+-        socket.waitForDisconnected(Timeout);
++    return (socket.state() == QTcpSocket::UnconnectedState) ? true : socket.waitForDisconnected(Timeout);
+ }
+ 
+ 
+@@ -372,7 +377,7 @@ bool BaselineProtocol::connect(const QString &testCase, bool *dryrun, const Plat
+ 
+     socket.connectToHost(serverName, ServerPort);
+     if (!socket.waitForConnected(Timeout)) {
+-        sysSleep(Timeout);  // Wait a bit and try again, the server might just be restarting
++        sysSleep(3000);  // Wait a bit and try again, the server might just be restarting
+         if (!socket.waitForConnected(Timeout)) {
+             errMsg += QLS("TCP connectToHost failed. Host:") + serverName + QLS(" port:") + QString::number(ServerPort);
+             return false;
+@@ -456,6 +461,15 @@ bool BaselineProtocol::requestBaselineChecksums(const QString &testFunction, Ima
+ }
+ 
+ 
++bool BaselineProtocol::submitMatch(const ImageItem &item, QByteArray *serverMsg)
++{
++    Command cmd;
++    ImageItem smallItem = item;
++    smallItem.image = QImage();  // No need to waste bandwith sending image (identical to baseline) to server
++    return (sendItem(AcceptMatch, smallItem) && receiveBlock(&cmd, serverMsg) && cmd == Ack);
++}
++
++
+ bool BaselineProtocol::submitNewBaseline(const ImageItem &item, QByteArray *serverMsg)
+ {
+     Command cmd;
+@@ -463,10 +477,15 @@ bool BaselineProtocol::submitNewBaseline(const ImageItem &item, QByteArray *serv
+ }
+ 
+ 
+-bool BaselineProtocol::submitMismatch(const ImageItem &item, QByteArray *serverMsg)
++bool BaselineProtocol::submitMismatch(const ImageItem &item, QByteArray *serverMsg, bool *fuzzyMatch)
+ {
+     Command cmd;
+-    return (sendItem(AcceptMismatch, item) && receiveBlock(&cmd, serverMsg) && cmd == Ack);
++    if (sendItem(AcceptMismatch, item) && receiveBlock(&cmd, serverMsg) && (cmd == Ack || cmd == FuzzyMatch)) {
++        if (fuzzyMatch)
++            *fuzzyMatch = (cmd == FuzzyMatch);
++        return true;
++    }
++    return false;
+ }
+ 
+ 
+diff --git a/tests/baselineserver/shared/baselineprotocol.h b/tests/baselineserver/shared/baselineprotocol.h
+index 61feaa3..a5f873e 100644
+--- a/tests/baselineserver/shared/baselineprotocol.h
++++ b/tests/baselineserver/shared/baselineprotocol.h
+@@ -55,6 +55,7 @@
+ 
+ #define FileFormat "png"
+ 
++extern const QString PI_Project;
+ extern const QString PI_TestCase;
+ extern const QString PI_HostName;
+ extern const QString PI_HostAddress;
+@@ -111,7 +112,9 @@ public:
+         Ok = 0,
+         BaselineNotFound = 1,
+         IgnoreItem = 2,
+-        Mismatch = 3
++        Mismatch = 3,
++        FuzzyMatch = 4,
++        Error = 5
+     };
+ 
+     QString testFunction;
+@@ -155,21 +158,25 @@ public:
+         // Queries
+         AcceptPlatformInfo = 1,
+         RequestBaselineChecksums = 2,
++        AcceptMatch = 3,
+         AcceptNewBaseline = 4,
+         AcceptMismatch = 5,
+         // Responses
+         Ack = 128,
+         Abort = 129,
+-        DoDryRun = 130
++        DoDryRun = 130,
++        FuzzyMatch = 131
+     };
+ 
+     // For client:
+ 
+     // For advanced client:
+     bool connect(const QString &testCase, bool *dryrun = 0, const PlatformInfo& clientInfo = PlatformInfo());
++    bool disconnect();
+     bool requestBaselineChecksums(const QString &testFunction, ImageItemList *itemList);
++    bool submitMatch(const ImageItem &item, QByteArray *serverMsg);
+     bool submitNewBaseline(const ImageItem &item, QByteArray *serverMsg);
+-    bool submitMismatch(const ImageItem &item, QByteArray *serverMsg);
++    bool submitMismatch(const ImageItem &item, QByteArray *serverMsg, bool *fuzzyMatch = 0);
+ 
+     // For server:
+     bool acceptConnection(PlatformInfo *pi);
+diff --git a/tests/baselineserver/shared/qbaselinetest.cpp b/tests/baselineserver/shared/qbaselinetest.cpp
+index 11de042..0c28f6e 100644
+--- a/tests/baselineserver/shared/qbaselinetest.cpp
++++ b/tests/baselineserver/shared/qbaselinetest.cpp
+@@ -41,44 +41,233 @@
+ 
+ #include "qbaselinetest.h"
+ #include "baselineprotocol.h"
++#include <QtCore/QProcess>
++#include <QtCore/QDir>
++
++#define MAXCMDLINEARGS 128
+ 
+ namespace QBaselineTest {
+ 
+-BaselineProtocol proto;
+-bool connected = false;
+-bool triedConnecting = false;
++static char *fargv[MAXCMDLINEARGS];
++static bool simfail = false;
++static PlatformInfo customInfo;
+ 
+-QByteArray curFunction;
+-ImageItemList itemList;
+-bool gotBaselines;
++static BaselineProtocol proto;
++static bool connected = false;
++static bool triedConnecting = false;
+ 
++static QByteArray curFunction;
++static ImageItemList itemList;
++static bool gotBaselines;
+ 
+-bool connect(QByteArray *msg, bool *error)
++static QString definedTestProject;
++static QString definedTestCase;
++
++
++void handleCmdLineArgs(int *argcp, char ***argvp)
+ {
+-    if (!triedConnecting) {
+-        triedConnecting = true;
+-        if (!proto.connect(QTest::testObject()->metaObject()->className())) {
+-            *msg += "Failed to connect to baseline server: " + proto.errorMessage().toLatin1();
+-            *error = true;
+-            return false;
++    if (!argcp || !argvp)
++        return;
++
++    bool showHelp = false;
++
++    int fargc = 0;
++    int numArgs = *argcp;
++
++    for (int i = 0; i < numArgs; i++) {
++        QByteArray arg = (*argvp)[i];
++        QByteArray nextArg = (i+1 < numArgs) ? (*argvp)[i+1] : 0;
++
++        if (arg == "-simfail") {
++            simfail = true;
++        } else if (arg == "-auto") {
++            customInfo.setAdHocRun(false);
++        } else if (arg == "-adhoc") {
++            customInfo.setAdHocRun(true);
++        } else if (arg == "-compareto") {
++            i++;
++            int split = qMax(0, nextArg.indexOf('='));
++            QByteArray key = nextArg.left(split).trimmed();
++            QByteArray value = nextArg.mid(split+1).trimmed();
++            if (key.isEmpty() || value.isEmpty()) {
++                qWarning() << "-compareto requires parameter of the form <key>=<value>";
++                showHelp = true;
++                break;
++            }
++            customInfo.addOverride(key, value);
++        } else {
++            if ( (arg == "-help") || (arg == "--help") )
++                showHelp = true;
++            if (fargc >= MAXCMDLINEARGS) {
++                qWarning() << "Too many command line arguments!";
++                break;
++            }
++            fargv[fargc++] = (*argvp)[i];
++        }
++    }
++    *argcp = fargc;
++    *argvp = fargv;
++
++    if (showHelp) {
++        // TBD: arrange for this to be printed *after* QTest's help
++        QTextStream out(stdout);
++        out << "\n Baseline testing (lancelot) options:\n";
++        out << " -simfail            : Force an image comparison mismatch. For testing purposes.\n";
++        out << " -auto               : Inform server that this run is done by a daemon, CI system or similar.\n";
++        out << " -adhoc (default)    : The inverse of -auto; this run is done by human, e.g. for testing.\n";
++        out << " -compareto KEY=VAL  : Force comparison to baselines from a different client,\n";
++        out << "                       for example: -compareto QtVersion=4.8.0\n";
++        out << "                       Multiple -compareto client specifications may be given.\n";
++        out << "\n";
++    }
++}
++
++
++void addClientProperty(const QString& key, const QString& value)
++{
++    customInfo.insert(key, value);
++}
++
++
++/*
++  If a client property script is present, run it and accept its output
++  in the form of one 'key: value' property per line
++*/
++void fetchCustomClientProperties()
++{
++    QString script = "hostinfo.sh";  //### TBD: better name
++
++    QProcess runScript;
++    runScript.setWorkingDirectory(QCoreApplication::applicationDirPath());
++    runScript.start("sh", QStringList() << script, QIODevice::ReadOnly);
++    if (!runScript.waitForFinished(5000) || runScript.error() != QProcess::UnknownError) {
++        qWarning() << "QBaselineTest: Error running script" << runScript.workingDirectory() + QDir::separator() + script << ":" << runScript.errorString();
++        qDebug() << "  stderr:" << runScript.readAllStandardError().trimmed();
++    }
++    while (!runScript.atEnd()) {
++        QByteArray line = runScript.readLine().trimmed();   // ###local8bit? utf8?
++        QString key, val;
++        int colonPos = line.indexOf(':');
++        if (colonPos > 0) {
++            key = line.left(colonPos).simplified().replace(' ', '_');
++            val = line.mid(colonPos+1).trimmed();
+         }
+-        connected = true;
++        if (!key.isEmpty() && key.length() < 64 && val.length() < 256)  // ###TBD: maximum 256 chars in value?
++            addClientProperty(key, val);
++        else
++            qDebug() << "Unparseable script output ignored:" << line;
++    }
++}
++
++
++bool connect(QByteArray *msg, bool *error)
++{
++    if (connected) {
++        return true;
+     }
+-    if (!connected) {
++    else if (triedConnecting) {
++        // Avoid repeated connection attempts, to avoid the program using Timeout * #testItems seconds before giving up
+         *msg = "Not connected to baseline server.";
+         *error = true;
+         return false;
+     }
++
++    triedConnecting = true;
++    fetchCustomClientProperties();
++    // Merge the platform info set by the program with the protocols default info
++    PlatformInfo clientInfo = customInfo;
++    PlatformInfo defaultInfo = PlatformInfo::localHostInfo();
++    foreach (QString key, defaultInfo.keys()) {
++        if (!clientInfo.contains(key))
++            clientInfo.insert(key, defaultInfo.value(key));
++    }
++
++    if (!definedTestProject.isEmpty())
++        clientInfo.insert(PI_Project, definedTestProject);
++
++    QString testCase = definedTestCase;
++    if (testCase.isEmpty() && QTest::testObject() && QTest::testObject()->metaObject()) {
++        //qDebug() << "Trying to Read TestCaseName from Testlib!";
++        testCase = QTest::testObject()->metaObject()->className();
++    }
++    if (testCase.isEmpty()) {
++        qWarning("QBaselineTest::connect: No test case name specified, cannot connect.");
++        return false;
++    }
++
++    bool dummy;                                                // ### TBD: dryrun handling
++    if (!proto.connect(testCase, &dummy, clientInfo)) {
++        *msg += "Failed to connect to baseline server: " + proto.errorMessage().toLatin1();
++        *error = true;
++        return false;
++    }
++    connected = true;
+     return true;
+ }
+ 
++bool disconnectFromBaselineServer()
++{
++    if (proto.disconnect()) {
++        connected = false;
++        triedConnecting = false;
++        return true;
++    }
++
++    return false;
++}
++
++bool connectToBaselineServer(QByteArray *msg, const QString &testProject, const QString &testCase)
++{
++    bool dummy;
++    QByteArray dummyMsg;
++
++    definedTestProject = testProject;
++    definedTestCase = testCase;
++
++    return connect(msg ? msg : &dummyMsg, &dummy);
++}
++
++void setAutoMode(bool mode)
++{
++    customInfo.setAdHocRun(!mode);
++}
++
++void setSimFail(bool fail)
++{
++    simfail = fail;
++}
++
++
++void modifyImage(QImage *img)
++{
++    uint c0 = 0x0000ff00;
++    uint c1 = 0x0080ff00;
++    img->setPixel(1,1,c0);
++    img->setPixel(2,1,c1);
++    img->setPixel(3,1,c0);
++    img->setPixel(1,2,c1);
++    img->setPixel(1,3,c0);
++    img->setPixel(2,3,c1);
++    img->setPixel(3,3,c0);
++    img->setPixel(1,4,c1);
++    img->setPixel(1,5,c0);
++}
++
+ 
+ bool compareItem(const ImageItem &baseline, const QImage &img, QByteArray *msg, bool *error)
+ {
+     ImageItem item = baseline;
+-    item.image = img;
++    if (simfail) {
++        // Simulate test failure by forcing image mismatch; for testing purposes
++        QImage misImg = img;
++        modifyImage(&misImg);
++        item.image = misImg;
++        simfail = false;                      // One failure is typically enough
++    } else {
++        item.image = img;
++    }
+     item.imageChecksums.clear();
+-    item.imageChecksums.prepend(ImageItem::computeChecksum(img));
++    item.imageChecksums.prepend(ImageItem::computeChecksum(item.image));
+     QByteArray srvMsg;
+     switch (baseline.status) {
+     case ImageItem::Ok:
+@@ -88,6 +277,7 @@ bool compareItem(const ImageItem &baseline, const QImage &img, QByteArray *msg,
+         return true;
+         break;
+     case ImageItem::BaselineNotFound:
++        // ### TBD: don't submit if have overrides; will be rejected anyway
+         if (proto.submitNewBaseline(item, &srvMsg))
+             qDebug() << msg->constData() << "Baseline not found on server. New baseline uploaded.";
+         else
+@@ -101,27 +291,43 @@ bool compareItem(const ImageItem &baseline, const QImage &img, QByteArray *msg,
+     }
+     *error = false;
+     // The actual comparison of the given image with the baseline:
+-    if (baseline.imageChecksums.contains(item.imageChecksums.at(0)))
++    if (baseline.imageChecksums.contains(item.imageChecksums.at(0))) {
++        if (!proto.submitMatch(item, &srvMsg))
++            qWarning() << "Failed to report image match to server:" << srvMsg;
+         return true;
+-    proto.submitMismatch(item, &srvMsg);
++    }
++    bool fuzzyMatch = false;
++    bool res = proto.submitMismatch(item, &srvMsg, &fuzzyMatch);
++    if (res && fuzzyMatch) {
++        *error = true;          // To force a QSKIP/debug output; somewhat kludgy
++        *msg += srvMsg;
++        return true;            // The server decides: a fuzzy match means no mismatch
++    }
+     *msg += "Mismatch. See report:\n   " + srvMsg;
+     return false;
+ }
+ 
+-bool checkImage(const QImage &img, const char *name, quint16 checksum, QByteArray *msg, bool *error)
++bool checkImage(const QImage &img, const char *name, quint16 checksum, QByteArray *msg, bool *error, int manualdatatag)
+ {
+     if (!connected && !connect(msg, error))
+         return true;
+ 
+     QByteArray itemName;
+     bool hasName = qstrlen(name);
++
+     const char *tag = QTest::currentDataTag();
+     if (qstrlen(tag)) {
+         itemName = tag;
+         if (hasName)
+             itemName.append('_').append(name);
+     } else {
+-        itemName = hasName ? name : "default_name";
++            itemName = hasName ? name : "default_name";
++    }
++
++    if (manualdatatag > 0)
++    {
++        itemName.prepend("_");
++        itemName.prepend(QByteArray::number(manualdatatag));
+     }
+ 
+     *msg = "Baseline check of image '" + itemName + "': ";
+diff --git a/tests/baselineserver/shared/qbaselinetest.h b/tests/baselineserver/shared/qbaselinetest.h
+index 40f4160..0bcfefa 100644
+--- a/tests/baselineserver/shared/qbaselinetest.h
++++ b/tests/baselineserver/shared/qbaselinetest.h
+@@ -45,9 +45,15 @@
+ #include <QTest>
+ 
+ namespace QBaselineTest {
+-bool checkImage(const QImage& img, const char *name, quint16 checksum, QByteArray *msg, bool *error);
++void setAutoMode(bool mode);
++void setSimFail(bool fail);
++void handleCmdLineArgs(int *argcp, char ***argvp);
++void addClientProperty(const QString& key, const QString& value);
++bool connectToBaselineServer(QByteArray *msg = 0, const QString &testProject = QString(), const QString &testCase = QString());
++bool checkImage(const QImage& img, const char *name, quint16 checksum, QByteArray *msg, bool *error, int manualdatatag = 0);
+ bool testImage(const QImage& img, QByteArray *msg, bool *error);
+ QTestData &newRow(const char *dataTag, quint16 checksum = 0);
++bool disconnectFromBaselineServer();
+ }
+ 
+ #define QBASELINE_CHECK_SUM(image, name, checksum)\
+diff --git a/tests/baselineserver/src/baselineserver.cpp b/tests/baselineserver/src/baselineserver.cpp
+index 1653754..a85dca3 100644
+--- a/tests/baselineserver/src/baselineserver.cpp
++++ b/tests/baselineserver/src/baselineserver.cpp
+@@ -52,6 +52,7 @@
+ #include <QTextStream>
+ #include <QProcess>
+ #include <QDirIterator>
++#include <QUrl>
+ 
+ // extra fields, for use in image metadata storage
+ const QString PI_ImageChecksum(QLS("ImageChecksum"));
+@@ -60,7 +61,7 @@ const QString PI_CreationDate(QLS("CreationDate"));
+ 
+ QString BaselineServer::storage;
+ QString BaselineServer::url;
+-QString BaselineServer::settingsFile;
++QStringList BaselineServer::pathKeys;
+ 
+ BaselineServer::BaselineServer(QObject *parent)
+     : QTcpServer(parent), lastRunIdIdx(0)
+@@ -92,13 +93,11 @@ QString BaselineServer::baseUrl()
+     return url;
+ }
+ 
+-QString BaselineServer::settingsFilePath()
++QStringList BaselineServer::defaultPathKeys()
+ {
+-    if (settingsFile.isEmpty()) {
+-        QString exeName = QCoreApplication::applicationFilePath().section(QLC('/'), -1);
+-        settingsFile = storagePath() + QLC('/') + exeName + QLS(".ini");
+-    }
+-    return settingsFile;
++    if (pathKeys.isEmpty())
++        pathKeys << PI_QtVersion << PI_QMakeSpec << PI_HostName;
++    return pathKeys;
+ }
+ 
+ void BaselineServer::incomingConnection(qintptr socketDescriptor)
+@@ -152,9 +151,13 @@ void BaselineThread::run()
+ 
+ 
+ BaselineHandler::BaselineHandler(const QString &runId, int socketDescriptor)
+-    : QObject(), runId(runId), connectionEstablished(false)
++    : QObject(), runId(runId), connectionEstablished(false), settings(0), fuzzLevel(0)
+ {
+-    settings = new QSettings(BaselineServer::settingsFilePath(), QSettings::IniFormat, this);
++    idleTimer = new QTimer(this);
++    idleTimer->setSingleShot(true);
++    idleTimer->setInterval(IDLE_CLIENT_TIMEOUT * 1000);
++    connect(idleTimer, SIGNAL(timeout()), this, SLOT(idleClientTimeout()));
++    idleTimer->start();
+ 
+     if (socketDescriptor == -1)
+         return;
+@@ -162,6 +165,7 @@ BaselineHandler::BaselineHandler(const QString &runId, int socketDescriptor)
+     connect(&proto.socket, SIGNAL(readyRead()), this, SLOT(receiveRequest()));
+     connect(&proto.socket, SIGNAL(disconnected()), this, SLOT(receiveDisconnect()));
+     proto.socket.setSocketDescriptor(socketDescriptor);
++    proto.socket.setSocketOption(QAbstractSocket::KeepAliveOption, 1);
+ }
+ 
+ const char *BaselineHandler::logtime()
+@@ -170,6 +174,85 @@ const char *BaselineHandler::logtime()
+     //return QTime::currentTime().toString(QLS("mm:ss.zzz"));
+ }
+ 
++QString BaselineHandler::projectPath(bool absolute) const
++{
++    QString p = clientInfo.value(PI_Project);
++    return absolute ? BaselineServer::storagePath() + QLC('/') + p : p;
++}
++
++bool BaselineHandler::checkClient(QByteArray *errMsg, bool *dryRunMode)
++{
++    if (!errMsg)
++        return false;
++    if (clientInfo.value(PI_Project).isEmpty() || clientInfo.value(PI_TestCase).isEmpty()) {
++        *errMsg = "No Project and/or TestCase specified in client info.";
++        return false;
++    }
++
++    // Determine ad-hoc state ### hardcoded for now
++    if (clientInfo.value(PI_TestCase) == QLS("tst_Lancelot")) {
++        //### Todo: push this stuff out in a script
++        if (!clientInfo.isAdHocRun()) {
++            // ### comp. with earlier versions still running (4.8) (?)
++            clientInfo.setAdHocRun(clientInfo.value(PI_PulseGitBranch).isEmpty() && clientInfo.value(PI_PulseTestrBranch).isEmpty());
++        }
++    }
++    else {
++        // TBD
++    }
++
++    if (clientInfo.isAdHocRun()) {
++        if (dryRunMode)
++            *dryRunMode = false;
++        return true;
++    }
++
++    // Not ad hoc: filter the client
++    settings->beginGroup("ClientFilters");
++    bool matched = false;
++    bool dryRunReq = false;
++    foreach (const QString &rule, settings->childKeys()) {
++        //qDebug() << "  > RULE" << rule;
++        dryRunReq = false;
++        QString ruleMode = settings->value(rule).toString().toLower();
++        if (ruleMode == QLS("dryrun"))
++            dryRunReq = true;
++        else if (ruleMode != QLS("enabled"))
++            continue;
++        settings->beginGroup(rule);
++        bool ruleMatched = true;
++        foreach (const QString &filterKey, settings->childKeys()) {
++            //qDebug() << "    > FILTER" << filterKey;
++            QString filter = settings->value(filterKey).toString();
++            if (filter.isEmpty())
++                continue;
++            QString platVal = clientInfo.value(filterKey);
++            if (!platVal.contains(filter)) {
++                ruleMatched = false;
++                break;
++            }
++        }
++        if (ruleMatched) {
++            ruleName = rule;
++            matched = true;
++            break;
++        }
++        settings->endGroup();
++    }
++
++    if (!matched && errMsg)
++        *errMsg = "Non-adhoc client did not match any filter rule in " + settings->fileName().toLatin1();
++
++    if (matched && dryRunMode)
++        *dryRunMode = dryRunReq;
++
++    // NB! Must reset the settings object before returning
++    while (!settings->group().isEmpty())
++        settings->endGroup();
++
++    return matched;
++}
++
+ bool BaselineHandler::establishConnection()
+ {
+     if (!proto.acceptConnection(&clientInfo)) {
+@@ -187,35 +270,46 @@ bool BaselineHandler::establishConnection()
+              << "[" << qPrintable(clientInfo.value(PI_HostAddress)) << "]" << logMsg
+              << "Overrides:" << clientInfo.overrides() << "AdHoc-Run:" << clientInfo.isAdHocRun();
+ 
+-    //### Temporarily override the client setting, for client compatibility:
+-    if (!clientInfo.isAdHocRun())
+-        clientInfo.setAdHocRun(clientInfo.value(PI_PulseGitBranch).isEmpty() && clientInfo.value(PI_PulseTestrBranch).isEmpty());
++    // ### Hardcoded backwards compatibility: add project field for certain existing clients that lack it
++    if (clientInfo.value(PI_Project).isEmpty()) {
++        QString tc = clientInfo.value(PI_TestCase);
++        if (tc == QLS("tst_Lancelot"))
++            clientInfo.insert(PI_Project, QLS("Raster"));
++        else if (tc == QLS("tst_Scenegraph"))
++            clientInfo.insert(PI_Project, QLS("SceneGraph"));
++        else
++            clientInfo.insert(PI_Project, QLS("Other"));
++    }
+ 
+-    settings->beginGroup("ClientFilters");
+-    if (!clientInfo.isAdHocRun()) {         // for CI runs, allow filtering of clients. TBD: different filters (settings file) per testCase
+-        foreach (QString filterKey, settings->childKeys()) {
+-            QString filter = settings->value(filterKey).toString();
+-            QString platVal = clientInfo.value(filterKey);
+-            if (filter.isEmpty())
+-                continue;  // tbd: add a syntax for specifying a "value-must-be-present" filter
+-            if (!platVal.contains(filter)) {
+-                qDebug() << runId << logtime() << "Did not pass client filter on" << filterKey << "; disconnecting.";
+-                proto.sendBlock(BaselineProtocol::Abort, QByteArray("Configured to not do testing for this client or repo, ref. ") + BaselineServer::settingsFilePath().toLatin1());
+-                proto.socket.disconnectFromHost();
+-                return false;
+-            }
+-        }
++    QString settingsFile = projectPath() + QLS("/config.ini");
++    settings = new QSettings(settingsFile, QSettings::IniFormat, this);
++
++    QByteArray errMsg;
++    bool dryRunMode = false;
++    if (!checkClient(&errMsg, &dryRunMode)) {
++        qDebug() << runId << logtime() << "Rejecting connection:" << errMsg;
++        proto.sendBlock(BaselineProtocol::Abort, errMsg);
++        proto.socket.disconnectFromHost();
++        return false;
+     }
+-    settings->endGroup();
+ 
+-    proto.sendBlock(BaselineProtocol::Ack, QByteArray());
++    fuzzLevel = qBound(0, settings->value("FuzzLevel").toInt(), 100);
++    if (!clientInfo.isAdHocRun()) {
++        qDebug() << runId << logtime() << "Client matches filter rule" << ruleName
++                 << "Dryrun:" << dryRunMode
++                 << "FuzzLevel:" << fuzzLevel
++                 << "ReportMissingResults:" << settings->value("ReportMissingResults").toBool();
++    }
+ 
+-    report.init(this, runId, clientInfo);
++    proto.sendBlock(dryRunMode ? BaselineProtocol::DoDryRun : BaselineProtocol::Ack, QByteArray());
++    report.init(this, runId, clientInfo, settings);
+     return true;
+ }
+ 
+ void BaselineHandler::receiveRequest()
+ {
++    idleTimer->start();   // Restart idle client timeout
++
+     if (!connectionEstablished) {
+         connectionEstablished = establishConnection();
+         return;
+@@ -233,6 +327,9 @@ void BaselineHandler::receiveRequest()
+     case BaselineProtocol::RequestBaselineChecksums:
+         provideBaselineChecksums(block);
+         break;
++    case BaselineProtocol::AcceptMatch:
++        recordMatch(block);
++        break;
+     case BaselineProtocol::AcceptNewBaseline:
+         storeImage(block, true);
+         break;
+@@ -295,6 +392,16 @@ void BaselineHandler::provideBaselineChecksums(const QByteArray &itemListBlock)
+ }
+ 
+ 
++void BaselineHandler::recordMatch(const QByteArray &itemBlock)
++{
++    QDataStream ds(itemBlock);
++    ImageItem item;
++    ds >> item;
++    report.addResult(item);
++    proto.sendBlock(BaselineProtocol::Ack, QByteArray());
++}
++
++
+ void BaselineHandler::storeImage(const QByteArray &itemBlock, bool isBaseline)
+ {
+     QDataStream ds(itemBlock);
+@@ -307,16 +414,23 @@ void BaselineHandler::storeImage(const QByteArray &itemBlock, bool isBaseline)
+         return;
+     }
+ 
+-    QString prefix = pathForItem(item, isBaseline);
++    QString blPrefix = pathForItem(item, true);
++    QString mmPrefix = pathForItem(item, false);
++    QString prefix = isBaseline ? blPrefix : mmPrefix;
++
+     qDebug() << runId << logtime() << "Received" << (isBaseline ? "baseline" : "mismatched") << "image for:" << item.itemName << "Storing in" << prefix;
+ 
++    // Reply to the client
+     QString msg;
+     if (isBaseline)
+-        msg = QLS("New baseline image stored: ") + pathForItem(item, true, true) + QLS(FileFormat);
++        msg = QLS("New baseline image stored: ") + blPrefix + QLS(FileFormat);
+     else
+         msg = BaselineServer::baseUrl() + report.filePath();
+-    proto.sendBlock(BaselineProtocol::Ack, msg.toLatin1());
+ 
++    if (isBaseline || !fuzzLevel)
++        proto.sendBlock(BaselineProtocol::Ack, msg.toLatin1());  // Do early reply if possible: don't make the client wait longer than necessary
++
++    // Store the image
+     QString dir = prefix.section(QLC('/'), 0, -2);
+     QDir cwd;
+     if (!cwd.exists(dir))
+@@ -329,8 +443,23 @@ void BaselineHandler::storeImage(const QByteArray &itemBlock, bool isBaseline)
+     itemData.insert(PI_CreationDate, QDateTime::currentDateTime().toString());
+     storeItemMetadata(itemData, prefix);
+ 
+-    if (!isBaseline)
+-        report.addMismatch(item);
++    if (!isBaseline) {
++        // Do fuzzy matching
++        bool fuzzyMatch = false;
++        if (fuzzLevel) {
++            BaselineProtocol::Command cmd = BaselineProtocol::Ack;
++            fuzzyMatch = fuzzyCompare(blPrefix, mmPrefix);
++            if (fuzzyMatch) {
++                msg.prepend(QString("Fuzzy match at fuzzlevel %1%. Report: ").arg(fuzzLevel));
++                cmd = BaselineProtocol::FuzzyMatch;
++            }
++            proto.sendBlock(cmd, msg.toLatin1());  // We didn't reply earlier
++        }
++
++        // Add to report
++        item.status = fuzzyMatch ? ImageItem::FuzzyMatch : ImageItem::Mismatch;
++        report.addResult(item);
++    }
+ }
+ 
+ 
+@@ -355,7 +484,7 @@ PlatformInfo BaselineHandler::fetchItemMetadata(const QString &path)
+ {
+     PlatformInfo res;
+     QFile file(path + QLS(MetadataFileExt));
+-    if (!file.open(QIODevice::ReadOnly))
++    if (!file.open(QIODevice::ReadOnly) || !QFile::exists(path + QLS(FileFormat)))
+         return res;
+     QTextStream in(&file);
+     do {
+@@ -368,20 +497,50 @@ PlatformInfo BaselineHandler::fetchItemMetadata(const QString &path)
+ }
+ 
+ 
++void BaselineHandler::idleClientTimeout()
++{
++    qWarning() << runId << logtime() << "Idle client timeout: no request received for" << IDLE_CLIENT_TIMEOUT << "seconds, terminating connection.";
++    proto.socket.disconnectFromHost();
++}
++
++
+ void BaselineHandler::receiveDisconnect()
+ {
+     qDebug() << runId << logtime() << "Client disconnected.";
+     report.end();
++    if (report.reportProduced() && !clientInfo.isAdHocRun())
++        issueMismatchNotification();
++    if (settings && settings->value("ProcessXmlResults").toBool() && !clientInfo.isAdHocRun()) {
++        // ### TBD: actually execute the processing command. For now, just generate the xml files.
++        QString xmlDir = report.writeResultsXmlFiles();
++    }
+     QThread::currentThread()->exit(0);
+ }
+ 
+ 
+ PlatformInfo BaselineHandler::mapPlatformInfo(const PlatformInfo& orig) const
+ {
+-    PlatformInfo mapped = orig;
++    PlatformInfo mapped;
++    foreach (const QString &key, orig.uniqueKeys()) {
++        QString val = orig.value(key).simplified();
++        val.replace(QLC('/'), QLC('_'));
++        val.replace(QLC(' '), QLC('_'));
++        mapped.insert(key, QUrl::toPercentEncoding(val, "+"));
++        //qDebug() << "MAPPED" << key << "FROM" << orig.value(key) << "TO" << mapped.value(key);
++    }
++
++    // Special fixup for OS version
++    if (mapped.value(PI_OSName) == QLS("MacOS")) {
++        int ver = mapped.value(PI_OSVersion).toInt();
++        if (ver > 1)
++            mapped.insert(PI_OSVersion, QString("MV_10_%1").arg(ver-2));
++    }
++    else if (mapped.value(PI_OSName) == QLS("Windows")) {
++        // TBD: map windows version numbers to names
++    }
+ 
+-    // Map hostname
+-    QString host = orig.value(PI_HostName).section(QLC('.'), 0, 0);  // Filter away domain, if any
++    // Special fixup for hostname
++    QString host = mapped.value(PI_HostName).section(QLC('.'), 0, 0);  // Filter away domain, if any
+     if (host.isEmpty() || host == QLS("localhost")) {
+         host = orig.value(PI_HostAddress);
+     } else {
+@@ -392,16 +551,15 @@ PlatformInfo BaselineHandler::mapPlatformInfo(const PlatformInfo& orig) const
+         }
+     }
+     if (host.isEmpty())
+-        host = QLS("unknownhost");
++        host = QLS("UNKNOWN-HOST");
++    if (mapped.value(PI_OSName) == QLS("MacOS"))        // handle multiple os versions on same host
++        host += QLC('-') + mapped.value(PI_OSVersion);
+     mapped.insert(PI_HostName, host);
+ 
+-    // Map qmakespec
+-    QString mkspec = orig.value(PI_QMakeSpec);
+-    mapped.insert(PI_QMakeSpec, mkspec.replace(QLC('/'), QLC('_')));
+-
+-    // Map Qt version
+-    QString ver = orig.value(PI_QtVersion);
+-    mapped.insert(PI_QtVersion, ver.prepend(QLS("Qt-")));
++    // Special fixup for Qt version
++    QString ver = mapped.value(PI_QtVersion);
++    if (!ver.isEmpty())
++        mapped.insert(PI_QtVersion, ver.prepend(QLS("Qt-")));
+ 
+     return mapped;
+ }
+@@ -412,6 +570,7 @@ QString BaselineHandler::pathForItem(const ImageItem &item, bool isBaseline, boo
+     if (mappedClientInfo.isEmpty()) {
+         mappedClientInfo = mapPlatformInfo(clientInfo);
+         PlatformInfo oraw = clientInfo;
++        // ### simplify: don't map if no overrides!
+         for (int i = 0; i < clientInfo.overrides().size()-1; i+=2)
+             oraw.insert(clientInfo.overrides().at(i), clientInfo.overrides().at(i+1));
+         overriddenMappedClientInfo = mapPlatformInfo(oraw);
+@@ -419,21 +578,21 @@ QString BaselineHandler::pathForItem(const ImageItem &item, bool isBaseline, boo
+ 
+     const PlatformInfo& mapped = isBaseline ? overriddenMappedClientInfo : mappedClientInfo;
+ 
+-    QString itemName = item.itemName.simplified();
+-    itemName.replace(QLC(' '), QLC('_'));
+-    itemName.replace(QLC('.'), QLC('_'));
+-    itemName.append(QLC('_'));
+-    itemName.append(QString::number(item.itemChecksum, 16).rightJustified(4, QLC('0')));
++    QString itemName = safeName(item.itemName);
++    itemName.append(QLC('_') + QString::number(item.itemChecksum, 16).rightJustified(4, QLC('0')));
+ 
+     QStringList path;
+-    if (absolute)
+-        path += BaselineServer::storagePath();
++    path += projectPath(absolute);
+     path += mapped.value(PI_TestCase);
+     path += QLS(isBaseline ? "baselines" : "mismatches");
+     path += item.testFunction;
+-    path += mapped.value(PI_QtVersion);
+-    path += mapped.value(PI_QMakeSpec);
+-    path += mapped.value(PI_HostName);
++    QStringList itemPathKeys;
++    if (settings)
++        itemPathKeys = settings->value("ItemPathKeys").toStringList();
++    if (itemPathKeys.isEmpty())
++        itemPathKeys = BaselineServer::defaultPathKeys();
++    foreach (const QString &key, itemPathKeys)
++        path += mapped.value(key, QLS("UNSET-")+key);
+     if (!isBaseline)
+         path += runId;
+     path += itemName + QLC('.');
+@@ -446,19 +605,33 @@ QString BaselineHandler::view(const QString &baseline, const QString &rendered,
+ {
+     QFile f(":/templates/view.html");
+     f.open(QIODevice::ReadOnly);
+-    return QString::fromLatin1(f.readAll()).arg('/'+baseline, '/'+rendered, '/'+compared);
++    return QString::fromLatin1(f.readAll()).arg('/'+baseline, '/'+rendered, '/'+compared, diffstats(baseline, rendered));
+ }
+ 
++QString BaselineHandler::diffstats(const QString &baseline, const QString &rendered)
++{
++    QImage blImg(BaselineServer::storagePath() + QLC('/') + baseline);
++    QImage mmImg(BaselineServer::storagePath() + QLC('/') + rendered);
++    if (blImg.isNull() || mmImg.isNull())
++        return QLS("Could not compute diffstats: image loading failed.");
++
++    // ### TBD: cache the results
++    return computeMismatchScore(blImg, mmImg);
++}
+ 
+ QString BaselineHandler::clearAllBaselines(const QString &context)
+ {
+     int tot = 0;
+     int failed = 0;
+     QDirIterator it(BaselineServer::storagePath() + QLC('/') + context,
+-                    QStringList() << QLS("*.") + QLS(FileFormat) << QLS("*.") + QLS(MetadataFileExt));
++                    QStringList() << QLS("*.") + QLS(FileFormat)
++                                  << QLS("*.") + QLS(MetadataFileExt)
++                                  << QLS("*.") + QLS(ThumbnailExt));
+     while (it.hasNext()) {
+-        tot++;
+-        if (!QFile::remove(it.next()))
++        bool counting = !it.next().endsWith(QLS(ThumbnailExt));
++        if (counting)
++            tot++;
++        if (!QFile::remove(it.filePath()) && counting)
+             failed++;
+     }
+     return QString(QLS("%1 of %2 baselines cleared from context ")).arg((tot-failed)/2).arg(tot/2) + context;
+@@ -471,13 +644,17 @@ QString BaselineHandler::updateBaselines(const QString &context, const QString &
+     QString storagePrefix = BaselineServer::storagePath() + QLC('/');
+     // If itemId is set, update just that one, otherwise, update all:
+     QString filter = itemFile.isEmpty() ? QLS("*_????.") : itemFile;
+-    QDirIterator it(storagePrefix + mismatchContext, QStringList() << filter + QLS(FileFormat) << filter + QLS(MetadataFileExt));
++    QDirIterator it(storagePrefix + mismatchContext,
++                    QStringList() << filter + QLS(FileFormat)
++                                  << filter + QLS(MetadataFileExt)
++                                  << filter + QLS(ThumbnailExt));
+     while (it.hasNext()) {
+-        tot++;
+-        it.next();
++        bool counting = !it.next().endsWith(QLS(ThumbnailExt));
++        if (counting)
++            tot++;
+         QString oldFile = storagePrefix + context + QLC('/') + it.fileName();
+-        QFile::remove(oldFile);                       // Remove existing baseline file
+-        if (!QFile::copy(it.filePath(), oldFile))     // and replace it with the mismatch
++        QFile::remove(oldFile);                                   // Remove existing baseline file
++        if (!QFile::copy(it.filePath(), oldFile) && counting)     // and replace it with the mismatch
+             failed++;
+     }
+     return QString(QLS("%1 of %2 baselines updated in context %3 from context %4")).arg((tot-failed)/2).arg(tot/2).arg(context, mismatchContext);
+@@ -534,7 +711,7 @@ void BaselineHandler::testPathMapping()
+     clientInfo.insert(PI_QtVersion, QLS("5.0.0"));
+     clientInfo.insert(PI_QMakeSpec, QLS("linux-g++"));
+     clientInfo.insert(PI_PulseGitBranch, QLS("somebranch"));
+-
++    clientInfo.setAdHocRun(false);
+     foreach(const QString& host, hosts) {
+         mappedClientInfo.clear();
+         clientInfo.insert(PI_HostName, host);
+@@ -547,9 +724,9 @@ void BaselineHandler::testPathMapping()
+ QString BaselineHandler::computeMismatchScore(const QImage &baseline, const QImage &rendered)
+ {
+     if (baseline.size() != rendered.size() || baseline.format() != rendered.format())
+-        return QLS("[No score, incomparable images.]");
++        return QLS("[No diffstats, incomparable images.]");
+     if (baseline.depth() != 32)
+-        return QLS("[Score computation not implemented for format.]");
++        return QLS("[Diffstats computation not implemented for format.]");
+ 
+     int w = baseline.width();
+     int h = baseline.height();
+@@ -558,6 +735,8 @@ QString BaselineHandler::computeMismatchScore(const QImage &baseline, const QIma
+     uint nad = 0; // number of differing alpha pixels
+     uint scd = 0; // sum of color pixel difference
+     uint sad = 0; // sum of alpha pixel difference
++    uint mind = 0; // minimum difference
++    uint maxd = 0; // maximum difference
+ 
+     for (int y=0; y<h; ++y) {
+         const QRgb *bl = (const QRgb *) baseline.constScanLine(y);
+@@ -566,14 +745,18 @@ QString BaselineHandler::computeMismatchScore(const QImage &baseline, const QIma
+             QRgb b = bl[x];
+             QRgb r = rl[x];
+             if (r != b) {
+-                int dr = qAbs(qRed(b) - qRed(r));
+-                int dg = qAbs(qGreen(b) - qGreen(r));
+-                int db = qAbs(qBlue(b) - qBlue(r));
+-                int ds = dr + dg + db;
+-                int da = qAbs(qAlpha(b) - qAlpha(r));
++                uint dr = qAbs(qRed(b) - qRed(r));
++                uint dg = qAbs(qGreen(b) - qGreen(r));
++                uint db = qAbs(qBlue(b) - qBlue(r));
++                uint ds = (dr + dg + db) / 3;
++                uint da = qAbs(qAlpha(b) - qAlpha(r));
+                 if (ds) {
+                     ncd++;
+                     scd += ds;
++                    if (!mind || ds < mind)
++                        mind = ds;
++                    if (ds > maxd)
++                        maxd = ds;
+                 }
+                 if (da) {
+                     nad++;
+@@ -583,13 +766,100 @@ QString BaselineHandler::computeMismatchScore(const QImage &baseline, const QIma
+         }
+     }
+ 
++
+     double pcd = 100.0 * ncd / (w*h);  // percent of pixels that differ
+-    double acd = ncd ? double(scd) / (3*ncd) : 0;         // avg. difference
+-    QString res = QString(QLS("Diffscore: %1% (Num:%2 Avg:%3)")).arg(pcd, 0, 'g', 2).arg(ncd).arg(acd, 0, 'g', 2);
++    double acd = ncd ? double(scd) / (ncd) : 0;         // avg. difference
++/*
+     if (baseline.hasAlphaChannel()) {
+         double pad = 100.0 * nad / (w*h);  // percent of pixels that differ
+         double aad = nad ? double(sad) / (3*nad) : 0;         // avg. difference
+-        res += QString(QLS(" Alpha-diffscore: %1% (Num:%2 Avg:%3)")).arg(pad, 0, 'g', 2).arg(nad).arg(aad, 0, 'g', 2);
+     }
++*/
++    QString res = "<table>\n";
++    QString item = "<tr><td>%1</td><td align=right>%2</td></tr>\n";
++    res += item.arg("Number of mismatching pixels").arg(ncd);
++    res += item.arg("Percentage mismatching pixels").arg(pcd, 0, 'g', 2);
++    res += item.arg("Minimum pixel distance").arg(mind);
++    res += item.arg("Maximum pixel distance").arg(maxd);
++    if (acd >= 10.0)
++        res += item.arg("Average pixel distance").arg(qRound(acd));
++    else
++        res += item.arg("Average pixel distance").arg(acd, 0, 'g', 2);
++
++    if (baseline.hasAlphaChannel())
++        res += item.arg("Number of mismatching alpha values").arg(nad);
++
++    res += "</table>\n";
++    res += "<p>(Distances are normalized to the range 0-255)</p>\n";
++    return res;
++}
++
++
++bool BaselineHandler::fuzzyCompare(const QString &baselinePath, const QString &mismatchPath)
++{
++    QProcess compareProc;
++    QStringList args;
++    args << "-fuzz" << QString("%1%").arg(fuzzLevel) << "-metric" << "AE";
++    args << baselinePath + QLS(FileFormat) << mismatchPath + QLS(FileFormat) << "/dev/null";  // TBD: Should save output image, so report won't have to regenerate it
++
++    compareProc.setProcessChannelMode(QProcess::MergedChannels);
++    compareProc.start("compare", args, QIODevice::ReadOnly);
++    if (compareProc.waitForFinished(3000) && compareProc.error() == QProcess::UnknownError) {
++        bool ok = false;
++        int metric = compareProc.readAll().trimmed().toInt(&ok);
++        if (ok && metric == 0)
++            return true;
++    }
++    return false;
++}
++
++
++void BaselineHandler::issueMismatchNotification()
++{
++    // KISS: hardcoded use of the "sendemail" utility. Make this configurable if and when demand arises.
++    if (!settings)
++        return;
++
++    settings->beginGroup("Notification");
++    QStringList receivers = settings->value("Receivers").toStringList();
++    QString sender = settings->value("Sender").toString();
++    QString server = settings->value("SMTPserver").toString();
++    settings->endGroup();
++    if (receivers.isEmpty() || sender.isEmpty() || server.isEmpty())
++        return;
++
++    QString msg = QString("\nResult summary for test run %1:\n").arg(runId);
++    msg += report.summary();
++    msg += "\nReport: " + BaselineServer::baseUrl() + report.filePath() + "\n";
++
++    msg += "\nTest run platform properties:\n------------------\n";
++    foreach (const QString &key, clientInfo.keys())
++        msg += key + ":  " + clientInfo.value(key) + '\n';
++    msg += "\nCheers,\n- Your friendly Lancelot Baseline Server\n";
++
++    QProcess proc;
++    QString cmd = "sendemail";
++    QStringList args;
++    args << "-s" << server << "-f" << sender << "-t" << receivers;
++    args << "-u" << "[Lancelot] Mismatch report for project " + clientInfo.value(PI_Project) + ", test case " + clientInfo.value(PI_TestCase);
++    args << "-m" << msg;
++
++    //proc.setProcessChannelMode(QProcess::MergedChannels);
++    proc.start(cmd, args);
++    if (!proc.waitForFinished(10 * 1000) || (proc.exitStatus() != QProcess::NormalExit) || proc.exitCode()) {
++        qWarning() << "FAILED to issue notification. Command:" << cmd << args.mid(0, args.size()-2);
++        qWarning() << "    Command standard output:" << proc.readAllStandardOutput();
++        qWarning() << "    Command error output:" << proc.readAllStandardError();
++    }
++}
++
++
++// Make an identifer safer for use as filename and URL
++QString safeName(const QString& name)
++{
++    QString res = name.simplified();
++    res.replace(QLC(' '), QLC('_'));
++    res.replace(QLC('.'), QLC('_'));
++    res.replace(QLC('/'), QLC('^'));
+     return res;
+ }
+diff --git a/tests/baselineserver/src/baselineserver.h b/tests/baselineserver/src/baselineserver.h
+index c8ce386..d30a741 100644
+--- a/tests/baselineserver/src/baselineserver.h
++++ b/tests/baselineserver/src/baselineserver.h
+@@ -53,9 +53,14 @@
+ #include "baselineprotocol.h"
+ #include "report.h"
+ 
+-// #seconds between update checks
++// #seconds between checks for update of the executable
+ #define HEARTBEAT 10
++// Timeout if no activity received from client, #seconds
++#define IDLE_CLIENT_TIMEOUT 3*60
++
+ #define MetadataFileExt "metadata"
++#define ThumbnailExt "thumbnail.jpg"
++
+ 
+ class BaselineServer : public QTcpServer
+ {
+@@ -66,7 +71,7 @@ public:
+ 
+     static QString storagePath();
+     static QString baseUrl();
+-    static QString settingsFilePath();
++    static QStringList defaultPathKeys();
+ 
+ protected:
+     void incomingConnection(qintptr socketDescriptor);
+@@ -81,7 +86,7 @@ private:
+     int lastRunIdIdx;
+     static QString storage;
+     static QString url;
+-    static QString settingsFile;
++    static QStringList pathKeys;
+ };
+ 
+ 
+@@ -106,28 +111,38 @@ class BaselineHandler : public QObject
+ 
+ public:
+     BaselineHandler(const QString &runId, int socketDescriptor = -1);
+-    void testPathMapping();
++    QString projectPath(bool absolute = true) const;
+     QString pathForItem(const ImageItem &item, bool isBaseline = true, bool absolute = true) const;
+ 
+     // CGI callbacks:
+     static QString view(const QString &baseline, const QString &rendered, const QString &compared);
++    static QString diffstats(const QString &baseline, const QString &rendered);
+     static QString clearAllBaselines(const QString &context);
+     static QString updateBaselines(const QString &context, const QString &mismatchContext, const QString &itemFile);
+     static QString blacklistTest(const QString &context, const QString &itemId, bool removeFromBlacklist = false);
+ 
++    // for debugging
++    void testPathMapping();
++
+ private slots:
+     void receiveRequest();
+     void receiveDisconnect();
++    void idleClientTimeout();
+ 
+ private:
++    bool checkClient(QByteArray *errMsg, bool *dryRunMode = 0);
+     bool establishConnection();
+     void provideBaselineChecksums(const QByteArray &itemListBlock);
++    void recordMatch(const QByteArray &itemBlock);
+     void storeImage(const QByteArray &itemBlock, bool isBaseline);
+     void storeItemMetadata(const PlatformInfo &metadata, const QString &path);
+     PlatformInfo fetchItemMetadata(const QString &path);
+     PlatformInfo mapPlatformInfo(const PlatformInfo& orig) const;
+     const char *logtime();
+-    QString computeMismatchScore(const QImage& baseline, const QImage& rendered);
++    void issueMismatchNotification();
++    bool fuzzyCompare(const QString& baselinePath, const QString& mismatchPath);
++
++    static QString computeMismatchScore(const QImage& baseline, const QImage& rendered);
+ 
+     BaselineProtocol proto;
+     PlatformInfo clientInfo;
+@@ -137,6 +152,13 @@ private:
+     bool connectionEstablished;
+     Report report;
+     QSettings *settings;
++    QString ruleName;
++    int fuzzLevel;
++    QTimer *idleTimer;
+ };
+ 
++
++// Make an identifer safer for use as filename and URL
++QString safeName(const QString& name);
++
+ #endif // BASELINESERVER_H
+diff --git a/tests/baselineserver/src/report.cpp b/tests/baselineserver/src/report.cpp
+index d29f22e..cd544a6 100644
+--- a/tests/baselineserver/src/report.cpp
++++ b/tests/baselineserver/src/report.cpp
+@@ -44,9 +44,11 @@
+ #include <QDir>
+ #include <QProcess>
+ #include <QUrl>
++#include <QXmlStreamWriter>
+ 
+ Report::Report()
+-    : written(false), numItems(0), numMismatches(0)
++    : initialized(false), handler(0), written(false), numItems(0), numMismatches(0), settings(0),
++      hasStats(false)
+ {
+ }
+ 
+@@ -60,19 +62,31 @@ QString Report::filePath()
+     return path;
+ }
+ 
+-void Report::init(const BaselineHandler *h, const QString &r, const PlatformInfo &p)
++int Report::numberOfMismatches()
++{
++    return numMismatches;
++}
++
++bool Report::reportProduced()
++{
++    return written;
++}
++
++void Report::init(const BaselineHandler *h, const QString &r, const PlatformInfo &p, const QSettings *s)
+ {
+     handler = h;
+     runId = r;
+     plat = p;
++    settings = s;
+     rootDir = BaselineServer::storagePath() + QLC('/');
+-    reportDir = plat.value(PI_TestCase) + QLC('/') + (plat.isAdHocRun() ? QLS("reports/adhoc/") : QLS("reports/pulse/"));
+-    QString dir = rootDir + reportDir;
++    baseDir = handler->pathForItem(ImageItem(), true, false).remove(QRegExp("/baselines/.*$"));
++    QString dir = baseDir + (plat.isAdHocRun() ? QLS("/adhoc-reports") : QLS("/auto-reports"));
+     QDir cwd;
+-    if (!cwd.exists(dir))
+-        cwd.mkpath(dir);
+-    path = reportDir + QLS("Report_") + runId + QLS(".html");
++    if (!cwd.exists(rootDir + dir))
++        cwd.mkpath(rootDir + dir);
++    path = dir + QLS("/Report_") + runId + QLS(".html");
+     hasOverride = !plat.overrides().isEmpty();
++    initialized = true;
+ }
+ 
+ void Report::addItems(const ImageItemList &items)
+@@ -83,38 +97,110 @@ void Report::addItems(const ImageItemList &items)
+     QString func = items.at(0).testFunction;
+     if (!testFunctions.contains(func))
+         testFunctions.append(func);
+-    itemLists[func] += items;
++    ImageItemList list = items;
++    if (settings->value("ReportMissingResults").toBool()) {
++        for (ImageItemList::iterator it = list.begin(); it != list.end(); ++it) {
++            if (it->status == ImageItem::Ok)
++                it->status = ImageItem::Error;   // Status should be set by report from client, else report as error
++        }
++    }
++    itemLists[func] += list;
+ }
+ 
+-void Report::addMismatch(const ImageItem &item)
++void Report::addResult(const ImageItem &item)
+ {
+     if (!testFunctions.contains(item.testFunction)) {
+-        qWarning() << "Report::addMismatch: unknown testfunction" << item.testFunction;
++        qWarning() << "Report::addResult: unknown testfunction" << item.testFunction;
+         return;
+     }
+     bool found = false;
+     ImageItemList &list = itemLists[item.testFunction];
+     for (ImageItemList::iterator it = list.begin(); it != list.end(); ++it) {
+         if (it->itemName == item.itemName && it->itemChecksum == item.itemChecksum) {
+-            it->status = ImageItem::Mismatch;
++            it->status = item.status;
+             found = true;
+             break;
+         }
+     }
+-    if (found)
+-        numMismatches++;
+-    else
+-        qWarning() << "Report::addMismatch: unknown item" << item.itemName << "in testfunction" << item.testFunction;
++    if (found) {
++        if (item.status == ImageItem::Mismatch)
++            numMismatches++;
++    } else {
++        qWarning() << "Report::addResult: unknown item" << item.itemName << "in testfunction" << item.testFunction;
++    }
+ }
+ 
+ void Report::end()
+ {
+-    if (written || !numMismatches)
++    if (!initialized || written)
++        return;
++    // Make report iff (#mismatches>0) || (#fuzzymatches>0) || (#errors>0 && settings say report errors)
++    bool doReport = (numMismatches > 0);
++    if (!doReport) {
++        bool reportErrors = settings->value("ReportMissingResults").toBool();
++        computeStats();
++        foreach (const QString &func, itemLists.keys()) {
++            FuncStats stat = stats.value(func);
++            if (stat.value(ImageItem::FuzzyMatch) > 0) {
++                doReport = true;
++                break;
++            }
++            foreach (const ImageItem &item, itemLists.value(func)) {
++                if (reportErrors && item.status == ImageItem::Error) {
++                    doReport = true;
++                    break;
++                }
++            }
++            if (doReport)
++                break;
++        }
++    }
++    if (!doReport)
+         return;
+     write();
+     written = true;
+ }
+ 
++void Report::computeStats()
++{
++    if (hasStats)
++        return;
++    foreach (const QString &func, itemLists.keys()) {
++        FuncStats funcStat;
++        funcStat[ImageItem::Ok] = 0;
++        funcStat[ImageItem::BaselineNotFound] = 0;
++        funcStat[ImageItem::IgnoreItem] = 0;
++        funcStat[ImageItem::Mismatch] = 0;
++        funcStat[ImageItem::FuzzyMatch] = 0;
++        funcStat[ImageItem::Error] = 0;
++        foreach (const ImageItem &item, itemLists.value(func)) {
++            funcStat[item.status]++;
++        }
++        stats[func] = funcStat;
++    }
++    hasStats = true;
++}
++
++QString Report::summary()
++{
++    computeStats();
++    QString res;
++    foreach (const QString &func, itemLists.keys()) {
++        FuncStats stat = stats.value(func);
++        QString s = QString("%1 %3 mismatch(es), %4 error(s), %5 fuzzy match(es)\n");
++        s = s.arg(QString("%1() [%2 items]:").arg(func).arg(itemLists.value(func).size()).leftJustified(40));
++        s = s.arg(stat.value(ImageItem::Mismatch));
++        s = s.arg(stat.value(ImageItem::Error));
++        s = s.arg(stat.value(ImageItem::FuzzyMatch));
++        res += s;
++    }
++#if 0
++    qDebug() << "***************************** Summary *************************";
++    qDebug() << res;
++    qDebug() << "***************************************************************";
++#endif
++    return res;
++}
+ 
+ void Report::write()
+ {
+@@ -131,24 +217,27 @@ void Report::write()
+     }
+     writeFooter();
+     file.close();
++    updateLatestPointer();
+ }
+ 
+ 
+ void Report::writeHeader()
+ {
+-    QString title = plat.value(PI_TestCase) + QLS(" Qt Baseline Test Report");
+-    out << "<head><title>" << title << "</title></head>\n"
+-        << "<html><body><h1>" << title << "</h1>\n"
++    QString title = plat.value(PI_Project) + QLC(':') + plat.value(PI_TestCase) + QLS(" Lancelot Test Report");
++    out << "<!DOCTYPE html>\n"
++        << "<html><head><title>" << title << "</title></head>\n"
++        << "<body bgcolor=""#ddeeff""><h1>" << title << "</h1>\n"
+         << "<p>Note: This is a <i>static</i> page, generated at " << QDateTime::currentDateTime().toString()
+         << " for the test run with id " << runId << "</p>\n"
+-        << "<p>Summary: <b><span style=\"color:red\">" << numMismatches << " of " << numItems << "</b></span> items reported mismatching</p>\n\n";
++        << "<p>Summary: <b><span style=\"color:red\">" << numMismatches << " of " << numItems << "</span></b> items reported mismatching</p>\n";
++    out << "<pre>\n" << summary() << "</pre>\n\n";
+     out << "<h3>Testing Client Platform Info:</h3>\n"
+         << "<table>\n";
+     foreach (QString key, plat.keys())
+         out << "<tr><td>" << key << ":</td><td>" << plat.value(key) << "</td></tr>\n";
+     out << "</table>\n\n";
+     if (hasOverride) {
+-        out << "<span style=\"color:red\"><h4>Note! Platform Override Info:</h4></span>\n"
++        out << "<span style=\"color:red\"><h4>Note! Override Platform Info:</h4></span>\n"
+             << "<p>The client's output has been compared to baselines created on a different platform. Differences:</p>\n"
+             << "<table>\n";
+         for (int i = 0; i < plat.overrides().size()-1; i+=2)
+@@ -184,14 +273,25 @@ void Report::writeFunctionResults(const ImageItemList &list)
+            "</tr>\n\n";
+ 
+     foreach (const ImageItem &item, list) {
++        QString mmPrefix = handler->pathForItem(item, false, false);
++        QString blPrefix = handler->pathForItem(item, true, false);
++
++        // Make hard links to the current baseline, so that the report is static even if the baseline changes
++        generateThumbnail(blPrefix + QLS(FileFormat), rootDir);   // Make sure baseline thumbnail is up to date
++        QString lnPrefix = mmPrefix + QLS("baseline.");
++        QByteArray blPrefixBa = (rootDir + blPrefix).toLatin1();
++        QByteArray lnPrefixBa = (rootDir + lnPrefix).toLatin1();
++        ::link((blPrefixBa + FileFormat).constData(), (lnPrefixBa + FileFormat).constData());
++        ::link((blPrefixBa + MetadataFileExt).constData(), (lnPrefixBa + MetadataFileExt).constData());
++        ::link((blPrefixBa + ThumbnailExt).constData(), (lnPrefixBa + ThumbnailExt).constData());
++
++        QString baseline = lnPrefix + QLS(FileFormat);
++        QString metadata = lnPrefix + QLS(MetadataFileExt);
+         out << "<tr>\n";
+         out << "<td>" << item.itemName << "</td>\n";
+-        QString prefix = handler->pathForItem(item, true, false);
+-        QString baseline = prefix + QLS(FileFormat);
+-        QString metadata = prefix + QLS(MetadataFileExt);
+-        if (item.status == ImageItem::Mismatch) {
+-            QString rendered = handler->pathForItem(item, false, false) + QLS(FileFormat);
+-            QString itemFile = prefix.section(QLC('/'), -1);
++        if (item.status == ImageItem::Mismatch || item.status == ImageItem::FuzzyMatch) {
++            QString rendered = mmPrefix + QLS(FileFormat);
++            QString itemFile = mmPrefix.section(QLC('/'), -1);
+             writeItem(baseline, rendered, item, itemFile, ctx, misCtx, metadata);
+         }
+         else {
+@@ -210,6 +310,9 @@ void Report::writeFunctionResults(const ImageItemList &list)
+                         << "\">Whitelist this item</a>";
+                 }
+                 break;
++            case ImageItem::Error:
++                out << "<span style=\"background-color:red\">Error: No result reported!</span>";
++                break;
+             case ImageItem::Ok:
+                 out << "<span style=\"color:green\"><small>No mismatch reported</small></span>";
+                 break;
+@@ -233,11 +336,14 @@ void Report::writeItem(const QString &baseline, const QString &rendered, const I
+ 
+     QStringList images = QStringList() << baseline << rendered << compared;
+     foreach (const QString& img, images)
+-        out << "<td height=246 align=center><a href=\"/" << img << "\"><img src=\"/" << generateThumbnail(img) << "\"></a></td>\n";
++        out << "<td height=246 align=center><a href=\"/" << img << "\"><img src=\"/" << generateThumbnail(img, rootDir) << "\"></a></td>\n";
+ 
+-    out << "<td align=center>\n"
+-        << "<p><span style=\"color:red\">Mismatch reported</span></p>\n"
+-        << "<p><a href=\"/" << metadata << "\">Baseline Info</a>\n";
++    out << "<td align=center>\n";
++    if (item.status == ImageItem::FuzzyMatch)
++        out << "<p><span style=\"color:orange\">Fuzzy match</span></p>\n";
++    else
++        out << "<p><span style=\"color:red\">Mismatch reported</span></p>\n";
++    out << "<p><a href=\"/" << metadata << "\">Baseline Info</a>\n";
+     if (!hasOverride) {
+         out << "<p><a href=\"/cgi-bin/server.cgi?cmd=updateSingleBaseline&context=" << ctx << "&mismatchContext=" << misCtx
+             << "&itemFile=" << itemFile << "&url=" << pageUrl << "\">Let this be the new baseline</a></p>\n"
+@@ -245,8 +351,14 @@ void Report::writeItem(const QString &baseline, const QString &rendered, const I
+             << "&itemId=" << item.itemName << "&url=" << pageUrl << "\">Blacklist this item</a></p>\n";
+     }
+     out << "<p><a href=\"/cgi-bin/server.cgi?cmd=view&baseline=" << baseline << "&rendered=" << rendered
+-        << "&compared=" << compared << "&url=" << pageUrl << "\">Inspect</a></p>\n"
+-        << "</td>\n";
++        << "&compared=" << compared << "&url=" << pageUrl << "\">Inspect</a></p>\n";
++
++#if 0
++    out << "<p><a href=\"/cgi-bin/server.cgi?cmd=diffstats&baseline=" << baseline << "&rendered=" << rendered
++        << "&url=" << pageUrl << "\">Diffstats</a></p>\n";
++#endif
++
++    out << "</td>\n";
+ }
+ 
+ void Report::writeFooter()
+@@ -259,8 +371,8 @@ QString Report::generateCompared(const QString &baseline, const QString &rendere
+ {
+     QString res = rendered;
+     QFileInfo fi(res);
+-    res.chop(fi.suffix().length() + 1);
+-    res += QLS(fuzzy ? "_fuzzycompared.png" : "_compared.png");
++    res.chop(fi.suffix().length());
++    res += QLS(fuzzy ? "fuzzycompared.png" : "compared.png");
+     QStringList args;
+     if (fuzzy)
+         args << QLS("-fuzz") << QLS("5%");
+@@ -270,12 +382,14 @@ QString Report::generateCompared(const QString &baseline, const QString &rendere
+ }
+ 
+ 
+-QString Report::generateThumbnail(const QString &image)
++QString Report::generateThumbnail(const QString &image, const QString &rootDir)
+ {
+     QString res = image;
+     QFileInfo imgFI(rootDir+image);
+-    res.chop(imgFI.suffix().length() + 1);
+-    res += QLS("_thumbnail.jpg");
++    if (!imgFI.exists())
++        return res;
++    res.chop(imgFI.suffix().length());
++    res += ThumbnailExt;
+     QFileInfo resFI(rootDir+res);
+     if (resFI.exists() && resFI.lastModified() > imgFI.lastModified())
+         return res;
+@@ -286,12 +400,80 @@ QString Report::generateThumbnail(const QString &image)
+ }
+ 
+ 
++QString Report::writeResultsXmlFiles()
++{
++    if (!itemLists.size())
++        return QString();
++    QString dir = rootDir + baseDir + QLS("/xml-reports/") + runId;
++    QDir cwd;
++    if (!cwd.exists(dir))
++        cwd.mkpath(dir);
++    foreach (const QString &func, itemLists.keys()) {
++        QFile f(dir + "/" + func + "-results.xml");
++        if (!f.open(QIODevice::WriteOnly))
++            continue;
++        QXmlStreamWriter s(&f);
++        s.setAutoFormatting(true);
++        s.writeStartDocument();
++        foreach (QString key, plat.keys()) {
++            QString cmt = " " + key + "=\"" + plat.value(key) +"\" ";
++            s.writeComment(cmt.replace("--", "[-]"));
++        }
++        s.writeStartElement("testsuite");
++        s.writeAttribute("name", func);
++        foreach (const ImageItem &item, itemLists.value(func)) {
++            QString res;
++            switch (item.status) {
++            case ImageItem::Ok:
++            case ImageItem::FuzzyMatch:
++                res = "pass";
++                break;
++            case ImageItem::Mismatch:
++            case ImageItem::Error:
++                res = "fail";
++                break;
++            case ImageItem::BaselineNotFound:
++            case ImageItem::IgnoreItem:
++            default:
++                res = "skip";
++            }
++            s.writeStartElement("testcase");
++            s.writeAttribute("name", item.itemName);
++            s.writeAttribute("result", res);
++            s.writeEndElement();
++        }
++        s.writeEndElement();
++        s.writeEndDocument();
++    }
++    return dir;
++}
++
++
++
++void Report::updateLatestPointer()
++{
++    QString linkPath = rootDir + baseDir + QLS("/latest_report.html");
++    QString reportPath = path.mid(baseDir.size()+1);
++    QFile::remove(linkPath);             // possible race with another thread, yada yada yada
++    QFile::link(reportPath, linkPath);
++
++#if 0
++    QByteArray fwd = "<!DOCTYPE html><html><head><meta HTTP-EQUIV=\"refresh\" CONTENT=\"0;URL=%1\"></meta></head><body></body></html>\n";
++    fwd.replace("%1", filePath().prepend(QLC('/')).toLatin1());
++
++    QFile file(rootDir + baseDir + "/latest_report.html");
++    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
++        file.write(fwd);
++#endif
++}
++
++
+ void Report::handleCGIQuery(const QString &query)
+ {
+     QUrl cgiUrl(QLS("http://dummy/cgi-bin/dummy.cgi?") + query);
+     QTextStream s(stdout);
+     s << "Content-Type: text/html\r\n\r\n"
+-      << "<HTML>";
++      << "<!DOCTYPE html>\n<HTML>\n<body bgcolor=""#ddeeff"">\n";          // Lancelot blue
+ 
+     QString command(cgiUrl.queryItemValue("cmd"));
+ 
+@@ -300,6 +482,12 @@ void Report::handleCGIQuery(const QString &query)
+                                    cgiUrl.queryItemValue(QLS("rendered")),
+                                    cgiUrl.queryItemValue(QLS("compared")));
+     }
++#if 0
++    else if (command == QLS("diffstats")) {
++        s << BaselineHandler::diffstats(cgiUrl.queryItemValue(QLS("baseline")),
++                                        cgiUrl.queryItemValue(QLS("rendered")));
++    }
++#endif
+     else if (command == QLS("updateSingleBaseline")) {
+         s << BaselineHandler::updateBaselines(cgiUrl.queryItemValue(QLS("context")),
+                                               cgiUrl.queryItemValue(QLS("mismatchContext")),
+@@ -321,6 +509,6 @@ void Report::handleCGIQuery(const QString &query)
+     } else {
+         s << "Unknown query:<br>" << query << "<br>";
+     }
+-    s << "<p><a href=\"" << cgiUrl.queryItemValue(QLS("url")) << "\">Back to report</a>";
+-    s << "</HTML>";
++    s << "<p><a href=\"" << cgiUrl.queryItemValue(QLS("url")) << "\">Back to report</a>\n";
++    s << "</body>\n</HTML>";
+ }
+diff --git a/tests/baselineserver/src/report.h b/tests/baselineserver/src/report.h
+index 6605937..918d09d 100644
+--- a/tests/baselineserver/src/report.h
++++ b/tests/baselineserver/src/report.h
+@@ -46,6 +46,7 @@
+ #include <QTextStream>
+ #include <QMap>
+ #include <QStringList>
++#include <QSettings>
+ 
+ class BaselineHandler;
+ 
+@@ -55,15 +56,24 @@ public:
+     Report();
+     ~Report();
+ 
+-    void init(const BaselineHandler *h, const QString &r, const PlatformInfo &p);
++    void init(const BaselineHandler *h, const QString &r, const PlatformInfo &p, const QSettings *s);
+     void addItems(const ImageItemList& items);
+-    void addMismatch(const ImageItem& item);
++    void addResult(const ImageItem& item);
+     void end();
+ 
++    bool reportProduced();
++
++    int numberOfMismatches();
++    QString summary();
++
+     QString filePath();
+ 
++    QString writeResultsXmlFiles();
++
+     static void handleCGIQuery(const QString &query);
+ 
++    static QString generateThumbnail(const QString &image, const QString &rootDir = QString());
++
+ private:
+     void write();
+     void writeFunctionResults(const ImageItemList &list);
+@@ -72,13 +82,17 @@ private:
+     void writeHeader();
+     void writeFooter();
+     QString generateCompared(const QString &baseline, const QString &rendered, bool fuzzy = false);
+-    QString generateThumbnail(const QString &image);
+ 
++    void updateLatestPointer();
++
++    void computeStats();
++
++    bool initialized;
+     const BaselineHandler *handler;
+     QString runId;
+     PlatformInfo plat;
+     QString rootDir;
+-    QString reportDir;
++    QString baseDir;
+     QString path;
+     QStringList testFunctions;
+     QMap<QString, ImageItemList> itemLists;
+@@ -87,6 +101,11 @@ private:
+     int numMismatches;
+     QTextStream out;
+     bool hasOverride;
++    const QSettings *settings;
++
++    typedef QMap<ImageItem::ItemStatus, int> FuncStats;
++    QMap<QString, FuncStats> stats;
++    bool hasStats;
+ };
+ 
+ #endif // REPORT_H
+diff --git a/tests/baselineserver/src/templates/view.html b/tests/baselineserver/src/templates/view.html
+index c048f47..f097101 100644
+--- a/tests/baselineserver/src/templates/view.html
++++ b/tests/baselineserver/src/templates/view.html
+@@ -23,9 +23,14 @@ Zoom:
+ </table></p>
+ 
+ 
+-<p>
++<p><table cellspacing="25"><tr>
++<td valign="top">
+ <canvas id="c" width="800" height="800"></canvas>
+-</p>
++</td>
++<td valign="top">
++%4
++</td>
++</tr></table></p>
+ 
+ <script>
+   var canvas = document.getElementById("c");

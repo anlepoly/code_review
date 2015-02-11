@@ -1,0 +1,189 @@
+diff --git a/src/corelib/statemachine/qstate_p.h b/src/corelib/statemachine/qstate_p.h
+index 30be47c..9558bd8 100644
+--- a/src/corelib/statemachine/qstate_p.h
++++ b/src/corelib/statemachine/qstate_p.h
+@@ -57,6 +57,7 @@
+ 
+ #include <QtCore/qlist.h>
+ #include <QtCore/qbytearray.h>
++#include <QtCore/qpointer.h>
+ #include <QtCore/qvariant.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -69,7 +70,10 @@ struct QPropertyAssignment
+                         const QVariant &v, bool es = true)
+         : object(o), propertyName(n), value(v), explicitlySet(es)
+         {}
+-    QObject *object;
++
++    bool objectDeleted() const { return !object; }
++
++    QPointer<QObject> object;
+     QByteArray propertyName;
+     QVariant value;
+     bool explicitlySet;
+diff --git a/src/corelib/statemachine/qstatemachine.cpp b/src/corelib/statemachine/qstatemachine.cpp
+index 3d0b1e9..24da4e6 100644
+--- a/src/corelib/statemachine/qstatemachine.cpp
++++ b/src/corelib/statemachine/qstatemachine.cpp
+@@ -176,6 +176,10 @@ QT_BEGIN_NAMESPACE
+ 
+ // #define QSTATEMACHINE_DEBUG
+ 
++template <class T>
++static uint qHash(const QPointer<T> &p)
++{ return qHash(p.data()); }
++
+ QStateMachinePrivate::QStateMachinePrivate()
+ {
+     isMachine = true;
+@@ -666,14 +670,20 @@ void QStateMachinePrivate::applyProperties(const QList<QAbstractTransition*> &tr
+         if (!s)
+             continue;
+ 
+-        QList<QPropertyAssignment> assignments = QStatePrivate::get(s)->propertyAssignments;
+-        for (int j = 0; j < assignments.size(); ++j) {
+-            const QPropertyAssignment &assn = assignments.at(j);
+-            if (globalRestorePolicy == QStateMachine::RestoreProperties) {
+-                registerRestorable(assn.object, assn.propertyName);
++        {
++            QList<QPropertyAssignment> &assignments = QStatePrivate::get(s)->propertyAssignments;
++            for (int j = 0; j < assignments.size(); ++j) {
++                const QPropertyAssignment &assn = assignments.at(j);
++                if (assn.objectDeleted()) {
++                    assignments.removeAt(j--);
++                } else {
++                    if (globalRestorePolicy == QStateMachine::RestoreProperties) {
++                        registerRestorable(assn.object, assn.propertyName);
++                    }
++                    pendingRestorables.remove(RestorableId(assn.object, assn.propertyName));
++                    propertyAssignmentsForState[s].append(assn);
++                }
+             }
+-            pendingRestorables.remove(RestorableId(assn.object, assn.propertyName));
+-            propertyAssignmentsForState[s].append(assn);
+         }
+ 
+         // Remove pending restorables for all parent states to avoid restoring properties
+@@ -681,12 +691,16 @@ void QStateMachinePrivate::applyProperties(const QList<QAbstractTransition*> &tr
+         // assign a property which is assigned by the parent, it inherits the parent's assignment.
+         QState *parentState = s;
+         while ((parentState = parentState->parentState()) != 0) {
+-            assignments = QStatePrivate::get(parentState)->propertyAssignments;
++            QList<QPropertyAssignment> &assignments = QStatePrivate::get(parentState)->propertyAssignments;
+             for (int j=0; j<assignments.size(); ++j) {
+                 const QPropertyAssignment &assn = assignments.at(j);
+-                int c = pendingRestorables.remove(RestorableId(assn.object, assn.propertyName));
+-                if (c > 0)
+-                    propertyAssignmentsForState[s].append(assn);                
++                if (assn.objectDeleted()) {
++                    assignments.removeAt(j--);
++                } else {
++                    int c = pendingRestorables.remove(RestorableId(assn.object, assn.propertyName));
++                    if (c > 0)
++                        propertyAssignmentsForState[s].append(assn);
++                }
+             }
+         }
+     }
+@@ -967,6 +981,10 @@ QList<QPropertyAssignment> QStateMachinePrivate::restorablesToPropertyList(const
+     QHash<RestorableId, QVariant>::const_iterator it;
+     for (it = restorables.constBegin(); it != restorables.constEnd(); ++it) {
+ //        qDebug() << "restorable:" << it.key().first << it.key().second << it.value();
++        if (!it.key().first) {
++            // Property object was deleted
++            continue;
++        }
+         result.append(QPropertyAssignment(it.key().first, it.key().second, it.value(), /*explicitlySet=*/false));
+     }
+     return result;
+diff --git a/src/corelib/statemachine/qstatemachine_p.h b/src/corelib/statemachine/qstatemachine_p.h
+index ae56607..6159107 100644
+--- a/src/corelib/statemachine/qstatemachine_p.h
++++ b/src/corelib/statemachine/qstatemachine_p.h
+@@ -60,6 +60,7 @@
+ #include <QtCore/qlist.h>
+ #include <QtCore/qmutex.h>
+ #include <QtCore/qpair.h>
++#include <QtCore/qpointer.h>
+ #include <QtCore/qset.h>
+ #include <QtCore/qvector.h>
+ #include <private/qfreelist_p.h>
+@@ -183,7 +184,7 @@ public:
+     void cancelAllDelayedEvents();
+     
+ #ifndef QT_NO_PROPERTIES
+-    typedef QPair<QObject *, QByteArray> RestorableId;
++    typedef QPair<QPointer<QObject>, QByteArray> RestorableId;
+     QHash<RestorableId, QVariant> registeredRestorables;
+     void registerRestorable(QObject *object, const QByteArray &propertyName);
+     void unregisterRestorable(QObject *object, const QByteArray &propertyName);
+diff --git a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+index 862ff96..6fde415 100644
+--- a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
++++ b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+@@ -187,6 +187,8 @@ private slots:
+ 
+     void testIncrementReceivers();
+     void initialStateIsEnteredBeforeStartedEmitted();
++    void deletePropertyAssignmentObjectBeforeEntry();
++    void deletePropertyAssignmentObjectBeforeRestore();
+ };
+ 
+ class TestState : public QState
+@@ -4021,5 +4023,55 @@ void tst_QStateMachine::initialStateIsEnteredBeforeStartedEmitted()
+     QTRY_COMPARE(finishedSpy.count(), 1);
+ }
+ 
++void tst_QStateMachine::deletePropertyAssignmentObjectBeforeEntry()
++{
++    QStateMachine machine;
++    QState *s1 = new QState(&machine);
++    machine.setInitialState(s1);
++
++    QObject *o1 = new QObject;
++    s1->assignProperty(o1, "objectName", "foo");
++    delete o1;
++    QObject *o2 = new QObject;
++    s1->assignProperty(o2, "objectName", "bar");
++
++    machine.start();
++    // Shouldn't crash
++    QTRY_VERIFY(machine.configuration().contains(s1));
++
++    QCOMPARE(o2->objectName(), QString::fromLatin1("bar"));
++    delete o2;
++}
++
++void tst_QStateMachine::deletePropertyAssignmentObjectBeforeRestore()
++{
++    QStateMachine machine;
++    machine.setGlobalRestorePolicy(QStateMachine::RestoreProperties);
++    QState *s1 = new QState(&machine);
++    machine.setInitialState(s1);
++    QState *s2 = new QState(&machine);
++    s1->addTransition(new EventTransition(QEvent::User, s2));
++
++    QObject *o1 = new QObject;
++    s1->assignProperty(o1, "objectName", "foo");
++    QObject *o2 = new QObject;
++    s1->assignProperty(o2, "objectName", "bar");
++
++    QVERIFY(o1->objectName().isEmpty());
++    QVERIFY(o2->objectName().isEmpty());
++    machine.start();
++    QTRY_VERIFY(machine.configuration().contains(s1));
++    QCOMPARE(o1->objectName(), QString::fromLatin1("foo"));
++    QCOMPARE(o2->objectName(), QString::fromLatin1("bar"));
++
++    delete o1;
++    machine.postEvent(new QEvent(QEvent::User));
++    // Shouldn't crash
++    QTRY_VERIFY(machine.configuration().contains(s2));
++
++    QVERIFY(o2->objectName().isEmpty());
++    delete o2;
++}
++
+ QTEST_MAIN(tst_QStateMachine)
+ #include "tst_qstatemachine.moc"

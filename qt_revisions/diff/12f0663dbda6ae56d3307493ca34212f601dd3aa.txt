@@ -1,0 +1,496 @@
+diff --git a/src/quick/items/qquicktext.cpp b/src/quick/items/qquicktext.cpp
+index 6f8aa38..44735c1 100644
+--- a/src/quick/items/qquicktext.cpp
++++ b/src/quick/items/qquicktext.cpp
+@@ -85,7 +85,7 @@ QQuickTextPrivate::QQuickTextPrivate()
+     , maximumLineCountValid(false), updateOnComponentComplete(true), richText(false)
+     , styledText(false), singleline(false), internalWidthUpdate(false), requireImplicitWidth(false)
+     , truncated(false), hAlignImplicit(true), rightToLeftText(false)
+-    , layoutTextElided(false), textHasChanged(true), needToUpdateLayout(false)
++    , layoutTextElided(false), textHasChanged(true), needToUpdateLayout(false), formatModifiesFontSize(false)
+ {
+ }
+ 
+@@ -298,7 +298,11 @@ void QQuickTextPrivate::updateLayout()
+     if (!richText) {
+         if (textHasChanged) {
+             if (styledText && !text.isEmpty()) {
+-                QDeclarativeStyledText::parse(text, layout, imgTags, q->baseUrl(), qmlContext(q), !maximumLineCountValid);
++                layout.setFont(font);
++                // needs temporary bool because formatModifiesFontSize is in a bit-field
++                bool fontSizeModified = false;
++                QDeclarativeStyledText::parse(text, layout, imgTags, q->baseUrl(), qmlContext(q), !maximumLineCountValid, &fontSizeModified);
++                formatModifiesFontSize = fontSizeModified;
+             } else {
+                 layout.clearAdditionalFormats();
+                 multilengthEos = text.indexOf(QLatin1Char('\x9c'));
+@@ -1252,8 +1256,13 @@ void QQuickText::setFont(const QFont &font)
+         d->font.setPointSizeF(size/2.0);
+     }
+ 
+-    if (oldFont != d->font)
++    if (oldFont != d->font) {
++        // if the format changes the size of the text
++        // with headings or <font> tag, we need to re-parse
++        if (d->formatModifiesFontSize)
++            d->textHasChanged = true;
+         d->updateLayout();
++    }
+ 
+     emit fontChanged(d->sourceFont);
+ }
+diff --git a/src/quick/items/qquicktext_p_p.h b/src/quick/items/qquicktext_p_p.h
+index 555f41f..e060cc1 100644
+--- a/src/quick/items/qquicktext_p_p.h
++++ b/src/quick/items/qquicktext_p_p.h
+@@ -148,6 +148,7 @@ public:
+     bool layoutTextElided:1;
+     bool textHasChanged:1;
+     bool needToUpdateLayout:1;
++    bool formatModifiesFontSize:1;
+ 
+     static const QChar elideChar;
+ 
+diff --git a/src/quick/util/qdeclarativestyledtext.cpp b/src/quick/util/qdeclarativestyledtext.cpp
+index 164e33c..ddb8cad 100644
+--- a/src/quick/util/qdeclarativestyledtext.cpp
++++ b/src/quick/util/qdeclarativestyledtext.cpp
+@@ -69,6 +69,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++Q_GUI_EXPORT int qt_defaultDpi();
++
+ class QDeclarativeStyledTextPrivate
+ {
+ public:
+@@ -85,9 +87,10 @@ public:
+                                   QList<QDeclarativeStyledTextImgTag*> &imgTags,
+                                   const QUrl &baseUrl,
+                                   QDeclarativeContext *context,
+-                                  bool preloadImages)
++                                  bool preloadImages,
++                                  bool *fontSizeModified)
+         : text(t), layout(l), imgTags(&imgTags), baseFont(layout.font()), baseUrl(baseUrl), hasNewLine(false), nbImages(0), updateImagePositions(false)
+-        , preFormat(false), prependSpace(false), hasSpace(true), preloadImages(preloadImages), context(context)
++        , preFormat(false), prependSpace(false), hasSpace(true), preloadImages(preloadImages), fontSizeModified(fontSizeModified), context(context)
+     {
+     }
+ 
+@@ -103,7 +106,7 @@ public:
+     void parseImageAttributes(const QChar *&ch, const QString &textIn, QString &textOut);
+     QPair<QStringRef,QStringRef> parseAttribute(const QChar *&ch, const QString &textIn);
+     QStringRef parseValue(const QChar *&ch, const QString &textIn);
+-
++    void setFontSize(int size, QTextCharFormat &format);
+ 
+     inline void skipSpace(const QChar *&ch) {
+         while (ch->isSpace() && !ch->isNull())
+@@ -126,6 +129,7 @@ public:
+     bool prependSpace;
+     bool hasSpace;
+     bool preloadImages;
++    bool *fontSizeModified;
+     QDeclarativeContext *context;
+ 
+     static const QChar lessThan;
+@@ -160,8 +164,9 @@ QDeclarativeStyledText::QDeclarativeStyledText(const QString &string, QTextLayou
+                                                QList<QDeclarativeStyledTextImgTag*> &imgTags,
+                                                const QUrl &baseUrl,
+                                                QDeclarativeContext *context,
+-                                               bool preloadImages)
+-    : d(new QDeclarativeStyledTextPrivate(string, layout, imgTags, baseUrl, context, preloadImages))
++                                               bool preloadImages,
++                                               bool *fontSizeModified)
++    : d(new QDeclarativeStyledTextPrivate(string, layout, imgTags, baseUrl, context, preloadImages, fontSizeModified))
+ {
+ }
+ 
+@@ -174,11 +179,12 @@ void QDeclarativeStyledText::parse(const QString &string, QTextLayout &layout,
+                                    QList<QDeclarativeStyledTextImgTag*> &imgTags,
+                                    const QUrl &baseUrl,
+                                    QDeclarativeContext *context,
+-                                   bool preloadImages)
++                                   bool preloadImages,
++                                   bool *fontSizeModified)
+ {
+     if (string.isEmpty())
+         return;
+-    QDeclarativeStyledText styledText(string, layout, imgTags, baseUrl, context, preloadImages);
++    QDeclarativeStyledText styledText(string, layout, imgTags, baseUrl, context, preloadImages, fontSizeModified);
+     styledText.d->parse();
+ }
+ 
+@@ -298,6 +304,20 @@ void QDeclarativeStyledTextPrivate::appendText(const QString &textIn, int start,
+     hasNewLine = false;
+ }
+ 
++//
++// Calculates and sets the correct font size in points
++// depending on the size multiplier and base font.
++//
++void QDeclarativeStyledTextPrivate::setFontSize(int size, QTextCharFormat &format)
++{
++    static const qreal scaling[] = { 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.4 };
++    if (baseFont.pointSizeF() != -1)
++        format.setFontPointSize(baseFont.pointSize() * scaling[size - 1]);
++    else
++        format.setFontPointSize(baseFont.pixelSize() * qreal(72.) / qreal(qt_defaultDpi()) * scaling[size - 1]);
++    *fontSizeModified = true;
++}
++
+ bool QDeclarativeStyledTextPrivate::parseTag(const QChar *&ch, const QString &textIn, QString &textOut, QTextCharFormat &format)
+ {
+     skipSpace(ch);
+@@ -353,12 +373,11 @@ bool QDeclarativeStyledTextPrivate::parseTag(const QChar *&ch, const QString &te
+             } else if (char0 == QLatin1Char('h') && tagLength == 2) {
+                 int level = tag.at(1).digitValue();
+                 if (level >= 1 && level <= 6) {
+-                    static const qreal scaling[] = { 2.0, 1.5, 1.2, 1.0, 0.8, 0.7 };
+                     if (!hasNewLine)
+                         textOut.append(QChar::LineSeparator);
+                     hasSpace = true;
+                     prependSpace = false;
+-                    format.setFontPointSize(baseFont.pointSize() * scaling[level - 1]);
++                    setFontSize(7 - level, format);
+                     format.setFontWeight(QFont::Bold);
+                     return true;
+                 }
+@@ -550,10 +569,8 @@ bool QDeclarativeStyledTextPrivate::parseFontAttributes(const QChar *&ch, const
+             int size = attr.second.toString().toInt();
+             if (attr.second.at(0) == QLatin1Char('-') || attr.second.at(0) == QLatin1Char('+'))
+                 size += 3;
+-            if (size >= 1 && size <= 7) {
+-                static const qreal scaling[] = { 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.4 };
+-                format.setFontPointSize(baseFont.pointSize() * scaling[size-1]);
+-            }
++            if (size >= 1 && size <= 7)
++                setFontSize(size, format);
+         }
+     } while (!ch->isNull() && !attr.first.isEmpty());
+ 
+diff --git a/src/quick/util/qdeclarativestyledtext_p.h b/src/quick/util/qdeclarativestyledtext_p.h
+index aa6ae3f..4487a9e 100644
+--- a/src/quick/util/qdeclarativestyledtext_p.h
++++ b/src/quick/util/qdeclarativestyledtext_p.h
+@@ -85,14 +85,16 @@ public:
+                       QList<QDeclarativeStyledTextImgTag*> &imgTags,
+                       const QUrl &baseUrl,
+                       QDeclarativeContext *context,
+-                      bool preloadImages);
++                      bool preloadImages,
++                      bool *fontSizeModified);
+ 
+ private:
+     QDeclarativeStyledText(const QString &string, QTextLayout &layout,
+                            QList<QDeclarativeStyledTextImgTag*> &imgTags,
+                            const QUrl &baseUrl,
+                            QDeclarativeContext *context,
+-                           bool preloadImages);
++                           bool preloadImages,
++                           bool *fontSizeModified);
+     ~QDeclarativeStyledText();
+ 
+     QDeclarativeStyledTextPrivate *d;
+diff --git a/tests/auto/qtquick2/qdeclarativestyledtext/tst_qdeclarativestyledtext.cpp b/tests/auto/qtquick2/qdeclarativestyledtext/tst_qdeclarativestyledtext.cpp
+index fd0d1ab..ca3855c 100644
+--- a/tests/auto/qtquick2/qdeclarativestyledtext/tst_qdeclarativestyledtext.cpp
++++ b/tests/auto/qtquick2/qdeclarativestyledtext/tst_qdeclarativestyledtext.cpp
+@@ -88,68 +88,69 @@ void tst_qdeclarativestyledtext::textOutput_data()
+     QTest::addColumn<QString>("input");
+     QTest::addColumn<QString>("output");
+     QTest::addColumn<FormatList>("formats");
+-
+-    QTest::newRow("bold") << "<b>bold</b>" << "bold" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("italic") << "<i>italic</i>" << "italic" << (FormatList() << Format(Format::Italic, 0, 6));
+-    QTest::newRow("underline") << "<u>underline</u>" << "underline" << (FormatList() << Format(Format::Underline, 0, 9));
+-    QTest::newRow("strong") << "<strong>strong</strong>" << "strong" << (FormatList() << Format(Format::Bold, 0, 6));
+-    QTest::newRow("underline") << "<u>underline</u>" << "underline" << (FormatList() << Format(Format::Underline, 0, 9));
+-    QTest::newRow("missing >") << "<b>text</b" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("missing b>") << "<b>text</" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("missing /b>") << "<b>text<" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("missing </b>") << "<b>text" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("nested") << "<b>text <i>italic</i> bold</b>" << "text italic bold" << (FormatList() << Format(Format::Bold, 0, 5) << Format(Format::Bold | Format::Italic, 5, 6) << Format(Format::Bold, 11, 5));
+-    QTest::newRow("bad nest") << "<b>text <i>italic</b></i>" << "text italic" << (FormatList() << Format(Format::Bold, 0, 5) << Format(Format::Bold | Format::Italic, 5, 6));
+-    QTest::newRow("font color") << "<font color=\"red\">red text</font>" << "red text" << (FormatList() << Format(0, 0, 8));
+-    QTest::newRow("font color: single quote") << "<font color='red'>red text</font>" << "red text" << (FormatList() << Format(0, 0, 8));
+-    QTest::newRow("font size") << "<font size=\"1\">text</font>" << "text" << (FormatList() << Format(0, 0, 4));
+-    QTest::newRow("font empty") << "<font>text</font>" << "text" << FormatList();
+-    QTest::newRow("font bad 1") << "<font ezis=\"blah\">text</font>" << "text" << FormatList();
+-    QTest::newRow("font bad 2") << "<font size=\"1>text</font>" << "" << FormatList();
+-    QTest::newRow("extra close") << "<b>text</b></b>" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("extra space") << "<b >text</b>" << "text" << (FormatList() << Format(Format::Bold, 0, 4));
+-    QTest::newRow("entities") << "&lt;b&gt;this &amp; that&lt;/b&gt;" << "<b>this & that</b>" << FormatList();
+-    QTest::newRow("newline") << "text<br>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("paragraph") << "text<p>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("paragraph closed") << "text<p>more text</p>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text")  + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("paragraph closed bold") << "<b>text<p>more text</p>more text</b>" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text")  + QChar(QChar::LineSeparator) + QLatin1String("more text") << (FormatList() << Format(Format::Bold, 0, 24));
+-    QTest::newRow("self-closing newline") << "text<br/>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("empty") << "" << "" << FormatList();
+-    QTest::newRow("unknown tag") << "<a href='#'><foo>underline</foo></a> not" << "underline not" << (FormatList() << Format(Format::Underline, 0, 9));
+-    QTest::newRow("ordered list") << "<ol><li>one<li>two" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") << FormatList();
+-    QTest::newRow("ordered list closed") << "<ol><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("ordered list alpha") << "<ol type=\"a\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("a.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("b.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("ordered list upper alpha") << "<ol type=\"A\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("A.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("B.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("ordered list roman") << "<ol type=\"i\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("i.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("ii.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("ordered list upper roman") << "<ol type=\"I\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("I.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("II.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("ordered list bad") << "<ol type=\"z\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("unordered list") << "<ul><li>one<li>two" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") << FormatList();
+-    QTest::newRow("unordered list closed") << "<ul><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("unordered list disc") << "<ul type=\"disc\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + disc + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + disc + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("unordered list square") << "<ul type=\"square\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + square + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + square + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("unordered list bad") << "<ul type=\"bad\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList();
+-    QTest::newRow("header close") << "<h1>head</h1>more" << QChar(QChar::LineSeparator) + QLatin1String("head") + QChar(QChar::LineSeparator) + QLatin1String("more") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h0") << "<h0>head" << "head" << FormatList();
+-    QTest::newRow("h1") << "<h1>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h2") << "<h2>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h3") << "<h3>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h4") << "<h4>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h5") << "<h5>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h6") << "<h6>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("h7") << "<h7>head" << "head" << FormatList();
+-    QTest::newRow("pre") << "normal<pre>pre text</pre>normal" << QLatin1String("normal") + QChar(QChar::LineSeparator) + QLatin1String("pre") + QChar(QChar::Nbsp) + QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("normal") << (FormatList() << Format(0, 6, 9));
+-    QTest::newRow("pre lb") << "normal<pre>pre\n text</pre>normal" << QLatin1String("normal") + QChar(QChar::LineSeparator) + QLatin1String("pre") + QChar(QChar::LineSeparator) + QChar(QChar::Nbsp) + QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("normal") << (FormatList() << Format(0, 6, 10));
+-    QTest::newRow("line feed") << "line\nfeed" << "line feed" << FormatList();
+-    QTest::newRow("leading whitespace") << " leading whitespace" << "leading whitespace" << FormatList();
+-    QTest::newRow("trailing whitespace") << "trailing whitespace " << "trailing whitespace" << FormatList();
+-    QTest::newRow("consecutive whitespace") << " consecutive  \t \n  whitespace" << "consecutive whitespace" << FormatList();
+-    QTest::newRow("space after newline") << "text<br/> more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("space after paragraph") << "text<p> more text</p> more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList();
+-    QTest::newRow("space in header") << "<h1> head</h1> " << QChar(QChar::LineSeparator) + QLatin1String("head") + QChar(QChar::LineSeparator) << (FormatList() << Format(Format::Bold, 0, 5));
+-    QTest::newRow("space before bold") << "this is <b>bold</b>" << "this is bold" << (FormatList() << Format(Format::Bold, 8, 4));
+-    QTest::newRow("space leading bold") << "this is<b> bold</b>" << "this is bold" << (FormatList() << Format(Format::Bold, 7, 5));
+-    QTest::newRow("space trailing bold") << "this is <b>bold </b>" << "this is bold " << (FormatList() << Format(Format::Bold, 8, 5));
+-    QTest::newRow("img") << "a<img src=\"blah.png\"/>b" << "a  b" << FormatList();
++    QTest::addColumn<bool>("modifiesFontSize");
++
++    QTest::newRow("bold") << "<b>bold</b>" << "bold" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("italic") << "<i>italic</i>" << "italic" << (FormatList() << Format(Format::Italic, 0, 6)) << false;
++    QTest::newRow("underline") << "<u>underline</u>" << "underline" << (FormatList() << Format(Format::Underline, 0, 9)) << false;
++    QTest::newRow("strong") << "<strong>strong</strong>" << "strong" << (FormatList() << Format(Format::Bold, 0, 6)) << false;
++    QTest::newRow("underline") << "<u>underline</u>" << "underline" << (FormatList() << Format(Format::Underline, 0, 9)) << false;
++    QTest::newRow("missing >") << "<b>text</b" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("missing b>") << "<b>text</" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("missing /b>") << "<b>text<" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("missing </b>") << "<b>text" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("nested") << "<b>text <i>italic</i> bold</b>" << "text italic bold" << (FormatList() << Format(Format::Bold, 0, 5) << Format(Format::Bold | Format::Italic, 5, 6) << Format(Format::Bold, 11, 5)) << false;
++    QTest::newRow("bad nest") << "<b>text <i>italic</b></i>" << "text italic" << (FormatList() << Format(Format::Bold, 0, 5) << Format(Format::Bold | Format::Italic, 5, 6)) << false;
++    QTest::newRow("font color") << "<font color=\"red\">red text</font>" << "red text" << (FormatList() << Format(0, 0, 8)) << false;
++    QTest::newRow("font color: single quote") << "<font color='red'>red text</font>" << "red text" << (FormatList() << Format(0, 0, 8)) << false;
++    QTest::newRow("font size") << "<font size=\"1\">text</font>" << "text" << (FormatList() << Format(0, 0, 4)) << true;
++    QTest::newRow("font empty") << "<font>text</font>" << "text" << FormatList() << false;
++    QTest::newRow("font bad 1") << "<font ezis=\"blah\">text</font>" << "text" << FormatList() << false;
++    QTest::newRow("font bad 2") << "<font size=\"1>text</font>" << "" << FormatList() << false;
++    QTest::newRow("extra close") << "<b>text</b></b>" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("extra space") << "<b >text</b>" << "text" << (FormatList() << Format(Format::Bold, 0, 4)) << false;
++    QTest::newRow("entities") << "&lt;b&gt;this &amp; that&lt;/b&gt;" << "<b>this & that</b>" << FormatList() << false;
++    QTest::newRow("newline") << "text<br>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("paragraph") << "text<p>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("paragraph closed") << "text<p>more text</p>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text")  + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("paragraph closed bold") << "<b>text<p>more text</p>more text</b>" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text")  + QChar(QChar::LineSeparator) + QLatin1String("more text") << (FormatList() << Format(Format::Bold, 0, 24)) << false;
++    QTest::newRow("self-closing newline") << "text<br/>more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("empty") << "" << "" << FormatList() << false;
++    QTest::newRow("unknown tag") << "<a href='#'><foo>underline</foo></a> not" << "underline not" << (FormatList() << Format(Format::Underline, 0, 9)) << false;
++    QTest::newRow("ordered list") << "<ol><li>one<li>two" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") << FormatList() << false;
++    QTest::newRow("ordered list closed") << "<ol><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("ordered list alpha") << "<ol type=\"a\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("a.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("b.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("ordered list upper alpha") << "<ol type=\"A\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("A.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("B.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("ordered list roman") << "<ol type=\"i\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("i.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("ii.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("ordered list upper roman") << "<ol type=\"I\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("I.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("II.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("ordered list bad") << "<ol type=\"z\"><li>one</li><li>two</li></ol>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("1.") + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + QLatin1String("2.") + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("unordered list") << "<ul><li>one<li>two" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") << FormatList() << false;
++    QTest::newRow("unordered list closed") << "<ul><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("unordered list disc") << "<ul type=\"disc\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + disc + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + disc + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("unordered list square") << "<ul type=\"square\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + square + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + square + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("unordered list bad") << "<ul type=\"bad\"><li>one</li><li>two</li></ul>" << QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("one") + QChar(QChar::LineSeparator) + QString(6, QChar::Nbsp) + bullet + QString(2, QChar::Nbsp) + QLatin1String("two") + QChar(QChar::LineSeparator) << FormatList() << false;
++    QTest::newRow("header close") << "<h1>head</h1>more" << QChar(QChar::LineSeparator) + QLatin1String("head") + QChar(QChar::LineSeparator) + QLatin1String("more") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h0") << "<h0>head" << "head" << FormatList() << false;
++    QTest::newRow("h1") << "<h1>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h2") << "<h2>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h3") << "<h3>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h4") << "<h4>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h5") << "<h5>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h6") << "<h6>head" << QChar(QChar::LineSeparator) + QLatin1String("head") << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("h7") << "<h7>head" << "head" << FormatList() << false;
++    QTest::newRow("pre") << "normal<pre>pre text</pre>normal" << QLatin1String("normal") + QChar(QChar::LineSeparator) + QLatin1String("pre") + QChar(QChar::Nbsp) + QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("normal") << (FormatList() << Format(0, 6, 9)) << false;
++    QTest::newRow("pre lb") << "normal<pre>pre\n text</pre>normal" << QLatin1String("normal") + QChar(QChar::LineSeparator) + QLatin1String("pre") + QChar(QChar::LineSeparator) + QChar(QChar::Nbsp) + QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("normal") << (FormatList() << Format(0, 6, 10)) << false;
++    QTest::newRow("line feed") << "line\nfeed" << "line feed" << FormatList() << false;
++    QTest::newRow("leading whitespace") << " leading whitespace" << "leading whitespace" << FormatList() << false;
++    QTest::newRow("trailing whitespace") << "trailing whitespace " << "trailing whitespace" << FormatList() << false;
++    QTest::newRow("consecutive whitespace") << " consecutive  \t \n  whitespace" << "consecutive whitespace" << FormatList() << false;
++    QTest::newRow("space after newline") << "text<br/> more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("space after paragraph") << "text<p> more text</p> more text" << QLatin1String("text") + QChar(QChar::LineSeparator) + QLatin1String("more text") + QChar(QChar::LineSeparator) + QLatin1String("more text") << FormatList() << false;
++    QTest::newRow("space in header") << "<h1> head</h1> " << QChar(QChar::LineSeparator) + QLatin1String("head") + QChar(QChar::LineSeparator) << (FormatList() << Format(Format::Bold, 0, 5)) << true;
++    QTest::newRow("space before bold") << "this is <b>bold</b>" << "this is bold" << (FormatList() << Format(Format::Bold, 8, 4)) << false;
++    QTest::newRow("space leading bold") << "this is<b> bold</b>" << "this is bold" << (FormatList() << Format(Format::Bold, 7, 5)) << false;
++    QTest::newRow("space trailing bold") << "this is <b>bold </b>" << "this is bold " << (FormatList() << Format(Format::Bold, 8, 5)) << false;
++    QTest::newRow("img") << "a<img src=\"blah.png\"/>b" << "a  b" << FormatList() << false;
+ }
+ 
+ void tst_qdeclarativestyledtext::textOutput()
+@@ -157,10 +158,12 @@ void tst_qdeclarativestyledtext::textOutput()
+     QFETCH(QString, input);
+     QFETCH(QString, output);
+     QFETCH(FormatList, formats);
++    QFETCH(bool, modifiesFontSize);
+ 
+     QTextLayout layout;
+     QList<QDeclarativeStyledTextImgTag*> imgTags;
+-    QDeclarativeStyledText::parse(input, layout, imgTags, QUrl(), 0, false);
++    bool fontSizeModified = false;
++    QDeclarativeStyledText::parse(input, layout, imgTags, QUrl(), 0, false, &fontSizeModified);
+ 
+     QCOMPARE(layout.text(), output);
+ 
+@@ -177,6 +180,7 @@ void tst_qdeclarativestyledtext::textOutput()
+         QVERIFY(layoutFormats.at(i).format.fontItalic() == bool(formats.at(i).type & Format::Italic));
+         QVERIFY(layoutFormats.at(i).format.fontUnderline() == bool(formats.at(i).type & Format::Underline));
+     }
++    QCOMPARE(fontSizeModified, modifiesFontSize);
+ }
+ 
+ 
+diff --git a/tests/auto/qtquick2/qquicktext/data/pixelFontSizes.qml b/tests/auto/qtquick2/qquicktext/data/pixelFontSizes.qml
+new file mode 100644
+index 0000000..e3d81b6
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktext/data/pixelFontSizes.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++
++Rectangle {
++    width: 400
++    height: 200
++
++    property variant pixelSize: 6
++
++    Text {
++        objectName: "text"
++        font.pixelSize: parent.pixelSize
++        text: "This is<br/>a font<br/> size test."
++    }
++
++    Text {
++        x: 200
++        objectName: "textWithTag"
++        font.pixelSize: parent.pixelSize
++        text: "This is <h4>a font</h4> size test."
++    }
++}
+diff --git a/tests/auto/qtquick2/qquicktext/data/pointFontSizes.qml b/tests/auto/qtquick2/qquicktext/data/pointFontSizes.qml
+new file mode 100644
+index 0000000..6feb8fe
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktext/data/pointFontSizes.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++
++Rectangle {
++    width: 400
++    height: 200
++
++    property variant pointSize: 6
++
++    Text {
++        objectName: "text"
++        font.pointSize: parent.pointSize
++        text: "This is<br/>a font<br/> size test."
++    }
++
++    Text {
++        x: 200
++        objectName: "textWithTag"
++        font.pointSize: parent.pointSize
++        text: "This is <h4>a font</h4> size test."
++    }
++}
+diff --git a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+index d1c0f76..86d502f 100644
+--- a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
++++ b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+@@ -122,6 +122,8 @@ private slots:
+     void fontSizeModeMultiline();
+     void multilengthStrings_data();
+     void multilengthStrings();
++    void fontFormatSizes_data();
++    void fontFormatSizes();
+ 
+ private:
+     QStringList standard;
+@@ -2427,6 +2429,76 @@ void tst_qquicktext::multilengthStrings()
+     QCOMPARE(myText->truncated(), true);
+ }
+ 
++void tst_qquicktext::fontFormatSizes_data()
++{
++    QTest::addColumn<QString>("text");
++    QTest::addColumn<QString>("textWithTag");
++    QTest::addColumn<bool>("fontIsBigger");
++
++    QTest::newRow("fs1") << "Hello world!" << "Hello <font size=\"1\">world</font>!" << false;
++    QTest::newRow("fs2") << "Hello world!" << "Hello <font size=\"2\">world</font>!" << false;
++    QTest::newRow("fs3") << "Hello world!" << "Hello <font size=\"3\">world</font>!" << false;
++    QTest::newRow("fs4") << "Hello world!" << "Hello <font size=\"4\">world</font>!" << true;
++    QTest::newRow("fs5") << "Hello world!" << "Hello <font size=\"5\">world</font>!" << true;
++    QTest::newRow("fs6") << "Hello world!" << "Hello <font size=\"6\">world</font>!" << true;
++    QTest::newRow("fs7") << "Hello world!" << "Hello <font size=\"7\">world</font>!" << true;
++    QTest::newRow("h1") << "This is<br/>a font<br/> size test." << "This is <h1>a font</h1> size test." << true;
++    QTest::newRow("h2") << "This is<br/>a font<br/> size test." << "This is <h2>a font</h2> size test." << true;
++    QTest::newRow("h3") << "This is<br/>a font<br/> size test." << "This is <h3>a font</h3> size test." << true;
++    QTest::newRow("h4") << "This is<br/>a font<br/> size test." << "This is <h4>a font</h4> size test." << true;
++    QTest::newRow("h5") << "This is<br/>a font<br/> size test." << "This is <h5>a font</h5> size test." << false;
++    QTest::newRow("h6") << "This is<br/>a font<br/> size test." << "This is <h6>a font</h6> size test." << false;
++}
++
++void tst_qquicktext::fontFormatSizes()
++{
++    QFETCH(QString, text);
++    QFETCH(QString, textWithTag);
++    QFETCH(bool, fontIsBigger);
++
++    QQuickView *view = new QQuickView;
++    {
++        view->setSource(testFileUrl("pointFontSizes.qml"));
++        view->show();
++
++        QQuickText *qtext = view->rootObject()->findChild<QQuickText*>("text");
++        QQuickText *qtextWithTag = view->rootObject()->findChild<QQuickText*>("textWithTag");
++        QVERIFY(qtext != 0);
++        QVERIFY(qtextWithTag != 0);
++
++        qtext->setText(text);
++        qtextWithTag->setText(textWithTag);
++
++        for (int size = 6; size < 100; size += 4) {
++            view->rootObject()->setProperty("pointSize", size);
++            if (fontIsBigger)
++                QVERIFY(qtext->height() <= qtextWithTag->height());
++            else
++                QVERIFY(qtext->height() >= qtextWithTag->height());
++        }
++    }
++
++    {
++        view->setSource(testFileUrl("pixelFontSizes.qml"));
++        QQuickText *qtext = view->rootObject()->findChild<QQuickText*>("text");
++        QQuickText *qtextWithTag = view->rootObject()->findChild<QQuickText*>("textWithTag");
++        QVERIFY(qtext != 0);
++        QVERIFY(qtextWithTag != 0);
++
++        qtext->setText(text);
++        qtextWithTag->setText(textWithTag);
++
++        for (int size = 6; size < 100; size += 4) {
++            view->rootObject()->setProperty("pixelSize", size);
++            if (fontIsBigger)
++                QVERIFY(qtext->height() <= qtextWithTag->height());
++            else
++                QVERIFY(qtext->height() >= qtextWithTag->height());
++        }
++    }
++    delete view;
++}
++
+ QTEST_MAIN(tst_qquicktext)
+ 
+ #include "tst_qquicktext.moc"

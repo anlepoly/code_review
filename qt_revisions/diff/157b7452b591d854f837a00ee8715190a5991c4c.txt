@@ -1,0 +1,307 @@
+diff --git a/src/declarative/qml/qdeclarativecompileddata.cpp b/src/declarative/qml/qdeclarativecompileddata.cpp
+index eae5b91..6ace1d3 100644
+--- a/src/declarative/qml/qdeclarativecompileddata.cpp
++++ b/src/declarative/qml/qdeclarativecompileddata.cpp
+@@ -145,9 +145,8 @@ QDeclarativeCompiledData::~QDeclarativeCompiledData()
+ 
+ void QDeclarativeCompiledData::clear()
+ {
+-    for (int ii = 0; ii < v8bindings.count(); ++ii)
+-        qPersistentDispose(v8bindings[ii]);
+-    v8bindings.clear();
++    for (int ii = 0; ii < programs.count(); ++ii)
++        qPersistentDispose(programs[ii].bindings);
+ }
+ 
+ const QMetaObject *QDeclarativeCompiledData::TypeReference::metaObject() const
+diff --git a/src/declarative/qml/qdeclarativecompiler.cpp b/src/declarative/qml/qdeclarativecompiler.cpp
+index ddae368..ef4f24d 100644
+--- a/src/declarative/qml/qdeclarativecompiler.cpp
++++ b/src/declarative/qml/qdeclarativecompiler.cpp
+@@ -914,8 +914,9 @@ void QDeclarativeCompiler::compileTree(QDeclarativeScript::Object *tree)
+     if (!compileState->v8BindingProgram.isEmpty()) {
+         Instruction::InitV8Bindings bindings;
+         int index = output->programs.count();
+-        output->programs.append(compileState->v8BindingProgram);
+-        output->v8bindings.append(v8::Persistent<v8::Array>());
++
++        typedef QDeclarativeCompiledData::V8Program V8Program;
++        output->programs.append(V8Program(compileState->v8BindingProgram, output));
+ 
+         bindings.programIndex = index;
+         bindings.line = compileState->v8BindingProgramLine;
+@@ -1472,8 +1473,9 @@ void QDeclarativeCompiler::genComponent(QDeclarativeScript::Object *obj)
+     if (!compileState->v8BindingProgram.isEmpty()) {
+         Instruction::InitV8Bindings bindings;
+         int index = output->programs.count();
+-        output->programs.append(compileState->v8BindingProgram);
+-        output->v8bindings.append(v8::Persistent<v8::Array>());
++
++        typedef QDeclarativeCompiledData::V8Program V8Program;
++        output->programs.append(V8Program(compileState->v8BindingProgram, output));
+ 
+         bindings.programIndex = index;
+         bindings.line = compileState->v8BindingProgramLine;
+diff --git a/src/declarative/qml/qdeclarativecompiler_p.h b/src/declarative/qml/qdeclarativecompiler_p.h
+index 8ae6685..637cd80 100644
+--- a/src/declarative/qml/qdeclarativecompiler_p.h
++++ b/src/declarative/qml/qdeclarativecompiler_p.h
+@@ -105,14 +105,22 @@ public:
+     };
+     QList<TypeReference> types;
+ 
+-    QList<v8::Persistent<v8::Array> > v8bindings;
++    struct V8Program {
++        V8Program(const QByteArray &p, QDeclarativeCompiledData *c)
++        : program(p), cdata(c) {}
++
++        QByteArray program;
++        v8::Persistent<v8::Array> bindings;
++        QDeclarativeCompiledData *cdata;
++    };
++
++    QList<V8Program> programs;
+ 
+     const QMetaObject *root;
+     QAbstractDynamicMetaObject rootData;
+     QDeclarativePropertyCache *rootPropertyCache;
+     QList<QString> primitives;
+     QList<QByteArray> datas;
+-    QList<QByteArray> programs;
+     QByteArray bytecode;
+     QList<QDeclarativePropertyCache *> propertyCaches;
+     QList<QDeclarativeIntegerCache *> contextCaches;
+diff --git a/src/declarative/qml/qdeclarativevme.cpp b/src/declarative/qml/qdeclarativevme.cpp
+index f44b767..a75eae1 100644
+--- a/src/declarative/qml/qdeclarativevme.cpp
++++ b/src/declarative/qml/qdeclarativevme.cpp
+@@ -750,7 +750,7 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+         QML_END_INSTR(BeginObject)
+ 
+         QML_BEGIN_INSTR(InitV8Bindings)
+-            CTXT->v8bindings = new QV8Bindings(instr.programIndex, instr.line, COMP, CTXT);
++            CTXT->v8bindings = new QV8Bindings(&PROGRAMS[instr.programIndex], instr.line, CTXT);
+         QML_END_INSTR(InitV8Bindings)
+ 
+         QML_BEGIN_INSTR(StoreBinding)
+diff --git a/src/declarative/qml/v8/qv8bindings.cpp b/src/declarative/qml/v8/qv8bindings.cpp
+index e0f196b..648e8f6 100644
+--- a/src/declarative/qml/v8/qv8bindings.cpp
++++ b/src/declarative/qml/v8/qv8bindings.cpp
+@@ -74,7 +74,8 @@ void QV8Bindings::Binding::setEnabled(bool e, QDeclarativePropertyPrivate::Write
+ 
+ void QV8Bindings::refresh()
+ {
+-    for (int ii = 0; ii < bindingsCount; ++ii)
++    int count = functions()->Length();
++    for (int ii = 0; ii < count; ++ii)
+         bindings[ii].refresh();
+ }
+ 
+@@ -89,11 +90,11 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+         return;
+ 
+     QDeclarativeTrace trace("V8 Binding Update");
+-    trace.addDetail("URL", parent->url);
++    trace.addDetail("URL", parent->url());
+     trace.addDetail("Line", instruction->line);
+     trace.addDetail("Column", instruction->column);
+ 
+-    QDeclarativeBindingProfiler prof(parent->url.toString(), instruction->line, instruction->column);
++    QDeclarativeBindingProfiler prof(parent->urlString(), instruction->line, instruction->column);
+ 
+     QDeclarativeContextData *context = parent->context();
+     if (!context || !context->isValid())
+@@ -112,7 +113,7 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+         v8::Context::Scope scope(ep->v8engine()->context());
+         v8::Local<v8::Value> result =
+             evaluate(context,
+-                     v8::Handle<v8::Function>::Cast(parent->functions->Get(instruction->value)),
++                     v8::Handle<v8::Function>::Cast(parent->functions()->Get(instruction->value)),
+                      &isUndefined);
+ 
+         trace.event("writing V8 result");
+@@ -126,7 +127,7 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+         if (!watcher.wasDeleted()) {
+ 
+             if (needsErrorData) {
+-                QUrl url = QUrl(parent->url);
++                QUrl url = parent->url();
+                 if (url.isEmpty()) url = QUrl(QLatin1String("<Unknown File>"));
+ 
+                 delayedError()->error.setUrl(url);
+@@ -155,7 +156,7 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+ QString QV8Bindings::Binding::expressionIdentifier(QDeclarativeJavaScriptExpression *e)
+ {
+     Binding *This = static_cast<Binding *>(e);
+-    return This->parent->url.toString() + QLatin1String(":") +
++    return This->parent->urlString() + QLatin1String(":") +
+            QString::number(This->instruction->line);
+ }
+ 
+@@ -174,14 +175,16 @@ void QV8Bindings::Binding::destroy()
+     parent->release();
+ }
+ 
+-QV8Bindings::QV8Bindings(int index, int line,
+-                         QDeclarativeCompiledData *compiled, 
++QV8Bindings::QV8Bindings(QDeclarativeCompiledData::V8Program *program,
++                         int line,
+                          QDeclarativeContextData *context)
+-: bindingsCount(0), bindings(0)
++: program(program), bindings(0), refCount(1)
+ {
++    program->cdata->addref();
++
+     QV8Engine *engine = QDeclarativeEnginePrivate::getV8Engine(context->engine);
+ 
+-    if (compiled->v8bindings[index].IsEmpty()) {
++    if (program->bindings.IsEmpty()) {
+         v8::HandleScope handle_scope;
+         v8::Context::Scope scope(engine->context());
+ 
+@@ -189,8 +192,9 @@ QV8Bindings::QV8Bindings(int index, int line,
+         bool compileFailed = false;
+         {
+             v8::TryCatch try_catch;
+-            const QByteArray &program = compiled->programs.at(index);
+-            script = engine->qmlModeCompile(program.constData(), program.length(), compiled->name, line);
++            const QByteArray &source = program->program;
++            script = engine->qmlModeCompile(source.constData(), source.length(),
++                                            program->cdata->name, line);
+             if (try_catch.HasCaught()) {
+                 // The binding was not compiled.  There are some exceptional cases which the
+                 // expression rewriter does not rewrite properly (e.g., \r-terminated lines
+@@ -203,39 +207,32 @@ QV8Bindings::QV8Bindings(int index, int line,
+                 if (!message.IsEmpty())
+                     QDeclarativeExpressionPrivate::exceptionToError(message, error);
+                 QDeclarativeEnginePrivate::get(engine->engine())->warning(error);
+-                compiled->v8bindings[index] = qPersistentNew(v8::Array::New());
++                program->bindings = qPersistentNew(v8::Array::New());
+             }
+         }
+ 
+         if (!compileFailed) {
+             v8::Local<v8::Value> result = script->Run(engine->contextWrapper()->sharedContext());
+             if (result->IsArray()) {
+-                compiled->v8bindings[index] = qPersistentNew(v8::Local<v8::Array>::Cast(result));
+-                compiled->programs[index].clear(); // We don't need the source anymore
++                program->bindings = qPersistentNew(v8::Local<v8::Array>::Cast(result));
++                program->program.clear(); // We don't need the source anymore
+             }
+         }
+     }
+ 
+-    url = compiled->url;
+-    functions = qPersistentNew(compiled->v8bindings[index]);
+-    bindingsCount = functions->Length();
+-    if (bindingsCount)
+-        bindings = new QV8Bindings::Binding[bindingsCount];
+-
+-    cdata = compiled;
+-    cdata->addref();
++    int bindingsCount = functions()->Length();
++    if (bindingsCount) bindings = new QV8Bindings::Binding[bindingsCount];
+ 
+     setContext(context);
+ }
+ 
+ QV8Bindings::~QV8Bindings()
+ {
+-    qPersistentDispose(functions);
+-    cdata->release();
++    program->cdata->release();
++    program = 0;
+ 
+     delete [] bindings;
+     bindings = 0;
+-    bindingsCount = 0;
+ }
+ 
+ QDeclarativeAbstractBinding *
+@@ -260,4 +257,20 @@ QV8Bindings::configBinding(QObject *target, QObject *scope,
+     return rv;
+ }
+ 
++const QUrl &QV8Bindings::url() const
++{
++    return program->cdata->url;
++}
++
++const QString &QV8Bindings::urlString() const
++{
++    return program->cdata->name;
++}
++
++v8::Persistent<v8::Array> &QV8Bindings::functions() const
++{
++    return program->bindings;
++}
++
++
+ QT_END_NAMESPACE
+diff --git a/src/declarative/qml/v8/qv8bindings_p.h b/src/declarative/qml/v8/qv8bindings_p.h
+index dd410dc..b1bb169 100644
+--- a/src/declarative/qml/v8/qv8bindings_p.h
++++ b/src/declarative/qml/v8/qv8bindings_p.h
+@@ -56,6 +56,7 @@
+ #include <private/qdeclarativepropertycache_p.h>
+ #include <private/qdeclarativeinstruction_p.h>
+ #include <private/qdeclarativeexpression_p.h>
++#include <private/qdeclarativecompiler_p.h>
+ #include <private/qdeclarativebinding_p.h>
+ #include <private/qflagpointer_p.h>
+ 
+@@ -66,12 +67,11 @@ QT_BEGIN_NAMESPACE
+ class QDeclarativeCompiledData;
+ 
+ class QV8BindingsPrivate;
+-class QV8Bindings : public QDeclarativeAbstractExpression, 
+-                    public QDeclarativeRefCount
++class QV8Bindings : public QDeclarativeAbstractExpression
+ {
+ public:
+-    QV8Bindings(int index, int line,
+-                QDeclarativeCompiledData *compiled,
++    QV8Bindings(QDeclarativeCompiledData::V8Program *,
++                int line,
+                 QDeclarativeContextData *context);
+     virtual ~QV8Bindings();
+ 
+@@ -111,16 +111,32 @@ public:
+         inline void setUpdatingFlag(bool v) { instruction.setFlag2Value(v); }
+     };
+ 
++    inline void addref();
++    inline void release();
++
+ private:
+     Q_DISABLE_COPY(QV8Bindings)
+ 
+-    QUrl url;
+-    int bindingsCount;
++    const QUrl &url() const;
++    const QString &urlString() const;
++    v8::Persistent<v8::Array> &functions() const;
++
++    QDeclarativeCompiledData::V8Program *program;
+     Binding *bindings;
+-    v8::Persistent<v8::Array> functions;
+-    QDeclarativeCompiledData *cdata;
++    int refCount;
+ };
+ 
++void QV8Bindings::addref()
++{
++    ++refCount;
++}
++
++void QV8Bindings::release()
++{
++    if (0 == --refCount)
++        delete this;
++}
++
+ QT_END_NAMESPACE
+ 
+ QT_END_HEADER

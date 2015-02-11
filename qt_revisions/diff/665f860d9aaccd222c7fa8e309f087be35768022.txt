@@ -1,0 +1,308 @@
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 93c7820..89e831c 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -820,6 +820,29 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         registers[instr->load.reg].setQObject(context->contextObject);
+     QML_V4_END_INSTR(LoadRoot, load)
+ 
++    QML_V4_BEGIN_INSTR(LoadModuleObject, load)
++    {
++        Register &reg = registers[instr->load.reg];
++
++        const QString *name = reg.getstringptr();
++        QQmlTypeNameCache::Result r = context->imports->query(*name);
++        reg.cleanupString();
++
++        if (r.isValid() && r.importNamespace) {
++            QQmlMetaType::ModuleApiInstance *moduleApi = context->imports->moduleApi(r.importNamespace);
++            if (moduleApi) {
++                if (moduleApi->qobjectCallback) {
++                    moduleApi->qobjectApi = moduleApi->qobjectCallback(context->engine, context->engine);
++                    moduleApi->qobjectCallback = 0;
++                    moduleApi->scriptCallback = 0;
++                }
++                if (moduleApi->qobjectApi)
++                    reg.setQObject(moduleApi->qobjectApi);
++            }
++        }
++    }
++    QML_V4_END_INSTR(LoadModuleObject, load)
++
+     QML_V4_BEGIN_INSTR(LoadAttached, attached)
+     {
+         const Register &input = registers[instr->attached.reg];
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index 620d260..b22708d 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -318,6 +318,22 @@ void QV4CompilerPrivate::visitName(IR::Name *e)
+         gen(attached);
+     } break;
+ 
++    case IR::Name::ModuleObject: {
++        /*
++          Existing module object lookup methods include:
++              1. string -> module object (search via importCache->query(name))
++              2. QQmlMetaType::ModuleApi -> module object (via QQmlEnginePrivate::moduleApiInstance() cache)
++          We currently use 1, which is not ideal for performance
++        */
++        _subscribeName << *e->id;
++
++        registerLiteralString(currentReg, e->id);
++
++        Instr::LoadModuleObject module;
++        module.reg = currentReg;
++        gen(module);
++    } break;
++
+     case IR::Name::Property: {
+         _subscribeName << *e->id;
+ 
+diff --git a/src/qml/qml/v4/qv4instruction.cpp b/src/qml/qml/v4/qv4instruction.cpp
+index a392c93..e260147 100644
+--- a/src/qml/qml/v4/qv4instruction.cpp
++++ b/src/qml/qml/v4/qv4instruction.cpp
+@@ -114,6 +114,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::LoadRoot:
+         INSTR_DUMP << "\t" << "LoadRoot" << "\t\t" << "-> Output_Reg(" << i->load.reg << ")";
+         break;
++    case V4Instr::LoadModuleObject:
++        INSTR_DUMP << "\t" << "LoadModuleObject" << "\t\t" << ") -> Output_Reg(" << i->load.reg << ")";
++        break;
+     case V4Instr::LoadAttached:
+         INSTR_DUMP << "\t" << "LoadAttached" << "\t\t" << "Object_Reg(" << i->attached.reg << ") Attached_Index(" << i->attached.id << ") -> Output_Reg(" << i->attached.output << ")";
+         break;
+diff --git a/src/qml/qml/v4/qv4instruction_p.h b/src/qml/qml/v4/qv4instruction_p.h
+index 9727c23..d330518 100644
+--- a/src/qml/qml/v4/qv4instruction_p.h
++++ b/src/qml/qml/v4/qv4instruction_p.h
+@@ -73,6 +73,7 @@ QT_BEGIN_NAMESPACE
+     F(LoadId, load) \
+     F(LoadScope, load) \
+     F(LoadRoot, load) \
++    F(LoadModuleObject, load) \
+     F(LoadAttached, attached) \
+     F(UnaryNot, unaryop) \
+     F(UnaryMinusReal, unaryop) \
+diff --git a/src/qml/qml/v4/qv4ir.cpp b/src/qml/qml/v4/qv4ir.cpp
+index 54679c3..34245f5 100644
+--- a/src/qml/qml/v4/qv4ir.cpp
++++ b/src/qml/qml/v4/qv4ir.cpp
+@@ -543,6 +543,17 @@ Name *BasicBlock::ATTACH_TYPE(const QString &id, const QQmlType *attachType, Nam
+     return name;
+ }
+ 
++Name *BasicBlock::MODULE_OBJECT(const QString &id, const QMetaObject *meta, Name::Storage storage,
++                                quint32 line, quint32 column)
++{
++    Name *name = function->pool->New<Name>();
++    name->init(/*base = */ 0, IR::ObjectType,
++               function->newString(id),
++               Name::ModuleObject, line, column);
++    name->meta = meta;
++    name->storage = storage;
++    return name;
++}
+ 
+ Expr *BasicBlock::UNOP(AluOp op, Expr *expr) 
+ { 
+@@ -675,6 +686,8 @@ static const char *symbolname(Name::Symbol s)
+         return "IdObject";
+     case Name::AttachType:
+         return "AttachType";
++    case Name::ModuleObject:
++        return "ModuleObject";
+     case Name::Object:
+         return "Object";
+     case Name::Property:
+diff --git a/src/qml/qml/v4/qv4ir_p.h b/src/qml/qml/v4/qv4ir_p.h
+index 79f50cd..4e9f9fa 100644
+--- a/src/qml/qml/v4/qv4ir_p.h
++++ b/src/qml/qml/v4/qv4ir_p.h
+@@ -252,6 +252,7 @@ struct Name: Expr {
+         Unbound,
+         IdObject,      // This is a load of a id object.  Storage will always be IdStorage
+         AttachType,    // This is a load of an attached object 
++        ModuleObject,  // This is a load of a module object
+         Object,        // XXX what is this for?
+         Property,      // This is a load of a regular property
+         Slot           // XXX what is this for?
+@@ -538,6 +539,7 @@ struct BasicBlock {
+     Name *SYMBOL(Name *base, Type type, const QString &id, const QMetaObject *meta, QQmlPropertyData *property, Name::Storage storage, quint32 line, quint32 column);
+     Name *ID_OBJECT(const QString &id, const QQmlScript::Object *object, quint32 line, quint32 column);
+     Name *ATTACH_TYPE(const QString &id, const QQmlType *attachType, Name::Storage storage, quint32 line, quint32 column);
++    Name *MODULE_OBJECT(const QString &id, const QMetaObject *meta, Name::Storage storage, quint32 line, quint32 column);
+ 
+     Expr *UNOP(AluOp op, Expr *expr);
+     Expr *BINOP(AluOp op, Expr *left, Expr *right);
+diff --git a/src/qml/qml/v4/qv4irbuilder.cpp b/src/qml/qml/v4/qv4irbuilder.cpp
+index 06f4024..8f74224 100644
+--- a/src/qml/qml/v4/qv4irbuilder.cpp
++++ b/src/qml/qml/v4/qv4irbuilder.cpp
+@@ -428,6 +428,17 @@ bool QV4IRBuilder::visit(AST::IdentifierExpression *ast)
+         if (r.isValid()) {
+             if (r.type) {
+                 _expr.code = _block->ATTACH_TYPE(name, r.type, IR::Name::ScopeStorage, line, column);
++            } else if (r.importNamespace) {
++                QQmlMetaType::ModuleApiInstance *moduleApi = m_expression->importCache->moduleApi(r.importNamespace);
++                if (moduleApi) {
++                    if (moduleApi->qobjectCallback) {
++                        moduleApi->qobjectApi = moduleApi->qobjectCallback(QQmlEnginePrivate::get(m_engine), QQmlEnginePrivate::get(m_engine));
++                        moduleApi->qobjectCallback = 0;
++                        moduleApi->scriptCallback = 0;
++                    }
++                    if (moduleApi->qobjectApi)
++                        _expr.code = _block->MODULE_OBJECT(name, moduleApi->qobjectApi->metaObject(), IR::Name::MemberStorage, line, column);
++                }
+             }
+             // We don't support anything else
+         } else {
+@@ -603,6 +614,46 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                 }
+                 break;
+ 
++            case IR::Name::ModuleObject: {
++                if (name.at(0).isUpper()) {
++                    QByteArray utf8Name = name.toUtf8();
++                    const char *enumName = utf8Name.constData();
++
++                    const QMetaObject *meta = baseName->meta;
++                    bool found = false;
++                    for (int ii = 0; !found && ii < meta->enumeratorCount(); ++ii) {
++                        QMetaEnum e = meta->enumerator(ii);
++                        for (int jj = 0; !found && jj < e.keyCount(); ++jj) {
++                            if (0 == strcmp(e.key(jj), enumName)) {
++                                found = true;
++                                _expr.code = _block->CONST(IR::IntType, e.value(jj));
++                            }
++                        }
++                    }
++                    if (!found && qmlVerboseCompiler())
++                        qWarning() << "*** unresolved enum:"
++                                   << (*baseName->id + QLatin1String(".") + ast->name.toString());
++                } else {
++                    QQmlPropertyCache *cache = m_engine->cache(baseName->meta);
++                    if (!cache) return false;
++                    QQmlPropertyData *data = cache->property(name);
++
++                    if (!data || data->isFunction())
++                        return false; // Don't support methods (or non-existing properties ;)
++
++                    if (!data->isFinal()) {
++                        if (qmlVerboseCompiler())
++                            qWarning() << "*** non-final attached property:"
++                                       << (*baseName->id + QLatin1String(".") + ast->name.toString());
++                        return false; // We don't know enough about this property
++                    }
++
++                    IR::Type irType = irTypeFromVariantType(data->propType, m_engine, baseName->meta);
++                    _expr.code = _block->SYMBOL(baseName, irType, name, baseName->meta, data, line, column);
++                }
++            }
++            break;
++
+             case IR::Name::IdObject: {
+                 const QQmlScript::Object *idObject = baseName->idObject;
+                 QQmlPropertyCache *cache = 
+diff --git a/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiWriting.qml b/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiWriting.qml
+index be647ca..e4a68d1 100644
+--- a/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiWriting.qml
++++ b/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiWriting.qml
+@@ -6,6 +6,7 @@ QtObject {
+     property int secondProperty: 2
+     property int readOnlyProperty: QtTest.qobjectTestProperty
+     property int writableProperty: QtTest.qobjectTestWritableProperty
++    property int writableFinalProperty: QtTest.qobjectTestWritableFinalProperty
+ 
+     onFirstPropertyChanged: {
+         // In this case, we want to attempt to set the module API property.
+@@ -16,11 +17,14 @@ QtObject {
+     }
+ 
+     onSecondPropertyChanged: {
+-        // In this case, we want to attempt to set the module API property.
+-        // This should succeed, as the module API property is writable.
++        // In this case, we want to attempt to set the module API properties.
++        // This should succeed, as the module API properties are writable.
+         if (secondProperty != QtTest.qobjectTestWritableProperty) {
+             QtTest.qobjectTestWritableProperty = secondProperty; // should succeed.
+         }
++        if (secondProperty != QtTest.qobjectTestWritableFinalProperty) {
++            QtTest.qobjectTestWritableFinalProperty = secondProperty; // should succeed.
++        }
+     }
+ }
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.cpp b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+index 78119cb..64e91fb 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.cpp
++++ b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+@@ -140,6 +140,7 @@ static QObject *qobject_api(QQmlEngine *engine, QJSEngine *scriptEngine)
+     testQObjectApi *o = new testQObjectApi();
+     o->setQObjectTestProperty(20);
+     o->setQObjectTestWritableProperty(50);
++    o->setQObjectTestWritableFinalProperty(10);
+     return o;
+ }
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 1d68e8a..65b84d6 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -978,10 +978,11 @@ class testQObjectApi : public QObject
+     Q_ENUMS(MyEnum)
+     Q_PROPERTY (int qobjectTestProperty READ qobjectTestProperty NOTIFY qobjectTestPropertyChanged)
+     Q_PROPERTY (int qobjectTestWritableProperty READ qobjectTestWritableProperty WRITE setQObjectTestWritableProperty NOTIFY qobjectTestWritablePropertyChanged)
++    Q_PROPERTY (int qobjectTestWritableFinalProperty READ qobjectTestWritableFinalProperty WRITE setQObjectTestWritableFinalProperty NOTIFY qobjectTestWritableFinalPropertyChanged FINAL)
+ 
+ public:
+     testQObjectApi(QObject* parent = 0)
+-        : QObject(parent), m_testProperty(0), m_testWritableProperty(0), m_methodCallCount(0)
++        : QObject(parent), m_testProperty(0), m_testWritableProperty(0), m_testWritableFinalProperty(0), m_methodCallCount(0)
+     {
+     }
+ 
+@@ -997,13 +998,18 @@ public:
+     int qobjectTestWritableProperty() const { return m_testWritableProperty; }
+     void setQObjectTestWritableProperty(int tp) { m_testWritableProperty = tp; emit qobjectTestWritablePropertyChanged(tp); }
+ 
++    int qobjectTestWritableFinalProperty() const { return m_testWritableFinalProperty; }
++    void setQObjectTestWritableFinalProperty(int tp) { m_testWritableFinalProperty = tp; emit qobjectTestWritableFinalPropertyChanged(); }
++
+ signals:
+     void qobjectTestPropertyChanged(int testProperty);
+     void qobjectTestWritablePropertyChanged(int testWritableProperty);
++    void qobjectTestWritableFinalPropertyChanged();
+ 
+ private:
+     int m_testProperty;
+     int m_testWritableProperty;
++    int m_testWritableFinalProperty;
+     int m_methodCallCount;
+ };
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 5770dc4..0631df1 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -3089,13 +3089,13 @@ void tst_qqmlecmascript::moduleApi_data()
+     QTest::newRow("qobject, writing + readonly constraints")
+             << testFileUrl("moduleapi/qobjectModuleApiWriting.qml")
+             << QString()
+-            << (QStringList() << QString(QLatin1String("file://") + testFileUrl("moduleapi/qobjectModuleApiWriting.qml").toLocalFile() + QLatin1String(":14: Error: Cannot assign to read-only property \"qobjectTestProperty\"")))
+-            << (QStringList() << "readOnlyProperty" << "writableProperty")
+-            << (QVariantList() << 20 << 50)
+-            << (QStringList() << "firstProperty" << "writableProperty")
++            << (QStringList() << QString(QLatin1String("file://") + testFileUrl("moduleapi/qobjectModuleApiWriting.qml").toLocalFile() + QLatin1String(":15: Error: Cannot assign to read-only property \"qobjectTestProperty\"")))
++            << (QStringList() << "readOnlyProperty" << "writableProperty" << "writableFinalProperty")
++            << (QVariantList() << 20 << 50 << 10)
++            << (QStringList() << "firstProperty" << "secondProperty")
+             << (QVariantList() << 30 << 30)
+-            << (QStringList() << "readOnlyProperty" << "writableProperty")
+-            << (QVariantList() << 20 << 30);
++            << (QStringList() << "readOnlyProperty" << "writableProperty" << "writableFinalProperty")
++            << (QVariantList() << 20 << 30 << 30);
+ 
+     QTest::newRow("script, writing + readonly constraints")
+             << testFileUrl("moduleapi/scriptModuleApiWriting.qml")

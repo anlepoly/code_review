@@ -1,0 +1,167 @@
+diff --git a/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp b/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
+index c4e6f2b..15391ff 100644
+--- a/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
++++ b/src/plugins/platforms/qnx/qqnxbpseventfilter.cpp
+@@ -40,6 +40,7 @@
+ ****************************************************************************/
+ 
+ #include "qqnxbpseventfilter.h"
++#include "qqnxnavigatoreventhandler.h"
+ #include "qqnxscreen.h"
+ #include "qqnxscreeneventhandler.h"
+ 
+@@ -47,14 +48,17 @@
+ #include <QDebug>
+ 
+ #include <bps/event.h>
++#include <bps/navigator.h>
+ #include <bps/screen.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ static QQnxBpsEventFilter *s_instance = 0;
+ 
+-QQnxBpsEventFilter::QQnxBpsEventFilter(QQnxScreenEventHandler *screenEventHandler, QObject *parent)
++QQnxBpsEventFilter::QQnxBpsEventFilter(QQnxNavigatorEventHandler *navigatorEventHandler,
++                                       QQnxScreenEventHandler *screenEventHandler, QObject *parent)
+     : QObject(parent)
++    , m_navigatorEventHandler(navigatorEventHandler)
+     , m_screenEventHandler(screenEventHandler)
+ {
+     Q_ASSERT(s_instance == 0);
+@@ -75,6 +79,9 @@ void QQnxBpsEventFilter::installOnEventDispatcher(QAbstractEventDispatcher *disp
+     qDebug() << Q_FUNC_INFO << "dispatcher=" << dispatcher;
+ #endif
+ 
++    if (navigator_request_events(0) != BPS_SUCCESS)
++        qWarning("QQNX: failed to register for navigator events");
++
+     QAbstractEventDispatcher::EventFilter previousEventFilter = dispatcher->setEventFilter(dispatcherEventFilter);
+ 
+     // the QPA plugin creates the event dispatcher so we are the first event
+@@ -122,7 +129,70 @@ bool QQnxBpsEventFilter::bpsEventFilter(bps_event_t *event)
+         return m_screenEventHandler->handleEvent(screenEvent);
+     }
+ 
++    if (eventDomain == navigator_get_domain())
++        return handleNavigatorEvent(event);
++
+     return false;
+ }
+ 
++bool QQnxBpsEventFilter::handleNavigatorEvent(bps_event_t *event)
++{
++    switch (bps_event_get_code(event)) {
++    case NAVIGATOR_ORIENTATION_CHECK: {
++        const int angle = navigator_event_get_orientation_angle(event);
++
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Navigator ORIENTATION CHECK event. angle=" << angle;
++        #endif
++
++        const bool result = m_navigatorEventHandler->handleOrientationCheck(angle);
++
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Navigator ORIENTATION CHECK event. result=" << result;
++        #endif
++
++        // reply to navigator whether orientation is acceptable
++        navigator_orientation_check_response(event, result);
++        break;
++    }
++
++    case NAVIGATOR_ORIENTATION: {
++        const int angle = navigator_event_get_orientation_angle(event);
++
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Navigator ORIENTATION event. angle=" << angle;
++        #endif
++
++        m_navigatorEventHandler->handleOrientationChange(angle);
++
++        navigator_done_orientation(event);
++        break;
++    }
++
++    case NAVIGATOR_SWIPE_DOWN:
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Navigator SWIPE DOWN event";
++        #endif
++
++        m_navigatorEventHandler->handleSwipeDown();
++        break;
++
++    case NAVIGATOR_EXIT:
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Navigator EXIT event";
++        #endif
++
++        m_navigatorEventHandler->handleExit();
++        break;
++
++    default:
++        #if defined(QQNXBPSEVENTFILTER_DEBUG)
++        qDebug() << "QQNX: Unhandled navigator event. code=" << bps_event_get_code(event);
++        #endif
++        return false;
++    }
++
++    return true;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxbpseventfilter.h b/src/plugins/platforms/qnx/qqnxbpseventfilter.h
+index 1c08f13..5965f2c 100644
+--- a/src/plugins/platforms/qnx/qqnxbpseventfilter.h
++++ b/src/plugins/platforms/qnx/qqnxbpseventfilter.h
+@@ -49,6 +49,7 @@ struct bps_event_t;
+ QT_BEGIN_NAMESPACE
+ 
+ class QAbstractEventDispatcher;
++class QQnxNavigatorEventHandler;
+ class QQnxScreen;
+ class QQnxScreenEventHandler;
+ 
+@@ -56,7 +57,8 @@ class QQnxBpsEventFilter : public QObject
+ {
+     Q_OBJECT
+ public:
+-    explicit QQnxBpsEventFilter(QQnxScreenEventHandler *screenEventHandler, QObject *parent = 0);
++    QQnxBpsEventFilter(QQnxNavigatorEventHandler *navigatorEventHandler,
++                       QQnxScreenEventHandler *screenEventHandler, QObject *parent = 0);
+     ~QQnxBpsEventFilter();
+ 
+     void installOnEventDispatcher(QAbstractEventDispatcher *dispatcher);
+@@ -68,7 +70,10 @@ private:
+     static bool dispatcherEventFilter(void *message);
+     bool bpsEventFilter(bps_event_t *event);
+ 
++    bool handleNavigatorEvent(bps_event_t *event);
++
+ private:
++    QQnxNavigatorEventHandler *m_navigatorEventHandler;
+     QQnxScreenEventHandler *m_screenEventHandler;
+ };
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.cpp b/src/plugins/platforms/qnx/qqnxintegration.cpp
+index 54aa311..b320862 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.cpp
++++ b/src/plugins/platforms/qnx/qqnxintegration.cpp
+@@ -134,7 +134,8 @@ QQnxIntegration::QQnxIntegration()
+         qFatal("QQnx: failed to connect to composition manager, errno=%d", errno);
+     }
+ 
+-#if defined(QQNX_PPS)
++    // Not on BlackBerry, it has specialised event dispatcher which also handles navigator events
++#if !defined(Q_OS_BLACKBERRY) && defined(QQNX_PPS)
+     // Create/start navigator event notifier
+     m_navigatorEventNotifier = new QQnxNavigatorEventNotifier(m_navigatorEventHandler);
+ 
+@@ -185,7 +186,7 @@ QQnxIntegration::QQnxIntegration()
+         m_services = new QQnxServices(m_navigator);
+ 
+ #if defined(Q_OS_BLACKBERRY)
+-    m_bpsEventFilter = new QQnxBpsEventFilter(m_screenEventHandler);
++    m_bpsEventFilter = new QQnxBpsEventFilter(m_navigatorEventHandler, m_screenEventHandler);
+     Q_FOREACH (QQnxScreen *screen, m_screens)
+         m_bpsEventFilter->registerForScreenEvents(screen);

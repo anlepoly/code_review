@@ -1,0 +1,806 @@
+diff --git a/src/corelib/io/io.pri b/src/corelib/io/io.pri
+index 521039d..4eb8c76 100644
+--- a/src/corelib/io/io.pri
++++ b/src/corelib/io/io.pri
+@@ -101,13 +101,8 @@ win32 {
+         }
+ 
+         linux-* {
+-            SOURCES += \
+-                    io/qfilesystemwatcher_inotify.cpp \
+-                    io/qfilesystemwatcher_dnotify.cpp
+-
+-            HEADERS += \
+-                    io/qfilesystemwatcher_inotify_p.h \
+-                    io/qfilesystemwatcher_dnotify_p.h
++            SOURCES += io/qfilesystemwatcher_inotify.cpp
++            HEADERS += io/qfilesystemwatcher_inotify_p.h
+         }
+ 
+         !nacl {
+diff --git a/src/corelib/io/qfilesystemwatcher.cpp b/src/corelib/io/qfilesystemwatcher.cpp
+index 302b6e5..efa9029 100644
+--- a/src/corelib/io/qfilesystemwatcher.cpp
++++ b/src/corelib/io/qfilesystemwatcher.cpp
+@@ -56,7 +56,6 @@
+ #  include "qfilesystemwatcher_win_p.h"
+ #elif defined(Q_OS_LINUX)
+ #  include "qfilesystemwatcher_inotify_p.h"
+-#  include "qfilesystemwatcher_dnotify_p.h"
+ #elif defined(Q_OS_FREEBSD) || defined(Q_OS_MAC)
+ #  if (defined Q_OS_MAC) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
+ #  include "qfilesystemwatcher_fsevents_p.h"
+@@ -247,10 +246,9 @@ QFileSystemWatcherEngine *QFileSystemWatcherPrivate::createNativeEngine()
+ #if defined(Q_OS_WIN)
+     return new QWindowsFileSystemWatcherEngine;
+ #elif defined(Q_OS_LINUX)
+-    QFileSystemWatcherEngine *eng = QInotifyFileSystemWatcherEngine::create();
+-    if(!eng)
+-        eng = QDnotifyFileSystemWatcherEngine::create();
+-    return eng;
++    // there is a chance that inotify may fail on Linux pre-2.6.13 (August
++    // 2005), so we can't just new inotify directly.
++    return QInotifyFileSystemWatcherEngine::create();
+ #elif defined(Q_OS_FREEBSD) || defined(Q_OS_MAC)
+ #  if 0 && defined(Q_OS_MAC) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
+     if (QSysInfo::MacintoshVersion >= QSysInfo::MV_10_5)
+@@ -264,7 +262,7 @@ QFileSystemWatcherEngine *QFileSystemWatcherPrivate::createNativeEngine()
+ }
+ 
+ QFileSystemWatcherPrivate::QFileSystemWatcherPrivate()
+-    : native(0), poller(0), forced(0)
++    : native(0), poller(0)
+ {
+ }
+ 
+@@ -284,35 +282,6 @@ void QFileSystemWatcherPrivate::init()
+     }
+ }
+ 
+-void QFileSystemWatcherPrivate::initForcedEngine(const QString &forceName)
+-{
+-    if(forced)
+-        return;
+-
+-    Q_Q(QFileSystemWatcher);
+-
+-#if defined(Q_OS_LINUX)
+-    if(forceName == QLatin1String("inotify")) {
+-        forced = QInotifyFileSystemWatcherEngine::create();
+-    } else if(forceName == QLatin1String("dnotify")) {
+-        forced = QDnotifyFileSystemWatcherEngine::create();
+-    }
+-#else
+-    Q_UNUSED(forceName);
+-#endif
+-
+-    if(forced) {
+-        QObject::connect(forced,
+-                         SIGNAL(fileChanged(QString,bool)),
+-                         q,
+-                         SLOT(_q_fileChanged(QString,bool)));
+-        QObject::connect(forced,
+-                         SIGNAL(directoryChanged(QString,bool)),
+-                         q,
+-                         SLOT(_q_directoryChanged(QString,bool)));
+-    }
+-}
+-
+ void QFileSystemWatcherPrivate::initPollerEngine()
+ {
+     if(poller)
+@@ -444,12 +413,6 @@ QFileSystemWatcher::~QFileSystemWatcher()
+         delete d->poller;
+         d->poller = 0;
+     }
+-    if (d->forced) {
+-        d->forced->stop();
+-        d->forced->wait();
+-        delete d->forced;
+-        d->forced = 0;
+-    }
+ }
+ 
+ /*!
+@@ -526,10 +489,6 @@ void QFileSystemWatcher::addPaths(const QStringList &paths)
+         } else if(forceName == QLatin1String("native")) {
+             qDebug() << "QFileSystemWatcher: skipping polling engine, using only native engine";
+             engine = d->native;
+-        } else {
+-            qDebug() << "QFileSystemWatcher: skipping polling and native engine, using only explicit" << forceName << "engine";
+-            d_func()->initForcedEngine(forceName);
+-            engine = d->forced;
+         }
+     }
+ 
+@@ -572,8 +531,6 @@ void QFileSystemWatcher::removePaths(const QStringList &paths)
+         p = d->native->removePaths(p, &d->files, &d->directories);
+     if (d->poller)
+         p = d->poller->removePaths(p, &d->files, &d->directories);
+-    if (d->forced)
+-        p = d->forced->removePaths(p, &d->files, &d->directories);
+ }
+ 
+ /*!
+diff --git a/src/corelib/io/qfilesystemwatcher_dnotify.cpp b/src/corelib/io/qfilesystemwatcher_dnotify.cpp
+deleted file mode 100644
+index 46c3b46..0000000
+--- a/src/corelib/io/qfilesystemwatcher_dnotify.cpp
++++ /dev/null
+@@ -1,461 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2011 Nokia Corporation and/or its subsidiary(-ies).
+-** All rights reserved.
+-** Contact: Nokia Corporation (qt-info@nokia.com)
+-**
+-** This file is part of the QtCore module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "qplatformdefs.h"
+-#include "qfilesystemwatcher.h"
+-#include "qfilesystemwatcher_dnotify_p.h"
+-
+-#ifndef QT_NO_FILESYSTEMWATCHER
+-
+-#include <qsocketnotifier.h>
+-#include <qcoreapplication.h>
+-#include <qfileinfo.h>
+-#include <qtimer.h>
+-#include <qwaitcondition.h>
+-#include <qmutex.h>
+-#include <dirent.h>
+-#include <qdir.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <signal.h>
+-#include <unistd.h>
+-#include <fcntl.h>
+-#include <time.h>
+-
+-#include "private/qcore_unix_p.h"
+-
+-#ifdef QT_LINUXBASE
+-
+-/* LSB doesn't standardize these */
+-#define F_NOTIFY       1026
+-#define DN_ACCESS      0x00000001
+-#define DN_MODIFY      0x00000002
+-#define DN_CREATE      0x00000004
+-#define DN_DELETE      0x00000008
+-#define DN_RENAME      0x00000010
+-#define DN_ATTRIB      0x00000020
+-#define DN_MULTISHOT   0x80000000
+-
+-#endif
+-
+-QT_BEGIN_NAMESPACE
+-
+-static int qfswd_fileChanged_pipe[2];
+-static void (*qfswd_old_sigio_handler)(int) = 0;
+-static void (*qfswd_old_sigio_action)(int, siginfo_t *, void *) = 0;
+-static void qfswd_sigio_monitor(int signum, siginfo_t *i, void *v)
+-{
+-    qt_safe_write(qfswd_fileChanged_pipe[1], reinterpret_cast<char*>(&i->si_fd), sizeof(int));
+-
+-    if (qfswd_old_sigio_handler && qfswd_old_sigio_handler != SIG_IGN)
+-        qfswd_old_sigio_handler(signum);
+-    if (qfswd_old_sigio_action)
+-        qfswd_old_sigio_action(signum, i, v);
+-}
+-
+-class QDnotifySignalThread : public QThread
+-{
+-Q_OBJECT
+-public:
+-    QDnotifySignalThread();
+-    virtual ~QDnotifySignalThread();
+-
+-    void startNotify();
+-
+-    virtual void run();
+-
+-signals:
+-    void fdChanged(int);
+-
+-protected:
+-    virtual bool event(QEvent *);
+-
+-private slots:
+-    void readFromDnotify();
+-
+-private:
+-    QMutex mutex;
+-    QWaitCondition wait;
+-    bool isExecing;
+-};
+-
+-Q_GLOBAL_STATIC(QDnotifySignalThread, dnotifySignal)
+-
+-QDnotifySignalThread::QDnotifySignalThread()
+-: isExecing(false)
+-{
+-    moveToThread(this);
+-
+-    qt_safe_pipe(qfswd_fileChanged_pipe, O_NONBLOCK);
+-
+-    struct sigaction oldAction;
+-    struct sigaction action;
+-    memset(&action, 0, sizeof(action));
+-    action.sa_sigaction = qfswd_sigio_monitor;
+-    action.sa_flags = SA_SIGINFO;
+-    ::sigaction(SIGIO, &action, &oldAction);
+-    if (!(oldAction.sa_flags & SA_SIGINFO))
+-        qfswd_old_sigio_handler = oldAction.sa_handler;
+-    else
+-        qfswd_old_sigio_action = oldAction.sa_sigaction;
+-}
+-
+-QDnotifySignalThread::~QDnotifySignalThread()
+-{
+-    if(isRunning()) {
+-        quit();
+-        QThread::wait();
+-    }
+-}
+-
+-bool QDnotifySignalThread::event(QEvent *e)
+-{
+-    if(e->type() == QEvent::User) {
+-        QMutexLocker locker(&mutex);
+-        isExecing = true;
+-        wait.wakeAll();
+-        return true;
+-    } else {
+-        return QThread::event(e);
+-    }
+-}
+-
+-void QDnotifySignalThread::startNotify()
+-{
+-    // Note: All this fancy waiting for the thread to enter its event
+-    // loop is to avoid nasty messages at app shutdown when the
+-    // QDnotifySignalThread singleton is deleted
+-    start();
+-    mutex.lock();
+-    while(!isExecing)
+-        wait.wait(&mutex);
+-    mutex.unlock();
+-}
+-
+-void QDnotifySignalThread::run()
+-{
+-    QSocketNotifier sn(qfswd_fileChanged_pipe[0], QSocketNotifier::Read, this);
+-    connect(&sn, SIGNAL(activated(int)), SLOT(readFromDnotify()));
+-
+-    QCoreApplication::instance()->postEvent(this, new QEvent(QEvent::User));
+-    (void) exec();
+-}
+-
+-void QDnotifySignalThread::readFromDnotify()
+-{
+-    int fd;
+-    int readrv = qt_safe_read(qfswd_fileChanged_pipe[0], reinterpret_cast<char*>(&fd), sizeof(int));
+-    // Only expect EAGAIN or EINTR.  Other errors are assumed to be impossible.
+-    if(readrv != -1) {
+-        Q_ASSERT(readrv == sizeof(int));
+-        Q_UNUSED(readrv);
+-
+-        if(0 == fd)
+-            quit();
+-        else
+-            emit fdChanged(fd);
+-    }
+-}
+-
+-QDnotifyFileSystemWatcherEngine::QDnotifyFileSystemWatcherEngine()
+-{
+-    QObject::connect(dnotifySignal(), SIGNAL(fdChanged(int)),
+-                     this, SLOT(refresh(int)), Qt::DirectConnection);
+-}
+-
+-QDnotifyFileSystemWatcherEngine::~QDnotifyFileSystemWatcherEngine()
+-{
+-    QMutexLocker locker(&mutex);
+-
+-    for(QHash<int, Directory>::ConstIterator iter = fdToDirectory.constBegin();
+-            iter != fdToDirectory.constEnd();
+-            ++iter) {
+-        qt_safe_close(iter->fd);
+-        if(iter->parentFd)
+-            qt_safe_close(iter->parentFd);
+-    }
+-}
+-
+-QDnotifyFileSystemWatcherEngine *QDnotifyFileSystemWatcherEngine::create()
+-{
+-    return new QDnotifyFileSystemWatcherEngine();
+-}
+-
+-void QDnotifyFileSystemWatcherEngine::run()
+-{
+-    qFatal("QDnotifyFileSystemWatcherEngine thread should not be run");
+-}
+-
+-QStringList QDnotifyFileSystemWatcherEngine::addPaths(const QStringList &paths, QStringList *files, QStringList *directories)
+-{
+-    QMutexLocker locker(&mutex);
+-
+-    QStringList p = paths;
+-    QMutableListIterator<QString> it(p);
+-
+-    while (it.hasNext()) {
+-        QString path = it.next();
+-
+-        QFileInfo fi(path);
+-
+-        if(!fi.exists()) {
+-            continue;
+-        }
+-
+-        bool isDir = fi.isDir();
+-
+-        if (isDir && directories->contains(path)) {
+-            continue; // Skip monitored directories
+-        } else if(!isDir && files->contains(path)) {
+-            continue; // Skip monitored files
+-        }
+-
+-        if(!isDir)
+-            path = fi.canonicalPath();
+-
+-        // Locate the directory entry (creating if needed)
+-        int fd = pathToFD[path];
+-
+-        if(fd == 0) {
+-
+-            QT_DIR *d = QT_OPENDIR(path.toUtf8().constData());
+-            if(!d) continue; // Could not open directory
+-            QT_DIR *parent = 0;
+-
+-            QDir parentDir(path);
+-            if(!parentDir.isRoot()) {
+-                parentDir.cdUp();
+-                parent = QT_OPENDIR(parentDir.path().toUtf8().constData());
+-                if(!parent) {
+-                    QT_CLOSEDIR(d);
+-                    continue;
+-                }
+-            }
+-
+-            fd = qt_safe_dup(::dirfd(d));
+-            int parentFd = parent ? qt_safe_dup(::dirfd(parent)) : 0;
+-
+-            QT_CLOSEDIR(d);
+-            if(parent) QT_CLOSEDIR(parent);
+-
+-            Q_ASSERT(fd);
+-            if(::fcntl(fd, F_SETSIG, SIGIO) ||
+-               ::fcntl(fd, F_NOTIFY, DN_MODIFY | DN_CREATE | DN_DELETE |
+-                                     DN_RENAME | DN_ATTRIB | DN_MULTISHOT) ||
+-               (parent && ::fcntl(parentFd, F_SETSIG, SIGIO)) ||
+-               (parent && ::fcntl(parentFd, F_NOTIFY, DN_DELETE | DN_RENAME |
+-                                            DN_MULTISHOT))) {
+-                continue; // Could not set appropriate flags
+-            }
+-
+-            Directory dir;
+-            dir.path = path;
+-            dir.fd = fd;
+-            dir.parentFd = parentFd;
+-
+-            fdToDirectory.insert(fd, dir);
+-            pathToFD.insert(path, fd);
+-            if(parentFd)
+-                parentToFD.insert(parentFd, fd);
+-        }
+-
+-        Directory &directory = fdToDirectory[fd];
+-
+-        if(isDir) {
+-            directory.isMonitored = true;
+-        } else {
+-            Directory::File file;
+-            file.path = fi.filePath();
+-            file.lastWrite = fi.lastModified();
+-            directory.files.append(file);
+-            pathToFD.insert(fi.filePath(), fd);
+-        }
+-
+-        it.remove();
+-
+-        if(isDir) {
+-            directories->append(path);
+-        } else {
+-            files->append(fi.filePath());
+-        }
+-    }
+-
+-    dnotifySignal()->startNotify();
+-
+-    return p;
+-}
+-
+-QStringList QDnotifyFileSystemWatcherEngine::removePaths(const QStringList &paths, QStringList *files, QStringList *directories)
+-{
+-    QMutexLocker locker(&mutex);
+-
+-    QStringList p = paths;
+-    QMutableListIterator<QString> it(p);
+-    while (it.hasNext()) {
+-
+-        QString path = it.next();
+-        int fd = pathToFD.take(path);
+-
+-        if(!fd)
+-            continue;
+-
+-        Directory &directory = fdToDirectory[fd];
+-        bool isDir = false;
+-        if(directory.path == path) {
+-            isDir = true;
+-            directory.isMonitored = false;
+-        } else {
+-            for(int ii = 0; ii < directory.files.count(); ++ii) {
+-                if(directory.files.at(ii).path == path) {
+-                    directory.files.removeAt(ii);
+-                    break;
+-                }
+-            }
+-        }
+-
+-        if(!directory.isMonitored && directory.files.isEmpty()) {
+-            // No longer needed
+-            qt_safe_close(directory.fd);
+-            pathToFD.remove(directory.path);
+-            fdToDirectory.remove(fd);
+-        }
+-
+-        if(isDir) {
+-            directories->removeAll(path);
+-        } else {
+-            files->removeAll(path);
+-        }
+-
+-        it.remove();
+-    }
+-
+-    return p;
+-}
+-
+-void QDnotifyFileSystemWatcherEngine::refresh(int fd)
+-{
+-    QMutexLocker locker(&mutex);
+-
+-    bool wasParent = false;
+-    QHash<int, Directory>::Iterator iter = fdToDirectory.find(fd);
+-    if(iter == fdToDirectory.end()) {
+-        QHash<int, int>::Iterator pIter = parentToFD.find(fd);
+-        if(pIter == parentToFD.end())
+-            return;
+-
+-        iter = fdToDirectory.find(*pIter);
+-        if (iter == fdToDirectory.end())
+-            return;
+-        wasParent = true;
+-    }
+-
+-    Directory &directory = *iter;
+-
+-    if(!wasParent) {
+-        for(int ii = 0; ii < directory.files.count(); ++ii) {
+-            Directory::File &file = directory.files[ii];
+-            if(file.updateInfo()) {
+-                // Emit signal
+-                QString filePath = file.path;
+-                bool removed = !QFileInfo(filePath).exists();
+-
+-                if(removed) {
+-                    directory.files.removeAt(ii);
+-                    --ii;
+-                }
+-
+-                emit fileChanged(filePath, removed);
+-            }
+-        }
+-    }
+-
+-    if(directory.isMonitored) {
+-        // Emit signal
+-        bool removed = !QFileInfo(directory.path).exists();
+-        QString path = directory.path;
+-
+-        if(removed)
+-            directory.isMonitored = false;
+-
+-        emit directoryChanged(path, removed);
+-    }
+-
+-    if(!directory.isMonitored && directory.files.isEmpty()) {
+-        qt_safe_close(directory.fd);
+-        if(directory.parentFd) {
+-            qt_safe_close(directory.parentFd);
+-            parentToFD.remove(directory.parentFd);
+-        }
+-        fdToDirectory.erase(iter);
+-    }
+-}
+-
+-void QDnotifyFileSystemWatcherEngine::stop()
+-{
+-}
+-
+-bool QDnotifyFileSystemWatcherEngine::Directory::File::updateInfo()
+-{
+-    QFileInfo fi(path);
+-    QDateTime nLastWrite = fi.lastModified();
+-    uint nOwnerId = fi.ownerId();
+-    uint nGroupId = fi.groupId();
+-    QFile::Permissions nPermissions = fi.permissions();
+-
+-    if(nLastWrite != lastWrite ||
+-       nOwnerId != ownerId ||
+-       nGroupId != groupId ||
+-       nPermissions != permissions) {
+-        ownerId = nOwnerId;
+-        groupId = nGroupId;
+-        permissions = nPermissions;
+-        lastWrite = nLastWrite;
+-        return true;
+-    } else {
+-        return false;
+-    }
+-}
+-
+-QT_END_NAMESPACE
+-
+-#include "qfilesystemwatcher_dnotify.moc"
+-
+-#endif // QT_NO_FILESYSTEMWATCHER
+diff --git a/src/corelib/io/qfilesystemwatcher_dnotify_p.h b/src/corelib/io/qfilesystemwatcher_dnotify_p.h
+deleted file mode 100644
+index f759e87..0000000
+--- a/src/corelib/io/qfilesystemwatcher_dnotify_p.h
++++ /dev/null
+@@ -1,131 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2011 Nokia Corporation and/or its subsidiary(-ies).
+-** All rights reserved.
+-** Contact: Nokia Corporation (qt-info@nokia.com)
+-**
+-** This file is part of the QtCore module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QFILESYSTEMWATCHER_DNOTIFY_P_H
+-#define QFILESYSTEMWATCHER_DNOTIFY_P_H
+-
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists for the convenience
+-// of the QLibrary class.  This header file may change from
+-// version to version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+-#include "qfilesystemwatcher_p.h"
+-
+-#ifndef QT_NO_FILESYSTEMWATCHER
+-
+-#include <qmutex.h>
+-#include <qhash.h>
+-#include <qdatetime.h>
+-#include <qfile.h>
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QDnotifyFileSystemWatcherEngine : public QFileSystemWatcherEngine
+-{
+-    Q_OBJECT
+-
+-public:
+-    virtual ~QDnotifyFileSystemWatcherEngine();
+-
+-    static QDnotifyFileSystemWatcherEngine *create();
+-
+-    void run();
+-
+-    QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories);
+-    QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories);
+-
+-    void stop();
+-
+-private Q_SLOTS:
+-    void refresh(int);
+-
+-private:
+-    struct Directory {
+-        Directory() : fd(0), parentFd(0), isMonitored(false) {}
+-        Directory(const Directory &o) : path(o.path),
+-                                        fd(o.fd),
+-                                        parentFd(o.parentFd),
+-                                        isMonitored(o.isMonitored),
+-                                        files(o.files) {}
+-        QString path;
+-        int fd;
+-        int parentFd;
+-        bool isMonitored;
+-
+-        struct File {
+-            File() : ownerId(0u), groupId(0u), permissions(0u) { }
+-            File(const File &o) : path(o.path),
+-                                  ownerId(o.ownerId),
+-                                  groupId(o.groupId),
+-                                  permissions(o.permissions),
+-                                  lastWrite(o.lastWrite) {}
+-            QString path;
+-
+-            bool updateInfo();
+-
+-            uint ownerId;
+-            uint groupId;
+-            QFile::Permissions permissions;
+-            QDateTime lastWrite;
+-        };
+-
+-        QList<File> files;
+-    };
+-
+-    QDnotifyFileSystemWatcherEngine();
+-
+-    QMutex mutex;
+-    QHash<QString, int> pathToFD;
+-    QHash<int, Directory> fdToDirectory;
+-    QHash<int, int> parentToFD;
+-};
+-
+-
+-
+-QT_END_NAMESPACE
+-#endif // QT_NO_FILESYSTEMWATCHER
+-#endif // QFILESYSTEMWATCHER_DNOTIFY_P_H
+diff --git a/src/corelib/io/qfilesystemwatcher_p.h b/src/corelib/io/qfilesystemwatcher_p.h
+index e136273..52e8800 100644
+--- a/src/corelib/io/qfilesystemwatcher_p.h
++++ b/src/corelib/io/qfilesystemwatcher_p.h
+@@ -105,9 +105,8 @@ public:
+     QFileSystemWatcherPrivate();
+     void init();
+     void initPollerEngine();
+-    void initForcedEngine(const QString &);
+ 
+-    QFileSystemWatcherEngine *native, *poller, *forced;
++    QFileSystemWatcherEngine *native, *poller;
+     QStringList files, directories;
+ 
+     // private slots
+diff --git a/tests/auto/corelib/io/qfilesystemwatcher/tst_qfilesystemwatcher.cpp b/tests/auto/corelib/io/qfilesystemwatcher/tst_qfilesystemwatcher.cpp
+index 0e71721..bc2b194 100644
+--- a/tests/auto/corelib/io/qfilesystemwatcher/tst_qfilesystemwatcher.cpp
++++ b/tests/auto/corelib/io/qfilesystemwatcher/tst_qfilesystemwatcher.cpp
+@@ -56,9 +56,6 @@ class tst_QFileSystemWatcher : public QObject
+ {
+     Q_OBJECT
+ 
+-public:
+-    tst_QFileSystemWatcher();
+-
+ private slots:
+     void basicTest_data();
+     void basicTest();
+@@ -81,37 +78,12 @@ private slots:
+     void cleanup();
+ 
+     void destroyAfterQCoreApplication();
+-private:
+-    QStringList do_force_engines;
+-    bool do_force_native;
+ };
+ 
+-tst_QFileSystemWatcher::tst_QFileSystemWatcher()
+-    : do_force_native(false)
+-{
+-#ifdef Q_OS_LINUX
+-    // the inotify implementation in the kernel is known to be buggy in certain versions of the linux kernel
+-    do_force_engines << "native";
+-    do_force_engines << "dnotify";
+-
+-#ifdef QT_NO_INOTIFY
+-    if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13))
+-        do_force_engines << "inotify";
+-#else
+-    if (inotify_init() != -1)
+-        do_force_engines << "inotify";
+-#endif
+-#elif defined(Q_OS_WIN) || defined(Q_OS_DARWIN) || defined(Q_OS_FREEBSD)
+-    // we have native engines for win32, macosx and freebsd
+-    do_force_engines << "native";
+-#endif
+-}
+-
+ void tst_QFileSystemWatcher::basicTest_data()
+ {
+     QTest::addColumn<QString>("backend");
+-    foreach(QString engine, do_force_engines)
+-        QTest::newRow(engine.toLatin1().constData()) << engine;
++    QTest::newRow("native") << "native";
+     QTest::newRow("poller") << "poller";
+ }
+ 
+@@ -438,9 +410,6 @@ void tst_QFileSystemWatcher::watchFileAndItsDirectory()
+     //sequence of changes will always generate this signal.
+     QVERIFY(dirChangedSpy.count() < 2);
+ 
+-    if (backend == "dnotify")
+-        QSKIP("dnotify is broken, skipping the rest of the test.");
+-
+     fileChangedSpy.clear();
+     dirChangedSpy.clear();
+     QFile secondFile(secondFileName);

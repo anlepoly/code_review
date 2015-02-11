@@ -1,0 +1,156 @@
+diff --git a/src/gui/kernel/qwindowsysteminterface.cpp b/src/gui/kernel/qwindowsysteminterface.cpp
+index d05dc8c..82e0e44 100644
+--- a/src/gui/kernel/qwindowsysteminterface.cpp
++++ b/src/gui/kernel/qwindowsysteminterface.cpp
+@@ -89,6 +89,26 @@ void QWindowSystemInterface::handleLeaveEvent(QWindow *tlw)
+     QWindowSystemInterfacePrivate::handleWindowSystemEvent(e);
+ }
+ 
++/*!
++    This method can be used to ensure leave and enter events are both in queue when moving from
++    one QWindow to another. This allows QWindow subclasses to check for a queued enter event
++    when handling the leave event (\c QWindowSystemInterfacePrivate::peekWindowSystemEvent) to
++    determine where mouse went and act accordingly. E.g. QWidgetWindow needs to know if mouse
++    cursor moves between windows in same window hierarchy.
++*/
++void QWindowSystemInterface::handleEnterLeaveEvent(QWindow *enter, QWindow *leave)
++{
++    bool wasSynchronous = QWindowSystemInterfacePrivate::synchronousWindowsSystemEvents;
++    if (wasSynchronous)
++        setSynchronousWindowsSystemEvents(false);
++    handleLeaveEvent(leave);
++    handleEnterEvent(enter);
++    if (wasSynchronous) {
++        flushWindowSystemEvents();
++        setSynchronousWindowsSystemEvents(true);
++    }
++}
++
+ void QWindowSystemInterface::handleWindowActivated(QWindow *tlw)
+ {
+     QWindowSystemInterfacePrivate::ActivatedWindowEvent *e = new QWindowSystemInterfacePrivate::ActivatedWindowEvent(tlw);
+@@ -324,6 +344,16 @@ QWindowSystemInterfacePrivate::WindowSystemEvent * QWindowSystemInterfacePrivate
+     return windowSystemEventQueue.takeFirstOrReturnNull();
+ }
+ 
++QWindowSystemInterfacePrivate::WindowSystemEvent *QWindowSystemInterfacePrivate::peekWindowSystemEvent(EventType t)
++{
++    return windowSystemEventQueue.peekAtFirstOfType(t);
++}
++
++void QWindowSystemInterfacePrivate::removeWindowSystemEvent(WindowSystemEvent *event)
++{
++    windowSystemEventQueue.remove(event);
++}
++
+ void QWindowSystemInterfacePrivate::handleWindowSystemEvent(QWindowSystemInterfacePrivate::WindowSystemEvent *ev)
+ {
+     if (synchronousWindowsSystemEvents) {
+diff --git a/src/gui/kernel/qwindowsysteminterface.h b/src/gui/kernel/qwindowsysteminterface.h
+index cf5d22e..74b5a13 100644
+--- a/src/gui/kernel/qwindowsysteminterface.h
++++ b/src/gui/kernel/qwindowsysteminterface.h
+@@ -136,6 +136,7 @@ public:
+     static void handleCloseEvent(QWindow *w);
+     static void handleEnterEvent(QWindow *w);
+     static void handleLeaveEvent(QWindow *w);
++    static void handleEnterLeaveEvent(QWindow *enter, QWindow *leave);
+     static void handleWindowActivated(QWindow *w);
+     static void handleWindowStateChanged(QWindow *w, Qt::WindowState newState);
+ 
+diff --git a/src/gui/kernel/qwindowsysteminterface_p.h b/src/gui/kernel/qwindowsysteminterface_p.h
+index e9d2fad..4e907f3 100644
+--- a/src/gui/kernel/qwindowsysteminterface_p.h
++++ b/src/gui/kernel/qwindowsysteminterface_p.h
+@@ -52,7 +52,7 @@ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QWindowSystemInterfacePrivate {
++class Q_GUI_EXPORT QWindowSystemInterfacePrivate {
+ public:
+     enum EventType {
+         Close,
+@@ -349,6 +349,25 @@ public:
+         { const QMutexLocker locker(&mutex); impl.append(e); }
+         int count() const
+         { const QMutexLocker locker(&mutex); return impl.count(); }
++        WindowSystemEvent *peekAtFirstOfType(EventType t) const
++        {
++            const QMutexLocker locker(&mutex);
++            for (int i = 0; i < impl.size(); ++i) {
++                if (impl.at(i)->type == t)
++                    return impl.at(i);
++            }
++            return 0;
++        }
++        void remove(const WindowSystemEvent *e)
++        {
++            const QMutexLocker locker(&mutex);
++            for (int i = 0; i < impl.size(); ++i) {
++                if (impl.at(i) == e) {
++                    impl.removeAt(i);
++                    break;
++                }
++            }
++        }
+     private:
+         Q_DISABLE_COPY(WindowSystemEventList);
+     };
+@@ -356,7 +375,9 @@ public:
+     static WindowSystemEventList windowSystemEventQueue;
+ 
+     static int windowSystemEventsQueued();
+-    static WindowSystemEvent * getWindowSystemEvent();
++    static WindowSystemEvent *getWindowSystemEvent();
++    static WindowSystemEvent *peekWindowSystemEvent(EventType t);
++    static void removeWindowSystemEvent(WindowSystemEvent *event);
+     static void handleWindowSystemEvent(WindowSystemEvent *ev);
+ 
+     static QElapsedTimer eventTime;
+diff --git a/src/widgets/kernel/qwidgetwindow.cpp b/src/widgets/kernel/qwidgetwindow.cpp
+index 10ec4d3..5f25e12 100644
+--- a/src/widgets/kernel/qwidgetwindow.cpp
++++ b/src/widgets/kernel/qwidgetwindow.cpp
+@@ -47,6 +47,7 @@
+ #include <QtGui/qaccessible.h>
+ #endif
+ #include <private/qwidgetbackingstore_p.h>
++#include <qpa/qwindowsysteminterface_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -212,9 +213,31 @@ QPointer<QWidget> qt_last_mouse_receiver = 0;
+ void QWidgetWindow::handleEnterLeaveEvent(QEvent *event)
+ {
+     if (event->type() == QEvent::Leave) {
++        QWidget *enter = 0;
++        // Check from window system event queue if the next queued enter targets a window
++        // in the same window hierarchy (e.g. enter a child of this window). If so,
++        // remove the enter event from queue and handle both in single dispatch.
++        QWindowSystemInterfacePrivate::EnterEvent *systemEvent =
++            static_cast<QWindowSystemInterfacePrivate::EnterEvent *>
++            (QWindowSystemInterfacePrivate::peekWindowSystemEvent(QWindowSystemInterfacePrivate::Enter));
++        if (systemEvent) {
++            if (QWidgetWindow *enterWindow = qobject_cast<QWidgetWindow *>(systemEvent->enter))
++            {
++                QWindow *thisParent = this;
++                QWindow *enterParent = enterWindow;
++                while (thisParent->parent())
++                    thisParent = thisParent->parent();
++                while (enterParent->parent())
++                    enterParent = enterParent->parent();
++                if (thisParent == enterParent) {
++                    enter = enterWindow->widget();
++                    QWindowSystemInterfacePrivate::removeWindowSystemEvent(systemEvent);
++                }
++            }
++        }
+         QWidget *leave = qt_last_mouse_receiver ? qt_last_mouse_receiver.data() : m_widget;
+-        QApplicationPrivate::dispatchEnterLeave(0, leave);
+-        qt_last_mouse_receiver = 0;
++        QApplicationPrivate::dispatchEnterLeave(enter, leave);
++        qt_last_mouse_receiver = enter;
+     } else {
+         QApplicationPrivate::dispatchEnterLeave(m_widget, 0);
+         qt_last_mouse_receiver = m_widget;

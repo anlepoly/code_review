@@ -1,0 +1,306 @@
+diff --git a/src/imports/testlib/TestCase.qml b/src/imports/testlib/TestCase.qml
+index 9060ecc..ddd7f70 100644
+--- a/src/imports/testlib/TestCase.qml
++++ b/src/imports/testlib/TestCase.qml
+@@ -253,24 +253,9 @@ Item {
+         return true
+     }
+ 
+-    function qtest_formatValue(value) {
+-        if (qtest_typeof(value) == "object") {
+-            if ("x" in value && "y" in value && "z" in value) {
+-                return "Qt.vector3d(" + value.x + ", " +
+-                       value.y + ", " + value.z + ")"
+-            }
+-            try {
+-                return JSON.stringify(value)
+-            } catch (ex) {
+-                // stringify might fail (e.g. due to circular references)
+-            }
+-        }
+-        return value
+-    }
+-
+     function compare(actual, expected, msg) {
+-        var act = testCase.qtest_formatValue(actual)
+-        var exp = testCase.qtest_formatValue(expected)
++        var act = qtest_results.stringify(actual)
++        var exp = qtest_results.stringify(expected)
+ 
+         var success = qtest_compareInternal(actual, expected)
+         if (msg === undefined) {
+@@ -284,6 +269,23 @@ Item {
+         }
+     }
+ 
++    function fuzzyCompare(actual, expected, delta, msg) {
++        if (delta === undefined)
++            qtest_fail("A delta value is required for fuzzyCompare", 2)
++
++        var success = qtest_results.fuzzyCompare(actual, expected, delta)
++        if (msg === undefined) {
++            if (success)
++                msg = "FUZZYCOMPARE()"
++            else
++                msg = "Compared values are not the same with delta(" + delta + ")"
++        }
++
++        if (!qtest_results.compare(success, msg, actual, expected, util.callerFile(), util.callerLine())) {
++            throw new Error("QtQuickTest::fail")
++        }
++    }
++
+     function grabImage(item) {
+         return qtest_results.grabImage(item);
+     }
+@@ -299,8 +301,8 @@ Item {
+             i += 50
+         }
+         var actual = obj[prop]
+-        var act = testCase.qtest_formatValue(actual)
+-        var exp = testCase.qtest_formatValue(value)
++        var act = qtest_results.stringify(actual)
++        var exp = qtest_results.stringify(value)
+         var success = qtest_compareInternal(actual, value)
+         if (!qtest_results.compare(success, "property " + prop, act, exp, util.callerFile(), util.callerLine()))
+             throw new Error("QtQuickTest::fail")
+diff --git a/src/imports/testlib/testcase.qdoc b/src/imports/testlib/testcase.qdoc
+index 90fc538..8a0f770 100644
+--- a/src/imports/testlib/testcase.qdoc
++++ b/src/imports/testlib/testcase.qdoc
+@@ -345,7 +345,22 @@
+     \a expected, and displays the optional \a message.  Similar
+     to \c{QCOMPARE(actual, expected)} in C++.
+ 
+-    \sa tryCompare()
++    \sa tryCompare(), fuzzyCompare
++*/
++
++
++/*!
++    \qmlmethod TestCase::fuzzyCompare(actual, expected, delta, message = "")
++
++    Fails the current test case if the difference betwen \a actual and \a expected
++    is greater than \a delta, and displays the optional \a message.  Similar
++    to \c{qFuzzyCompare(actual, expected)} in C++ but with a required \a delta value.
++
++    This funtion can also be used for color comparisons if both the \a actual and
++    \a expected values can be converted into color values. If any of the differences
++    for RGBA channel values are greater than \a delta, the test fails.
++
++    \sa tryCompare(), compare()
+ */
+ 
+ /*!
+diff --git a/src/qml/qml/qqmlglobal_p.h b/src/qml/qml/qqmlglobal_p.h
+index b10457b..ff33763 100644
+--- a/src/qml/qml/qqmlglobal_p.h
++++ b/src/qml/qml/qqmlglobal_p.h
+@@ -277,7 +277,7 @@ public:
+ };
+ 
+ Q_QML_PRIVATE_EXPORT QQmlColorProvider *QQml_setColorProvider(QQmlColorProvider *);
+-Q_AUTOTEST_EXPORT QQmlColorProvider *QQml_colorProvider();
++Q_QML_PRIVATE_EXPORT QQmlColorProvider *QQml_colorProvider();
+ 
+ 
+ class Q_QML_PRIVATE_EXPORT QQmlGuiProvider
+diff --git a/src/qmltest/qmltest.pro b/src/qmltest/qmltest.pro
+index f0b265e..330d622 100644
+--- a/src/qmltest/qmltest.pro
++++ b/src/qmltest/qmltest.pro
+@@ -2,9 +2,9 @@ load(qt_build_config)
+ 
+ TARGET     = QtQuickTest
+ CONFIG += dll warn_on
+-QT += qml testlib-private gui-private
+ 
+ DEFINES += QT_NO_URL_CAST_FROM_STRING
++QT += testlib testlib-private qml quick  gui qml-private v8-private core-private
+ 
+ load(qt_module_config)
+ 
+@@ -28,4 +28,4 @@ HEADERS += \
+     $$PWD/quicktestresult_p.h \
+     $$PWD/qtestoptions_p.h
+ 
+-DEFINES += QT_QML_DEBUG_NO_WARNING
++DEFINES += QT_QML_DEBUG_NO_WARNING
+\ No newline at end of file
+diff --git a/src/qmltest/quicktestresult.cpp b/src/qmltest/quicktestresult.cpp
+index ff2cf05..f6fd873 100644
+--- a/src/qmltest/quicktestresult.cpp
++++ b/src/qmltest/quicktestresult.cpp
+@@ -56,6 +56,8 @@
+ #include <QtCore/QUrl>
+ #include <QtCore/QDir>
+ #include <QtQuick/qquickwindow.h>
++#include <QtGui/qvector3d.h>
++#include <QtQml/private/qqmlglobal_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -426,15 +428,101 @@ bool QuickTestResult::verify
+     }
+ }
+ 
++bool QuickTestResult::fuzzyCompare(const QVariant &actual, const QVariant &expected, qreal delta)
++{
++    if (actual.type() == QVariant::Color || expected.type() == QVariant::Color) {
++        if (!actual.canConvert(QVariant::Color) || !expected.canConvert(QVariant::Color))
++            return false;
++
++        //fuzzy color comparison
++        QColor act;
++        QColor exp;
++        bool ok(false);
++
++        QVariant var = QQml_colorProvider()->colorFromString(actual.toString(), &ok);
++        if (!ok)
++            return false;
++        act = var.value<QColor>();
++
++        QQml_colorProvider()->colorFromString(expected.toString(), &ok);
++        if (!ok)
++            return false;
++        exp = var.value<QColor>();
++
++        return ( qAbs(act.red() - exp.red()) <= delta
++              && qAbs(act.green() - exp.green()) <= delta
++              && qAbs(act.blue() - exp.blue()) <= delta
++              && qAbs(act.alpha() - exp.alpha()) <= delta);
++    } else {
++        //number comparison
++        bool ok = true;
++        qreal act = actual.toFloat(&ok);
++        if (!ok)
++            return false;
++
++        qreal exp = expected.toFloat(&ok);
++        if (!ok)
++            return false;
++
++        return (qAbs(act - exp) <= delta);
++    }
++
++    return false;
++}
++
++void QuickTestResult::stringify(QQmlV8Function *args)
++{
++    if (args->Length() < 1)
++        args->returnValue(v8::Null());
++
++    v8::Local<v8::Value> value = (*args)[0];
++
++    QString result;
++    QV8Engine *engine = args->engine();
++
++    //Check for Object Type
++    if (value->IsObject()
++    && !value->IsFunction()
++    && !value->IsArray()
++    && !value->IsDate()
++    && !value->IsRegExp()) {
++        QVariant v = engine->toVariant(value, QMetaType::UnknownType);
++        if (v.isValid()) {
++            switch (v.type()) {
++            case QVariant::Vector3D:
++            {
++                QVector3D v3d = v.value<QVector3D>();
++                result = QString::fromLatin1("Qt.vector3d(%1, %2, %3)").arg(v3d.x()).arg(v3d.y()).arg(v3d.z());
++                break;
++            }
++            default:
++                result = v.toString();
++            }
++
++        } else {
++            result = QLatin1String("Object");
++        }
++    } else {
++        v8::Local<v8::String> jsstr = value->ToString();
++        QString tmp = engine->toString(jsstr);
++        if (value->IsArray())
++            result.append(QString::fromLatin1("[%1]").arg(tmp));
++        else
++            result.append(tmp);
++    }
++
++    args->returnValue(args->engine()->toString(result));
++}
++
+ bool QuickTestResult::compare
+     (bool success, const QString &message,
+-     const QString &val1, const QString &val2,
++     const QVariant &val1, const QVariant &val2,
+      const QUrl &location, int line)
+ {
+     return QTestResult::compare
+         (success, message.toLocal8Bit().constData(),
+-         QTest::toString(val1.toLatin1().constData()),
+-         QTest::toString(val2.toLatin1().constData()),
++         QTest::toString(val1.toString().toLatin1().constData()),
++         QTest::toString(val2.toString().toLatin1().constData()),
+          "", "",
+          qtestFixUrl(location).toLatin1().constData(), line);
+ }
+diff --git a/src/qmltest/quicktestresult_p.h b/src/qmltest/quicktestresult_p.h
+index 76761b6..0ef41ad 100644
+--- a/src/qmltest/quicktestresult_p.h
++++ b/src/qmltest/quicktestresult_p.h
+@@ -48,6 +48,7 @@
+ #include <QtCore/qstringlist.h>
+ #include <QtCore/qscopedpointer.h>
+ #include <QtQuick/qquickitem.h>
++#include <QtQml/private/qv8engine_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -111,12 +112,15 @@ public Q_SLOTS:
+     void finishTestDataCleanup();
+     void finishTestFunction();
+ 
++    void stringify(QQmlV8Function *args);
++
+     void fail(const QString &message, const QUrl &location, int line);
+     bool verify(bool success, const QString &message,
+                 const QUrl &location, int line);
+     bool compare(bool success, const QString &message,
+-                 const QString &val1, const QString &val2,
++                 const QVariant &val1, const QVariant &val2,
+                  const QUrl &location, int line);
++    bool fuzzyCompare(const QVariant &actual, const QVariant &expected, qreal delta);
+     void skip(const QString &message, const QUrl &location, int line);
+     bool expectFail(const QString &tag, const QString &comment,
+                     const QUrl &location, int line);
+diff --git a/tests/auto/qmltest/pixel/tst_pixel.qml b/tests/auto/qmltest/pixel/tst_pixel.qml
+index d36bce2..f2a9d5f 100644
+--- a/tests/auto/qmltest/pixel/tst_pixel.qml
++++ b/tests/auto/qmltest/pixel/tst_pixel.qml
+@@ -59,6 +59,10 @@ Rectangle {
+            compare(img.blue(1,1), 0);
+            compare(img.alpha(1,1), 255);
+ 
++           fuzzyCompare(img.red(1,1), 254, 2);
++           fuzzyCompare(img.pixel(1,1), Qt.rgba(254, 0, 0, 254), 2);
++           fuzzyCompare(img.pixel(1,1), "#FF0201", 2);
++
+            rect.color = "blue";
+            wait(200);
+            img = grabImage(rect);
+diff --git a/tests/auto/qmltest/selftests/tst_selftests.qml b/tests/auto/qmltest/selftests/tst_selftests.qml
+index 7ef3f33..19f06f4 100644
+--- a/tests/auto/qmltest/selftests/tst_selftests.qml
++++ b/tests/auto/qmltest/selftests/tst_selftests.qml
+@@ -85,6 +85,10 @@ TestCase {
+         function skip(msg, file, line) {
+             failmsg = "skip:" + msg
+         }
++
++        function stringify(str) {
++            return str;
++        }
+     }
+ 
+     TestCase {

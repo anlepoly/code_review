@@ -1,0 +1,297 @@
+diff --git a/src/quick/items/qquickthreadedwindowmanager.cpp b/src/quick/items/qquickthreadedwindowmanager.cpp
+index 1baa72b..d654e3a 100644
+--- a/src/quick/items/qquickthreadedwindowmanager.cpp
++++ b/src/quick/items/qquickthreadedwindowmanager.cpp
+@@ -360,7 +360,6 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+ #ifdef THREAD_DEBUG
+             printf("                RenderThread: aquired sync lock...\n");
+ #endif
+-            allowMainThreadProcessingFlag = false;
+             QCoreApplication::postEvent(this, new QEvent(QEvent_Sync));
+ 
+ #ifdef THREAD_DEBUG
+@@ -413,7 +412,6 @@ void QQuickRenderThreadSingleContextWindowManager::run()
+         inSync = false;
+ 
+         // Wake GUI after sync to let it continue animating and event processing.
+-        allowMainThreadProcessingFlag = true;
+         wake();
+         unlock();
+ #ifdef THREAD_DEBUG
+@@ -574,7 +572,7 @@ bool QQuickRenderThreadSingleContextWindowManager::event(QEvent *e)
+             printf("GUI: Advancing animations...\n");
+ #endif
+ 
+-            animationDriver->advance();
++            animDriver->advance();
+ 
+ #ifdef THREAD_DEBUG
+             printf("GUI: Animations advanced...\n");
+@@ -589,7 +587,7 @@ bool QQuickRenderThreadSingleContextWindowManager::event(QEvent *e)
+ #ifdef THREAD_DEBUG
+             printf("GUI: Animations advanced via timer...\n");
+ #endif
+-        animationDriver->advance();
++        animDriver->advance();
+     }
+ 
+     return QThread::event(e);
+@@ -766,7 +764,7 @@ void QQuickRenderThreadSingleContextWindowManager::startRendering()
+     inSync = false;
+ 
+     lockInGui();
+-    animationRunning = animationDriver->isRunning();
++    animationRunning = animDriver->isRunning();
+     start(); // Start the render thread...
+     wait();
+     unlockInGui();
+@@ -820,7 +818,7 @@ void QQuickRenderThreadSingleContextWindowManager::stopRendering()
+ #endif
+ 
+     // Activate timer to keep animations running
+-    if (animationDriver->isRunning())
++    if (animDriver->isRunning())
+         animationTimer = startTimer(1000/60);
+ }
+ 
+@@ -893,14 +891,4 @@ void QQuickRenderThreadSingleContextWindowManager::maybeUpdate(QQuickWindow *)
+ 
+ }
+ 
+-void QQuickRenderThreadSingleContextWindowManager::wakeup()
+-{
+-    lockInGui();
+-    isExternalUpdatePending = true;
+-    if (isRenderBlocked)
+-        wake();
+-    unlockInGui();
+-}
+-
+-
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickthreadedwindowmanager_p.h b/src/quick/items/qquickthreadedwindowmanager_p.h
+index 1f95d0d..d4878c8 100644
+--- a/src/quick/items/qquickthreadedwindowmanager_p.h
++++ b/src/quick/items/qquickthreadedwindowmanager_p.h
+@@ -63,7 +63,6 @@ public:
+         : sg(QSGContext::createDefaultContext())
+         , gl(0)
+         , animationTimer(-1)
+-        , allowMainThreadProcessingFlag(false)
+         , isGuiLocked(0)
+         , animationRunning(false)
+         , isPostingSyncEvent(false)
+@@ -78,10 +77,10 @@ public:
+     {
+         sg->moveToThread(this);
+ 
+-        animationDriver = sg->createAnimationDriver(this);
+-        animationDriver->install();
+-        connect(animationDriver, SIGNAL(started()), this, SLOT(animationStarted()));
+-        connect(animationDriver, SIGNAL(stopped()), this, SLOT(animationStopped()));
++        animDriver = sg->createAnimationDriver(this);
++        animDriver->install();
++        connect(animDriver, SIGNAL(started()), this, SLOT(animationStarted()));
++        connect(animDriver, SIGNAL(stopped()), this, SLOT(animationStopped()));
+     }
+ 
+     QSGContext *sceneGraphContext() const { return sg; }
+@@ -99,7 +98,6 @@ public:
+     void handleDeferredUpdate();
+     void maybeUpdate(QQuickWindow *window);
+     void update(QQuickWindow *window) { maybeUpdate(window); } // identical for this implementation
+-    void wakeup();
+ 
+     void startRendering();
+     void stopRendering();
+@@ -109,8 +107,6 @@ public:
+ 
+     void initialize();
+ 
+-    volatile bool *allowMainThreadProcessing() { return &allowMainThreadProcessingFlag; }
+-
+     bool event(QEvent *);
+ 
+     inline void lock() { mutex.lock(); }
+@@ -132,6 +128,8 @@ public:
+         return win;
+     }
+ 
++    QAnimationDriver *animationDriver() const { return animDriver; }
++
+ public slots:
+     void animationStarted();
+     void animationStopped();
+@@ -144,14 +142,12 @@ private:
+ 
+     QSGContext *sg;
+     QOpenGLContext *gl;
+-    QAnimationDriver *animationDriver;
++    QAnimationDriver *animDriver;
+     int animationTimer;
+ 
+     QMutex mutex;
+     QWaitCondition condition;
+ 
+-    volatile bool allowMainThreadProcessingFlag;
+-
+     int isGuiLocked;
+     uint animationRunning: 1;
+     uint isPostingSyncEvent : 1;
+diff --git a/src/quick/items/qquickwindow.cpp b/src/quick/items/qquickwindow.cpp
+index c95a28d..4af76aa 100644
+--- a/src/quick/items/qquickwindow.cpp
++++ b/src/quick/items/qquickwindow.cpp
+@@ -80,46 +80,66 @@ void QQuickWindowPrivate::updateFocusItemTransform()
+         qApp->inputMethod()->setInputItemTransform(QQuickItemPrivate::get(focus)->itemToWindowTransform());
+ }
+ 
++
+ class QQuickWindowIncubationController : public QObject, public QQmlIncubationController
+ {
++    Q_OBJECT
++
+ public:
+-    QQuickWindowIncubationController(QQuickWindowPrivate *window)
+-    : m_window(window), m_eventSent(false) {}
++    QQuickWindowIncubationController(const QQuickWindow *window)
++        : m_window(QQuickWindowPrivate::get(const_cast<QQuickWindow *>(window)))
++    {
++        // Allow incubation for 1/3 of a frame.
++        m_incubation_time = qMax(1, int(1000 / QGuiApplication::primaryScreen()->refreshRate()) / 3);
++
++        m_animation_driver = m_window->windowManager->animationDriver();
++        if (m_animation_driver) {
++            connect(m_animation_driver, SIGNAL(stopped()), this, SLOT(animationStopped()));
++            connect(window, SIGNAL(frameSwapped()), this, SLOT(incubate()));
++        }
++    }
+ 
+ protected:
+     virtual bool event(QEvent *e)
+     {
+         if (e->type() == QEvent::User) {
+-            Q_ASSERT(m_eventSent);
+-            volatile bool *amtp = m_window->windowManager->allowMainThreadProcessing();
+-            while (incubatingObjectCount()) {
+-                if (amtp)
+-                    incubateWhile(amtp, 2);
+-                else
+-                    incubateFor(5);
+-                QCoreApplication::processEvents();
+-            }
+-
+-            m_eventSent = false;
++            incubate();
++            return true;
+         }
+         return QObject::event(e);
+     }
+ 
++public slots:
++    void incubate() {
++        if (incubatingObjectCount()) {
++            if (m_animation_driver && m_animation_driver->isRunning()) {
++                incubateFor(m_incubation_time);
++            } else {
++                incubateFor(m_incubation_time * 2);
++                if (incubatingObjectCount())
++                    QCoreApplication::postEvent(this, new QEvent(QEvent::User));
++            }
++        }
++    }
++
++    void animationStopped() { incubate(); }
++
++protected:
+     virtual void incubatingObjectCountChanged(int count)
+     {
+-        if (count && !m_eventSent) {
+-            m_eventSent = true;
++        if (count && (!m_animation_driver || !m_animation_driver->isRunning()))
+             QCoreApplication::postEvent(this, new QEvent(QEvent::User));
+-        }
+-        // If no animations are running, the renderer may be waiting
+-        m_window->windowManager->wakeup();
+     }
+ 
+ private:
+     QQuickWindowPrivate *m_window;
+-    bool m_eventSent;
++    int m_incubation_time;
++    QAnimationDriver *m_animation_driver;
+ };
+ 
++#include "qquickwindow.moc"
++
++
+ #ifndef QT_NO_ACCESSIBILITY
+ QAccessibleInterface *QQuickWindow::accessibleRoot() const
+ {
+@@ -2507,7 +2527,7 @@ QQmlIncubationController *QQuickWindow::incubationController() const
+     Q_D(const QQuickWindow);
+ 
+     if (!d->incubationController)
+-        d->incubationController = new QQuickWindowIncubationController(const_cast<QQuickWindowPrivate *>(d));
++        d->incubationController = new QQuickWindowIncubationController(this);
+     return d->incubationController;
+ }
+ 
+diff --git a/src/quick/items/qquickwindowmanager.cpp b/src/quick/items/qquickwindowmanager.cpp
+index 3cced7a..7ddedad 100644
+--- a/src/quick/items/qquickwindowmanager.cpp
++++ b/src/quick/items/qquickwindowmanager.cpp
+@@ -92,14 +92,13 @@ public:
+     void exposureChanged(QQuickWindow *window);
+     QImage grab(QQuickWindow *window);
+     void resize(QQuickWindow *window, const QSize &size);
+-    void wakeup();
+ 
+     void maybeUpdate(QQuickWindow *window);
+     void update(QQuickWindow *window) { maybeUpdate(window); } // identical for this implementation.
+ 
+     void releaseResources() { }
+ 
+-    volatile bool *allowMainThreadProcessing();
++    QAnimationDriver *animationDriver() const { return 0; }
+ 
+     QSGContext *sceneGraphContext() const;
+ 
+@@ -292,15 +291,6 @@ void QQuickTrivialWindowManager::maybeUpdate(QQuickWindow *window)
+     }
+ }
+ 
+-void QQuickTrivialWindowManager::wakeup()
+-{
+-}
+-
+-volatile bool *QQuickTrivialWindowManager::allowMainThreadProcessing()
+-{
+-    return 0;
+-}
+-
+ 
+ 
+ QSGContext *QQuickTrivialWindowManager::sceneGraphContext() const
+diff --git a/src/quick/items/qquickwindowmanager_p.h b/src/quick/items/qquickwindowmanager_p.h
+index ccad33c..d56c5fe 100644
+--- a/src/quick/items/qquickwindowmanager_p.h
++++ b/src/quick/items/qquickwindowmanager_p.h
+@@ -49,6 +49,7 @@ QT_BEGIN_NAMESPACE
+ 
+ class QQuickWindow;
+ class QSGContext;
++class QAnimationDriver;
+ 
+ class Q_QUICK_PRIVATE_EXPORT QQuickWindowManager
+ {
+@@ -66,9 +67,8 @@ public:
+ 
+     virtual void update(QQuickWindow *window) = 0;
+     virtual void maybeUpdate(QQuickWindow *window) = 0;
+-    virtual void wakeup() = 0;
+ 
+-    virtual volatile bool *allowMainThreadProcessing() = 0;
++    virtual QAnimationDriver *animationDriver() const = 0;
+ 
+     virtual QSGContext *sceneGraphContext() const = 0;

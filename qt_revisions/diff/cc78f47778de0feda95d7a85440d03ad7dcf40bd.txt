@@ -1,0 +1,274 @@
+diff --git a/src/gui/text/qfont.cpp b/src/gui/text/qfont.cpp
+index ee833a0..3515c7d 100644
+--- a/src/gui/text/qfont.cpp
++++ b/src/gui/text/qfont.cpp
+@@ -2715,18 +2715,22 @@ QFontEngine *QFontCache::findEngine(const Key &key)
+     EngineCache::Iterator it = engineCache.find(key),
+                          end = engineCache.end();
+     if (it == end) return 0;
+-
+     // found... update the hitcount and timestamp
+-    it.value().hits++;
+-    it.value().timestamp = ++current_timestamp;
++    updateHitCountAndTimeStamp(it.value());
++
++    return it.value().data;
++}
++
++void QFontCache::updateHitCountAndTimeStamp(Engine &value)
++{
++    value.hits++;
++    value.timestamp = ++current_timestamp;
+ 
+     FC_DEBUG("QFontCache: found font engine\n"
+              "  %p: timestamp %4u hits %3u ref %2d/%2d, type '%s'",
+-             it.value().data, it.value().timestamp, it.value().hits,
+-             it.value().data->ref.load(), it.value().data->cache_count,
+-             it.value().data->name());
+-
+-    return it.value().data;
++             value.data, value.timestamp, value.hits,
++             value.data->ref.load(), value.data->cache_count,
++             value.data->name());
+ }
+ 
+ void QFontCache::removeEngine(QFontEngine *engine)
+@@ -2743,14 +2747,17 @@ void QFontCache::removeEngine(QFontEngine *engine)
+     }
+ }
+ 
+-void QFontCache::insertEngine(const Key &key, QFontEngine *engine)
++void QFontCache::insertEngine(const Key &key, QFontEngine *engine, bool insertMulti)
+ {
+     FC_DEBUG("QFontCache: inserting new engine %p", engine);
+ 
+     Engine data(engine);
+     data.timestamp = ++current_timestamp;
+ 
+-    engineCache.insert(key, data);
++    if (insertMulti)
++        engineCache.insertMulti(key, data);
++    else
++        engineCache.insert(key, data);
+ 
+     // only increase the cost if this is the first time we insert the engine
+     if (engine->cache_count == 0)
+diff --git a/src/gui/text/qfont_p.h b/src/gui/text/qfont_p.h
+index d102492..06cf787 100644
+--- a/src/gui/text/qfont_p.h
++++ b/src/gui/text/qfont_p.h
+@@ -242,9 +242,10 @@ public:
+     EngineCache engineCache;
+ 
+     QFontEngine *findEngine(const Key &key);
+-    void insertEngine(const Key &key, QFontEngine *engine);
+-    void removeEngine(QFontEngine *engine);
+ 
++    void updateHitCountAndTimeStamp(Engine &value);
++    void insertEngine(const Key &key, QFontEngine *engine, bool insertMulti = false);
++    void removeEngine(QFontEngine *engine);
+ 
+     private:
+     void increaseCost(uint cost);
+diff --git a/src/gui/text/qfontdatabase.h b/src/gui/text/qfontdatabase.h
+index b569799..b30f7da 100644
+--- a/src/gui/text/qfontdatabase.h
++++ b/src/gui/text/qfontdatabase.h
+@@ -162,7 +162,6 @@ private:
+     friend class QFontEngineMultiXLFD;
+     friend class QFontEngineMultiQWS;
+     friend class QFontEngineMultiQPA;
+-    friend class QTextEngine;
+ #ifdef QT_BUILD_INTERNAL
+     friend class ::tst_QFont;
+ #endif
+diff --git a/src/gui/text/qfontengine_p.h b/src/gui/text/qfontengine_p.h
+index 023882d..fed135e 100644
+--- a/src/gui/text/qfontengine_p.h
++++ b/src/gui/text/qfontengine_p.h
+@@ -85,6 +85,7 @@ struct QGlyphLayout;
+ 
+ class Q_GUI_EXPORT QFontEngine : public QObject
+ {
++    Q_OBJECT
+ public:
+     enum Type {
+         Box,
+@@ -344,6 +345,7 @@ private:
+ 
+ class Q_GUI_EXPORT QFontEngineMulti : public QFontEngine
+ {
++    Q_OBJECT
+ public:
+     explicit QFontEngineMulti(int engineCount);
+     ~QFontEngineMulti();
+diff --git a/src/gui/text/qfontengine_qpa.cpp b/src/gui/text/qfontengine_qpa.cpp
+index 3365736..4867982 100644
+--- a/src/gui/text/qfontengine_qpa.cpp
++++ b/src/gui/text/qfontengine_qpa.cpp
+@@ -46,8 +46,10 @@
+ #include <QtCore/QDir>
+ #include <QtCore/QBuffer>
+ 
+-#include <QtGui/QPlatformFontDatabase>
+ #include <QtGui/private/qpaintengine_raster_p.h>
++#include <QtGui/private/qguiapplication_p.h>
++#include <QtGui/QPlatformFontDatabase>
++#include <QtGui/QPlatformIntegration>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -662,6 +664,20 @@ void QPAGenerator::writeTaggedQFixed(QFontEngineQPA::HeaderTag tag, QFixed value
+ QFontEngineMultiQPA::QFontEngineMultiQPA(QFontEngine *fe, int _script, const QStringList &fallbacks)
+     : QFontEngineMulti(fallbacks.size() + 1),
+       fallbackFamilies(fallbacks), script(_script)
++    , fallbacksQueried(true)
++{
++    init(fe);
++}
++
++QFontEngineMultiQPA::QFontEngineMultiQPA(QFontEngine *fe, int _script)
++    : QFontEngineMulti(2)
++    , script(_script)
++    , fallbacksQueried(false)
++{
++    init(fe);
++}
++
++void QFontEngineMultiQPA::init(QFontEngine *fe)
+ {
+     Q_ASSERT(fe && fe->type() != QFontEngine::Multi);
+     engines[0] = fe;
+@@ -672,18 +688,73 @@ QFontEngineMultiQPA::QFontEngineMultiQPA(QFontEngine *fe, int _script, const QSt
+ 
+ void QFontEngineMultiQPA::loadEngine(int at)
+ {
++    bool canLoadFallbackEngine = true;
++    if (!fallbacksQueried) {
++        // Original FontEngine to restore after the fill.
++        QFontEngine *fe = engines[0];
++        fallbackFamilies = QGuiApplicationPrivate::instance()->platformIntegration()->fontDatabase()->fallbacksForFamily(fe->fontDef.family, QFont::Style(fe->fontDef.style)
++                                                                                                                         , QFont::AnyStyle, QUnicodeTables::Script(script));
++        if (fallbackFamilies.size() > 1) {
++            engines.fill(0, fallbackFamilies.size() + 1);
++            engines[0] = fe;
++        } else {
++            // Turns out we lied about having any fallback at all.
++            canLoadFallbackEngine = false;
++            engines[1] = fe;
++        }
++        fallbacksQueried = true;
++    }
+     Q_ASSERT(at < engines.size());
+     Q_ASSERT(engines.at(at) == 0);
+-
+     QFontDef request = fontDef;
+-    request.styleStrategy |= QFont::NoFontMerging;
+-    request.family = fallbackFamilies.at(at-1);
+-    engines[at] = QFontDatabase::findFont(script,
+-                                          /*fontprivate*/0,
+-                                          request, false);
++    if (canLoadFallbackEngine) {
++        request.styleStrategy |= QFont::NoFontMerging;
++        request.family = fallbackFamilies.at(at-1);
++        engines[at] = QFontDatabase::findFont(script,
++                                              /*fontprivate = */0,
++                                              request, /*multi = */false);
++    }
+     Q_ASSERT(engines[at]);
+     engines[at]->ref.ref();
+     engines[at]->fontDef = request;
+ }
+ 
++/*
++  This is used indirectly by QtWebKit when using QTextLayout::setRawFont
++
++  The purpose of this is to provide the necessary font fallbacks when drawing complex
++  text. Since QtWebKit ends up repeatedly creating QTextLayout instances and passing them
++  the same raw font over and over again, we want to cache the corresponding multi font engine
++  as it may contain fallback font engines already.
++*/
++QFontEngine* QFontEngineMultiQPA::createMultiFontEngine(QFontEngine *fe, int script)
++{
++    QFontEngine *engine = 0;
++    QFontCache::Key key(fe->fontDef, script, /*multi = */true);
++    QFontCache *fc = QFontCache::instance();
++    //  We can't rely on the fontDef (and hence the cache Key)
++    //  alone to distinguish webfonts, since these should not be
++    //  accidentally shared, even if the resulting fontcache key
++    //  is strictly identical. See:
++    //   http://www.w3.org/TR/css3-fonts/#font-face-rule
++    const bool faceIsLocal = !fe->faceId().filename.isEmpty();
++    QFontCache::EngineCache::Iterator it = fc->engineCache.find(key),
++            end = fc->engineCache.end();
++    while (it != end && it.key() == key) {
++        QFontEngineMulti *cachedEngine = qobject_cast<QFontEngineMulti *>(it.value().data);
++        if (faceIsLocal || (cachedEngine && fe == cachedEngine->engine(0))) {
++            engine = cachedEngine;
++            fc->updateHitCountAndTimeStamp(it.value());
++            break;
++        }
++        it++;
++    }
++    if (!engine) {
++        engine = new QFontEngineMultiQPA(fe, script);
++        QFontCache::instance()->insertEngine(key, engine, /* insertMulti */ !faceIsLocal);
++    }
++    Q_ASSERT(engine);
++    return engine;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/gui/text/qfontengine_qpa_p.h b/src/gui/text/qfontengine_qpa_p.h
+index ed2e071..16991ad 100644
+--- a/src/gui/text/qfontengine_qpa_p.h
++++ b/src/gui/text/qfontengine_qpa_p.h
+@@ -249,13 +249,18 @@ public:
+     QFontEngineMultiQPA(QFontEngine *fe, int script, const QStringList &fallbacks);
+ 
+     void loadEngine(int at);
++    static QFontEngine* createMultiFontEngine(QFontEngine *fe, int script);
+ 
+     int fallbackFamilyCount() const { return fallbackFamilies.size(); }
+     QString fallbackFamilyAt(int at) const { return fallbackFamilies.at(at); }
+ 
+ private:
++    QFontEngineMultiQPA(QFontEngine *fe, int script);
++    void init(QFontEngine *fe);
++
+     QStringList fallbackFamilies;
+     int script;
++    bool fallbacksQueried;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/text/qtextengine.cpp b/src/gui/text/qtextengine.cpp
+index a95e613..0460db1 100644
+--- a/src/gui/text/qtextengine.cpp
++++ b/src/gui/text/qtextengine.cpp
+@@ -59,6 +59,7 @@
+ #include <qinputmethod.h>
+ #include <stdlib.h>
+ 
++#include "qfontengine_qpa_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -1708,7 +1709,7 @@ QFontEngine *QTextEngine::fontEngine(const QScriptItem &si, QFixed *ascent, QFix
+         if (feCache.prevFontEngine && feCache.prevFontEngine->type() == QFontEngine::Multi && feCache.prevScript == script) {
+             engine = feCache.prevFontEngine;
+         } else {
+-            engine = QFontDatabase::findFont(script, /*fontPrivate*/0, rawFont.d->fontEngine->fontDef, true);
++            engine = QFontEngineMultiQPA::createMultiFontEngine(rawFont.d->fontEngine, script);
+             feCache.prevFontEngine = engine;
+             feCache.prevScript = script;
+             engine->ref.ref();
+@@ -1720,7 +1721,7 @@ QFontEngine *QTextEngine::fontEngine(const QScriptItem &si, QFixed *ascent, QFix
+                 scaledEngine = feCache.prevScaledFontEngine;
+             } else {
+                 QFontEngine *scEngine = rawFont.d->fontEngine->cloneWithSize(smallCapsFraction * rawFont.pixelSize());
+-                scaledEngine = QFontDatabase::findFont(script, /*fontPrivate*/0, scEngine->fontDef, true);
++                scaledEngine = QFontEngineMultiQPA::createMultiFontEngine(scEngine, script);
+                 scaledEngine->ref.ref();
+                 feCache.prevScaledFontEngine = scaledEngine;
+             }

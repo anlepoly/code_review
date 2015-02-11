@@ -1,0 +1,331 @@
+diff --git a/src/network/socket/qlocalserver.cpp b/src/network/socket/qlocalserver.cpp
+index b3fe4ac..97f5920 100644
+--- a/src/network/socket/qlocalserver.cpp
++++ b/src/network/socket/qlocalserver.cpp
+@@ -82,6 +82,27 @@ QT_BEGIN_NAMESPACE
+ */
+ 
+ /*!
++    \enum QLocalServer::SocketOption
++
++    This enum describes the possible options that can be used to create the
++    socket. This changes the access permissions on platforms (Linux, Windows)
++    that support access permissions on the socket. Both GroupAccess and OtherAccess
++    may vary slightly in meanings depending on the platform.
++
++    \value UserAccess
++    Access is restricted to the same user as the process that created the socket.
++    \value GroupAccess
++    Access is restricted to the same group but not the user that created the socket on Linux.
++    \value OtherAccess
++    Access is available to everyone but the user and group that created the socket on Linux.
++    \value WorldAccess
++    No access restrictions.
++
++    \sa SocketOptions
++*/
++
++
++/*!
+     Create a new local socket server with the given \a parent.
+ 
+     \sa listen()
+@@ -109,6 +130,48 @@ QLocalServer::~QLocalServer()
+ }
+ 
+ /*!
++    \property QLocalServer::socketOptions
++    \since 5.0
++
++    The setSocketOptions method controls how the socket operates.
++    For example the socket may restrict access to what user ids can
++    connect to the socket.
++
++    These options must be set before listen() is called.
++
++    In some cases, such as with Unix domain sockets on Linux, the
++    access to the socket will be determined by file system permissions,
++    and are created based on the umask. Setting the access flags will
++    overide this and will restrict or permit access as specified.
++
++    Other Unix-based operating systems, such as Mac OS X, do not
++    honor file permissions for Unix domain sockets and by default
++    have WorldAccess and these permission flags will have no effect.
++
++    By default none of the flags are set, access permissions
++    are the platform default.
++
++    \sa listen()
++*/
++void QLocalServer::setSocketOptions(SocketOptions options)
++{
++    Q_D(QLocalServer);
++
++    d->socketOptions = options;
++}
++
++/*!
++    Returns the socket options set on the socket.
++
++    \sa setSocketOptions()
++ */
++QLocalServer::SocketOptions QLocalServer::socketOptions() const
++{
++    Q_D(const QLocalServer);
++    return d->socketOptions;
++}
++
++/*!
+     Stop listening for incoming connections.  Existing connections are not
+     effected, but any new connections will be refused.
+ 
+diff --git a/src/network/socket/qlocalserver.h b/src/network/socket/qlocalserver.h
+index f694131..6f883ad 100644
+--- a/src/network/socket/qlocalserver.h
++++ b/src/network/socket/qlocalserver.h
+@@ -58,11 +58,22 @@ class Q_NETWORK_EXPORT QLocalServer : public QObject
+ {
+     Q_OBJECT
+     Q_DECLARE_PRIVATE(QLocalServer)
++    Q_PROPERTY(SocketOptions socketOptions READ socketOptions WRITE setSocketOptions)
++    Q_FLAGS(SocketOption SocketOptions)
+ 
+ Q_SIGNALS:
+     void newConnection();
+ 
+ public:
++    enum SocketOption {
++        NoOptions = 0x0,
++        UserAccessOption = 0x01,
++        GroupAccessOption = 0x2,
++        OtherAccessOption = 0x4,
++        WorldAccessOption = 0x7
++    };
++    Q_DECLARE_FLAGS(SocketOptions, SocketOption)
++
+     QLocalServer(QObject *parent = 0);
+     ~QLocalServer();
+ 
+@@ -80,6 +91,9 @@ public:
+     void setMaxPendingConnections(int numConnections);
+     bool waitForNewConnection(int msec = 0, bool *timedOut = 0);
+ 
++    void setSocketOptions(SocketOptions options);
++    SocketOptions socketOptions() const;
++
+ protected:
+     virtual void incomingConnection(quintptr socketDescriptor);
+ 
+@@ -88,6 +102,8 @@ private:
+     Q_PRIVATE_SLOT(d_func(), void _q_onNewConnection())
+ };
+ 
++Q_DECLARE_OPERATORS_FOR_FLAGS(QLocalServer::SocketOptions)
++
+ #endif // QT_NO_LOCALSERVER
+ 
+ QT_END_NAMESPACE
+diff --git a/src/network/socket/qlocalserver_p.h b/src/network/socket/qlocalserver_p.h
+index 6e39136..03c06a4 100644
+--- a/src/network/socket/qlocalserver_p.h
++++ b/src/network/socket/qlocalserver_p.h
+@@ -80,7 +80,8 @@ public:
+ #if !defined(QT_LOCALSOCKET_TCP) && !defined(Q_OS_WIN)
+             listenSocket(-1), socketNotifier(0),
+ #endif
+-            maxPendingConnections(30), error(QAbstractSocket::UnknownSocketError)
++            maxPendingConnections(30), error(QAbstractSocket::UnknownSocketError),
++            socketOptions(QLocalServer::NoOptions)
+     {
+     }
+ 
+@@ -121,6 +122,7 @@ public:
+     QQueue<QLocalSocket*> pendingConnections;
+     QString errorString;
+     QAbstractSocket::SocketError error;
++    QLocalServer::SocketOptions socketOptions;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/network/socket/qlocalserver_unix.cpp b/src/network/socket/qlocalserver_unix.cpp
+index c4482da..ce0c283 100644
+--- a/src/network/socket/qlocalserver_unix.cpp
++++ b/src/network/socket/qlocalserver_unix.cpp
+@@ -44,6 +44,7 @@
+ #include "qlocalsocket.h"
+ #include "qlocalsocket_p.h"
+ #include "qnet_unix_p.h"
++#include "qtemporarydir.h"
+ 
+ #ifndef QT_NO_LOCALSERVER
+ 
+@@ -92,6 +93,20 @@ bool QLocalServerPrivate::listen(const QString &requestedServerName)
+     }
+     serverName = requestedServerName;
+ 
++    QString tempPath;
++    QScopedPointer<QTemporaryDir> tempDir;
++
++    // Check any of the flags
++    if (socketOptions & QLocalServer::WorldAccessOption) {
++        tempDir.reset(new QTemporaryDir(fullServerName));
++        if (!tempDir->isValid()) {
++            setError(QLatin1String("QLocalServer::listen"));
++            return false;
++        }
++        tempPath = tempDir->path();
++        tempPath += QLatin1Char('/') + requestedServerName;
++    }
++
+     // create the unix socket
+     listenSocket = qt_safe_socket(PF_UNIX, SOCK_STREAM, 0);
+     if (-1 == listenSocket) {
+@@ -108,8 +123,26 @@ bool QLocalServerPrivate::listen(const QString &requestedServerName)
+         closeServer();
+         return false;
+     }
+-    ::memcpy(addr.sun_path, fullServerName.toLatin1().data(),
+-             fullServerName.toLatin1().size() + 1);
++
++    if (socketOptions & QLocalServer::WorldAccessOption) {
++        if (sizeof(addr.sun_path) < (uint)tempPath.toLatin1().size() + 1) {
++            setError(QLatin1String("QLocalServer::listen"));
++            closeServer();
++            return false;
++        }
++        ::memcpy(addr.sun_path, tempPath.toLatin1().data(),
++                 tempPath.toLatin1().size() + 1);
++
++        if (-1 == ::fchmod(listenSocket, 0)) {
++            setError(QLatin1String("QLocalServer::listen"));
++            closeServer();
++            return false;
++        }
++
++    } else {
++        ::memcpy(addr.sun_path, fullServerName.toLatin1().data(),
++                 fullServerName.toLatin1().size() + 1);
++    }
+ 
+     // bind
+     if(-1 == QT_SOCKET_BIND(listenSocket, (sockaddr *)&addr, sizeof(sockaddr_un))) {
+@@ -133,6 +166,34 @@ bool QLocalServerPrivate::listen(const QString &requestedServerName)
+             QFile::remove(fullServerName);
+         return false;
+     }
++
++    if (socketOptions & QLocalServer::WorldAccessOption) {
++            mode_t mode = 000;
++
++            if (socketOptions & QLocalServer::UserAccessOption) {
++                mode |= S_IRWXU;
++            }
++            if (socketOptions & QLocalServer::GroupAccessOption) {
++                mode |= S_IRWXG;
++            }
++            if (socketOptions & QLocalServer::OtherAccessOption) {
++                mode |= S_IRWXO;
++            }
++
++            if (mode) {
++                if (-1 == ::chmod(tempPath.toLatin1(), mode)) {
++                    setError(QLatin1String("QLocalServer::listen"));
++                    closeServer();
++                    return false;
++                }
++            }
++            if (-1 == ::rename(tempPath.toLatin1(), fullServerName.toLatin1())){
++                setError(QLatin1String("QLocalServer::listen"));
++                closeServer();
++                return false;
++            }
++    }
++
+     Q_ASSERT(!socketNotifier);
+     socketNotifier = new QSocketNotifier(listenSocket,
+                                          QSocketNotifier::Read, q);
+diff --git a/tests/auto/network/socket/qlocalsocket/tst_qlocalsocket.cpp b/tests/auto/network/socket/qlocalsocket/tst_qlocalsocket.cpp
+index 5d3cb6e..03b95bf 100644
+--- a/tests/auto/network/socket/qlocalsocket/tst_qlocalsocket.cpp
++++ b/tests/auto/network/socket/qlocalsocket/tst_qlocalsocket.cpp
+@@ -48,6 +48,8 @@
+ 
+ Q_DECLARE_METATYPE(QLocalSocket::LocalSocketError)
+ Q_DECLARE_METATYPE(QLocalSocket::LocalSocketState)
++Q_DECLARE_METATYPE(QLocalServer::SocketOption)
++Q_DECLARE_METATYPE(QFile::Permissions)
+ 
+ class tst_QLocalSocket : public QObject
+ {
+@@ -104,12 +106,17 @@ private slots:
+     void bytesWrittenSignal();
+     void syncDisconnectNotify();
+     void asyncDisconnectNotify();
++
++    void verifySocketOptions();
++    void verifySocketOptions_data();
+ };
+ 
+ void tst_QLocalSocket::init()
+ {
+     qRegisterMetaType<QLocalSocket::LocalSocketState>("QLocalSocket::LocalSocketState");
+     qRegisterMetaType<QLocalSocket::LocalSocketError>("QLocalSocket::LocalSocketError");
++    qRegisterMetaType<QLocalServer::SocketOption>("QLocalServer::SocketOption");
++    qRegisterMetaType<QFile::Permissions>("QFile::Permissions");
+ }
+ 
+ void tst_QLocalSocket::cleanup()
+@@ -1010,6 +1017,54 @@ void tst_QLocalSocket::asyncDisconnectNotify()
+     QTRY_VERIFY(!disconnectedSpy.isEmpty());
+ }
+ 
++void tst_QLocalSocket::verifySocketOptions_data()
++{
++#ifdef Q_OS_LINUX
++    QTest::addColumn<QString>("service");
++    QTest::addColumn<QLocalServer::SocketOption>("opts");
++    QTest::addColumn<QFile::Permissions>("perms");
++
++    QFile::Permissions p = QFile::ExeOwner|QFile::WriteOwner|QFile::ReadOwner |
++                           QFile::ExeUser|QFile::WriteUser|QFile::ReadUser;
++    QTest::newRow("user")  << "userPerms"  << QLocalServer::UserAccess << p;
++
++    p = QFile::ExeGroup|QFile::WriteGroup|QFile::ReadGroup;
++    QTest::newRow("group") << "groupPerms" << QLocalServer::GroupAccess << p;
++
++    p = QFile::ExeOther|QFile::WriteOther|QFile::ReadOther;
++    QTest::newRow("other") << "otherPerms" << QLocalServer::OtherAccess << p;
++
++    p = QFile::ExeOwner|QFile::WriteOwner|QFile::ReadOwner|
++        QFile::ExeUser|QFile::WriteUser|QFile::ReadUser |
++        QFile::ExeGroup|QFile::WriteGroup|QFile::ReadGroup|
++        QFile::ExeOther|QFile::WriteOther|QFile::ReadOther;
++    QTest::newRow("all")   << "worldPerms" << QLocalServer::WorldAccess << p;
++#endif
++}
++
++void tst_QLocalSocket::verifySocketOptions()
++{
++    // These are only guaranteed to be useful on linux at this time
++#ifdef Q_OS_LINUX
++   QFETCH(QString, service);
++   QFETCH(QLocalServer::SocketOption, opts);
++   QFETCH(QFile::Permissions, perms);
++
++
++   QLocalServer::removeServer(service);
++   QLocalServer server;
++   server.setSocketOptions(opts);
++   QVERIFY2(server.listen(service), "service failed to start listening");
++
++   // find the socket
++   QString fullServerPath = QDir::cleanPath(QDir::tempPath());
++   fullServerPath += QLatin1Char('/') + service;
++
++   QFile socketFile(fullServerPath);
++   QVERIFY2(perms == socketFile.permissions(), "permissions on the socket don't match");
++#endif
++}
++
+ QTEST_MAIN(tst_QLocalSocket)
+ #include "tst_qlocalsocket.moc"

@@ -1,0 +1,408 @@
+diff --git a/src/plugins/platforms/cocoa/cocoa.pro b/src/plugins/platforms/cocoa/cocoa.pro
+index 3ea5dc2..ce46c46 100644
+--- a/src/plugins/platforms/cocoa/cocoa.pro
++++ b/src/plugins/platforms/cocoa/cocoa.pro
+@@ -37,6 +37,7 @@ OBJECTIVE_SOURCES += main.mm \
+     qcocoainputcontext.mm \
+     qcocoaservices.mm \
+     qcocoasystemtrayicon.mm \
++    qcocoaintrospection.mm \
+ 
+ HEADERS += qcocoaintegration.h \
+     qcocoatheme.h \
+@@ -70,6 +71,7 @@ HEADERS += qcocoaintegration.h \
+     qcocoainputcontext.h \
+     qcocoaservices.h \
+     qcocoasystemtrayicon.h \
++    qcocoaintrospection.h \
+ 
+ RESOURCES += qcocoaresources.qrc
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoaapplication.h b/src/plugins/platforms/cocoa/qcocoaapplication.h
+index 783edad..6670028 100644
+--- a/src/plugins/platforms/cocoa/qcocoaapplication.h
++++ b/src/plugins/platforms/cocoa/qcocoaapplication.h
+@@ -102,13 +102,14 @@
+ - (BOOL)qt_filterEvent:(NSEvent *)event;
+ @end
+ 
+-@interface QNSApplication : NSApplication {
++@interface QT_MANGLE_NAMESPACE(QNSApplication) : NSApplication {
+ }
+ @end
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ void qt_redirectNSApplicationSendEvent();
++void qt_resetNSApplicationSendEvent();
+ 
+ QT_END_NAMESPACE
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoaapplication.mm b/src/plugins/platforms/cocoa/qcocoaapplication.mm
+index 5b646d8..a50c480 100644
+--- a/src/plugins/platforms/cocoa/qcocoaapplication.mm
++++ b/src/plugins/platforms/cocoa/qcocoaapplication.mm
+@@ -75,6 +75,7 @@
+ 
+ #include <qcocoaapplication.h>
+ 
++#include <qcocoaintrospection.h>
+ #include <qcocoaapplicationdelegate.h>
+ #include <qcocoahelpers.h>
+ #include <qguiapplication.h>
+@@ -107,8 +108,6 @@ QT_USE_NAMESPACE
+ 
+ - (void)qt_sendPostedMessage:(NSEvent *)event
+ {
+-    Q_UNUSED(event);
+-/*
+     // WARNING: data1 and data2 is truncated to from 64-bit to 32-bit on OS 10.5!
+     // That is why we need to split the address in two parts:
+     quint64 lower = [event data1];
+@@ -131,14 +130,14 @@ QT_USE_NAMESPACE
+     }
+ 
+     delete args;
+-*/
+ }
+ 
++static const QByteArray q_macLocalEventType = QByteArrayLiteral("mac_generic_NSEvent");
++
+ - (BOOL)qt_filterEvent:(NSEvent *)event
+ {
+-    Q_UNUSED(event);
+-/*
+-    if (qApp && qApp->macEventFilter(0, reinterpret_cast<EventRef>(event)))
++    if (qApp && qApp->eventDispatcher()->
++            filterNativeEvent(q_macLocalEventType, static_cast<void*>(event), 0))
+         return true;
+ 
+     if ([event type] == NSApplicationDefined) {
+@@ -150,13 +149,13 @@ QT_USE_NAMESPACE
+                 break;
+         }
+     }
+-*/
++
+     return false;
+ }
+ 
+ @end
+ 
+-@implementation QNSApplication
++@implementation QT_MANGLE_NAMESPACE(QNSApplication)
+ 
+ - (void)qt_sendEvent_original:(NSEvent *)event
+ {
+@@ -190,8 +189,7 @@ QT_BEGIN_NAMESPACE
+ 
+ void qt_redirectNSApplicationSendEvent()
+ {
+-/*
+-    if ([NSApp isMemberOfClass:[QNSApplication class]]) {
++    if ([NSApp isMemberOfClass:[QT_MANGLE_NAMESPACE(QNSApplication) class]]) {
+         // No need to change implementation since Qt
+         // already controls a subclass of NSApplication
+         return;
+@@ -204,10 +202,16 @@ void qt_redirectNSApplicationSendEvent()
+     qt_cocoa_change_implementation(
+             [NSApplication class],
+             @selector(sendEvent:),
+-            [QNSApplication class],
++            [QT_MANGLE_NAMESPACE(QNSApplication) class],
+             @selector(qt_sendEvent_replacement:),
+             @selector(qt_sendEvent_original:));
+- */
+  }
+ 
++void qt_resetNSApplicationSendEvent()
++{
++    qt_cocoa_change_back_implementation([NSApplication class],
++                                         @selector(sendEvent:),
++                                         @selector(QT_MANGLE_NAMESPACE(qt_sendEvent_original):));
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoahelpers.h b/src/plugins/platforms/cocoa/qcocoahelpers.h
+index 45c35cc..2de955c 100644
+--- a/src/plugins/platforms/cocoa/qcocoahelpers.h
++++ b/src/plugins/platforms/cocoa/qcocoahelpers.h
+@@ -129,6 +129,34 @@ bool qt_mac_execute_apple_script(const QString &script, AEDesc *ret);
+ // accelerators.
+ QString qt_mac_removeAmpersandEscapes(QString s);
+ 
++enum {
++    QtCocoaEventSubTypeWakeup       = SHRT_MAX,
++    QtCocoaEventSubTypePostMessage  = SHRT_MAX-1
++};
++
++class QCocoaPostMessageArgs {
++public:
++    id target;
++    SEL selector;
++    int argCount;
++    id arg1;
++    id arg2;
++    QCocoaPostMessageArgs(id target, SEL selector, int argCount=0, id arg1=0, id arg2=0)
++        : target(target), selector(selector), argCount(argCount), arg1(arg1), arg2(arg2)
++    {
++        [target retain];
++        [arg1 retain];
++        [arg2 retain];
++    }
++
++    ~QCocoaPostMessageArgs()
++    {
++        [arg2 release];
++        [arg1 release];
++        [target release];
++    }
++};
++
+ QT_END_NAMESPACE
+ 
+ #endif //QCOCOAHELPERS_H
+diff --git a/src/plugins/platforms/cocoa/qcocoaintegration.mm b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+index f17e97c..a361027 100644
+--- a/src/plugins/platforms/cocoa/qcocoaintegration.mm
++++ b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+@@ -192,7 +192,8 @@ QCocoaIntegration::QCocoaIntegration()
+ 
+     qApp->setAttribute(Qt::AA_DontUseNativeMenuBar, false);
+ 
+-    NSApplication *cocoaApplication = [NSApplication sharedApplication];
++    NSApplication *cocoaApplication = [QT_MANGLE_NAMESPACE(QNSApplication) sharedApplication];
++    qt_redirectNSApplicationSendEvent();
+ 
+     if (qEnvironmentVariableIsEmpty("QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM")) {
+         // Applications launched from plain executables (without an app
+@@ -233,6 +234,8 @@ QCocoaIntegration::QCocoaIntegration()
+ 
+ QCocoaIntegration::~QCocoaIntegration()
+ {
++    qt_resetNSApplicationSendEvent();
++
+     QCocoaAutoReleasePool pool;
+     if (!QCoreApplication::testAttribute(Qt::AA_MacPluginApplication)) {
+         // remove the apple event handlers installed by QCocoaApplicationDelegate
+diff --git a/src/plugins/platforms/cocoa/qcocoaintrospection.h b/src/plugins/platforms/cocoa/qcocoaintrospection.h
+new file mode 100644
+index 0000000..ffe3d96
+--- /dev/null
++++ b/src/plugins/platforms/cocoa/qcocoaintrospection.h
+@@ -0,0 +1,84 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Digia Plc and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/legal
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** Commercial License Usage
++** Licensees holding valid commercial Qt licenses may use this file in
++** accordance with the commercial license agreement provided with the
++** Software or, alternatively, in accordance with the terms contained in
++** a written agreement between you and Digia.  For licensing terms and
++** conditions see http://qt.digia.com/licensing.  For further information
++** use the contact form at http://qt.digia.com/contact-us.
++**
++** GNU Lesser General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU Lesser
++** General Public License version 2.1 as published by the Free Software
++** Foundation and appearing in the file LICENSE.LGPL included in the
++** packaging of this file.  Please review the following information to
++** ensure the GNU Lesser General Public License version 2.1 requirements
++** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Digia gives you certain additional
++** rights.  These rights are described in the Digia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU
++** General Public License version 3.0 as published by the Free Software
++** Foundation and appearing in the file LICENSE.GPL included in the
++** packaging of this file.  Please review the following information to
++** ensure the GNU General Public License version 3.0 requirements will be
++** met: http://www.gnu.org/copyleft/gpl.html.
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++/****************************************************************************
++**
++** Copyright (c) 2007-2008, Apple, Inc.
++**
++** All rights reserved.
++**
++** Redistribution and use in source and binary forms, with or without
++** modification, are permitted provided that the following conditions are met:
++**
++**   * Redistributions of source code must retain the above copyright notice,
++**     this list of conditions and the following disclaimer.
++**
++**   * Redistributions in binary form must reproduce the above copyright notice,
++**     this list of conditions and the following disclaimer in the documentation
++**     and/or other materials provided with the distribution.
++**
++**   * Neither the name of Apple, Inc. nor the names of its contributors
++**     may be used to endorse or promote products derived from this software
++**     without specific prior written permission.
++**
++** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++** "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++** LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++** A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
++** CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++** EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++** PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++** PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++** LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++** NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++** SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++**
++****************************************************************************/
++
++#include <qglobal.h>
++#import <objc/objc-class.h>
++
++QT_BEGIN_NAMESPACE
++
++void qt_cocoa_change_implementation(Class baseClass, SEL originalSel, Class proxyClass, SEL replacementSel = 0, SEL backupSel = 0);
++void qt_cocoa_change_back_implementation(Class baseClass, SEL originalSel, SEL backupSel);
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoaintrospection.mm b/src/plugins/platforms/cocoa/qcocoaintrospection.mm
+new file mode 100644
+index 0000000..e1af986
+--- /dev/null
++++ b/src/plugins/platforms/cocoa/qcocoaintrospection.mm
+@@ -0,0 +1,125 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Digia Plc and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/legal
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** Commercial License Usage
++** Licensees holding valid commercial Qt licenses may use this file in
++** accordance with the commercial license agreement provided with the
++** Software or, alternatively, in accordance with the terms contained in
++** a written agreement between you and Digia.  For licensing terms and
++** conditions see http://qt.digia.com/licensing.  For further information
++** use the contact form at http://qt.digia.com/contact-us.
++**
++** GNU Lesser General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU Lesser
++** General Public License version 2.1 as published by the Free Software
++** Foundation and appearing in the file LICENSE.LGPL included in the
++** packaging of this file.  Please review the following information to
++** ensure the GNU Lesser General Public License version 2.1 requirements
++** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Digia gives you certain additional
++** rights.  These rights are described in the Digia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU
++** General Public License version 3.0 as published by the Free Software
++** Foundation and appearing in the file LICENSE.GPL included in the
++** packaging of this file.  Please review the following information to
++** ensure the GNU General Public License version 3.0 requirements will be
++** met: http://www.gnu.org/copyleft/gpl.html.
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++/****************************************************************************
++**
++** Copyright (c) 2007-2008, Apple, Inc.
++**
++** All rights reserved.
++**
++** Redistribution and use in source and binary forms, with or without
++** modification, are permitted provided that the following conditions are met:
++**
++**   * Redistributions of source code must retain the above copyright notice,
++**     this list of conditions and the following disclaimer.
++**
++**   * Redistributions in binary form must reproduce the above copyright notice,
++**     this list of conditions and the following disclaimer in the documentation
++**     and/or other materials provided with the distribution.
++**
++**   * Neither the name of Apple, Inc. nor the names of its contributors
++**     may be used to endorse or promote products derived from this software
++**     without specific prior written permission.
++**
++** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++** "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++** LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++** A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
++** CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++** EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++** PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++** PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++** LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++** NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++** SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++**
++****************************************************************************/
++
++#include "qcocoaintrospection.h"
++
++QT_BEGIN_NAMESPACE
++
++void qt_cocoa_change_implementation(Class baseClass, SEL originalSel, Class proxyClass, SEL replacementSel, SEL backupSel)
++{
++#ifndef QT_MAC_USE_COCOA
++    if (QSysInfo::MacintoshVersion >= QSysInfo::MV_10_5)
++#endif
++    {
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5
++        // The following code replaces the _implementation_ for the selector we want to hack
++        // (originalSel) with the implementation found in proxyClass. Then it creates
++        // a new 'backup' method inside baseClass containing the old, original,
++        // implementation (fakeSel). You can let the proxy implementation of originalSel
++        // call fakeSel if needed (similar approach to calling a super class implementation).
++        // fakeSel must also be implemented in proxyClass, as the signature is used
++        // as template for the method one we add into baseClass.
++        // NB: You will typically never create any instances of proxyClass; we use it
++        // only for stealing its contents and put it into baseClass.
++        if (!replacementSel)
++            replacementSel = originalSel;
++
++        Method originalMethod = class_getInstanceMethod(baseClass, originalSel);
++        Method replacementMethod = class_getInstanceMethod(proxyClass, replacementSel);
++        IMP originalImp = method_setImplementation(originalMethod, method_getImplementation(replacementMethod));
++
++        if (backupSel) {
++            Method backupMethod = class_getInstanceMethod(proxyClass, backupSel);
++            class_addMethod(baseClass, backupSel, originalImp, method_getTypeEncoding(backupMethod));
++        }
++#endif
++    }
++}
++
++void qt_cocoa_change_back_implementation(Class baseClass, SEL originalSel, SEL backupSel)
++{
++#ifndef QT_MAC_USE_COCOA
++    if (QSysInfo::MacintoshVersion >= QSysInfo::MV_10_5)
++#endif
++    {
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5
++        Method originalMethod = class_getInstanceMethod(baseClass, originalSel);
++        Method backupMethodInBaseClass = class_getInstanceMethod(baseClass, backupSel);
++        method_setImplementation(originalMethod, method_getImplementation(backupMethodInBaseClass));
++#endif
++    }
++}
++
++QT_END_NAMESPACE

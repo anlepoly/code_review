@@ -1,0 +1,402 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index ef8e44f..808e633 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -2933,6 +2933,30 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+     int effectivePropertyIndex = cache->propertyIndexCacheStart;
+     int effectiveMethodIndex = cache->methodIndexCacheStart;
+ 
++    // For property change signal override detection.
++    // We prepopulate a set of signal names which already exist in the object,
++    // and throw an error if there is a signal/method defined as an override.
++    QSet<QString> seenSignals;
++    seenSignals << QStringLiteral("destroyed") << QStringLiteral("parentChanged") << QStringLiteral("objectNameChanged");
++    QQmlPropertyCache *parentCache = cache;
++    while ((parentCache = parentCache->parent())) {
++        if (int pSigCount = parentCache->signalCount()) {
++            int pSigOffset = parentCache->signalOffset();
++            for (int i = 0; i < pSigCount; ++i) {
++                QQmlPropertyData *currPSig = parentCache->signal(pSigOffset+i);
++                if (!currPSig) continue;
++                // XXX TODO: find a better way to get signal name from the property data :-/
++                for (QQmlPropertyCache::StringCache::ConstIterator iter = parentCache->stringCache.begin();
++                        iter != parentCache->stringCache.end(); ++iter) {
++                    if (currPSig == iter.value()) {
++                        seenSignals.insert(iter.key());
++                        break;
++                    }
++                }
++            }
++        }
++    }
++
+     // First set up notify signals for properties - first normal, then var, then alias
+     enum { NSS_Normal = 0, NSS_Var = 1, NSS_Alias = 2 };
+     for (int ii = NSS_Normal; ii <= NSS_Alias; ++ii) { // 0 == normal, 1 == var, 2 == alias
+@@ -2952,14 +2976,15 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+             quint32 flags = QQmlPropertyData::IsSignal | QQmlPropertyData::IsFunction |
+                             QQmlPropertyData::IsVMESignal;
+ 
++            QString changedSigName = p->name.toString() + QLatin1String("Changed");
++            seenSignals.insert(changedSigName);
++
+             if (p->nameIndex != -1) {
+                 QHashedCStringRef changedSignalName(cStringData + p->nameIndex,
+                                                     p->name.length() + 7 /* strlen("Changed") */);
+                 cache->appendSignal(changedSignalName, flags, effectiveMethodIndex++);
+             } else {
+-                QString changedSignalName = p->name.toString() + QLatin1String("Changed");
+-
+-                cache->appendSignal(changedSignalName, flags, effectiveMethodIndex++);
++                cache->appendSignal(changedSigName, flags, effectiveMethodIndex++);
+             }
+         }
+     }
+@@ -3012,13 +3037,19 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+         if (paramCount)
+             flags |= QQmlPropertyData::HasArguments;
+ 
++        QString signalName = s->name.toString();
++        if (seenSignals.contains(signalName)) {
++            const QQmlScript::Object::DynamicSignal &currSig = *s;
++            COMPILE_EXCEPTION(&currSig, tr("Duplicate signal name: invalid override of property change signal or superclass signal"));
++        }
++        seenSignals.insert(signalName);
++
+         if (s->nameIndex != -1) {
+             QHashedCStringRef name(cStringData + s->nameIndex, s->name.length(), s->name.hash());
+             cache->appendSignal(name, flags, effectiveMethodIndex++,
+                                 paramCount?paramTypes.constData():0, names);
+         } else {
+-            QString name = s->name.toString();
+-            cache->appendSignal(name, flags, effectiveMethodIndex++,
++            cache->appendSignal(signalName, flags, effectiveMethodIndex++,
+                                 paramCount?paramTypes.constData():0, names);
+         }
+     }
+@@ -3033,12 +3064,19 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+         if (paramCount)
+             flags |= QQmlPropertyData::HasArguments;
+ 
++        QString slotName = s->name.toString();
++        if (seenSignals.contains(slotName)) {
++            const QQmlScript::Object::DynamicSlot &currSlot = *s;
++            COMPILE_EXCEPTION(&currSlot, tr("Duplicate method name: invalid override of property change signal or superclass signal"));
++        }
++        // Note: we don't append slotName to the seenSignals list, since we don't
++        // protect against overriding change signals or methods with properties.
++
+         if (s->nameIndex != -1) {
+             QHashedCStringRef name(cStringData + s->nameIndex, s->name.length(), s->name.hash());
+             cache->appendMethod(name, flags, effectiveMethodIndex++, s->parameterNames);
+         } else {
+-            QString name = s->name.toString();
+-            cache->appendMethod(name, flags, effectiveMethodIndex++, s->parameterNames);
++            cache->appendMethod(slotName, flags, effectiveMethodIndex++, s->parameterNames);
+         }
+     }
+ 
+diff --git a/tests/auto/qml/qqmllanguage/data/OverrideSignalComponent.qml b/tests/auto/qml/qqmllanguage/data/OverrideSignalComponent.qml
+new file mode 100644
+index 0000000..f984e70
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/OverrideSignalComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property int test: 10
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.1.errors.txt b/tests/auto/qml/qqmllanguage/data/overrideSignal.1.errors.txt
+new file mode 100644
+index 0000000..ba8945b
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.1.errors.txt
+@@ -0,0 +1 @@
++5:12:Duplicate signal name: invalid override of property change signal or superclass signal
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.1.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.1.qml
+new file mode 100644
+index 0000000..d6328fa
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.1.qml
+@@ -0,0 +1,26 @@
++import QtQuick 2.0
++
++Item {
++    property int test: 10
++    signal testChanged // manual signal override, should not be valid.
++
++    Component.onCompleted: test = 20
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.2.errors.txt b/tests/auto/qml/qqmllanguage/data/overrideSignal.2.errors.txt
+new file mode 100644
+index 0000000..bc14907
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.2.errors.txt
+@@ -0,0 +1 @@
++5:14:Duplicate method name: invalid override of property change signal or superclass signal
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.2.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.2.qml
+new file mode 100644
+index 0000000..3b38d00
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.2.qml
+@@ -0,0 +1,26 @@
++import QtQuick 2.0
++
++Item {
++    property int test: 10
++    function testChanged() { console.log("function override"); } // manual function override, should not be valid.
++
++    Component.onCompleted: test = 20
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.3.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.3.qml
+new file mode 100644
+index 0000000..779724a
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.3.qml
+@@ -0,0 +1,32 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++    property int test: 10
++    property int testChanged: 15 // property override is fine.
++
++    onTestChanged: if (test == 20) success = true;
++
++    Component.onCompleted: {
++        test = 20;
++        testChanged = 25;
++    }
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.4.errors.txt b/tests/auto/qml/qqmllanguage/data/overrideSignal.4.errors.txt
+new file mode 100644
+index 0000000..e2e235c
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.4.errors.txt
+@@ -0,0 +1 @@
++6:12:Duplicate signal name: invalid override of property change signal or superclass signal
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.4.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.4.qml
+new file mode 100644
+index 0000000..2f5abf3
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.4.qml
+@@ -0,0 +1,32 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++    property alias test: child.test
++    signal testChanged // manual signal override, should not be valid.
++
++    Component.onCompleted: test = 20;
++
++    Item {
++        id: child
++        property int test: 10
++    }
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.5.errors.txt b/tests/auto/qml/qqmllanguage/data/overrideSignal.5.errors.txt
+new file mode 100644
+index 0000000..e2e235c
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.5.errors.txt
+@@ -0,0 +1 @@
++6:12:Duplicate signal name: invalid override of property change signal or superclass signal
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.5.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.5.qml
+new file mode 100644
+index 0000000..fd393f6
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.5.qml
+@@ -0,0 +1,32 @@
++import QtQuick 2.0
++
++OverrideSignalComponent {
++    property bool success: (testChangedCount == 1)
++    property int testChangedCount: 0
++    signal testChanged // override change signal from super
++
++    Component.onCompleted: {
++        test = 20;
++        testChanged();
++    }
++
++    onTestChanged: testChangedCount = 1; // override the signal, change handler won't be called.
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.6.errors.txt b/tests/auto/qml/qqmllanguage/data/overrideSignal.6.errors.txt
+new file mode 100644
+index 0000000..da45191
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.6.errors.txt
+@@ -0,0 +1 @@
++4:12:Duplicate signal name: invalid override of property change signal or superclass signal
+diff --git a/tests/auto/qml/qqmllanguage/data/overrideSignal.6.qml b/tests/auto/qml/qqmllanguage/data/overrideSignal.6.qml
+new file mode 100644
+index 0000000..69e56bf
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/overrideSignal.6.qml
+@@ -0,0 +1,23 @@
++import QtQuick 2.0
++
++OverrideSignalComponent {
++    signal objectNameChanged // manual signal override of builtin signal, invalid.
++
++    // due to an unrelated bug (QTBUG-26818), a certain
++    // number of properties are needed to exist before the
++    // crash condition is hit, currently.
++    property int a
++    property int b
++    property int c
++    property int d
++    property int e
++    property int f
++    property int g
++    property int h
++    property int i
++    property int j
++    property int k
++    property int l
++    property int m
++    property int n
++}
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index ab547dc..50e93ca 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -105,6 +105,8 @@ private slots:
+     void idProperty();
+     void autoNotifyConnection();
+     void assignSignal();
++    void overrideSignal_data();
++    void overrideSignal();
+     void dynamicProperties();
+     void dynamicPropertiesNested();
+     void listProperties();
+@@ -1157,6 +1159,37 @@ void tst_qqmllanguage::assignSignal()
+     emit object->basicParameterizedSignal(9);
+ }
+ 
++
++void tst_qqmllanguage::overrideSignal_data()
++{
++    QTest::addColumn<QString>("file");
++    QTest::addColumn<QString>("errorFile");
++
++    QTest::newRow("override signal with signal") << "overrideSignal.1.qml" << "overrideSignal.1.errors.txt";
++    QTest::newRow("override signal with method") << "overrideSignal.2.qml" << "overrideSignal.2.errors.txt";
++    QTest::newRow("override signal with property") << "overrideSignal.3.qml" << "";
++    QTest::newRow("override signal of alias property with signal") << "overrideSignal.4.qml" << "overrideSignal.4.errors.txt";
++    QTest::newRow("override signal of superclass with signal") << "overrideSignal.5.qml" << "overrideSignal.5.errors.txt";
++    QTest::newRow("override builtin signal with signal") << "overrideSignal.6.qml" << "overrideSignal.6.errors.txt";
++}
++
++void tst_qqmllanguage::overrideSignal()
++{
++    QFETCH(QString, file);
++    QFETCH(QString, errorFile);
++
++    QQmlComponent component(&engine, testFileUrl(file));
++    if (errorFile.isEmpty()) {
++        VERIFY_ERRORS(0);
++        QObject *object = component.create();
++        QVERIFY(object != 0);
++        QVERIFY(object->property("success").toBool());
++        delete object;
++    } else {
++        VERIFY_ERRORS(errorFile.toLatin1().constData());
++    }
++}
++
+ // Tests the creation and assignment of dynamic properties
+ void tst_qqmllanguage::dynamicProperties()
+ {

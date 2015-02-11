@@ -1,0 +1,391 @@
+diff --git a/doc/src/qml/qtdeclarative.qdoc b/doc/src/qml/qtdeclarative.qdoc
+index 20d1c40..48cc898 100644
+--- a/doc/src/qml/qtdeclarative.qdoc
++++ b/doc/src/qml/qtdeclarative.qdoc
+@@ -27,10 +27,10 @@
+ 
+ /*!
+   \module QtQml
+-  \title Qt Declarative Module
++  \title Qt Qml Module
+   \ingroup modules
+ 
+-  \brief The Qt Declarative module provides a declarative framework
++  \brief The Qt Qml module provides a declarative framework
+   for building highly dynamic, custom user interfaces.
+ 
+   To include the definitions of the module's classes, use the
+@@ -44,10 +44,11 @@
+   .pro file:
+ 
+   \code
+-  QT += declarative
++  QT += qml
+   \endcode
+ 
+-  For more information on the Qt Declarative module, see the
++  For more information on the Qt Qml module (including the visual
++  elements which are implemented on top of the Qt Qml module) see the
+   \l{Qt Quick} documentation.
+ */
+ 
+@@ -278,7 +279,16 @@
+   */
+ 
+ /*!
++   \internal
+    \fn int qmlRegisterModuleApi(const char *uri, int versionMajor, int versionMinor, QObject *(*callback)(QQmlEngine *, QJSEngine *))
++   \deprecated
++
++   Any uses of a module API in a binding where that module API was registered with this
++   function instead of the template version will result in suboptimal binding generation.
++ */
++
++/*!
++   \fn template<typename T> int qmlRegisterModuleApi(const char *uri, int versionMajor, int versionMinor, QObject *(*callback)(QQmlEngine *, QJSEngine *))
+    \relates QQmlEngine
+ 
+    This function may be used to register a module API provider \a callback in a particular \a uri
+@@ -289,13 +299,18 @@
+ 
+    A module API may be either a QObject or a QJSValue.  Only one module API provider
+    may be registered into any given namespace (combination of \a uri, \a versionMajor and \a versionMinor).
+-   This function should be used to register a module API provider function which returns a QObject as a module API.
++   This function should be used to register a module API provider function which returns a QObject
++   of the given type T as a module API.
+ 
+    A QObject module API must be imported with a qualifier, and that qualifier may be used as
+    the target in a \l Connections element or otherwise used as any other element id would.
+    One exception to this is that a QObject module API property may not be aliased (because the
+    module API qualifier does not identify an object within the same component as any other item).
+ 
++   \b{NOTE:} A QObject module API instance returned from a module API provider is owned by the QML
++   engine.  For this reason, the module API provider function should \b{not} be implemented as a
++   singleton factory.
++
+    Usage:
+    \code
+    // first, define your QObject which provides the functionality.
+diff --git a/src/imports/localstorage/plugin.cpp b/src/imports/localstorage/plugin.cpp
+index 0187d06..4f08e71 100644
+--- a/src/imports/localstorage/plugin.cpp
++++ b/src/imports/localstorage/plugin.cpp
+@@ -661,7 +661,7 @@ public:
+     void registerTypes(const char *uri)
+     {
+         Q_ASSERT(QLatin1String(uri) == "QtQuick.LocalStorage");
+-        qmlRegisterModuleApi(uri, 2, 0, module_api_factory);
++        qmlRegisterModuleApi<QQuickLocalStorage>(uri, 2, 0, module_api_factory);
+     }
+ };
+ 
+diff --git a/src/qml/qml/qqml.h b/src/qml/qml/qqml.h
+index 32da2c6..5b500e0 100644
+--- a/src/qml/qml/qqml.h
++++ b/src/qml/qml/qqml.h
+@@ -421,7 +421,7 @@ inline int qmlRegisterModuleApi(const char *uri, int versionMajor, int versionMi
+ 
+         uri, versionMajor, versionMinor,
+ 
+-        callback, 0
++        callback, 0, 0
+     };
+ 
+     return QQmlPrivate::qmlregister(QQmlPrivate::ModuleApiRegistration, &api);
+@@ -435,7 +435,22 @@ inline int qmlRegisterModuleApi(const char *uri, int versionMajor, int versionMi
+ 
+         uri, versionMajor, versionMinor,
+ 
+-        0, callback
++        0, callback, 0 // unknown QObject instance type
++    };
++
++    return QQmlPrivate::qmlregister(QQmlPrivate::ModuleApiRegistration, &api);
++}
++
++template <typename T>
++inline int qmlRegisterModuleApi(const char *uri, int versionMajor, int versionMinor,
++                                QObject *(*callback)(QQmlEngine *, QJSEngine *))
++{
++    QQmlPrivate::RegisterModuleApi api = {
++        1,
++
++        uri, versionMajor, versionMinor,
++
++        0, callback, &T::staticMetaObject
+     };
+ 
+     return QQmlPrivate::qmlregister(QQmlPrivate::ModuleApiRegistration, &api);
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 489b4f8..3d09ebb 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -1701,6 +1701,7 @@ QQmlEnginePrivate::moduleApiInstance(const QQmlMetaType::ModuleApi &module)
+         a = new QQmlMetaType::ModuleApiInstance;
+         a->scriptCallback = module.script;
+         a->qobjectCallback = module.qobject;
++        a->instanceMetaObject = module.instanceMetaObject;
+         moduleApiInstances.insert(module, a);
+     }
+ 
+diff --git a/src/qml/qml/qqmlmetatype.cpp b/src/qml/qml/qqmlmetatype.cpp
+index 985adbf..d4c19f8 100644
+--- a/src/qml/qml/qqmlmetatype.cpp
++++ b/src/qml/qml/qqmlmetatype.cpp
+@@ -913,6 +913,10 @@ int registerModuleApi(const QQmlPrivate::RegisterModuleApi &api)
+     import.minor = api.versionMinor;
+     import.script = api.scriptApi;
+     import.qobject = api.qobjectApi;
++    import.instanceMetaObject = (api.qobjectApi && api.version >= 1) ? api.instanceMetaObject : 0; // BC with version 0.
++
++    if (import.qobject && !import.instanceMetaObject) // BC - check import.iMO rather than api.iMO.
++        qWarning() << "qmlRegisterModuleApi(): sub-optimal: use the templated version of this function instead!";
+ 
+     int index = data->moduleApiCount++;
+ 
+diff --git a/src/qml/qml/qqmlmetatype_p.h b/src/qml/qml/qqmlmetatype_p.h
+index b715d0c..03017ca 100644
+--- a/src/qml/qml/qqmlmetatype_p.h
++++ b/src/qml/qml/qqmlmetatype_p.h
+@@ -115,20 +115,23 @@ public:
+ 
+     struct ModuleApiInstance {
+         ModuleApiInstance()
+-            : scriptCallback(0), qobjectCallback(0), qobjectApi(0) {}
++            : scriptCallback(0), qobjectCallback(0), qobjectApi(0), instanceMetaObject(0) {}
+ 
+         QJSValue (*scriptCallback)(QQmlEngine *, QJSEngine *);
+         QObject *(*qobjectCallback)(QQmlEngine *, QJSEngine *);
+-        QJSValue scriptApi;
+         QObject *qobjectApi;
++        const QMetaObject *instanceMetaObject;
++        QJSValue scriptApi;
++
+     };
+     struct ModuleApi {
+         inline ModuleApi();
+         inline bool operator==(const ModuleApi &) const;
+         int major;
+         int minor;
+-        QJSValue (*script)(QQmlEngine *, QJSEngine *);
+         QObject *(*qobject)(QQmlEngine *, QJSEngine *);
++        const QMetaObject *instanceMetaObject;
++        QJSValue (*script)(QQmlEngine *, QJSEngine *);
+     };
+     static ModuleApi moduleApi(const QString &, int, int);
+     static QHash<QString, QList<ModuleApi> > moduleApis();
+@@ -247,8 +250,9 @@ QQmlMetaType::ModuleApi::ModuleApi()
+ {
+     major = 0;
+     minor = 0;
+-    script = 0;
+     qobject = 0;
++    instanceMetaObject = 0;
++    script = 0;
+ }
+ 
+ bool QQmlMetaType::ModuleApi::operator==(const ModuleApi &other) const
+diff --git a/src/qml/qml/qqmlprivate.h b/src/qml/qml/qqmlprivate.h
+index b4c6fc3..82da62f 100644
+--- a/src/qml/qml/qqmlprivate.h
++++ b/src/qml/qml/qqmlprivate.h
+@@ -246,6 +246,7 @@ namespace QQmlPrivate
+ 
+         QJSValue (*scriptApi)(QQmlEngine *, QJSEngine *);
+         QObject *(*qobjectApi)(QQmlEngine *, QJSEngine *);
++        const QMetaObject *instanceMetaObject;
+     };
+ 
+     enum RegistrationType {
+diff --git a/src/qml/qml/v4/qv4irbuilder.cpp b/src/qml/qml/v4/qv4irbuilder.cpp
+index ea4d1af..453120c 100644
+--- a/src/qml/qml/v4/qv4irbuilder.cpp
++++ b/src/qml/qml/v4/qv4irbuilder.cpp
+@@ -428,18 +428,18 @@ bool QV4IRBuilder::visit(AST::IdentifierExpression *ast)
+         if (r.isValid()) {
+             if (r.type) {
+                 _expr.code = _block->ATTACH_TYPE(name, r.type, IR::Name::ScopeStorage, line, column);
+-            } /*else if (r.importNamespace) {
++            } else if (r.importNamespace) {
+                 QQmlMetaType::ModuleApiInstance *moduleApi = m_expression->importCache->moduleApi(r.importNamespace);
+-                if (moduleApi) {
+-                    if (moduleApi->qobjectCallback) {
+-                        moduleApi->qobjectApi = moduleApi->qobjectCallback(QQmlEnginePrivate::get(m_engine), QQmlEnginePrivate::get(m_engine));
+-                        moduleApi->qobjectCallback = 0;
+-                        moduleApi->scriptCallback = 0;
+-                    }
+-                    if (moduleApi->qobjectApi)
+-                        _expr.code = _block->MODULE_OBJECT(name, moduleApi->qobjectApi->metaObject(), IR::Name::MemberStorage, line, column);
++                if (moduleApi && moduleApi->instanceMetaObject) {
++                    // Note: we don't need to check moduleApi->qobjectCallback here, since
++                    // we did that check in registerModuleApi() in qqmlmetatype.cpp.
++                    // We cannot create the QObject Module Api Instance here,
++                    // as we might be running in a loader thread.
++                    // Thus, V4 can only handle bindings which use Module APIs which
++                    // were registered with the templated registration function.
++                    _expr.code = _block->MODULE_OBJECT(name, moduleApi->instanceMetaObject, IR::Name::MemberStorage, line, column);
+                 }
+-            }*/ //### we can't create the actual QObject here, as we may be running in a thread (can be reenabled once QTBUG-24894 is handled)
++            }
+             // We don't support anything else
+         } else {
+             bool found = false;
+diff --git a/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiLegacy.qml b/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiLegacy.qml
+new file mode 100644
+index 0000000..e282ad6
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/moduleapi/qobjectModuleApiLegacy.qml
+@@ -0,0 +1,13 @@
++import QtQuick 2.0
++
++import Qt.test.legacyModuleApi 1.0 as ModApi // was registered with non-templated function
++
++QtObject {
++    property int legacyModulePropertyTest: ModApi.qobjectTestProperty
++    property int legacyModuleMethodTest
++
++    Component.onCompleted: {
++        legacyModuleMethodTest = ModApi.qobjectTestMethod();
++    }
++}
++
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.cpp b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+index a79207a..d674fa3 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.cpp
++++ b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+@@ -187,14 +187,15 @@ void registerTypes()
+ 
+     qRegisterMetaType<MyQmlObject::MyType>("MyQmlObject::MyType");
+ 
+-    qmlRegisterModuleApi("Qt.test",1,0,script_api);             // register (script) module API for an existing uri which contains elements
+-    qmlRegisterModuleApi("Qt.test",1,0,qobject_api);            // register (qobject) for an existing uri for which another module API was previously regd.  Should replace!
+-    qmlRegisterModuleApi("Qt.test.scriptApi",1,0,script_api);   // register (script) module API for a uri which doesn't contain elements
+-    qmlRegisterModuleApi("Qt.test.scriptApi",2,0,readonly_script_api); // register (script) module API for a uri which doesn't contain elements - will be made read-only
+-    qmlRegisterModuleApi("Qt.test.qobjectApi",1,0,qobject_api); // register (qobject) module API for a uri which doesn't contain elements
+-    qmlRegisterModuleApi("Qt.test.qobjectApi",1,3,qobject_api); // register (qobject) module API for a uri which doesn't contain elements, minor version set
+-    qmlRegisterModuleApi("Qt.test.qobjectApi",2,0,qobject_api); // register (qobject) module API for a uri which doesn't contain elements, major version set
+-    qmlRegisterModuleApi("Qt.test.qobjectApiParented",1,0,qobject_api_engine_parent); // register (parented qobject) module API for a uri which doesn't contain elements
++    qmlRegisterModuleApi("Qt.test",1,0,script_api);                             // register (script) module API for an existing uri which contains elements
++    qmlRegisterModuleApi<testQObjectApi>("Qt.test",1,0,qobject_api);            // register (qobject) for an existing uri for which another module API was previously regd.  Should replace!
++    qmlRegisterModuleApi("Qt.test.scriptApi",1,0,script_api);                   // register (script) module API for a uri which doesn't contain elements
++    qmlRegisterModuleApi("Qt.test.scriptApi",2,0,readonly_script_api);          // register (script) module API for a uri which doesn't contain elements - will be made read-only
++    qmlRegisterModuleApi<testQObjectApi>("Qt.test.qobjectApi",1,0,qobject_api); // register (qobject) module API for a uri which doesn't contain elements
++    qmlRegisterModuleApi<testQObjectApi>("Qt.test.qobjectApi",1,3,qobject_api); // register (qobject) module API for a uri which doesn't contain elements, minor version set
++    qmlRegisterModuleApi<testQObjectApi>("Qt.test.qobjectApi",2,0,qobject_api); // register (qobject) module API for a uri which doesn't contain elements, major version set
++    qmlRegisterModuleApi<testQObjectApi>("Qt.test.qobjectApiParented",1,0,qobject_api_engine_parent); // register (parented qobject) module API for a uri which doesn't contain elements
++    qmlRegisterModuleApi("Qt.test.legacyModuleApi", 1, 0, qobject_api); // this registration function doesn't provide type information.
+ 
+     qRegisterMetaType<MyQmlObject::MyEnum2>("MyEnum2");
+     qRegisterMetaType<Qt::MouseButtons>("Qt::MouseButtons");
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index fa1a6a5..eaa6d39 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -3372,6 +3372,17 @@ void tst_qqmlecmascript::moduleApi_data()
+             << QVariantList()
+             << QStringList()
+             << QVariantList();
++
++    QTest::newRow("legacy module api registration")
++            << testFileUrl("moduleapi/qobjectModuleApiLegacy.qml")
++            << QString()
++            << QStringList() // warning doesn't occur in the test, but in registerTypes()
++            << (QStringList() << "legacyModulePropertyTest" << "legacyModuleMethodTest")
++            << (QVariantList() << 20 << 2)
++            << QStringList()
++            << QVariantList()
++            << QStringList()
++            << QVariantList();
+ }
+ 
+ void tst_qqmlecmascript::moduleApi()
+diff --git a/tests/auto/qml/qquickconnection/tst_qquickconnection.cpp b/tests/auto/qml/qquickconnection/tst_qquickconnection.cpp
+index ad687dd..1167281 100644
+--- a/tests/auto/qml/qquickconnection/tst_qquickconnection.cpp
++++ b/tests/auto/qml/qquickconnection/tst_qquickconnection.cpp
+@@ -263,7 +263,7 @@ static QObject *module_api_factory(QQmlEngine *engine, QJSEngine *scriptEngine)
+ // QTBUG-20937
+ void tst_qquickconnection::moduleApiTarget()
+ {
+-    qmlRegisterModuleApi("MyTestModuleApi", 1, 0, module_api_factory);
++    qmlRegisterModuleApi<MyTestModuleApi>("MyTestModuleApi", 1, 0, module_api_factory);
+     QQmlComponent component(&engine, testFileUrl("moduleapi-target.qml"));
+     QObject *object = component.create();
+     QVERIFY(object != 0);
+diff --git a/tests/auto/qml/v4/data/moduleApi.qml b/tests/auto/qml/v4/data/moduleApi.qml
+new file mode 100644
+index 0000000..9f3bf0c
+--- /dev/null
++++ b/tests/auto/qml/v4/data/moduleApi.qml
+@@ -0,0 +1,12 @@
++import Qt.test 1.0 as ModApi
++import QtQuick 2.0
++
++Item {
++    property int testProp: ModApi.ip
++    property int testProp2: 2
++
++    function getRandom() {
++        testProp2 = ModApi.random();
++        // testProp should also have changed.
++    }
++}
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index 8c811f2..47fa10b 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -81,6 +81,7 @@ private slots:
+     void mathCeil();
+     void mathMax();
+     void mathMin();
++    void moduleApi();
+ 
+ private:
+     QQmlEngine engine;
+@@ -589,6 +590,46 @@ void tst_v4::mathMin()
+     delete o;
+ }
+ 
++class V4ModuleApi : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(int ip READ ip WRITE setIp NOTIFY ipChanged FINAL)
++public:
++    V4ModuleApi() : m_ip(12) {}
++    ~V4ModuleApi() {}
++
++    Q_INVOKABLE int random() { static int prng = 3; prng++; m_ip++; emit ipChanged(); return prng; }
++
++    int ip() const { return m_ip; }
++    void setIp(int v) { m_ip = v; emit ipChanged(); }
++
++signals:
++    void ipChanged();
++
++private:
++    int m_ip;
++};
++
++static QObject *v4_module_api_factory(QQmlEngine*, QJSEngine*)
++{
++    return new V4ModuleApi;
++}
++
++void tst_v4::moduleApi()
++{
++    // register module api, providing typeinfo via template
++    qmlRegisterModuleApi<V4ModuleApi>("Qt.test", 1, 0, v4_module_api_factory);
++    QQmlComponent component(&engine, testFileUrl("moduleApi.qml"));
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++    QCOMPARE(o->property("testProp").toInt(), 12);
++    QCOMPARE(o->property("testProp2").toInt(), 2);
++    QMetaObject::invokeMethod(o, "getRandom");
++    QCOMPARE(o->property("testProp").toInt(), 13);
++    QCOMPARE(o->property("testProp2").toInt(), 4);
++    delete o;
++}
++
+ QTEST_MAIN(tst_v4)
+ 
+ #include "tst_v4.moc"

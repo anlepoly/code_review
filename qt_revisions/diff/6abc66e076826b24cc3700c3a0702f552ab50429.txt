@@ -1,0 +1,222 @@
+diff --git a/src/network/socket/qnativesocketengine_unix.cpp b/src/network/socket/qnativesocketengine_unix.cpp
+index 91299f5..f5f9bba 100644
+--- a/src/network/socket/qnativesocketengine_unix.cpp
++++ b/src/network/socket/qnativesocketengine_unix.cpp
+@@ -862,23 +862,28 @@ qint64 QNativeSocketEnginePrivate::nativeSendDatagram(const char *data, qint64 l
+     if (host.protocol() == QAbstractSocket::IPv6Protocol
+         || socketProtocol == QAbstractSocket::IPv6Protocol
+         || socketProtocol == QAbstractSocket::AnyIPProtocol) {
+-    memset(&sockAddrIPv6, 0, sizeof(sockAddrIPv6));
+-    sockAddrIPv6.sin6_family = AF_INET6;
+-    sockAddrIPv6.sin6_port = htons(port);
+-
+-    Q_IPV6ADDR tmp = host.toIPv6Address();
+-    memcpy(&sockAddrIPv6.sin6_addr.s6_addr, &tmp, sizeof(tmp));
+-    sockAddrSize = sizeof(sockAddrIPv6);
+-    sockAddrPtr = (struct sockaddr *)&sockAddrIPv6;
+-    } else
++        memset(&sockAddrIPv6, 0, sizeof(sockAddrIPv6));
++        sockAddrIPv6.sin6_family = AF_INET6;
++        sockAddrIPv6.sin6_port = htons(port);
+ 
+-    if (host.protocol() == QAbstractSocket::IPv4Protocol) {
+-    memset(&sockAddrIPv4, 0, sizeof(sockAddrIPv4));
+-    sockAddrIPv4.sin_family = AF_INET;
+-    sockAddrIPv4.sin_port = htons(port);
+-    sockAddrIPv4.sin_addr.s_addr = htonl(host.toIPv4Address());
+-    sockAddrSize = sizeof(sockAddrIPv4);
+-    sockAddrPtr = (struct sockaddr *)&sockAddrIPv4;
++        Q_IPV6ADDR tmp = host.toIPv6Address();
++        memcpy(&sockAddrIPv6.sin6_addr.s6_addr, &tmp, sizeof(tmp));
++        QString scopeid = host.scopeId();
++        bool ok;
++        sockAddrIPv6.sin6_scope_id = scopeid.toInt(&ok);
++#ifndef QT_NO_IPV6IFNAME
++        if (!ok)
++            sockAddrIPv6.sin6_scope_id = ::if_nametoindex(scopeid.toLatin1());
++#endif
++        sockAddrSize = sizeof(sockAddrIPv6);
++        sockAddrPtr = (struct sockaddr *)&sockAddrIPv6;
++    } else if (host.protocol() == QAbstractSocket::IPv4Protocol) {
++        memset(&sockAddrIPv4, 0, sizeof(sockAddrIPv4));
++        sockAddrIPv4.sin_family = AF_INET;
++        sockAddrIPv4.sin_port = htons(port);
++        sockAddrIPv4.sin_addr.s_addr = htonl(host.toIPv4Address());
++        sockAddrSize = sizeof(sockAddrIPv4);
++        sockAddrPtr = (struct sockaddr *)&sockAddrIPv4;
+     }
+ 
+     // ignore the SIGPIPE signal
+diff --git a/src/network/socket/qnativesocketengine_win.cpp b/src/network/socket/qnativesocketengine_win.cpp
+index 4bf2a6c..bd9550e 100644
+--- a/src/network/socket/qnativesocketengine_win.cpp
++++ b/src/network/socket/qnativesocketengine_win.cpp
+@@ -170,10 +170,12 @@ static inline void qt_socket_getPortAndAddress(SOCKET socketDescriptor, const qt
+         Q_IPV6ADDR tmp;
+         for (int i = 0; i < 16; ++i)
+             tmp.c[i] = sa6->sin6_addr.qt_s6_addr[i];
+-        QHostAddress a;
+-	a.setAddress(tmp);
+-	if (address)
+-	    *address = a;
++        if (address) {
++            QHostAddress a;
++            a.setAddress(tmp);
++            a.setScopeId(QString::number(sa6->sin6_scope_id));
++            *address = a;
++        }
+         if (port)
+ 	    WSANtohs(socketDescriptor, sa6->sin6_port, port);
+     } else
+diff --git a/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp b/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
+index 3060e51..1196825 100644
+--- a/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
++++ b/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
+@@ -122,6 +122,8 @@ private slots:
+     void multicast();
+     void echo_data();
+     void echo();
++    void linkLocalIPv6();
++    void linkLocalIPv4();
+ 
+ protected slots:
+     void empty_readyReadSlot();
+@@ -1342,5 +1344,138 @@ void tst_QUdpSocket::echo()
+     QVERIFY(successes >= 9);
+ }
+ 
++void tst_QUdpSocket::linkLocalIPv6()
++{
++    QFETCH_GLOBAL(bool, setProxy);
++    if (setProxy)
++        return;
++
++    QList <QHostAddress> addresses;
++    QSet <QString> scopes;
++    QHostAddress localMask("fe80::");
++    foreach (const QNetworkInterface& iface, QNetworkInterface::allInterfaces()) {
++        //Windows preallocates link local addresses to interfaces that are down.
++        //These may or may not work depending on network driver
++        if (iface.flags() & QNetworkInterface::IsUp) {
++            foreach (QNetworkAddressEntry addressEntry, iface.addressEntries()) {
++                QHostAddress addr(addressEntry.ip());
++                if (!addr.scopeId().isEmpty() && addr.isInSubnet(localMask, 64)) {
++                    scopes << addr.scopeId();
++                    addresses << addr;
++                    qDebug() << addr;
++                }
++            }
++        }
++    }
++    if (addresses.isEmpty())
++        QSKIP("No IPv6 link local addresses");
++
++    QList <QUdpSocket*> sockets;
++    quint16 port = 0;
++    foreach (const QHostAddress& addr, addresses) {
++        QUdpSocket *s = new QUdpSocket;
++        QVERIFY2(s->bind(addr, port), qPrintable(s->errorString()));
++        port = s->localPort(); //bind same port, different networks
++        sockets << s;
++    }
++
++    QUdpSocket neutral;
++    QVERIFY(neutral.bind(QHostAddress(QHostAddress::AnyIPv6)));
++    QSignalSpy neutralReadSpy(&neutral, SIGNAL(readyRead()));
++
++    QByteArray testData("hello");
++    QByteArray receiveBuffer("xxxxx");
++    foreach (QUdpSocket *s, sockets) {
++        QSignalSpy spy(s, SIGNAL(readyRead()));
++
++        neutralReadSpy.clear();
++        QVERIFY(s->writeDatagram(testData, s->localAddress(), neutral.localPort()));
++        QTRY_VERIFY(neutralReadSpy.count() > 0); //note may need to accept a firewall prompt
++        QHostAddress from;
++        quint16 fromPort;
++        QCOMPARE((int)neutral.readDatagram(receiveBuffer.data(), receiveBuffer.length(), &from, &fromPort), testData.length());
++        QCOMPARE(from, s->localAddress());
++        QCOMPARE(fromPort, s->localPort());
++        QCOMPARE(receiveBuffer, testData);
++
++        QVERIFY(neutral.writeDatagram(testData, s->localAddress(), s->localPort()));
++        QTRY_VERIFY(spy.count() > 0); //note may need to accept a firewall prompt
++        QCOMPARE((int)s->readDatagram(receiveBuffer.data(), receiveBuffer.length(), &from, &fromPort), testData.length());
++        QCOMPARE(receiveBuffer, testData);
++
++        //sockets bound to other interfaces shouldn't have received anything
++        foreach (QUdpSocket *s2, sockets) {
++            QCOMPARE((int)s2->bytesAvailable(), 0);
++        }
++
++        //Sending to the same address with different scope should normally fail
++        //However it will pass if there is a route between two interfaces,
++        //e.g. connected to a home/office network via wired and wireless interfaces
++        //which is a reasonably common case.
++        //So this is not auto tested.
++    }
++    qDeleteAll(sockets);
++}
++
++void tst_QUdpSocket::linkLocalIPv4()
++{
++    QFETCH_GLOBAL(bool, setProxy);
++    if (setProxy)
++        return;
++
++    QList <QHostAddress> addresses;
++    QHostAddress localMask("169.254.0.0");
++    foreach (const QNetworkInterface& iface, QNetworkInterface::allInterfaces()) {
++        //Windows preallocates link local addresses to interfaces that are down.
++        //These may or may not work depending on network driver (they do not work for the Bluetooth PAN driver)
++        if (iface.flags() & QNetworkInterface::IsUp) {
++            foreach (QNetworkAddressEntry addr, iface.addressEntries()) {
++                if (addr.ip().isInSubnet(localMask, 16)) {
++                    addresses << addr.ip();
++                    qDebug() << addr.ip();
++                }
++            }
++        }
++    }
++    if (addresses.isEmpty())
++        QSKIP("No IPv4 link local addresses");
++
++    QList <QUdpSocket*> sockets;
++    quint16 port = 0;
++    foreach (const QHostAddress& addr, addresses) {
++        QUdpSocket *s = new QUdpSocket;
++        QVERIFY2(s->bind(addr, port), qPrintable(s->errorString()));
++        port = s->localPort(); //bind same port, different networks
++        sockets << s;
++    }
++
++    QUdpSocket neutral;
++    QVERIFY(neutral.bind(QHostAddress(QHostAddress::AnyIPv4)));
++
++    QByteArray testData("hello");
++    QByteArray receiveBuffer("xxxxx");
++    foreach (QUdpSocket *s, sockets) {
++        QVERIFY(s->writeDatagram(testData, s->localAddress(), neutral.localPort()));
++        QVERIFY(neutral.waitForReadyRead(10000));
++        QHostAddress from;
++        quint16 fromPort;
++        QCOMPARE((int)neutral.readDatagram(receiveBuffer.data(), receiveBuffer.length(), &from, &fromPort), testData.length());
++        QCOMPARE(from, s->localAddress());
++        QCOMPARE(fromPort, s->localPort());
++        QCOMPARE(receiveBuffer, testData);
++
++        QVERIFY(neutral.writeDatagram(testData, s->localAddress(), s->localPort()));
++        QVERIFY(s->waitForReadyRead(10000));
++        QCOMPARE((int)s->readDatagram(receiveBuffer.data(), receiveBuffer.length(), &from, &fromPort), testData.length());
++        QCOMPARE(receiveBuffer, testData);
++
++        //sockets bound to other interfaces shouldn't have received anything
++        foreach (QUdpSocket *s2, sockets) {
++            QCOMPARE((int)s2->bytesAvailable(), 0);
++        }
++    }
++    qDeleteAll(sockets);
++}
++
+ QTEST_MAIN(tst_QUdpSocket)
+ #include "tst_qudpsocket.moc"

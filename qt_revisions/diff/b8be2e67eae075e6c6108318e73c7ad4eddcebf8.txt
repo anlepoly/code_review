@@ -1,0 +1,354 @@
+diff --git a/src/gui/kernel/qplatformwindow.cpp b/src/gui/kernel/qplatformwindow.cpp
+index 2bc6b01..edd9a3d 100644
+--- a/src/gui/kernel/qplatformwindow.cpp
++++ b/src/gui/kernel/qplatformwindow.cpp
+@@ -466,12 +466,18 @@ bool QPlatformWindow::frameStrutEventsEnabled() const
+         \li Mouse grab: Qt expects windows to automatically grab the mouse if the user presses
+             a button until the button is released.
+             Automatic grab should be released if some window is explicitly grabbed.
+-        \li Enter/Leave events: Enter and leave events should be sent independently of
+-            explicit mouse grabs (\c{setMouseGrabEnabled()}). That is, if the mouse leaves
+-            a window that has explicit mouse grab, a leave event should be sent and other
+-            windows should get enter/leave events as well as the mouse traverses them.
+-            For automatic mouse grab, however, a leave event should be sent when the
+-            button is released.
++        \li Enter/Leave events: If there is a window explicitly grabbing mouse events
++            (\c{setMouseGrabEnabled()}), enter and leave events should only be sent to the
++            grabbing window when mouse cursor passes over the grabbing window boundary.
++            Other windows will not receive enter or leave events while the grab is active.
++            While an automatic mouse grab caused by a mouse button press is active, no window
++            will receive enter or leave events. When the last mouse button is released, the
++            autograbbing window will receive leave event if mouse cursor is no longer within
++            the window boundary.
++            When any grab starts, the window under cursor will receive a leave event unless
++            it is the grabbing window.
++            When any grab ends, the window under cursor will receive an enter event unless it
++            was the grabbing window.
+         \li Window positioning: When calling \c{QWindow::setFramePos()}, the flag
+             \c{QWindowPrivate::positionPolicy} is set to \c{QWindowPrivate::WindowFrameInclusive}.
+             This means the position includes the window frame, whose size is at this point
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.cpp b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+index 2f624c3..2f2d5d2 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.cpp
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+@@ -130,7 +130,8 @@ QWindowsMouseHandler::QWindowsMouseHandler() :
+     m_windowUnderMouse(0),
+     m_trackedWindow(0),
+     m_touchDevice(0),
+-    m_leftButtonDown(false)
++    m_leftButtonDown(false),
++    m_previousCaptureWindow(0)
+ {
+ }
+ 
+@@ -212,6 +213,7 @@ bool QWindowsMouseHandler::translateMouseEvent(QWindow *window, HWND hwnd,
+                 if (QWindowsContext::verboseEvents)
+                     qDebug() << "Automatic mouse capture for missing buttondown event" << window;
+             }
++            m_previousCaptureWindow = window;
+             return true;
+         } else if (m_leftButtonDown && !actualLeftDown) {
+             m_leftButtonDown = false;
+@@ -253,12 +255,13 @@ bool QWindowsMouseHandler::translateMouseEvent(QWindow *window, HWND hwnd,
+         }
+     }
+ 
++    const bool hasCapture = platformWindow->hasMouseCapture();
++    const bool currentNotCapturing = hasCapture && currentWindowUnderMouse != window;
+ #ifndef Q_OS_WINCE
+     // Enter new window: track to generate leave event.
+-    // If there is an active capture, we must track the actual capture window instead of window
+-    // under cursor or leaves will trigger constantly, so always track the window we got
+-    // native mouse event for.
+-    if (window != m_trackedWindow) {
++    // If there is an active capture, only track if the current window is capturing,
++    // so we don't get extra leave when cursor leaves the application.
++    if (window != m_trackedWindow && !currentNotCapturing) {
+         TRACKMOUSEEVENT tme;
+         tme.cbSize = sizeof(TRACKMOUSEEVENT);
+         tme.dwFlags = TME_LEAVE;
+@@ -270,39 +273,53 @@ bool QWindowsMouseHandler::translateMouseEvent(QWindow *window, HWND hwnd,
+     }
+ #endif // !Q_OS_WINCE
+ 
+-    // Qt expects enter/leave events for windows even when some window is capturing mouse input,
+-    // except for automatic capture when mouse button is pressed - in that case enter/leave
+-    // should be sent only after the last button is released.
+-    // We need to track m_windowUnderMouse separately from m_trackedWindow, as
+-    // Windows mouse tracking will not trigger WM_MOUSELEAVE for leaving window when
+-    // mouse capture is set.
+-    if (!platformWindow->hasMouseCapture()
+-        || !platformWindow->testFlag(QWindowsWindow::AutoMouseCapture)) {
+-        if (m_windowUnderMouse != currentWindowUnderMouse) {
+-            if (m_windowUnderMouse) {
+-                if (QWindowsContext::verboseEvents)
+-                    qDebug() << "Synthetic leave for " << m_windowUnderMouse;
+-                QWindowSystemInterface::handleLeaveEvent(m_windowUnderMouse);
+-                // Clear tracking if we are no longer over application,
+-                // since we have already sent the leave.
+-                if (!currentWindowUnderMouse)
+-                    m_trackedWindow = 0;
+-            }
+-
+-            if (currentWindowUnderMouse) {
+-                if (QWindowsContext::verboseEvents)
+-                    qDebug() << "Entering " << currentWindowUnderMouse;
+-                QWindowsWindow::baseWindowOf(currentWindowUnderMouse)->applyCursor();
+-                QWindowSystemInterface::handleEnterEvent(currentWindowUnderMouse,
+-                                                         currentWindowUnderMouse->mapFromGlobal(globalPosition),
+-                                                         globalPosition);
++    // No enter or leave events are sent as long as there is an autocapturing window.
++    if (!hasCapture || !platformWindow->testFlag(QWindowsWindow::AutoMouseCapture)) {
++        // Leave is needed if:
++        // 1) There is no capture and we move from a window to another window.
++        //    Note: Leaving the application entirely is handled in WM_MOUSELEAVE case.
++        // 2) There is capture and we move out of the capturing window.
++        // 3) There is a new capture and we were over another window.
++        if ((m_windowUnderMouse && m_windowUnderMouse != currentWindowUnderMouse
++                && (!hasCapture || window == m_windowUnderMouse))
++            || (hasCapture && m_previousCaptureWindow != window && m_windowUnderMouse
++                && m_windowUnderMouse != window)) {
++            if (QWindowsContext::verboseEvents)
++                qDebug() << "Synthetic leave for " << m_windowUnderMouse;
++            QWindowSystemInterface::handleLeaveEvent(m_windowUnderMouse);
++            if (currentNotCapturing) {
++                // Clear tracking if capturing and current window is not the capturing window
++                // to avoid leave when mouse actually leaves the application.
++                m_trackedWindow = 0;
++                // We are not officially in any window, but we need to set some cursor to clear
++                // whatever cursor the left window had, so apply the cursor of the capture window.
++                QWindowsWindow::baseWindowOf(window)->applyCursor();
+             }
+         }
++        // Enter is needed if:
++        // 1) There is no capture and we move to a new window.
++        // 2) There is capture and we move into the capturing window.
++        // 3) The capture just ended and we are over non-capturing window.
++        if ((currentWindowUnderMouse && m_windowUnderMouse != currentWindowUnderMouse
++                && (!hasCapture || currentWindowUnderMouse == window))
++            || (m_previousCaptureWindow && window != m_previousCaptureWindow && currentWindowUnderMouse
++                && currentWindowUnderMouse != m_previousCaptureWindow)) {
++            if (QWindowsContext::verboseEvents)
++                qDebug() << "Entering " << currentWindowUnderMouse;
++            QWindowsWindow::baseWindowOf(currentWindowUnderMouse)->applyCursor();
++            QWindowSystemInterface::handleEnterEvent(currentWindowUnderMouse,
++                                                     currentWindowUnderMouse->mapFromGlobal(globalPosition),
++                                                     globalPosition);
++        }
++        // We need to track m_windowUnderMouse separately from m_trackedWindow, as
++        // Windows mouse tracking will not trigger WM_MOUSELEAVE for leaving window when
++        // mouse capture is set.
+         m_windowUnderMouse = currentWindowUnderMouse;
+     }
+ 
+     QWindowSystemInterface::handleMouseEvent(window, winEventPosition, globalPosition, buttons,
+                                              QWindowsKeyMapper::queryKeyboardModifiers());
++    m_previousCaptureWindow = hasCapture ? window : 0;
+     return true;
+ }
+ 
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.h b/src/plugins/platforms/windows/qwindowsmousehandler.h
+index e43d20e..965deb4 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.h
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.h
+@@ -82,6 +82,7 @@ private:
+     QHash<DWORD, int> m_touchInputIDToTouchPointID;
+     QTouchDevice *m_touchDevice;
+     bool m_leftButtonDown;
++    QWindow *m_previousCaptureWindow;
+ };
+ 
+ Qt::MouseButtons QWindowsMouseHandler::keyStateToMouseButtons(int wParam)
+diff --git a/src/widgets/kernel/qapplication_qpa.cpp b/src/widgets/kernel/qapplication_qpa.cpp
+index e8db364..21bc950 100644
+--- a/src/widgets/kernel/qapplication_qpa.cpp
++++ b/src/widgets/kernel/qapplication_qpa.cpp
+@@ -250,13 +250,6 @@ void QApplicationPrivate::openPopup(QWidget *popup)
+             QApplication::sendEvent(fw, &e);
+         }
+     }
+-
+-    // Dispatch leave for last mouse receiver to update undermouse states
+-    if (qt_last_mouse_receiver && !QWidget::mouseGrabber()) {
+-        QApplicationPrivate::dispatchEnterLeave(0, qt_last_mouse_receiver.data(),
+-                                                QGuiApplicationPrivate::lastCursorPosition);
+-        qt_last_mouse_receiver = 0;
+-    }
+ }
+ 
+ void QApplicationPrivate::initializeMultitouch_sys()
+diff --git a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+index 548b5cc..a84709a 100644
+--- a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
++++ b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+@@ -9665,6 +9665,11 @@ void tst_QWidget::underMouse()
+     QVERIFY(popupWindow);
+     QVERIFY(QApplication::activePopupWidget() == &popupWidget);
+ 
++    // Send an artificial leave event for window, as it won't get generated automatically
++    // due to cursor not actually being over the window.
++    QWindowSystemInterface::handleLeaveEvent(window);
++    QApplication::processEvents();
++
+     // If there is an active popup, undermouse should not be reported (QTBUG-27478),
+     // but opening a popup causes leave for widgets under mouse.
+     QVERIFY(!topLevelWidget.underMouse());
+@@ -9682,13 +9687,8 @@ void tst_QWidget::underMouse()
+     topLevelWidget.resetCounts();
+     childWidget2.resetCounts();
+ 
+-    // Note about commented out compares below:
+-    // Widgets are not receiving enter/leave events properly when there is a popup up,
+-    // so all enter and leave counts are not correct yet.
+-    // Fix this test when QTBUG-27800 is fixed (i.e. uncomment commented out compares).
+-
+-    // Moving around while popup active should not change undermouse either,
+-    // but should send enter and leave events for widgets
++    // Moving around while popup active should not change undermouse or cause
++    // enter and leave events for widgets.
+     QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(child2PointB)));
+     QVERIFY(!topLevelWidget.underMouse());
+     QVERIFY(!childWidget1.underMouse());
+@@ -9696,14 +9696,12 @@ void tst_QWidget::underMouse()
+     QVERIFY(!popupWidget.underMouse());
+     QCOMPARE(popupWidget.enters, 0);
+     QCOMPARE(popupWidget.leaves, 0);
+-    //QCOMPARE(topLevelWidget.enters, 1); // QTBUG-27800
++    QCOMPARE(topLevelWidget.enters, 0);
+     QCOMPARE(topLevelWidget.leaves, 0);
+     QCOMPARE(childWidget1.enters, 0);
+     QCOMPARE(childWidget1.leaves, 0);
+-    //QCOMPARE(childWidget2.enters, 1); // QTBUG-27800
++    QCOMPARE(childWidget2.enters, 0);
+     QCOMPARE(childWidget2.leaves, 0);
+-    topLevelWidget.resetCounts();
+-    childWidget2.resetCounts();
+ 
+     QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(inWindowPoint)));
+     QVERIFY(!topLevelWidget.underMouse());
+@@ -9717,27 +9715,9 @@ void tst_QWidget::underMouse()
+     QCOMPARE(childWidget1.enters, 0);
+     QCOMPARE(childWidget1.leaves, 0);
+     QCOMPARE(childWidget2.enters, 0);
+-    //QCOMPARE(childWidget2.leaves, 1); // QTBUG-27800
+-    childWidget2.resetCounts();
+-
+-    QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(child1Point)));
+-    QVERIFY(!topLevelWidget.underMouse());
+-    QVERIFY(!childWidget1.underMouse());
+-    QVERIFY(!childWidget2.underMouse());
+-    QVERIFY(!popupWidget.underMouse());
+-    QCOMPARE(popupWidget.enters, 0);
+-    QCOMPARE(popupWidget.leaves, 0);
+-    QCOMPARE(topLevelWidget.enters, 0);
+-    QCOMPARE(topLevelWidget.leaves, 0);
+-    //QCOMPARE(childWidget1.enters, 1); // QTBUG-27800
+-    QCOMPARE(childWidget1.leaves, 0);
+-    QCOMPARE(childWidget2.enters, 0);
+     QCOMPARE(childWidget2.leaves, 0);
+-    childWidget1.resetCounts();
+ 
+-    // Mouse moves off-application, should cause leaves for currently entered widgets
+-    QWindowSystemInterface::handleLeaveEvent(window);
+-    QApplication::processEvents();
++    QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(child1Point)));
+     QVERIFY(!topLevelWidget.underMouse());
+     QVERIFY(!childWidget1.underMouse());
+     QVERIFY(!childWidget2.underMouse());
+@@ -9745,52 +9725,20 @@ void tst_QWidget::underMouse()
+     QCOMPARE(popupWidget.enters, 0);
+     QCOMPARE(popupWidget.leaves, 0);
+     QCOMPARE(topLevelWidget.enters, 0);
+-    QCOMPARE(topLevelWidget.leaves, 1);
+-    QCOMPARE(childWidget1.enters, 0);
+-    //QCOMPARE(childWidget1.leaves, 1); // QTBUG-27800
+-    QCOMPARE(childWidget2.enters, 0);
+-    QCOMPARE(childWidget2.leaves, 0);
+-    topLevelWidget.resetCounts();
+-    childWidget1.resetCounts();
+-
+-    // Mouse enters back in, should cause enter to topLevelWidget
+-    QWindowSystemInterface::handleEnterEvent(window, inWindowPoint, window->mapToGlobal(inWindowPoint));
+-    QApplication::processEvents();
+-    QVERIFY(!topLevelWidget.underMouse());
+-    QVERIFY(!childWidget1.underMouse());
+-    QVERIFY(!childWidget2.underMouse());
+-    QVERIFY(!popupWidget.underMouse());
+-    QCOMPARE(popupWidget.enters, 0);
+-    QCOMPARE(popupWidget.leaves, 0);
+-    QCOMPARE(topLevelWidget.enters, 1);
+     QCOMPARE(topLevelWidget.leaves, 0);
+     QCOMPARE(childWidget1.enters, 0);
+     QCOMPARE(childWidget1.leaves, 0);
+     QCOMPARE(childWidget2.enters, 0);
+     QCOMPARE(childWidget2.leaves, 0);
+-    topLevelWidget.resetCounts();
+ 
+-    // Mouse moves to child widget, should cause enter to child
+-    QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(child2PointB)));
+-    QVERIFY(!topLevelWidget.underMouse());
+-    QVERIFY(!childWidget1.underMouse());
+-    QVERIFY(!childWidget2.underMouse());
+-    QVERIFY(!popupWidget.underMouse());
+-    QCOMPARE(popupWidget.enters, 0);
+-    QCOMPARE(popupWidget.leaves, 0);
+-    QCOMPARE(topLevelWidget.enters, 0);
+-    QCOMPARE(topLevelWidget.leaves, 0);
+-    QCOMPARE(childWidget1.enters, 0);
+-    QCOMPARE(childWidget1.leaves, 0);
+-    //QCOMPARE(childWidget2.enters, 1); // QTBUG-27800
+-    QCOMPARE(childWidget2.leaves, 0);
+-    childWidget2.resetCounts();
++    // Note: Mouse moving off-application while there is an active popup cannot be simulated
++    // without actually moving the cursor so it is not tested.
+ 
+-    // Mouse enters popup, should cause enter to popup and leave to current widgets under mouse
+-    QWindowSystemInterface::handleLeaveEvent(window);
++    // Mouse enters popup, should cause enter to popup.
++    // Once again, need to create artificial enter event.
+     const QPoint popupCenter = popupWindow->geometry().center();
+     QWindowSystemInterface::handleEnterEvent(popupWindow, popupWindow->mapFromGlobal(popupCenter), popupCenter);
+-    QApplication::processEvents();
++    QTest::mouseMove(popupWindow, popupCenter);
+     QVERIFY(!topLevelWidget.underMouse());
+     QVERIFY(!childWidget1.underMouse());
+     QVERIFY(!childWidget2.underMouse());
+@@ -9798,14 +9746,12 @@ void tst_QWidget::underMouse()
+     QCOMPARE(popupWidget.enters, 1);
+     QCOMPARE(popupWidget.leaves, 0);
+     QCOMPARE(topLevelWidget.enters, 0);
+-    QCOMPARE(topLevelWidget.leaves, 1);
++    QCOMPARE(topLevelWidget.leaves, 0);
+     QCOMPARE(childWidget1.enters, 0);
+     QCOMPARE(childWidget1.leaves, 0);
+     QCOMPARE(childWidget2.enters, 0);
+-    //QCOMPARE(childWidget2.leaves, 1); // QTBUG-27800
++    QCOMPARE(childWidget2.leaves, 0);
+     popupWidget.resetCounts();
+-    topLevelWidget.resetCounts();
+-    childWidget2.resetCounts();
+ 
+     // Mouse moves around inside popup, no changes
+     QTest::mouseMove(popupWindow, QPoint(5, 5));
+@@ -9822,9 +9768,10 @@ void tst_QWidget::underMouse()
+     QCOMPARE(childWidget2.enters, 0);
+     QCOMPARE(childWidget2.leaves, 0);
+ 
+-    // Mouse leaves popup and enters topLevelWidget, should cause enter to topLevelWidget and leave for popup
++    // Mouse leaves popup and enters topLevelWidget, should cause leave for popup
++    // but no enter to topLevelWidget. Again, artificial leave event needed.
+     QWindowSystemInterface::handleLeaveEvent(popupWindow);
+-    QWindowSystemInterface::handleEnterEvent(window, inWindowPoint, window->mapToGlobal(inWindowPoint));
++    QTest::mouseMove(popupWindow, popupWindow->mapFromGlobal(window->mapToGlobal(inWindowPoint)));
+     QApplication::processEvents();
+     QVERIFY(!topLevelWidget.underMouse());
+     QVERIFY(!childWidget1.underMouse());
+@@ -9832,7 +9779,7 @@ void tst_QWidget::underMouse()
+     QVERIFY(!popupWidget.underMouse());
+     QCOMPARE(popupWidget.enters, 0);
+     QCOMPARE(popupWidget.leaves, 1);
+-    QCOMPARE(topLevelWidget.enters, 1);
++    QCOMPARE(topLevelWidget.enters, 0);
+     QCOMPARE(topLevelWidget.leaves, 0);
+     QCOMPARE(childWidget1.enters, 0);
+     QCOMPARE(childWidget1.leaves, 0);

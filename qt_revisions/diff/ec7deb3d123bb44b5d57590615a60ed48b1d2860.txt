@@ -1,0 +1,207 @@
+diff --git a/src/qml/debugger/qqmlprofilerservice_p.h b/src/qml/debugger/qqmlprofilerservice_p.h
+index e9a58b4..2037643 100644
+--- a/src/qml/debugger/qqmlprofilerservice_p.h
++++ b/src/qml/debugger/qqmlprofilerservice_p.h
+@@ -205,16 +205,16 @@ struct QQmlHandlingSignalProfiler {
+     {
+         enabled = QQmlProfilerService::instance
+                 ? QQmlProfilerService::instance->profilingEnabled() : false;
+-        if (enabled) {
+-            QQmlProfilerService *service = QQmlProfilerService::instance;
+-            service->startRange(QQmlProfilerService::HandlingSignal);
+-            service->rangeData(QQmlProfilerService::HandlingSignal,
+-                               QLatin1String(signal.signature()) + QLatin1String(": ")
+-                               + expression->expression());
+-            service->rangeLocation(QQmlProfilerService::HandlingSignal,
+-                                   expression->sourceFile(), expression->lineNumber(),
+-                                   expression->columnNumber());
+-        }
++        if (enabled)
++            init(signal, expression);
++    }
++
++    QQmlHandlingSignalProfiler(QObject *object, int index, QQmlExpression *expression)
++    {
++        enabled = QQmlProfilerService::instance
++                ? QQmlProfilerService::instance->profilingEnabled() : false;
++        if (enabled)
++            init(object->metaObject()->method(index), expression);
+     }
+ 
+     ~QQmlHandlingSignalProfiler()
+@@ -224,6 +224,19 @@ struct QQmlHandlingSignalProfiler {
+     }
+ 
+     bool enabled;
++
++private:
++    void init(const QMetaMethod &signal, QQmlExpression *expression)
++    {
++        QQmlProfilerService *service = QQmlProfilerService::instance;
++        service->startRange(QQmlProfilerService::HandlingSignal);
++        service->rangeData(QQmlProfilerService::HandlingSignal,
++                           QLatin1String(signal.signature()) + QLatin1String(": ")
++                           + expression->expression());
++        service->rangeLocation(QQmlProfilerService::HandlingSignal,
++                               expression->sourceFile(), expression->lineNumber(),
++                               expression->columnNumber());
++    }
+ };
+ 
+ struct QQmlObjectCreatingProfiler {
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index d666d9c..b375a70 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -300,6 +300,71 @@ int QQmlBoundSignalParameters::metaCall(QMetaObject::Call c, int id, void **a)
+     }
+ }
+ 
++////////////////////////////////////////////////////////////////////////
++
++QQmlBoundSignalNoParams::QQmlBoundSignalNoParams(QObject *scope, const QMetaMethod &signal,
++                               QObject *owner)
++: m_expression(0), m_owner(owner), m_index(signal.methodIndex()), m_isEvaluating(false)
++{
++    callback = &subscriptionCallback;
++    QQmlNotifierEndpoint::connect(scope, m_index);
++}
++
++QQmlBoundSignalNoParams::~QQmlBoundSignalNoParams()
++{
++    delete m_expression;
++    m_expression = 0;
++}
++
++int QQmlBoundSignalNoParams::index() const
++{
++    return m_index;
++}
++
++/*!
++    Returns the signal expression.
++*/
++QQmlExpression *QQmlBoundSignalNoParams::expression() const
++{
++    return m_expression;
++}
++
++/*!
++    Sets the signal expression to \a e.  Returns the current signal expression,
++    or null if there is no signal expression.
++
++    The QQmlBoundSignalNoParams instance takes ownership of \a e.  The caller is
++    assumes ownership of the returned QQmlExpression.
++*/
++QQmlExpression *QQmlBoundSignalNoParams::setExpression(QQmlExpression *e)
++{
++    QQmlExpression *rv = m_expression;
++    m_expression = e;
++    if (m_expression) m_expression->setNotifyOnValueChanged(false);
++    return rv;
++}
++
++void QQmlBoundSignalNoParams::subscriptionCallback(QQmlNotifierEndpoint *e)
++{
++    QQmlBoundSignalNoParams *s = static_cast<QQmlBoundSignalNoParams*>(e);
++    if (!s->m_expression)
++        return;
++
++    if (QQmlDebugService::isDebuggingEnabled())
++        QV8DebugService::instance()->signalEmitted(QString::fromAscii(s->m_owner->metaObject()->method(s->m_index).signature()));
++
++    QQmlHandlingSignalProfiler prof(s->m_owner, s->m_index, s->m_expression);
++
++    s->m_isEvaluating = true;
++
++    if (s->m_expression && s->m_expression->engine()) {
++        QQmlExpressionPrivate::get(s->m_expression)->value();
++        if (s->m_expression && s->m_expression->hasError())
++            QQmlEnginePrivate::warning(s->m_expression->engine(), s->m_expression->error());
++    }
++    s->m_isEvaluating = false;
++}
++
+ QT_END_NAMESPACE
+ 
+ #include <qqmlboundsignal.moc>
+diff --git a/src/qml/qml/qqmlboundsignal_p.h b/src/qml/qml/qqmlboundsignal_p.h
+index 03b6008..5fc8c35 100644
+--- a/src/qml/qml/qqmlboundsignal_p.h
++++ b/src/qml/qml/qqmlboundsignal_p.h
+@@ -57,6 +57,7 @@
+ 
+ #include <QtCore/qmetaobject.h>
+ 
++#include <private/qqmlnotifier_p.h>
+ #include <private/qobject_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -110,6 +111,31 @@ private:
+     QObject *m_owner;
+ };
+ 
++class Q_QML_EXPORT QQmlBoundSignalNoParams : public QQmlAbstractBoundSignal,
++                                             public QQmlNotifierEndpoint
++{
++public:
++    QQmlBoundSignalNoParams(QObject *scope, const QMetaMethod &signal, QObject *owner);
++    virtual ~QQmlBoundSignalNoParams();
++
++    int index() const;
++
++    QQmlExpression *expression() const;
++    QQmlExpression *setExpression(QQmlExpression *);
++    QObject *object() { return m_owner; }
++
++    static void subscriptionCallback(QQmlNotifierEndpoint *e);
++
++    bool isEvaluating() const { return m_isEvaluating; }
++
++private:
++    QQmlExpression *m_expression;
++    QObject *m_owner;
++    int m_index;
++    bool m_isEvaluating;
++};
++
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLBOUNDSIGNAL_P_H
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index ea7d624..2d45942 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -970,7 +970,11 @@ QQmlPropertyPrivate::setSignalExpression(const QQmlProperty &that,
+         return signalHandler->setExpression(expr);
+ 
+     if (expr) {
+-        QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object);
++        QQmlAbstractBoundSignal *signal = 0;
++        if (that.method().parameterTypes().count())
++            signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object);
++        else
++            signal = new QQmlBoundSignalNoParams(that.d->object, that.method(), that.d->object);
+         QQmlExpression *oldExpr = signal->setExpression(expr);
+         signal->addToObject();
+         return oldExpr;
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index ba53f8d..6010adf 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -711,8 +711,12 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+ 
+             QMetaMethod signal = target->metaObject()->method(instr.signalIndex);
+ 
+-            QQmlBoundSignal *bs = new QQmlBoundSignal(target, signal, target);
+-            QQmlExpression *expr = 
++            QQmlAbstractBoundSignal *bs = 0;
++            if (signal.parameterTypes().count())
++                bs = new QQmlBoundSignal(target, signal, target);
++            else
++                bs = new QQmlBoundSignalNoParams(target, signal, target);
++            QQmlExpression *expr =
+                 new QQmlExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column, *new QQmlExpressionPrivate);
+             bs->setExpression(expr);
+             bs->addToObject();

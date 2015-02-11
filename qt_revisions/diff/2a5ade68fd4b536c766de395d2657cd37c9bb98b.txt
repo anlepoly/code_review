@@ -1,0 +1,266 @@
+diff --git a/src/plugins/platforms/kms/kms.pro b/src/plugins/platforms/kms/kms.pro
+index 7c0cc79..f97973b 100644
+--- a/src/plugins/platforms/kms/kms.pro
++++ b/src/plugins/platforms/kms/kms.pro
+@@ -21,7 +21,8 @@ SOURCES =   main.cpp \
+             qkmsbackingstore.cpp \
+             qkmsnativeinterface.cpp \
+             qkmsudevlistener.cpp \
+-            qkmsudevhandler.cpp
++            qkmsudevhandler.cpp \
++            qkmsudevdrmhandler.cpp
+ HEADERS =   qkmsintegration.h \
+             qkmsscreen.h \
+             qkmscontext.h \
+@@ -32,7 +33,8 @@ HEADERS =   qkmsintegration.h \
+             qkmsbackingstore.h \
+             qkmsnativeinterface.h \
+             qkmsudevlistener.h \
+-            qkmsudevhandler.h
++            qkmsudevhandler.h \
++            qkmsudevdrmhandler.h
+ 
+ target.path += $$[QT_INSTALL_PLUGINS]/platforms
+ INSTALLS += target
+diff --git a/src/plugins/platforms/kms/qkmsintegration.cpp b/src/plugins/platforms/kms/qkmsintegration.cpp
+index 74346e8..0405330 100644
+--- a/src/plugins/platforms/kms/qkmsintegration.cpp
++++ b/src/plugins/platforms/kms/qkmsintegration.cpp
+@@ -46,6 +46,8 @@
+ #include "qkmsbackingstore.h"
+ #include "qkmscontext.h"
+ #include "qkmsnativeinterface.h"
++#include "qkmsudevlistener.h"
++#include "qkmsudevdrmhandler.h"
+ 
+ #include <QtPlatformSupport/private/qgenericunixprintersupport_p.h>
+ #include <QtPlatformSupport/private/qgenericunixeventdispatcher_p.h>
+@@ -60,14 +62,13 @@ QKmsIntegration::QKmsIntegration()
+     : QPlatformIntegration(),
+       m_fontDatabase(new QGenericUnixFontDatabase()),
+       m_eventDispatcher(createUnixEventDispatcher()),
+-      m_nativeInterface(new QKmsNativeInterface)
++      m_nativeInterface(new QKmsNativeInterface),
++      m_udevListener(new QKmsUdevListener)
+ {
+     QGuiApplicationPrivate::instance()->setEventDispatcher(m_eventDispatcher);
+     setenv("EGL_PLATFORM", "drm",1);
+-    QStringList drmDevices = findDrmDevices();
+-    foreach (QString path, drmDevices) {
+-        m_devices.append(new QKmsDevice(path, this));
+-    }
++    m_drmHandler = new QKmsUdevDRMHandler(this);
++    m_udevListener->addHandler(m_drmHandler);
+ }
+ 
+ QKmsIntegration::~QKmsIntegration()
+@@ -79,6 +80,14 @@ QKmsIntegration::~QKmsIntegration()
+         delete screen;
+     }
+     delete m_fontDatabase;
++    delete m_udevListener;
++}
++
++QObject *QKmsIntegration::createDevice(const char *path)
++{
++    QKmsDevice *device = new QKmsDevice(path, this);
++    m_devices.append(device);
++    return device;
+ }
+ 
+ bool QKmsIntegration::hasCapability(QPlatformIntegration::Capability cap) const
+@@ -112,14 +121,6 @@ QPlatformFontDatabase *QKmsIntegration::fontDatabase() const
+     return m_fontDatabase;
+ }
+ 
+-QStringList QKmsIntegration::findDrmDevices()
+-{
+-    //Return a list addresses of DRM supported devices
+-    //Hardcoded now, but could use udev to return a list
+-    //of multiple devices.
+-    return QStringList(QString::fromLatin1("/dev/dri/card0"));
+-}
+-
+ void QKmsIntegration::addScreen(QKmsScreen *screen)
+ {
+     m_screens.append(screen);
+diff --git a/src/plugins/platforms/kms/qkmsintegration.h b/src/plugins/platforms/kms/qkmsintegration.h
+index 96d030f..03fc508 100644
+--- a/src/plugins/platforms/kms/qkmsintegration.h
++++ b/src/plugins/platforms/kms/qkmsintegration.h
+@@ -49,6 +49,8 @@ QT_BEGIN_NAMESPACE
+ 
+ class QKmsScreen;
+ class QKmsDevice;
++class QKmsUdevListener;
++class QKmsUdevDRMHandler;
+ 
+ class QKmsIntegration : public QPlatformIntegration
+ {
+@@ -65,10 +67,11 @@ public:
+     QPlatformFontDatabase *fontDatabase() const;
+     QAbstractEventDispatcher *guiThreadEventDispatcher() const;
+ 
+-    void addScreen(QKmsScreen *screen);
+-
+     QPlatformNativeInterface *nativeInterface() const;
+ 
++    void addScreen(QKmsScreen *screen);
++    QObject *createDevice(const char *);
++
+ private:
+     QStringList findDrmDevices();
+ 
+@@ -77,6 +80,8 @@ private:
+     QPlatformFontDatabase *m_fontDatabase;
+     QAbstractEventDispatcher *m_eventDispatcher;
+     QPlatformNativeInterface *m_nativeInterface;
++    QKmsUdevListener *m_udevListener;
++    QKmsUdevDRMHandler *m_drmHandler;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/kms/qkmsudevdrmhandler.cpp b/src/plugins/platforms/kms/qkmsudevdrmhandler.cpp
+new file mode 100644
+index 0000000..0f59de4
+--- /dev/null
++++ b/src/plugins/platforms/kms/qkmsudevdrmhandler.cpp
+@@ -0,0 +1,66 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <QtCore/QRegExp>
++
++#include <qkmsintegration.h>
++#include <qkmsudevdrmhandler.h>
++
++QT_BEGIN_NAMESPACE
++
++QKmsUdevDRMHandler::QKmsUdevDRMHandler(QKmsIntegration *integration)
++    : m_integration(integration)
++{
++}
++
++QObject *QKmsUdevDRMHandler::create(struct udev_device *device)
++{
++    if (strcmp(udev_device_get_subsystem(device), "drm"))
++        return 0;
++
++    QRegExp regexp("^card\\d+$");
++    if (!regexp.exactMatch(udev_device_get_sysname(device)))
++        return 0;
++
++    return m_integration->createDevice(udev_device_get_devnode(device));
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/kms/qkmsudevdrmhandler.h b/src/plugins/platforms/kms/qkmsudevdrmhandler.h
+new file mode 100644
+index 0000000..d627fec
+--- /dev/null
++++ b/src/plugins/platforms/kms/qkmsudevdrmhandler.h
+@@ -0,0 +1,66 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QKMSUDEVDRMHANDLER_H
++#define QKMSUDEVDRMHANDLER_H
++
++#include <QObject>
++
++#include <qkmsudevhandler.h>
++
++QT_BEGIN_NAMESPACE
++
++class QKmsIntegration;
++
++class QKmsUdevDRMHandler : public QKmsUdevHandler
++{
++public:
++    QKmsUdevDRMHandler(QKmsIntegration *integration);
++
++    QObject *create(struct udev_device *device);
++
++private:
++    QKmsIntegration *m_integration;
++};
++
++QT_END_NAMESPACE
++
++#endif // QKMSUDEVDRMHANDLER_H

@@ -1,0 +1,755 @@
+diff --git a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.cpp b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.cpp
+index 4668a39..1d4de00 100644
+--- a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.cpp
++++ b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.cpp
+@@ -64,6 +64,9 @@ QGstreamerAudioDecoderControl::QGstreamerAudioDecoderControl(QGstreamerAudioDeco
+     connect(m_session, SIGNAL(formatChanged(QAudioFormat)), this, SIGNAL(formatChanged(QAudioFormat)));
+     connect(m_session, SIGNAL(sourceChanged()), this, SIGNAL(sourceChanged()));
+     connect(m_session, SIGNAL(stateChanged(QAudioDecoder::State)), this, SIGNAL(stateChanged(QAudioDecoder::State)));
++    connect(m_session, SIGNAL(finished()), this, SIGNAL(finished()));
++    connect(m_session, SIGNAL(positionChanged(qint64)), this, SIGNAL(positionChanged(qint64)));
++    connect(m_session, SIGNAL(durationChanged(qint64)), this, SIGNAL(durationChanged(qint64)));
+ }
+ 
+ QGstreamerAudioDecoderControl::~QGstreamerAudioDecoderControl()
+@@ -73,7 +76,7 @@ QGstreamerAudioDecoderControl::~QGstreamerAudioDecoderControl()
+ 
+ QAudioDecoder::State QGstreamerAudioDecoderControl::state() const
+ {
+-    return m_session->state();
++    return m_session->pendingState();
+ }
+ 
+ QString QGstreamerAudioDecoderControl::sourceFilename() const
+@@ -116,9 +119,9 @@ void QGstreamerAudioDecoderControl::setAudioFormat(const QAudioFormat &format)
+     m_session->setAudioFormat(format);
+ }
+ 
+-QAudioBuffer QGstreamerAudioDecoderControl::read(bool *ok)
++QAudioBuffer QGstreamerAudioDecoderControl::read()
+ {
+-    return m_session->read(ok);
++    return m_session->read();
+ }
+ 
+ bool QGstreamerAudioDecoderControl::bufferAvailable() const
+@@ -126,5 +129,14 @@ bool QGstreamerAudioDecoderControl::bufferAvailable() const
+     return m_session->bufferAvailable();
+ }
+ 
++qint64 QGstreamerAudioDecoderControl::position() const
++{
++    return m_session->position();
++}
++
++qint64 QGstreamerAudioDecoderControl::duration() const
++{
++    return m_session->duration();
++}
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.h b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.h
+index 40699b6..bee39aa 100644
+--- a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.h
++++ b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodercontrol.h
+@@ -80,9 +80,12 @@ public:
+     QAudioFormat audioFormat() const;
+     void setAudioFormat(const QAudioFormat &format);
+ 
+-    QAudioBuffer read(bool *ok);
++    QAudioBuffer read();
+     bool bufferAvailable() const;
+ 
++    qint64 position() const;
++    qint64 duration() const;
++
+ private:
+     // Stuff goes here
+ 
+diff --git a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.cpp b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.cpp
+index 518bf77..8815819 100644
+--- a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.cpp
++++ b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.cpp
+@@ -87,7 +87,10 @@ QGstreamerAudioDecoderSession::QGstreamerAudioDecoderSession(QObject *parent)
+      m_appSrc(0),
+ #endif
+      mDevice(0),
+-     m_buffersAvailable(0)
++     m_buffersAvailable(0),
++     m_position(-1),
++     m_duration(-1),
++     m_durationQueries(0)
+ {
+     // Create pipeline here
+     m_playbin = gst_element_factory_make("playbin2", NULL);
+@@ -160,7 +163,9 @@ bool QGstreamerAudioDecoderSession::processBusMessage(const QGstreamerMessage &m
+ {
+     GstMessage* gm = message.rawMessage();
+     if (gm) {
+-        if (GST_MESSAGE_SRC(gm) == GST_OBJECT_CAST(m_playbin)) {
++        if (GST_MESSAGE_TYPE(gm) == GST_MESSAGE_DURATION) {
++            updateDuration();
++        } else if (GST_MESSAGE_SRC(gm) == GST_OBJECT_CAST(m_playbin)) {
+             switch (GST_MESSAGE_TYPE(gm))  {
+             case GST_MESSAGE_STATE_CHANGED:
+                 {
+@@ -180,30 +185,39 @@ bool QGstreamerAudioDecoderSession::processBusMessage(const QGstreamerMessage &m
+                                 .arg(states[pending]) << "internal" << m_state;
+ #endif
+ 
++                    QAudioDecoder::State prevState = m_state;
++
+                     switch (newState) {
+                     case GST_STATE_VOID_PENDING:
+                     case GST_STATE_NULL:
+-                        if (m_state != QAudioDecoder::StoppedState)
+-                            emit stateChanged(m_state = QAudioDecoder::StoppedState);
++                        m_state = QAudioDecoder::StoppedState;
+                         break;
+                     case GST_STATE_READY:
+-                        if (m_state != QAudioDecoder::StoppedState)
+-                            emit stateChanged(m_state = QAudioDecoder::StoppedState);
++                        m_state = QAudioDecoder::StoppedState;
+                         break;
+                     case GST_STATE_PLAYING:
+-                        if (m_state != QAudioDecoder::DecodingState)
+-                            emit stateChanged(m_state = QAudioDecoder::DecodingState);
++                        m_state = QAudioDecoder::DecodingState;
+                         break;
+                     case GST_STATE_PAUSED:
+-                        if (m_state != QAudioDecoder::WaitingState)
+-                            emit stateChanged(m_state = QAudioDecoder::WaitingState);
++                        m_state = QAudioDecoder::DecodingState;
++
++                        //gstreamer doesn't give a reliable indication the duration
++                        //information is ready, GST_MESSAGE_DURATION is not sent by most elements
++                        //the duration is queried up to 5 times with increasing delay
++                        m_durationQueries = 5;
++                        updateDuration();
+                         break;
+                     }
++
++                    if (prevState != m_state)
++                        emit stateChanged(m_state);
+                 }
+                 break;
+ 
+             case GST_MESSAGE_EOS:
+-                emit stateChanged(m_state = QAudioDecoder::StoppedState);
++                m_pendingState = m_state = QAudioDecoder::StoppedState;
++                emit finished();
++                emit stateChanged(m_state);
+                 break;
+ 
+             case GST_MESSAGE_ERROR: {
+@@ -364,6 +378,16 @@ void QGstreamerAudioDecoderSession::stop()
+             emit bufferAvailableChanged(false);
+         }
+ 
++        if (m_position != -1) {
++            m_position = -1;
++            emit positionChanged(m_position);
++        }
++
++        if (m_duration != -1) {
++            m_duration = -1;
++            emit durationChanged(m_duration);
++        }
++
+         if (oldState != m_state)
+             emit stateChanged(m_state);
+     }
+@@ -382,7 +406,7 @@ void QGstreamerAudioDecoderSession::setAudioFormat(const QAudioFormat &format)
+     }
+ }
+ 
+-QAudioBuffer QGstreamerAudioDecoderSession::read(bool *ok)
++QAudioBuffer QGstreamerAudioDecoderSession::read()
+ {
+     QAudioBuffer audioBuffer;
+ 
+@@ -407,13 +431,17 @@ QAudioBuffer QGstreamerAudioDecoderSession::read(bool *ok)
+         if (format.isValid()) {
+             // XXX At the moment we have to copy data from GstBuffer into QAudioBuffer.
+             // We could improve performance by implementing QAbstractAudioBuffer for GstBuffer.
+-            audioBuffer = QAudioBuffer(QByteArray((const char*)buffer->data, buffer->size), format);
++            qint64 position = getPositionFromBuffer(buffer);
++            audioBuffer = QAudioBuffer(QByteArray((const char*)buffer->data, buffer->size), format, position);
++            position /= 1000; // convert to milliseconds
++            if (position != m_position) {
++                m_position = position;
++                emit positionChanged(m_position);
++            }
+         }
+         gst_buffer_unref(buffer);
+     }
+ 
+-    if (ok)
+-        *ok = audioBuffer.isValid();
+     return audioBuffer;
+ }
+ 
+@@ -423,6 +451,16 @@ bool QGstreamerAudioDecoderSession::bufferAvailable() const
+     return m_buffersAvailable;
+ }
+ 
++qint64 QGstreamerAudioDecoderSession::position() const
++{
++    return m_position;
++}
++
++qint64 QGstreamerAudioDecoderSession::duration() const
++{
++     return m_duration;
++}
++
+ void QGstreamerAudioDecoderSession::processInvalidMedia(QAudioDecoder::Error errorCode, const QString& errorString)
+ {
+     stop();
+@@ -492,4 +530,39 @@ void QGstreamerAudioDecoderSession::removeAppSink()
+     m_appSink = 0;
+ }
+ 
++void QGstreamerAudioDecoderSession::updateDuration()
++{
++    GstFormat format = GST_FORMAT_TIME;
++    gint64 gstDuration = 0;
++    int duration = -1;
++
++    if (m_playbin && gst_element_query_duration(m_playbin, &format, &gstDuration))
++        duration = gstDuration / 1000000;
++
++    if (m_duration != duration) {
++        m_duration = duration;
++        emit durationChanged(m_duration);
++    }
++
++    if (m_duration > 0)
++        m_durationQueries = 0;
++
++    if (m_durationQueries > 0) {
++        //increase delay between duration requests
++        int delay = 25 << (5 - m_durationQueries);
++        QTimer::singleShot(delay, this, SLOT(updateDuration()));
++        m_durationQueries--;
++    }
++}
++
++qint64 QGstreamerAudioDecoderSession::getPositionFromBuffer(GstBuffer* buffer)
++{
++    qint64 position = GST_BUFFER_TIMESTAMP(buffer);
++    if (position >= 0)
++        position = position / G_GINT64_CONSTANT(1000); // microseconds
++    else
++        position = -1;
++    return position;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.h b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.h
+index 2ec6e34..2c491cb 100644
+--- a/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.h
++++ b/src/plugins/gstreamer/audiodecoder/qgstreameraudiodecodersession.h
+@@ -94,9 +94,12 @@ public:
+     QAudioFormat audioFormat() const;
+     void setAudioFormat(const QAudioFormat &format);
+ 
+-    QAudioBuffer read(bool *ok);
++    QAudioBuffer read();
+     bool bufferAvailable() const;
+ 
++    qint64 position() const;
++    qint64 duration() const;
++
+     static GstFlowReturn new_buffer(GstAppSink *sink, gpointer user_data);
+ 
+ signals:
+@@ -108,14 +111,21 @@ signals:
+ 
+     void bufferReady();
+     void bufferAvailableChanged(bool available);
++    void finished();
+ 
+-private:
++    void positionChanged(qint64 position);
++    void durationChanged(qint64 duration);
++
++private slots:
++    void updateDuration();
+ 
++private:
+     void setAudioFlags(bool wantNativeAudio);
+     void addAppSink();
+     void removeAppSink();
+ 
+     void processInvalidMedia(QAudioDecoder::Error errorCode, const QString& errorString);
++    static qint64 getPositionFromBuffer(GstBuffer* buffer);
+ 
+     QAudioDecoder::State m_state;
+     QAudioDecoder::State m_pendingState;
+@@ -136,6 +146,11 @@ private:
+ 
+     mutable QMutex m_buffersMutex;
+     int m_buffersAvailable;
++
++    qint64 m_position;
++    qint64 m_duration;
++
++    int m_durationQueries;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/tests/auto/integration/qaudiodecoderbackend/tst_qaudiodecoderbackend.cpp b/tests/auto/integration/qaudiodecoderbackend/tst_qaudiodecoderbackend.cpp
+index f71062a..e437019 100644
+--- a/tests/auto/integration/qaudiodecoderbackend/tst_qaudiodecoderbackend.cpp
++++ b/tests/auto/integration/qaudiodecoderbackend/tst_qaudiodecoderbackend.cpp
+@@ -82,7 +82,6 @@ void tst_QAudioDecoderBackend::cleanup()
+ void tst_QAudioDecoderBackend::fileTest()
+ {
+     QAudioDecoder d;
+-    bool ok;
+     QAudioBuffer buffer;
+     quint64 duration = 0;
+     int byteCount = 0;
+@@ -104,6 +103,9 @@ void tst_QAudioDecoderBackend::fileTest()
+     QSignalSpy bufferChangedSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
+     QSignalSpy errorSpy(&d, SIGNAL(error(QAudioDecoder::Error)));
+     QSignalSpy stateSpy(&d, SIGNAL(stateChanged(QAudioDecoder::State)));
++    QSignalSpy durationSpy(&d, SIGNAL(durationChanged(qint64)));
++    QSignalSpy finishedSpy(&d, SIGNAL(finished()));
++    QSignalSpy positionSpy(&d, SIGNAL(positionChanged(qint64)));
+ 
+     d.start();
+     QTRY_VERIFY(d.state() == QAudioDecoder::DecodingState);
+@@ -111,9 +113,10 @@ void tst_QAudioDecoderBackend::fileTest()
+     QTRY_VERIFY(!readySpy.isEmpty());
+     QTRY_VERIFY(!bufferChangedSpy.isEmpty());
+     QVERIFY(d.bufferAvailable());
++    QTRY_VERIFY(!durationSpy.isEmpty());
++    QVERIFY(qAbs(d.duration() - 1000) < 20);
+ 
+-    buffer = d.read(&ok);
+-    QVERIFY(ok);
++    buffer = d.read();
+     QVERIFY(buffer.isValid());
+ 
+     // Test file is 44.1K 16bit mono, 44094 samples
+@@ -139,9 +142,11 @@ void tst_QAudioDecoderBackend::fileTest()
+     }
+ 
+     while (d.bufferAvailable()) {
+-        buffer = d.read(&ok);
+-        QVERIFY(ok);
++        buffer = d.read();
+         QVERIFY(buffer.isValid());
++        QTRY_VERIFY(!positionSpy.isEmpty());
++        QVERIFY(positionSpy.takeLast().at(0).toLongLong() == qint64(duration / 1000));
++
+         duration += buffer.duration();
+         sampleCount += buffer.sampleCount();
+         byteCount += buffer.byteCount();
+@@ -155,13 +160,22 @@ void tst_QAudioDecoderBackend::fileTest()
+     QCOMPARE(sampleCount, 44094);
+     QCOMPARE(byteCount, 44094 * 2);
+     QVERIFY(qAbs(qint64(duration) - 1000000) < 20000);
++    QVERIFY(qAbs((d.position() + (buffer.duration() / 1000)) - 1000) < 20);
++    QTRY_COMPARE(finishedSpy.count(), 1);
++    QVERIFY(!d.bufferAvailable());
++    QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
+ 
+     d.stop();
+     QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
++    QTRY_COMPARE(durationSpy.count(), 2);
++    QCOMPARE(d.duration(), qint64(-1));
+     QVERIFY(!d.bufferAvailable());
+     readySpy.clear();
+     bufferChangedSpy.clear();
+     stateSpy.clear();
++    durationSpy.clear();
++    finishedSpy.clear();
++    positionSpy.clear();
+ 
+     // change output audio format
+     QAudioFormat format;
+@@ -189,9 +203,10 @@ void tst_QAudioDecoderBackend::fileTest()
+     QTRY_VERIFY(!readySpy.isEmpty());
+     QTRY_VERIFY(!bufferChangedSpy.isEmpty());
+     QVERIFY(d.bufferAvailable());
++    QTRY_VERIFY(!durationSpy.isEmpty());
++    QVERIFY(qAbs(d.duration() - 1000) < 20);
+ 
+-    buffer = d.read(&ok);
+-    QVERIFY(ok);
++    buffer = d.read();
+     QVERIFY(buffer.isValid());
+     // See if we got the right format
+     QVERIFY(buffer.format() == format);
+@@ -211,9 +226,11 @@ void tst_QAudioDecoderBackend::fileTest()
+     }
+ 
+     while (d.bufferAvailable()) {
+-        buffer = d.read(&ok);
+-        QVERIFY(ok);
++        buffer = d.read();
+         QVERIFY(buffer.isValid());
++        QTRY_VERIFY(!positionSpy.isEmpty());
++        QVERIFY(positionSpy.takeLast().at(0).toLongLong() == qint64(duration / 1000));
++
+         duration += buffer.duration();
+         sampleCount += buffer.sampleCount();
+         byteCount += buffer.byteCount();
+@@ -228,16 +245,21 @@ void tst_QAudioDecoderBackend::fileTest()
+     QVERIFY(qAbs(sampleCount - 22047) < 100);
+     QVERIFY(qAbs(byteCount - 22047) < 100);
+     QVERIFY(qAbs(qint64(duration) - 1000000) < 20000);
++    QVERIFY(qAbs((d.position() + (buffer.duration() / 1000)) - 1000) < 20);
++    QTRY_COMPARE(finishedSpy.count(), 1);
++    QVERIFY(!d.bufferAvailable());
++    QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
+ 
+     d.stop();
+     QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
++    QTRY_COMPARE(durationSpy.count(), 2);
++    QCOMPARE(d.duration(), qint64(-1));
+     QVERIFY(!d.bufferAvailable());
+ }
+ 
+ void tst_QAudioDecoderBackend::deviceTest()
+ {
+     QAudioDecoder d;
+-    bool ok;
+     QAudioBuffer buffer;
+     quint64 duration = 0;
+     int sampleCount = 0;
+@@ -246,6 +268,9 @@ void tst_QAudioDecoderBackend::deviceTest()
+     QSignalSpy bufferChangedSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
+     QSignalSpy errorSpy(&d, SIGNAL(error(QAudioDecoder::Error)));
+     QSignalSpy stateSpy(&d, SIGNAL(stateChanged(QAudioDecoder::State)));
++    QSignalSpy durationSpy(&d, SIGNAL(durationChanged(qint64)));
++    QSignalSpy finishedSpy(&d, SIGNAL(finished()));
++    QSignalSpy positionSpy(&d, SIGNAL(positionChanged(qint64)));
+ 
+     QVERIFY(d.state() == QAudioDecoder::StoppedState);
+     QVERIFY(d.bufferAvailable() == false);
+@@ -269,9 +294,10 @@ void tst_QAudioDecoderBackend::deviceTest()
+     QTRY_VERIFY(!readySpy.isEmpty());
+     QTRY_VERIFY(!bufferChangedSpy.isEmpty());
+     QVERIFY(d.bufferAvailable());
++    QTRY_VERIFY(!durationSpy.isEmpty());
++    QVERIFY(qAbs(d.duration() - 1000) < 20);
+ 
+-    buffer = d.read(&ok);
+-    QVERIFY(ok);
++    buffer = d.read();
+     QVERIFY(buffer.isValid());
+ 
+     // Test file is 44.1K 16bit mono
+@@ -292,9 +318,11 @@ void tst_QAudioDecoderBackend::deviceTest()
+     }
+ 
+     while (d.bufferAvailable()) {
+-        buffer = d.read(&ok);
+-        QVERIFY(ok);
++        buffer = d.read();
+         QVERIFY(buffer.isValid());
++        QTRY_VERIFY(!positionSpy.isEmpty());
++        QVERIFY(positionSpy.takeLast().at(0).toLongLong() == qint64(duration / 1000));
++
+         duration += buffer.duration();
+         sampleCount += buffer.sampleCount();
+         if (sampleCount < 44094) {
+@@ -305,13 +333,22 @@ void tst_QAudioDecoderBackend::deviceTest()
+     // Make sure the duration is roughly correct (+/- 20ms)
+     QCOMPARE(sampleCount, 44094);
+     QVERIFY(qAbs(qint64(duration) - 1000000) < 20000);
++    QVERIFY(qAbs((d.position() + (buffer.duration() / 1000)) - 1000) < 20);
++    QTRY_COMPARE(finishedSpy.count(), 1);
++    QVERIFY(!d.bufferAvailable());
++    QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
+ 
+     d.stop();
+     QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
+     QVERIFY(!d.bufferAvailable());
++    QTRY_COMPARE(durationSpy.count(), 2);
++    QCOMPARE(d.duration(), qint64(-1));
+     readySpy.clear();
+     bufferChangedSpy.clear();
+     stateSpy.clear();
++    durationSpy.clear();
++    finishedSpy.clear();
++    positionSpy.clear();
+ 
+     // Now try changing formats
+     QAudioFormat format;
+@@ -332,9 +369,10 @@ void tst_QAudioDecoderBackend::deviceTest()
+     QTRY_VERIFY(!readySpy.isEmpty());
+     QTRY_VERIFY(!bufferChangedSpy.isEmpty());
+     QVERIFY(d.bufferAvailable());
++    QTRY_VERIFY(!durationSpy.isEmpty());
++    QVERIFY(qAbs(d.duration() - 1000) < 20);
+ 
+-    buffer = d.read(&ok);
+-    QVERIFY(ok);
++    buffer = d.read();
+     QVERIFY(buffer.isValid());
+     // See if we got the right format
+     QVERIFY(buffer.format() == format);
+@@ -347,7 +385,8 @@ void tst_QAudioDecoderBackend::deviceTest()
+     d.stop();
+     QTRY_COMPARE(d.state(), QAudioDecoder::StoppedState);
+     QVERIFY(!d.bufferAvailable());
+-
++    QTRY_COMPARE(durationSpy.count(), 2);
++    QCOMPARE(d.duration(), qint64(-1));
+ }
+ 
+ QTEST_MAIN(tst_QAudioDecoderBackend)
+diff --git a/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp b/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp
+index aacc607..edc2501 100644
+--- a/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp
++++ b/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp
+@@ -61,6 +61,7 @@ private Q_SLOTS:
+     void stop();
+     void format();
+     void source();
++    void readAll();
+ 
+ private:
+     MockAudioDecoderService  *mockAudioDecoderService;
+@@ -125,10 +126,7 @@ void tst_QAudioDecoder::read()
+     QCOMPARE(d.bufferAvailable(), false); // not yet
+ 
+     // Try to read
+-    bool ok = false;
+-    QAudioBuffer b = d.read(&ok);
+-
+-    QVERIFY(ok == false);
++    QAudioBuffer b = d.read();
+     QVERIFY(!b.isValid());
+ 
+     // Read again with no parameter
+@@ -140,7 +138,7 @@ void tst_QAudioDecoder::read()
+ 
+     QVERIFY(d.bufferAvailable());
+ 
+-    b = d.read(&ok);
++    b = d.read();
+     QVERIFY(b.format().isValid());
+     QVERIFY(b.isValid());
+     QVERIFY(b.format().channelCount() == 1);
+@@ -189,10 +187,7 @@ void tst_QAudioDecoder::stop()
+     QCOMPARE(d.bufferAvailable(), false); // not yet
+ 
+     // Try to read
+-    bool ok = false;
+-    QAudioBuffer b = d.read(&ok);
+-
+-    QVERIFY(ok == false);
++    QAudioBuffer b = d.read();
+     QVERIFY(!b.isValid());
+ 
+     // Read again with no parameter
+@@ -234,10 +229,7 @@ void tst_QAudioDecoder::format()
+     QCOMPARE(d.bufferAvailable(), false); // not yet
+ 
+     // Try to read
+-    bool ok = false;
+-    QAudioBuffer b = d.read(&ok);
+-
+-    QVERIFY(ok == false);
++    QAudioBuffer b = d.read();
+     QVERIFY(!b.isValid());
+ 
+     // Read again with no parameter
+@@ -247,7 +239,7 @@ void tst_QAudioDecoder::format()
+     // Wait a while
+     QTRY_COMPARE(d.bufferAvailable(), 1);
+ 
+-    b = d.read(&ok);
++    b = d.read();
+     QVERIFY(d.audioFormat() == b.format());
+ 
+     // Setting format while decoding is forbidden
+@@ -267,7 +259,7 @@ void tst_QAudioDecoder::format()
+     d.start();
+     QTRY_COMPARE(d.bufferAvailable(), 1);
+ 
+-    b = d.read(&ok);
++    b = d.read();
+     QVERIFY(d.audioFormat() == f);
+     QVERIFY(b.format() == f);
+ }
+@@ -301,6 +293,51 @@ void tst_QAudioDecoder::source()
+     QVERIFY(d.sourceDevice() == 0);
+ }
+ 
++void tst_QAudioDecoder::readAll()
++{
++    QAudioDecoder d;
++    d.setSourceFilename("Foo");
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++
++    QSignalSpy durationSpy(&d, SIGNAL(durationChanged(qint64)));
++    QSignalSpy positionSpy(&d, SIGNAL(positionChanged(qint64)));
++    QSignalSpy stateSpy(&d, SIGNAL(stateChanged(QAudioDecoder::State)));
++    QSignalSpy finishedSpy(&d, SIGNAL(finished()));
++    QSignalSpy bufferAvailableSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
++    d.start();
++    int i = 0;
++    forever {
++        QVERIFY(d.state() == QAudioDecoder::DecodingState);
++        QCOMPARE(stateSpy.count(), 1);
++        QCOMPARE(durationSpy.count(), 1);
++        QVERIFY(finishedSpy.isEmpty());
++        QTRY_VERIFY(bufferAvailableSpy.count() >= 1);
++        if (d.bufferAvailable()) {
++            QAudioBuffer b = d.read();
++            QVERIFY(b.isValid());
++            QCOMPARE(b.startTime() / 1000, d.position());
++            QVERIFY(!positionSpy.isEmpty());
++            QList<QVariant> arguments = positionSpy.takeLast();
++            QCOMPARE(arguments.at(0).toLongLong(), b.startTime() / 1000);
++
++            i++;
++            if (i == MOCK_DECODER_MAX_BUFFERS) {
++                QCOMPARE(finishedSpy.count(), 1);
++                QCOMPARE(stateSpy.count(), 2);
++                QVERIFY(d.state() == QAudioDecoder::StoppedState);
++                QList<QVariant> arguments = stateSpy.takeLast();
++                QVERIFY(arguments.at(0).toInt() == (int)QAudioDecoder::StoppedState);
++                QVERIFY(!d.bufferAvailable());
++                QVERIFY(!bufferAvailableSpy.isEmpty());
++                arguments = bufferAvailableSpy.takeLast();
++                QVERIFY(arguments.at(0).toBool() == false);
++                break;
++            }
++        } else
++            QTest::qWait(30);
++    }
++}
++
+ QTEST_MAIN(tst_QAudioDecoder)
+ 
+ #include "tst_qaudiodecoder.moc"
+diff --git a/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h b/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h
+index 938da31..f0b0adc 100644
+--- a/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h
++++ b/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h
+@@ -51,6 +51,8 @@
+ #include <QTimer>
+ #include <QIODevice>
+ 
++#define MOCK_DECODER_MAX_BUFFERS 10
++
+ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+@@ -66,6 +68,7 @@ public:
+         : QAudioDecoderControl(parent)
+         , mState(QAudioDecoder::StoppedState)
+         , mDevice(0)
++        , mPosition(-1)
+         , mSerial(0)
+     {
+         mFormat.setChannels(1);
+@@ -126,6 +129,7 @@ public:
+             if (!mSource.isEmpty()) {
+                 mState = QAudioDecoder::DecodingState;
+                 emit stateChanged(mState);
++                emit durationChanged(duration());
+ 
+                 QTimer::singleShot(50, this, SLOT(pretendDecode()));
+             } else {
+@@ -139,28 +143,33 @@ public:
+         if (mState != QAudioDecoder::StoppedState) {
+             mState = QAudioDecoder::StoppedState;
+             mSerial = 0;
++            mPosition = 0;
+             mBuffers.clear();
+             emit stateChanged(mState);
+             emit bufferAvailableChanged(false);
+         }
+     }
+ 
+-    QAudioBuffer read(bool *ok)
++    QAudioBuffer read()
+     {
++        QAudioBuffer a;
+         if (mBuffers.length() > 0) {
+-            if (ok)
+-                *ok = true;
+-            QAudioBuffer a = mBuffers.takeFirst();
+-            if (mBuffers.length() == 0)
++            a = mBuffers.takeFirst();
++            mPosition = a.startTime() / 1000;
++            emit positionChanged(mPosition);
++
++            if (mBuffers.isEmpty())
+                 emit bufferAvailableChanged(false);
+-            QTimer::singleShot(50, this, SLOT(pretendDecode()));
+-            return a;
+-        } else {
+-            // Can't do anything here :(
+-            if (ok)
+-                *ok = false;
+-            return QAudioBuffer();
++
++            if (mBuffers.isEmpty() && mSerial >= MOCK_DECODER_MAX_BUFFERS) {
++                mState = QAudioDecoder::StoppedState;
++                emit finished();
++                emit stateChanged(mState);
++            } else
++                QTimer::singleShot(50, this, SLOT(pretendDecode()));
+         }
++
++        return a;
+     }
+ 
+     bool bufferAvailable() const
+@@ -168,22 +177,33 @@ public:
+         return mBuffers.length() > 0;
+     }
+ 
++    qint64 position() const
++    {
++        return mPosition;
++    }
++
++    qint64 duration() const
++    {
++        return (sizeof(mSerial) * MOCK_DECODER_MAX_BUFFERS * qint64(1000)) / (mFormat.sampleRate() * mFormat.channels());
++    }
++
+ private slots:
+     void pretendDecode()
+     {
++        // Check if we've reached end of stream
++        if (mSerial >= MOCK_DECODER_MAX_BUFFERS)
++            return;
++
+         // We just keep the length of mBuffers to 3 or less.
+         if (mBuffers.length() < 3) {
+             QByteArray b(sizeof(mSerial), 0);
+             memcpy(b.data(), &mSerial, sizeof(mSerial));
++            qint64 position = (sizeof(mSerial) * mSerial * qint64(1000000)) / (mFormat.sampleRate() * mFormat.channels());
+             mSerial++;
+-            mBuffers.push_back(QAudioBuffer(b, mFormat));
++            mBuffers.push_back(QAudioBuffer(b, mFormat, position));
+             emit bufferReady();
+             if (mBuffers.count() == 1)
+                 emit bufferAvailableChanged(true);
+-        } else {
+-            // Can't do anything here, wait for a read to restart the timer
+-            mState = QAudioDecoder::WaitingState;
+-            emit stateChanged(mState);
+         }
+     }
+ 
+@@ -192,6 +212,7 @@ public:
+     QString mSource;
+     QIODevice *mDevice;
+     QAudioFormat mFormat;
++    qint64 mPosition;
+ 
+     int mSerial;
+     QList<QAudioBuffer> mBuffers;

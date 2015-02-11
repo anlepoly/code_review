@@ -1,0 +1,633 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 7f51202..8e536a4 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -327,6 +327,7 @@ void QQuickCanvasPrivate::init(QQuickCanvas *c)
+     rootItem = new QQuickRootItem;
+     QQuickItemPrivate *rootItemPrivate = QQuickItemPrivate::get(rootItem);
+     rootItemPrivate->canvas = q;
++    rootItemPrivate->canvasRefCount = 1;
+     rootItemPrivate->flags |= QQuickItem::ItemIsFocusScope;
+ 
+     // In the absence of a focus in event on some platforms assume the window will
+@@ -800,11 +801,6 @@ QQuickCanvas::~QQuickCanvas()
+ 
+     d->windowManager->canvasDestroyed(this);
+ 
+-    // ### should we change ~QQuickItem to handle this better?
+-    // manually cleanup for the root item (item destructor only handles these when an item is parented)
+-    QQuickItemPrivate *rootItemPrivate = QQuickItemPrivate::get(d->rootItem);
+-    rootItemPrivate->removeFromDirtyList();
+-
+     QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
+     delete d->incubationController; d->incubationController = 0;
+ 
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index f1dec0c..0ebacf7 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -1824,10 +1824,13 @@ QQuickItem::~QQuickItem()
+ 
+     Q_D(QQuickItem);
+ 
++    if (d->canvasRefCount > 1)
++        d->canvasRefCount = 1; // Make sure canvas is set to null in next call to derefCanvas().
+     if (d->parentItem)
+         setParentItem(0);
+-    else if (d->canvas && d->itemNodeInstance)
+-        QQuickCanvasPrivate::get(d->canvas)->cleanup(d->itemNodeInstance); // cleanup root
++    else if (d->canvas)
++        d->derefCanvas();
++
+     // XXX todo - optimize
+     while (!d->childItems.isEmpty())
+         d->childItems.first()->setParentItem(0);
+@@ -1950,19 +1953,25 @@ void QQuickItem::setParentItem(QQuickItem *parentItem)
+         QQuickCanvasPrivate::get(d->canvas)->parentlessItems.remove(this);
+     }
+ 
+-    d->parentItem = parentItem;
+-
+-    QQuickCanvas *parentCanvas = parentItem?QQuickItemPrivate::get(parentItem)->canvas:0;
+-    if (d->canvas != parentCanvas) {
+-        QQuickItemPrivate::InitializationState initState;
+-        initState.clear();
+-        d->initCanvas(&initState, parentCanvas);
++    QQuickCanvas *oldParentCanvas = oldParentItem ? QQuickItemPrivate::get(oldParentItem)->canvas : 0;
++    QQuickCanvas *parentCanvas = parentItem ? QQuickItemPrivate::get(parentItem)->canvas : 0;
++    if (oldParentCanvas == parentCanvas) {
++        // Avoid freeing and reallocating resources if the canvas stays the same.
++        d->parentItem = parentItem;
++    } else {
++        if (oldParentCanvas)
++            d->derefCanvas();
++        d->parentItem = parentItem;
++        if (parentCanvas)
++            d->refCanvas(parentCanvas);
+     }
+ 
+     d->dirty(QQuickItemPrivate::ParentChanged);
+ 
+     if (d->parentItem)
+         QQuickItemPrivate::get(d->parentItem)->addChild(this);
++    else if (d->canvas)
++        QQuickCanvasPrivate::get(d->canvas)->parentlessItems.insert(this);
+ 
+     d->setEffectiveVisibleRecur(d->calcEffectiveVisible());
+     d->setEffectiveEnableRecur(0, d->calcEffectiveEnable());
+@@ -2175,30 +2184,82 @@ QQuickItem *QQuickItemPrivate::InitializationState::getFocusScope(QQuickItem *it
+     return focusScope;
+ }
+ 
+-void QQuickItemPrivate::initCanvas(InitializationState *state, QQuickCanvas *c)
++void QQuickItemPrivate::refCanvas(InitializationState *state, QQuickCanvas *c)
+ {
+-    Q_Q(QQuickItem);
++    // An item needs a canvas if it is referenced by another item which has a canvas.
++    // Typically the item is referenced by a parent, but can also be referenced by a
++    // ShaderEffect or ShaderEffectSource. 'canvasRefCount' counts how many items with
++    // a canvas is referencing this item. When the reference count goes from zero to one,
++    // or one to zero, the canvas of this item is updated and propagated to the children.
++    // As long as the reference count stays above zero, the canvas is unchanged.
++    // refCanvas() increments the reference count.
++    // derefCanvas() decrements the reference count.
+ 
+-    if (canvas) {
+-        removeFromDirtyList();
+-        QQuickCanvasPrivate *c = QQuickCanvasPrivate::get(canvas);
+-        if (polishScheduled)
+-            c->itemsToPolish.remove(q);
+-        if (c->mouseGrabberItem == q)
+-            c->mouseGrabberItem = 0;
+-        if ( hoverEnabled )
+-            c->hoverItems.removeAll(q);
+-        if (itemNodeInstance)
+-            c->cleanup(itemNodeInstance);
+-        if (!parentItem)
+-            c->parentlessItems.remove(q);
++    Q_Q(QQuickItem);
++    Q_ASSERT((canvas != 0) == (canvasRefCount > 0));
++    Q_ASSERT(c);
++    if (++canvasRefCount > 1) {
++        if (c != canvas)
++            qWarning("QQuickItem: Cannot use same item on different canvases at the same time.");
++        return; // Canvas already set.
+     }
+ 
++    Q_ASSERT(canvas == 0);
+     canvas = c;
+ 
+-    if (canvas && polishScheduled)
++    if (polishScheduled)
+         QQuickCanvasPrivate::get(canvas)->itemsToPolish.insert(q);
+ 
++    InitializationState _dummy;
++    InitializationState *childState = state;
++
++    if (q->isFocusScope()) {
++        _dummy.clear(q);
++        childState = &_dummy;
++    }
++
++    if (!parentItem)
++        QQuickCanvasPrivate::get(canvas)->parentlessItems.insert(q);
++
++    for (int ii = 0; ii < childItems.count(); ++ii) {
++        QQuickItem *child = childItems.at(ii);
++        QQuickItemPrivate::get(child)->refCanvas(childState, c);
++    }
++
++    dirty(Canvas);
++
++    if (extra.isAllocated() && extra->screenAttached)
++        extra->screenAttached->canvasChanged(c);
++    itemChange(QQuickItem::ItemSceneChange, c);
++}
++
++void QQuickItemPrivate::derefCanvas()
++{
++    Q_Q(QQuickItem);
++    Q_ASSERT((canvas != 0) == (canvasRefCount > 0));
++
++    if (!canvas)
++        return; // This can happen when destroying recursive shader effect sources.
++
++    if (--canvasRefCount > 0)
++        return; // There are still other references, so don't set canvas to null yet.
++
++    q->releaseResources();
++    removeFromDirtyList();
++    QQuickCanvasPrivate *c = QQuickCanvasPrivate::get(canvas);
++    if (polishScheduled)
++        c->itemsToPolish.remove(q);
++    if (c->mouseGrabberItem == q)
++        c->mouseGrabberItem = 0;
++    if ( hoverEnabled )
++        c->hoverItems.removeAll(q);
++    if (itemNodeInstance)
++        c->cleanup(itemNodeInstance);
++    if (!parentItem)
++        c->parentlessItems.remove(q);
++
++    canvas = 0;
++
+     itemNodeInstance = 0;
+ 
+     if (extra.isAllocated()) {
+@@ -2211,29 +2272,19 @@ void QQuickItemPrivate::initCanvas(InitializationState *state, QQuickCanvas *c)
+     groupNode = 0;
+     paintNode = 0;
+ 
+-    InitializationState _dummy;
+-    InitializationState *childState = state;
+-
+-    if (c && q->isFocusScope()) {
+-        _dummy.clear(q);
+-        childState = &_dummy;
+-    }
+-
+-    if (!parentItem && canvas)
+-        QQuickCanvasPrivate::get(canvas)->parentlessItems.insert(q);
+-
+     for (int ii = 0; ii < childItems.count(); ++ii) {
+         QQuickItem *child = childItems.at(ii);
+-        QQuickItemPrivate::get(child)->initCanvas(childState, c);
++        QQuickItemPrivate::get(child)->derefCanvas();
+     }
+ 
+     dirty(Canvas);
+ 
+     if (extra.isAllocated() && extra->screenAttached)
+-        extra->screenAttached->canvasChanged(c);
+-    itemChange(QQuickItem::ItemSceneChange, c);
++        extra->screenAttached->canvasChanged(0);
++    itemChange(QQuickItem::ItemSceneChange, (QQuickCanvas *)0);
+ }
+ 
++
+ /*!
+ Returns a transform that maps points from canvas space into item space.
+ */
+@@ -2346,7 +2397,7 @@ QQuickItemPrivate::QQuickItemPrivate()
+ 
+   dirtyAttributes(0), nextDirtyItem(0), prevDirtyItem(0),
+ 
+-  canvas(0), parentItem(0), sortedChildItems(&childItems),
++  canvas(0), canvasRefCount(0), parentItem(0), sortedChildItems(&childItems),
+ 
+   subFocusItem(0),
+ 
+@@ -2990,6 +3041,23 @@ QSGNode *QQuickItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
+     return 0;
+ }
+ 
++/*!
++    This function is called when the item's scene graph resources are no longer needed.
++    It allows items to free its resources, for instance textures, that are not owned by scene graph
++    nodes. Note that scene graph nodes are managed by QQuickCanvas and should not be deleted by
++    this function. Scene graph resources are no longer needed when the parent is set to null and
++    the item is not used by any \l ShaderEffect or \l ShaderEffectSource.
++
++    This function is called from the main thread. Therefore, resources used by the scene graph
++    should not be deleted directly, but by calling \l QObject::deleteLater().
++
++    \note The item destructor still needs to free its scene graph resources if not already done.
++ */
++
++void QQuickItem::releaseResources()
++{
++}
++
+ QSGTransformNode *QQuickItemPrivate::createTransformNode()
+ {
+     return new QSGTransformNode;
+diff --git a/src/quick/items/qquickitem.h b/src/quick/items/qquickitem.h
+index c44192b..ff862b0 100644
+--- a/src/quick/items/qquickitem.h
++++ b/src/quick/items/qquickitem.h
+@@ -395,6 +395,7 @@ protected:
+                                  const QRectF &oldGeometry);
+ 
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
++    virtual void releaseResources();
+     virtual void updatePolish();
+ 
+ protected Q_SLOTS:
+diff --git a/src/quick/items/qquickitem_p.h b/src/quick/items/qquickitem_p.h
+index 3443a38..01e8b4d 100644
+--- a/src/quick/items/qquickitem_p.h
++++ b/src/quick/items/qquickitem_p.h
+@@ -450,6 +450,7 @@ public:
+     QQuickItem**prevDirtyItem;
+ 
+     QQuickCanvas *canvas;
++    int canvasRefCount;
+     inline QSGContext *sceneGraphContext() const;
+ 
+     QQuickItem *parentItem;
+@@ -472,7 +473,10 @@ public:
+     private:
+         QQuickItem *focusScope;
+     };
+-    void initCanvas(InitializationState *, QQuickCanvas *);
++
++    void refCanvas(QQuickCanvas *);
++    void refCanvas(InitializationState *, QQuickCanvas *);
++    void derefCanvas();
+ 
+     QQuickItem *subFocusItem;
+     void updateSubFocusItem(QQuickItem *scope, bool focus);
+@@ -857,6 +861,13 @@ QQuickItem::TransformOrigin QQuickItemPrivate::origin() const
+     return extra.isAllocated()?extra->origin:QQuickItem::Center;
+ }
+ 
++inline void QQuickItemPrivate::refCanvas(QQuickCanvas *c)
++{
++    QQuickItemPrivate::InitializationState initState;
++    initState.clear();
++    refCanvas(&initState, c);
++}
++
+ QSGTransformNode *QQuickItemPrivate::itemNode()
+ {
+     if (!itemNodeInstance) {
+diff --git a/src/quick/items/qquickshadereffect.cpp b/src/quick/items/qquickshadereffect.cpp
+index 7704725..c872356 100644
+--- a/src/quick/items/qquickshadereffect.cpp
++++ b/src/quick/items/qquickshadereffect.cpp
+@@ -398,12 +398,27 @@ void QQuickShaderEffect::updateLogAndStatus(const QString &log, int status)
+     emit statusChanged();
+ }
+ 
++void QQuickShaderEffect::sourceDestroyed(QObject *object)
++{
++    for (int i = 0; i < m_sources.size(); ++i) {
++        SourceData &source = m_sources[i];
++        if (object == source.sourceObject)
++            source.sourceObject = 0;
++    }
++}
++
+ void QQuickShaderEffect::setSource(const QVariant &var, int index)
+ {
+     Q_ASSERT(index >= 0 && index < m_sources.size());
+ 
+     SourceData &source = m_sources[index];
+ 
++    if (source.sourceObject) {
++        if (canvas())
++            QQuickItemPrivate::get(source.sourceObject)->derefCanvas();
++        disconnect(source.sourceObject, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
++    }
++
+     source.sourceObject = 0;
+     if (var.isNull()) {
+         return;
+@@ -425,16 +440,13 @@ void QQuickShaderEffect::setSource(const QVariant &var, int index)
+     source.sourceObject = item;
+ 
+     if (item) {
+-        QQuickItemPrivate *d = QQuickItemPrivate::get(item);
+         // 'item' needs a canvas to get a scene graph node. It usually gets one through its
+         // parent, but if the source item is "inline" rather than a reference -- i.e.
+         // "property variant source: Image { }" instead of "property variant source: foo" -- it
+         // will not get a parent. In those cases, 'item' should get the canvas from 'this'.
+-        if (!d->parentItem && canvas() && !d->canvas) {
+-            QQuickItemPrivate::InitializationState initState;
+-            initState.clear();
+-            d->initCanvas(&initState, canvas());
+-        }
++        if (canvas())
++            QQuickItemPrivate::get(item)->refCanvas(canvas());
++        connect(item, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
+     }
+ }
+ 
+@@ -512,6 +524,11 @@ void QQuickShaderEffect::reset()
+     for (int i = 0; i < m_sources.size(); ++i) {
+         const SourceData &source = m_sources.at(i);
+         delete source.mapper;
++        if (source.sourceObject) {
++            if (canvas())
++                QQuickItemPrivate::get(source.sourceObject)->derefCanvas();
++            disconnect(source.sourceObject, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
++        }
+     }
+     m_sources.clear();
+     m_log.clear();
+@@ -817,15 +834,22 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+         }
+         for (int i = 0; i < oldTextures.size(); ++i) {
+             QSGTextureProvider *t = oldTextures.at(i).second;
+-            if (t)
++            if (t) {
+                 disconnect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
++                disconnect(t, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
++            }
+         }
+         for (int i = 0; i < m_sources.size(); ++i) {
+             const SourceData &source = m_sources.at(i);
+             QSGTextureProvider *t = source.sourceObject ? source.sourceObject->textureProvider() : 0;
+             textures.append(qMakePair(source.name, t));
+-            if (t)
+-                connect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()), Qt::DirectConnection);
++            if (t) {
++                Q_ASSERT_X(t->thread() == QThread::currentThread(),
++                           "QQuickShaderEffect::updatePaintNode",
++                           "Texture provider must belong to the rendering thread");
++                connect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
++                connect(t, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
++            }
+         }
+         material->setUniforms(values);
+         material->setTextureProviders(textures);
+@@ -840,12 +864,15 @@ void QQuickShaderEffect::itemChange(ItemChange change, const ItemChangeData &val
+ {
+     if (change == QQuickItem::ItemSceneChange) {
+         // See comment in QQuickShaderEffect::setSource().
+-        for (int i = 0; i < m_sources.size(); ++i) {
+-            QQuickItemPrivate *d = QQuickItemPrivate::get(m_sources.at(i).sourceObject);
+-            if (!d->parentItem && value.canvas != d->canvas) {
+-                QQuickItemPrivate::InitializationState initState;
+-                initState.clear();
+-                d->initCanvas(&initState, value.canvas);
++        if (value.canvas) {
++            for (int i = 0; i < m_sources.size(); ++i) {
++                if (m_sources.at(i).sourceObject)
++                    QQuickItemPrivate::get(m_sources.at(i).sourceObject)->refCanvas(value.canvas);
++            }
++        } else {
++            for (int i = 0; i < m_sources.size(); ++i) {
++                if (m_sources.at(i).sourceObject)
++                    QQuickItemPrivate::get(m_sources.at(i).sourceObject)->derefCanvas();
+             }
+         }
+     }
+diff --git a/src/quick/items/qquickshadereffect_p.h b/src/quick/items/qquickshadereffect_p.h
+index 4475c22..db1e4e7 100644
+--- a/src/quick/items/qquickshadereffect_p.h
++++ b/src/quick/items/qquickshadereffect_p.h
+@@ -133,6 +133,7 @@ private Q_SLOTS:
+     void updateData();
+     void updateGeometry();
+     void updateLogAndStatus(const QString &log, int status);
++    void sourceDestroyed(QObject *object);
+ 
+ private:
+     friend class QQuickCustomMaterialShader;
+@@ -156,7 +157,7 @@ private:
+     struct SourceData
+     {
+         QSignalMapper *mapper;
+-        QPointer<QQuickItem> sourceObject;
++        QQuickItem *sourceObject;
+         QByteArray name;
+     };
+     QVector<SourceData> m_sources;
+diff --git a/src/quick/items/qquickshadereffectnode.cpp b/src/quick/items/qquickshadereffectnode.cpp
+index ae61ad9..c4b9184 100644
+--- a/src/quick/items/qquickshadereffectnode.cpp
++++ b/src/quick/items/qquickshadereffectnode.cpp
+@@ -376,6 +376,14 @@ void QQuickShaderEffectMaterial::updateTextures() const
+     }
+ }
+ 
++void QQuickShaderEffectMaterial::invalidateTextureProvider(QSGTextureProvider *provider)
++{
++    for (int i = 0; i < m_textures.size(); ++i) {
++        if (provider == m_textures.at(i).second)
++            m_textures[i].second = 0;
++    }
++}
++
+ 
+ QQuickShaderEffectNode::QQuickShaderEffectNode()
+     : m_material(this)
+@@ -397,6 +405,12 @@ void QQuickShaderEffectNode::markDirtyTexture()
+     markDirty(DirtyMaterial);
+ }
+ 
++void QQuickShaderEffectNode::textureProviderDestroyed(QObject *object)
++{
++    Q_ASSERT(qobject_cast<QSGTextureProvider *>(object));
++    m_material.invalidateTextureProvider(static_cast<QSGTextureProvider *>(object));
++}
++
+ void QQuickShaderEffectNode::preprocess()
+ {
+     Q_ASSERT(material());
+diff --git a/src/quick/items/qquickshadereffectnode_p.h b/src/quick/items/qquickshadereffectnode_p.h
+index fc47f62..e22d2de 100644
+--- a/src/quick/items/qquickshadereffectnode_p.h
++++ b/src/quick/items/qquickshadereffectnode_p.h
+@@ -102,6 +102,7 @@ public:
+     void setTextureProviders(const QVector<QPair<QByteArray, QSGTextureProvider *> > &textures);
+     const QVector<QPair<QByteArray, QSGTextureProvider *> > &textureProviders() const;
+     void updateTextures() const;
++    void invalidateTextureProvider(QSGTextureProvider *provider);
+ 
+ protected:
+     friend class QQuickCustomMaterialShader;
+@@ -143,6 +144,7 @@ Q_SIGNALS:
+ 
+ private Q_SLOTS:
+     void markDirtyTexture();
++    void textureProviderDestroyed(QObject *object);
+ 
+ private:
+     QQuickShaderEffectMaterial m_material;
+diff --git a/src/quick/items/qquickshadereffectsource.cpp b/src/quick/items/qquickshadereffectsource.cpp
+index 33776be..4819665 100644
+--- a/src/quick/items/qquickshadereffectsource.cpp
++++ b/src/quick/items/qquickshadereffectsource.cpp
+@@ -504,6 +504,8 @@ QQuickShaderEffectSource::~QQuickShaderEffectSource()
+         QQuickItemPrivate *sd = QQuickItemPrivate::get(m_sourceItem);
+         sd->removeItemChangeListener(this, QQuickItemPrivate::Geometry);
+         sd->derefFromEffectItem(m_hideSource);
++        if (canvas())
++            sd->derefCanvas();
+     }
+ }
+ 
+@@ -599,6 +601,9 @@ void QQuickShaderEffectSource::setSourceItem(QQuickItem *item)
+         QQuickItemPrivate *d = QQuickItemPrivate::get(m_sourceItem);
+         d->derefFromEffectItem(m_hideSource);
+         d->removeItemChangeListener(this, QQuickItemPrivate::Geometry);
++        disconnect(m_sourceItem, SIGNAL(destroyed(QObject*)), this, SLOT(sourceItemDestroyed(QObject*)));
++        if (canvas())
++            d->derefCanvas();
+     }
+     m_sourceItem = item;
+ 
+@@ -608,18 +613,25 @@ void QQuickShaderEffectSource::setSourceItem(QQuickItem *item)
+         // parent, but if the source item is "inline" rather than a reference -- i.e.
+         // "sourceItem: Item { }" instead of "sourceItem: foo" -- it will not get a parent.
+         // In those cases, 'item' should get the canvas from 'this'.
+-        if (!d->parentItem && canvas() && !d->canvas) {
+-            QQuickItemPrivate::InitializationState initState;
+-            initState.clear();
+-            d->initCanvas(&initState, canvas());
+-        }
++        if (canvas())
++            d->refCanvas(canvas());
+         d->refFromEffectItem(m_hideSource);
+         d->addItemChangeListener(this, QQuickItemPrivate::Geometry);
++        connect(m_sourceItem, SIGNAL(destroyed(QObject*)), this, SLOT(sourceItemDestroyed(QObject*)));
+     }
+     update();
+     emit sourceItemChanged();
+ }
+ 
++void QQuickShaderEffectSource::sourceItemDestroyed(QObject *item)
++{
++    Q_ASSERT(item == m_sourceItem);
++    m_sourceItem = 0;
++    update();
++    emit sourceItemChanged();
++}
++
++
+ /*!
+     \qmlproperty rect ShaderEffectSource::sourceRect
+ 
+@@ -841,22 +853,35 @@ static void get_wrap_mode(QQuickShaderEffectSource::WrapMode mode, QSGTexture::W
+ }
+ 
+ 
++void QQuickShaderEffectSource::releaseResources()
++{
++    if (m_texture) {
++        m_texture->deleteLater();
++        m_texture = 0;
++    }
++    if (m_provider) {
++        m_provider->deleteLater();
++        m_provider = 0;
++    }
++}
++
+ QSGNode *QQuickShaderEffectSource::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
+ {
+     if (!m_sourceItem || m_sourceItem->width() == 0 || m_sourceItem->height() == 0) {
++        if (m_texture)
++            m_texture->setItem(0);
+         delete oldNode;
+         return 0;
+     }
+ 
+     ensureTexture();
+ 
+-    QQuickShaderEffectTexture *tex = qobject_cast<QQuickShaderEffectTexture *>(m_texture);
+-    tex->setLive(m_live);
+-    tex->setItem(QQuickItemPrivate::get(m_sourceItem)->itemNode());
++    m_texture->setLive(m_live);
++    m_texture->setItem(QQuickItemPrivate::get(m_sourceItem)->itemNode());
+     QRectF sourceRect = m_sourceRect.width() == 0 || m_sourceRect.height() == 0
+                       ? QRectF(0, 0, m_sourceItem->width(), m_sourceItem->height())
+                       : m_sourceRect;
+-    tex->setRect(sourceRect);
++    m_texture->setRect(sourceRect);
+     QSize textureSize = m_textureSize.isEmpty()
+                       ? QSize(qCeil(qAbs(sourceRect.width())), qCeil(qAbs(sourceRect.height())))
+                       : m_textureSize;
+@@ -869,13 +894,13 @@ QSGNode *QQuickShaderEffectSource::updatePaintNode(QSGNode *oldNode, UpdatePaint
+     while (textureSize.height() < minTextureSize.height())
+         textureSize.rheight() *= 2;
+ 
+-    tex->setSize(textureSize);
+-    tex->setRecursive(m_recursive);
+-    tex->setFormat(GLenum(m_format));
+-    tex->setHasMipmaps(m_mipmap);
++    m_texture->setSize(textureSize);
++    m_texture->setRecursive(m_recursive);
++    m_texture->setFormat(GLenum(m_format));
++    m_texture->setHasMipmaps(m_mipmap);
+ 
+     if (m_grab)
+-        tex->scheduleUpdate();
++        m_texture->scheduleUpdate();
+     m_grab = false;
+ 
+     QSGTexture::Filtering filtering = QQuickItemPrivate::get(this)->smooth
+@@ -924,12 +949,10 @@ void QQuickShaderEffectSource::itemChange(ItemChange change, const ItemChangeDat
+ {
+     if (change == QQuickItem::ItemSceneChange && m_sourceItem) {
+         // See comment in QQuickShaderEffectSource::setSourceItem().
+-        QQuickItemPrivate *d = QQuickItemPrivate::get(m_sourceItem);
+-        if (!d->parentItem && value.canvas != d->canvas) {
+-            QQuickItemPrivate::InitializationState initState;
+-            initState.clear();
+-            d->initCanvas(&initState, value.canvas);
+-        }
++        if (value.canvas)
++            QQuickItemPrivate::get(m_sourceItem)->refCanvas(value.canvas);
++        else
++            QQuickItemPrivate::get(m_sourceItem)->derefCanvas();
+     }
+     QQuickItem::itemChange(change, value);
+ }
+diff --git a/src/quick/items/qquickshadereffectsource_p.h b/src/quick/items/qquickshadereffectsource_p.h
+index 793e89c..a9d9aa8 100644
+--- a/src/quick/items/qquickshadereffectsource_p.h
++++ b/src/quick/items/qquickshadereffectsource_p.h
+@@ -228,7 +228,11 @@ Q_SIGNALS:
+ 
+     void scheduledUpdateCompleted();
+ 
++private Q_SLOTS:
++    void sourceItemDestroyed(QObject *item);
++
+ protected:
++    virtual void releaseResources();
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
+ 
+     virtual void itemGeometryChanged(QQuickItem *item, const QRectF &newRect, const QRectF &oldRect);
+@@ -240,7 +244,7 @@ private:
+     QQuickShaderEffectSourceTextureProvider *m_provider;
+     QQuickShaderEffectTexture *m_texture;
+     WrapMode m_wrapMode;
+-    QPointer<QQuickItem> m_sourceItem;
++    QQuickItem *m_sourceItem;
+     QRectF m_sourceRect;
+     QSize m_textureSize;
+     Format m_format;

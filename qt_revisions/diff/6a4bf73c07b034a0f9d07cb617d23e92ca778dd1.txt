@@ -1,0 +1,496 @@
+diff --git a/src/gui/kernel/kernel.pri b/src/gui/kernel/kernel.pri
+index 06773f5..b0fe871 100644
+--- a/src/gui/kernel/kernel.pri
++++ b/src/gui/kernel/kernel.pri
+@@ -15,6 +15,7 @@ HEADERS += \
+         kernel/qplatformscreen_qpa.h \
+         kernel/qplatformscreen_qpa_p.h \
+         kernel/qplatforminputcontext_qpa.h \
++        kernel/qplatforminputcontext_qpa_p.h \
+         kernel/qplatformintegrationfactory_qpa_p.h \
+         kernel/qplatformintegrationplugin_qpa.h \
+         kernel/qplatformtheme_qpa.h\
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index f585691..0f5c218 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -69,7 +69,8 @@
+ #include <QtGui/qstylehints.h>
+ #include <QtGui/qinputpanel.h>
+ #include <QtGui/qplatformtheme_qpa.h>
+-
++#include <QtGui/qplatforminputcontext_qpa.h>
++#include <private/qplatforminputcontext_qpa_p.h>
+ 
+ #include <QWindowSystemInterface>
+ #include "private/qwindowsysteminterface_qpa_p.h"
+@@ -1180,7 +1181,7 @@ void QGuiApplicationPrivate::processActivatedEvent(QWindowSystemInterfacePrivate
+         QFocusEvent focusOut(QEvent::FocusOut);
+         QCoreApplication::sendSpontaneousEvent(previous, &focusOut);
+         QObject::disconnect(previous, SIGNAL(focusObjectChanged(QObject*)),
+-                            qApp, SIGNAL(focusObjectChanged(QObject*)));
++                            qApp, SLOT(q_updateFocusObject(QObject*)));
+     } else {
+         QEvent appActivate(QEvent::ApplicationActivate);
+         qApp->sendSpontaneousEvent(qApp, &appActivate);
+@@ -1190,17 +1191,18 @@ void QGuiApplicationPrivate::processActivatedEvent(QWindowSystemInterfacePrivate
+         QFocusEvent focusIn(QEvent::FocusIn);
+         QCoreApplication::sendSpontaneousEvent(QGuiApplicationPrivate::focus_window, &focusIn);
+         QObject::connect(QGuiApplicationPrivate::focus_window, SIGNAL(focusObjectChanged(QObject*)),
+-                         qApp, SIGNAL(focusObjectChanged(QObject*)));
++                         qApp, SLOT(q_updateFocusObject(QObject*)));
+     } else {
+         QEvent appActivate(QEvent::ApplicationDeactivate);
+         qApp->sendSpontaneousEvent(qApp, &appActivate);
+     }
+ 
+-    if (self)
++    if (self) {
+         self->notifyActiveWindowChange(previous);
+ 
+-    if (previousFocusObject != qApp->focusObject())
+-        emit qApp->focusObjectChanged(qApp->focusObject());
++        if (previousFocusObject != qApp->focusObject())
++            self->q_updateFocusObject(qApp->focusObject());
++    }
+ }
+ 
+ void QGuiApplicationPrivate::processWindowStateChangedEvent(QWindowSystemInterfacePrivate::WindowStateChangedEvent *wse)
+@@ -2186,4 +2188,24 @@ const QDrawHelperGammaTables *QGuiApplicationPrivate::gammaTables()
+     return result;
+ }
+ 
++void QGuiApplicationPrivate::q_updateFocusObject(QObject *object)
++{
++    Q_Q(QGuiApplication);
++
++    bool enabled = false;
++    if (object) {
++        QInputMethodQueryEvent query(Qt::ImEnabled);
++        QGuiApplication::sendEvent(object, &query);
++        enabled = query.value(Qt::ImEnabled).toBool();
++    }
++
++    QPlatformInputContextPrivate::setInputMethodAccepted(enabled);
++    QPlatformInputContext *inputContext = platformIntegration()->inputContext();
++    if (inputContext)
++        inputContext->setFocusObject(object);
++    emit q->focusObjectChanged(object);
++}
++
++#include "moc_qguiapplication.cpp"
++
+ QT_END_NAMESPACE
+diff --git a/src/gui/kernel/qguiapplication.h b/src/gui/kernel/qguiapplication.h
+index cc7dea4..b58720d 100644
+--- a/src/gui/kernel/qguiapplication.h
++++ b/src/gui/kernel/qguiapplication.h
+@@ -155,6 +155,8 @@ private:
+     Q_DISABLE_COPY(QGuiApplication)
+     Q_DECLARE_PRIVATE(QGuiApplication)
+ 
++    Q_PRIVATE_SLOT(d_func(), void q_updateFocusObject(QObject *object))
++
+ #ifndef QT_NO_GESTURES
+     friend class QGestureManager;
+ #endif
+diff --git a/src/gui/kernel/qguiapplication_p.h b/src/gui/kernel/qguiapplication_p.h
+index 4d8ef6f..a686b4f 100644
+--- a/src/gui/kernel/qguiapplication_p.h
++++ b/src/gui/kernel/qguiapplication_p.h
+@@ -145,6 +145,8 @@ public:
+ 
+     QPixmap getPixmapCursor(Qt::CursorShape cshape);
+ 
++    void q_updateFocusObject(QObject *object);
++
+     static QGuiApplicationPrivate *instance() { return self; }
+ 
+     static QString *platform_name;
+diff --git a/src/gui/kernel/qinputmethod.cpp b/src/gui/kernel/qinputmethod.cpp
+index b9ba731..c443a47 100644
+--- a/src/gui/kernel/qinputmethod.cpp
++++ b/src/gui/kernel/qinputmethod.cpp
+@@ -43,6 +43,7 @@
+ #include <private/qinputmethod_p.h>
+ #include <qguiapplication.h>
+ #include <qtimer.h>
++#include <private/qplatforminputcontext_qpa_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -295,8 +296,12 @@ void QInputMethod::update(Qt::InputMethodQueries queries)
+ {
+     Q_D(QInputMethod);
+ 
+-    if (queries & Qt::ImEnabled)
+-        d->q_checkFocusObject(qApp->focusObject());
++    if (queries & Qt::ImEnabled) {
++        QObject *focus = qApp->focusObject();
++        bool enabled = d->objectAcceptsInputMethod(focus);
++        setInputItem(enabled ? focus : 0);
++        QPlatformInputContextPrivate::setInputMethodAccepted(enabled);
++    }
+ 
+     QPlatformInputContext *ic = d->platformInputContext();
+     if (ic)
+@@ -361,14 +366,20 @@ void QInputMethodPrivate::q_connectFocusObject()
+ void QInputMethodPrivate::q_checkFocusObject(QObject *object)
+ {
+     Q_Q(QInputMethod);
++    bool enabled = objectAcceptsInputMethod(object);
++    q->setInputItem(enabled ? object : 0);
++}
+ 
++bool QInputMethodPrivate::objectAcceptsInputMethod(QObject *object)
++{
+     bool enabled = false;
+     if (object) {
+         QInputMethodQueryEvent query(Qt::ImEnabled);
+         QGuiApplication::sendEvent(object, &query);
+         enabled = query.value(Qt::ImEnabled).toBool();
+     }
+-    q->setInputItem(enabled ? object : 0);
++
++    return enabled;
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/kernel/qinputmethod_p.h b/src/gui/kernel/qinputmethod_p.h
+index 8a17c85..34a0430 100644
+--- a/src/gui/kernel/qinputmethod_p.h
++++ b/src/gui/kernel/qinputmethod_p.h
+@@ -71,6 +71,7 @@ public:
+     }
+     void q_connectFocusObject();
+     void q_checkFocusObject(QObject *object);
++    bool objectAcceptsInputMethod(QObject *object);
+ 
+     QTransform inputItemTransform;
+     QWeakPointer<QObject> inputItem;
+diff --git a/src/gui/kernel/qplatforminputcontext_qpa.cpp b/src/gui/kernel/qplatforminputcontext_qpa.cpp
+index ee18f3e..0461089 100644
+--- a/src/gui/kernel/qplatforminputcontext_qpa.cpp
++++ b/src/gui/kernel/qplatforminputcontext_qpa.cpp
+@@ -43,6 +43,7 @@
+ #include <qguiapplication.h>
+ #include <QRect>
+ #include "private/qkeymapper_p.h"
++#include "private/qplatforminputcontext_qpa_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -75,6 +76,7 @@ QT_BEGIN_NAMESPACE
+     \internal
+  */
+ QPlatformInputContext::QPlatformInputContext()
++    : QObject(*(new QPlatformInputContextPrivate))
+ {
+ }
+ 
+@@ -228,5 +230,30 @@ void QPlatformInputContext::emitInputDirectionChanged(Qt::LayoutDirection newDir
+     emit qApp->inputMethod()->inputDirectionChanged(newDirection);
+ }
+ 
++/*!
++    This virtual method gets called to notify updated focus to \a object.
++    \warning Input methods must not call this function directly.
++ */
++void QPlatformInputContext::setFocusObject(QObject *object)
++{
++    Q_UNUSED(object)
++}
++
++/*!
++    Returns true if current focus object supports input method events.
++ */
++bool QPlatformInputContext::inputMethodAccepted() const
++{
++    Q_D(const QPlatformInputContext);
++    return d->s_inputMethodAccepted;
++}
++
++bool QPlatformInputContextPrivate::s_inputMethodAccepted = false;
++
++void QPlatformInputContextPrivate::setInputMethodAccepted(bool accepted)
++{
++    s_inputMethodAccepted = accepted;
++}
++
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/kernel/qplatforminputcontext_qpa.h b/src/gui/kernel/qplatforminputcontext_qpa.h
+index c7d823d..5e8060c 100644
+--- a/src/gui/kernel/qplatforminputcontext_qpa.h
++++ b/src/gui/kernel/qplatforminputcontext_qpa.h
+@@ -48,13 +48,13 @@ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-
+-class QWindow;
+-class QMouseEvent;
++class QPlatformInputContextPrivate;
+ 
+ class Q_GUI_EXPORT QPlatformInputContext : public QObject
+ {
+     Q_OBJECT
++    Q_DECLARE_PRIVATE(QPlatformInputContext)
++
+ public:
+     QPlatformInputContext();
+     virtual ~QPlatformInputContext();
+@@ -81,6 +81,14 @@ public:
+     void emitLocaleChanged();
+     virtual Qt::LayoutDirection inputDirection() const;
+     void emitInputDirectionChanged(Qt::LayoutDirection newDirection);
++
++    virtual void setFocusObject(QObject *object);
++    bool inputMethodAccepted() const;
++
++private:
++    friend class QGuiApplication;
++    friend class QGuiApplicationPrivate;
++    friend class QInputMethod;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/kernel/qplatforminputcontext_qpa_p.h b/src/gui/kernel/qplatforminputcontext_qpa_p.h
+new file mode 100644
+index 0000000..dc12d26
+--- /dev/null
++++ b/src/gui/kernel/qplatforminputcontext_qpa_p.h
+@@ -0,0 +1,67 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtGui module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QPLATFORMINPUTCONTEXT_P_H
++#define QPLATFORMINPUTCONTEXT_P_H
++
++#include <private/qobject_p.h>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++class QPlatformInputContextPrivate: public QObjectPrivate
++{
++public:
++    QPlatformInputContextPrivate() {}
++    ~QPlatformInputContextPrivate() {}
++
++    static void setInputMethodAccepted(bool accepted);
++    static bool inputMethodAccepted();
++
++    static bool s_inputMethodAccepted;
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif
+diff --git a/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.cpp b/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.cpp
+index 5579b4c..38fe0cc 100644
+--- a/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.cpp
++++ b/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.cpp
+@@ -89,7 +89,6 @@ QIBusPlatformInputContext::QIBusPlatformInputContext ()
+         connect(d->context, SIGNAL(UpdatePreeditText(QDBusVariant,uint,bool)), this, SLOT(updatePreeditText(QDBusVariant,uint,bool)));
+     }
+     QInputMethod *p = qApp->inputMethod();
+-    connect(p, SIGNAL(inputItemChanged()), this, SLOT(inputItemChanged()));
+     connect(p, SIGNAL(cursorRectangleChanged()), this, SLOT(cursorRectChanged()));
+ }
+ 
+@@ -130,7 +129,7 @@ void QIBusPlatformInputContext::commit()
+     if (!d->valid)
+         return;
+ 
+-    QObject *input = qApp->inputMethod()->inputItem();
++    QObject *input = qApp->focusObject();
+     if (!input) {
+         d->predit = QString();
+         return;
+@@ -159,7 +158,7 @@ void QIBusPlatformInputContext::cursorRectChanged()
+     if(!r.isValid())
+         return;
+ 
+-    QWindow *inputWindow = qApp->inputMethod()->inputWindow();
++    QWindow *inputWindow = qApp->focusWindow();
+     if (!inputWindow)
+         return;
+     r.moveTopLeft(inputWindow->mapToGlobal(r.topLeft()));
+@@ -168,15 +167,14 @@ void QIBusPlatformInputContext::cursorRectChanged()
+     d->context->SetCursorLocation(r.x(), r.y(), r.width(), r.height());
+ }
+ 
+-void QIBusPlatformInputContext::inputItemChanged()
++void QIBusPlatformInputContext::setFocusObject(QObject *object)
+ {
+     if (!d->valid)
+         return;
+ 
+-    QObject *input = qApp->inputMethod()->inputItem();
+     if (debug)
+-        qDebug() << "setFocusObject" << input;
+-    if (input)
++        qDebug() << "setFocusObject" << object;
++    if (object)
+         d->context->FocusIn();
+     else
+         d->context->FocusOut();
+@@ -184,7 +182,7 @@ void QIBusPlatformInputContext::inputItemChanged()
+ 
+ void QIBusPlatformInputContext::commitText(const QDBusVariant &text)
+ {
+-    QObject *input = qApp->inputMethod()->inputItem();
++    QObject *input = qApp->focusObject();
+     if (!input)
+         return;
+ 
+@@ -206,7 +204,7 @@ void QIBusPlatformInputContext::commitText(const QDBusVariant &text)
+ 
+ void QIBusPlatformInputContext::updatePreeditText(const QDBusVariant &text, uint cursorPos, bool visible)
+ {
+-    QObject *input = qApp->inputMethod()->inputItem();
++    QObject *input = qApp->focusObject();
+     if (!input)
+         return;
+ 
+@@ -254,6 +252,9 @@ QIBusPlatformInputContext::x11FilterEvent(uint keyval, uint keycode, uint state,
+     if (!d->valid)
+         return false;
+ 
++    if (!inputMethodAccepted())
++        return false;
++
+     if (!press)
+         return false;
+ 
+diff --git a/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.h b/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.h
+index ca8f492..1ed4262 100644
+--- a/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.h
++++ b/src/plugins/platforminputcontexts/ibus/qibusplatforminputcontext.h
+@@ -56,6 +56,7 @@ public:
+     ~QIBusPlatformInputContext();
+ 
+     bool isValid() const;
++    void setFocusObject(QObject *object);
+ 
+     void invokeAction(QInputMethod::Action a, int x);
+     void reset();
+@@ -67,7 +68,6 @@ public:
+ public Q_SLOTS:
+     void commitText(const QDBusVariant &text);
+     void updatePreeditText(const QDBusVariant &text, uint cursor_pos, bool visible);
+-    void inputItemChanged();
+     void cursorRectChanged();
+ 
+ private:
+diff --git a/tests/auto/gui/kernel/qinputmethod/tst_qinputmethod.cpp b/tests/auto/gui/kernel/qinputmethod/tst_qinputmethod.cpp
+index 3810546..cfe26d2 100644
+--- a/tests/auto/gui/kernel/qinputmethod/tst_qinputmethod.cpp
++++ b/tests/auto/gui/kernel/qinputmethod/tst_qinputmethod.cpp
+@@ -122,6 +122,8 @@ private slots:
+     void update();
+     void query();
+     void inputDirection();
++    void inputMethodAccepted();
++
+ private:
+     InputItem m_inputItem;
+     PlatformInputContext m_platformInputContext;
+@@ -304,5 +306,23 @@ void tst_qinputmethod::inputDirection()
+     QCOMPARE(m_platformInputContext.m_localeCallCount, 1);
+ }
+ 
++void tst_qinputmethod::inputMethodAccepted()
++{
++    InputItem disabledItem;
++    disabledItem.setEnabled(false);
++
++    DummyWindow window;
++    window.show();
++    QTest::qWaitForWindowShown(&window);
++    window.requestActivateWindow();
++    QTRY_COMPARE(qApp->focusWindow(), &window);
++    window.setFocusObject(&disabledItem);
++
++    QCOMPARE(m_platformInputContext.inputMethodAccepted(), false);
++
++    window.setFocusObject(&m_inputItem);
++    QCOMPARE(m_platformInputContext.inputMethodAccepted(), true);
++}
++
+ QTEST_MAIN(tst_qinputmethod)
+ #include "tst_qinputmethod.moc"
+diff --git a/tests/auto/shared/platforminputcontext.h b/tests/auto/shared/platforminputcontext.h
+index 2c1a3bc..2049ec7 100644
+--- a/tests/auto/shared/platforminputcontext.h
++++ b/tests/auto/shared/platforminputcontext.h
+@@ -55,7 +55,8 @@ public:
+         m_lastQueries(Qt::ImhNone),
+         m_action(QInputMethod::Click),
+         m_cursorPosition(0),
+-        m_lastEventType(QEvent::None)
++        m_lastEventType(QEvent::None),
++        m_setFocusObjectCallCount(0)
+     {}
+ 
+     virtual QRectF keyboardRect() const { return m_keyboardRect; }
+@@ -111,6 +112,11 @@ public:
+         m_inputDirectionCallCount++;
+         return Qt::LeftToRight;
+     }
++    virtual void setFocusObject(QObject *object)
++    {
++        Q_UNUSED(object);
++        m_setFocusObjectCallCount++;
++    }
+ 
+     bool m_animating;
+     bool m_visible;
+@@ -125,4 +131,5 @@ public:
+     int m_cursorPosition;
+     int m_lastEventType;
+     QRectF m_keyboardRect;
++    int m_setFocusObjectCallCount;
+ };

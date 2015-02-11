@@ -1,0 +1,812 @@
+diff --git a/src/qml/qml/qqmlabstractbinding_p.h b/src/qml/qml/qqmlabstractbinding_p.h
+index ae92077..1ce0a23 100644
+--- a/src/qml/qml/qqmlabstractbinding_p.h
++++ b/src/qml/qml/qqmlabstractbinding_p.h
+@@ -63,8 +63,24 @@ QT_BEGIN_NAMESPACE
+ class Q_QML_PRIVATE_EXPORT QQmlAbstractBinding
+ {
+ public:
++    enum DestroyMode {
++
++        // The binding should disconnect itself upon destroy
++        DisconnectBinding,
++
++        // The binding doesn't need to disconnect itself, but it can if it wants to.
++        //
++        // This is used in QQmlData::destroyed() - at the point at which the bindings are
++        // destroyed, the notifiers are already disconnected, so no need to disconnect each
++        // binding again.
++        //
++        // Bindings can use this flag to speed up destruction, especially for v4 bindings
++        // disconnecting a single binding might be slow.
++        KeepBindingConnected
++    };
++
+     struct VTable {
+-        void (*destroy)(QQmlAbstractBinding *);
++        void (*destroy)(QQmlAbstractBinding *, DestroyMode destroyMode);
+         QString (*expression)(const QQmlAbstractBinding *);
+         int (*propertyIndex)(const QQmlAbstractBinding *);
+         QObject *(*object)(const QQmlAbstractBinding *);
+@@ -82,7 +98,9 @@ public:
+     // Bindings are free to implement their own memory management, so the delete operator is
+     // not necessarily safe.  The default implementation clears the binding, removes it from
+     // the object and calls delete.
+-    void destroy() { vtable()->destroy(this); }
++    void destroy(DestroyMode destroyMode = DisconnectBinding)
++    { vtable()->destroy(this, destroyMode); }
++
+     QString expression() const { return vtable()->expression(this); }
+ 
+     // Should return the encoded property index for the binding.  Should return this value
+@@ -108,7 +126,7 @@ public:
+ 
+     // Default implementation for some VTable functions
+     template<typename T>
+-    static void default_destroy(QQmlAbstractBinding *);
++    static void default_destroy(QQmlAbstractBinding *, DestroyMode);
+     static QString default_expression(const QQmlAbstractBinding *);
+     static void default_retargetBinding(QQmlAbstractBinding *, QObject *, int);
+ 
+@@ -182,8 +200,12 @@ QQmlAbstractBinding::BindingType QQmlAbstractBinding::bindingType() const
+ }
+ 
+ template<typename T>
+-void QQmlAbstractBinding::default_destroy(QQmlAbstractBinding *This)
++void QQmlAbstractBinding::default_destroy(QQmlAbstractBinding *This, DestroyMode mode)
+ {
++    // Assume the binding disconnects itself in the destructor, which for example QQmlBinding
++    // does in the destructor of its base class, QQmlJavaScriptExpression
++    Q_UNUSED(mode);
++
+     This->removeFromObject();
+     This->clear();
+     delete static_cast<T *>(This);
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 92c1a0c..5f5dafa 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -145,6 +145,7 @@ public:
+     void addNotify(int index, QQmlNotifierEndpoint *);
+     int endpointCount(int index);
+     bool signalHasEndpoint(int index);
++    void disconnectNotifiers();
+ 
+     // The context that created the C++ object
+     QQmlContextData *context; 
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 90a71f9..6ebd6b7 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -483,6 +483,11 @@ void QQmlPrivate::qdeclarativeelement_destructor(QObject *o)
+         // Mark this object as in the process of deletion to
+         // prevent it resolving in bindings
+         QQmlData::markAsDeleted(o);
++
++        // Disconnect the notifiers now - during object destruction this would be too late, since
++        // the disconnect call wouldn't be able to call disconnectNotify(), as it isn't possible to
++        // get the metaobject anymore.
++        d->disconnectNotifiers();
+     }
+ }
+ 
+@@ -1330,6 +1335,21 @@ bool QQmlData::signalHasEndpoint(int index)
+     return notifyList && (notifyList->connectionMask & (1ULL << quint64(index % 64)));
+ }
+ 
++void QQmlData::disconnectNotifiers()
++{
++    if (notifyList) {
++        while (notifyList->todo)
++            notifyList->todo->disconnect();
++        for (int ii = 0; ii < notifyList->notifiesSize; ++ii) {
++            while (QQmlNotifierEndpoint *ep = notifyList->notifies[ii])
++                ep->disconnect();
++        }
++        free(notifyList->notifies);
++        free(notifyList);
++        notifyList = 0;
++    }
++}
++
+ QHash<int, QObject *> *QQmlData::attachedProperties() const
+ {
+     if (!extendedData) extendedData = new QQmlDataExtended;
+@@ -1410,17 +1430,7 @@ void QQmlData::destroyed(QObject *object)
+         guard->objectDestroyed(object);
+     }
+ 
+-    if (notifyList) {
+-        while (notifyList->todo)
+-            notifyList->todo->disconnect();
+-        for (int ii = 0; ii < notifyList->notifiesSize; ++ii) {
+-            while (QQmlNotifierEndpoint *ep = notifyList->notifies[ii])
+-                ep->disconnect();
+-        }
+-        free(notifyList->notifies);
+-        free(notifyList);
+-        notifyList = 0;
+-    }
++    disconnectNotifiers();
+ 
+     if (extendedData)
+         delete extendedData;
+diff --git a/src/qml/qml/qqmljavascriptexpression_p.h b/src/qml/qml/qqmljavascriptexpression_p.h
+index dc9b4b6..09da661 100644
+--- a/src/qml/qml/qqmljavascriptexpression_p.h
++++ b/src/qml/qml/qqmljavascriptexpression_p.h
+@@ -141,6 +141,7 @@ public:
+     inline bool hasDelayedError() const;
+     QQmlError error(QQmlEngine *) const;
+     void clearError();
++    void clearGuards();
+     QQmlDelayedError *delayedError();
+ 
+     static void exceptionToError(v8::Handle<v8::Message>, QQmlError &);
+@@ -185,8 +186,6 @@ private:
+     //    activeGuards:flag2  - useSharedContext
+     QBiPointer<QObject, DeleteWatcher> m_scopeObject;
+     QForwardFieldList<Guard, &Guard::next> activeGuards;
+-
+-    void clearGuards();
+ };
+ 
+ QQmlJavaScriptExpression::DeleteWatcher::DeleteWatcher(QQmlJavaScriptExpression *e)
+diff --git a/src/qml/qml/qqmlnotifier.cpp b/src/qml/qml/qqmlnotifier.cpp
+index 2e451ee..0d63012 100644
+--- a/src/qml/qml/qqmlnotifier.cpp
++++ b/src/qml/qml/qqmlnotifier.cpp
+@@ -118,6 +118,8 @@ void QQmlNotifierEndpoint::connect(QObject *source, int sourceSignal, QQmlEngine
+     QQmlPropertyPrivate::flushSignal(source, sourceSignal);
+     QQmlData *ddata = QQmlData::get(source, true);
+     ddata->addNotify(sourceSignal, this);
++    QObjectPrivate * const priv = QObjectPrivate::get(source);
++    priv->connectNotify(QMetaObjectPrivate::signal(source->metaObject(), sourceSignal));
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlnotifier_p.h b/src/qml/qml/qqmlnotifier_p.h
+index 7f5606f..2e52882 100644
+--- a/src/qml/qml/qqmlnotifier_p.h
++++ b/src/qml/qml/qqmlnotifier_p.h
+@@ -44,6 +44,8 @@
+ 
+ #include "qqmldata_p.h"
+ #include "qqmlguard_p.h"
++#include <QtCore/qmetaobject.h>
++#include <private/qmetaobject_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -187,6 +189,11 @@ void QQmlNotifierEndpoint::connect(QQmlNotifier *notifier)
+ 
+ void QQmlNotifierEndpoint::disconnect()
+ {
++    if (sourceSignal != -1) {
++        QObject * const obj = senderAsObject();
++        QObjectPrivate * const priv = QObjectPrivate::get(obj);
++        priv->disconnectNotify(QMetaObjectPrivate::signal(obj->metaObject(), sourceSignal));
++    }
+     if (next) next->prev = prev;
+     if (prev) *prev = next;
+     if (isNotifying()) *((intptr_t *)(senderPtr & ~0x1)) = 0;
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 150a11d..0088741 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -382,10 +382,13 @@ void QV4Bindings::Binding::update(QQmlAbstractBinding *_This, QQmlPropertyPrivat
+     This->parent->run(This, flags);
+ }
+ 
+-void QV4Bindings::Binding::destroy(QQmlAbstractBinding *_This)
++void QV4Bindings::Binding::destroy(QQmlAbstractBinding *_This, QQmlAbstractBinding::DestroyMode mode)
+ {
+     QV4Bindings::Binding *This = static_cast<QV4Bindings::Binding *>(_This);
+ 
++    if (mode == QQmlAbstractBinding::DisconnectBinding)
++        This->disconnect();
++
+     This->setEnabledFlag(false);
+     This->removeFromObject();
+     This->clear();
+@@ -417,8 +420,30 @@ void QV4Bindings::Binding::retargetBinding(QQmlAbstractBinding *_This, QObject *
+     This->target.value().targetProperty = i;
+ }
+ 
++void QV4Bindings::Binding::disconnect()
++{
++    // We iterate over the signal table to find all subscriptions associated with this binding.
++    // This is slow, but disconnect() is not called in the common case, only in special cases
++    // like when the binding is overwritten.
++    QV4Program * const program = parent->program;
++    for (quint16 subIndex = 0; subIndex < program->subscriptions; subIndex++) {
++        QV4Program::BindingReferenceList * const list = program->signalTable(subIndex);
++        for (quint32 bindingIndex = 0; bindingIndex < list->count; ++bindingIndex) {
++            QV4Program::BindingReference * const bindingRef = list->bindings + bindingIndex;
++            Binding * const binding = parent->bindings + bindingRef->binding;
++            if (binding == this) {
++                Subscription * const sub = parent->subscriptions + subIndex;
++                if (sub->active) {
++                    sub->active = false;
++                    sub->disconnect();
++                }
++            }
++        }
++    }
++}
++
+ QV4Bindings::Subscription::Subscription()
+-: bindings(0), method(-1)
++    : bindings(0), method(-1), active(false)
+ {
+     setCallback(QQmlNotifierEndpoint::QV4BindingsSubscription);
+ }
+@@ -526,22 +551,18 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+     }
+ }
+ 
+-
+-void QV4Bindings::unsubscribe(int subIndex)
++void QV4Bindings::subscribeId(QQmlContextData *p, int idIndex, int subIndex)
+ {
+     Subscription *sub = (subscriptions + subIndex);
+     sub->disconnect();
+-}
+-
+-void QV4Bindings::subscribeId(QQmlContextData *p, int idIndex, int subIndex)
+-{
+-    unsubscribe(subIndex);
+ 
+     if (p->idValues[idIndex]) {
+-        Subscription *sub = (subscriptions + subIndex);
+         sub->bindings = this;
+         sub->method = subIndex;
+         sub->connect(&p->idValues[idIndex].bindings);
++        sub->active = true;
++    } else {
++        sub->active = false;
+     }
+ }
+ 
+@@ -552,10 +573,13 @@ void QV4Bindings::subscribe(QObject *o, int notifyIndex, int subIndex, QQmlEngin
+         return;
+     sub->bindings = this;
+     sub->method = subIndex;
+-    if (o)
++    if (o) {
+         sub->connect(o, notifyIndex, e);
+-    else
++        sub->active = true;
++    } else {
+         sub->disconnect();
++        sub->active = false;
++    }
+ }
+ 
+ static bool testCompareVariants(const QVariant &qtscriptRaw, const QVariant &v4)
+@@ -942,14 +966,6 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         } else {
+             INVALIDATION_CHECK(invalidated, object, instr->fetchAndSubscribe.property.coreIndex);
+ 
+-            int subIdx = instr->fetchAndSubscribe.subscription;
+-            Subscription *sub = 0;
+-            if (subIdx != -1) {
+-                sub = (subscriptions + subIdx);
+-                sub->bindings = this;
+-                sub->method = subIdx;
+-            }
+-
+             const Register::Type valueType = (Register::Type)instr->fetchAndSubscribe.valueType;
+             reg.init(valueType);
+             if (instr->fetchAndSubscribe.valueType >= FirstCleanupType)
+@@ -967,9 +983,22 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+             if (accessors->notifier) {
+                 QQmlNotifier *notifier = 0;
+                 accessors->notifier(object, instr->fetchAndSubscribe.property.accessorData, &notifier);
+-                if (notifier) sub->connect(notifier);
+-            } else if (instr->fetchAndSubscribe.property.notifyIndex != -1) {
+-                sub->connect(object, instr->fetchAndSubscribe.property.notifyIndex, context->engine);
++                if (notifier) {
++                    int subIdx = instr->fetchAndSubscribe.subscription;
++                    Subscription *sub = 0;
++                    if (subIdx != -1) {
++                        sub = (subscriptions + subIdx);
++                        sub->bindings = this;
++                        sub->method = subIdx;
++                    }
++                    sub->connect(notifier);
++                }
++            } else {
++                const int notifyIndex = instr->fetchAndSubscribe.property.notifyIndex;
++                if (notifyIndex != -1) {
++                    const int subIdx = instr->fetchAndSubscribe.subscription;
++                    subscribe(object, notifyIndex, subIdx, context->engine);
++                }
+             }
+         }
+     }
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index 0553e57..04fca85 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -84,13 +84,15 @@ public:
+             : QQmlAbstractBinding(V4), target(0), scope(0), instruction(0), executedBlocks(0), parent(0) {}
+ 
+         // Inherited from QQmlAbstractBinding
+-        static void destroy(QQmlAbstractBinding *);
++        static void destroy(QQmlAbstractBinding *, QQmlAbstractBinding::DestroyMode mode);
+         static int propertyIndex(const QQmlAbstractBinding *);
+         static QObject *object(const QQmlAbstractBinding *);
+         static void setEnabled(QQmlAbstractBinding *, bool, QQmlPropertyPrivate::WriteFlags);
+         static void update(QQmlAbstractBinding *, QQmlPropertyPrivate::WriteFlags);
+         static void retargetBinding(QQmlAbstractBinding *, QObject *, int);
+ 
++        void disconnect();
++
+         struct Retarget {
+             QObject *target;
+             int targetProperty;
+@@ -121,7 +123,10 @@ private:
+     public:
+         inline Subscription();
+         QV4Bindings *bindings;
+-        int method;
++        int method:31;
++
++        // Subscriptions are not shared between bindings (anymore), so this can be a simple bool flag
++        bool active:1;
+     };
+     friend void QV4BindingsSubscription_callback(QQmlNotifierEndpoint *e, void **);
+ 
+@@ -144,7 +149,6 @@ private:
+              );
+ 
+ 
+-    inline void unsubscribe(int subIndex);
+     inline void subscribeId(QQmlContextData *p, int idIndex, int subIndex);
+     inline void subscribe(QObject *o, int notifyIndex, int subIndex, QQmlEngine *);
+ 
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index dd57d57..a15831a 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -214,10 +214,13 @@ void QV8Bindings::Binding::expressionChanged(QQmlJavaScriptExpression *e)
+     This->update(QQmlPropertyPrivate::DontRemoveBinding);
+ }
+ 
+-void QV8Bindings::Binding::destroy(QQmlAbstractBinding *_This)
++void QV8Bindings::Binding::destroy(QQmlAbstractBinding *_This, QQmlAbstractBinding::DestroyMode mode)
+ {
+     QV8Bindings::Binding *This = static_cast<QV8Bindings::Binding *>(_This);
+ 
++    if (mode == QQmlAbstractBinding::DisconnectBinding)
++        This->clearGuards();
++
+     This->setEnabledFlag(false);
+     This->setDestroyedFlag(true);
+     This->removeFromObject();
+diff --git a/src/qml/qml/v8/qv8bindings_p.h b/src/qml/qml/v8/qv8bindings_p.h
+index ca5c028..9fbeaeb 100644
+--- a/src/qml/qml/v8/qv8bindings_p.h
++++ b/src/qml/qml/v8/qv8bindings_p.h
+@@ -94,7 +94,7 @@ public:
+         static void expressionChanged(QQmlJavaScriptExpression *);
+ 
+         // "Inherited" from QQmlAbstractBinding
+-        static void destroy(QQmlAbstractBinding *);
++        static void destroy(QQmlAbstractBinding *, QQmlAbstractBinding::DestroyMode mode);
+         static int propertyIndex(const QQmlAbstractBinding *);
+         static QObject *object(const QQmlAbstractBinding *);
+         static void setEnabled(QQmlAbstractBinding *, bool, QQmlPropertyPrivate::WriteFlags);
+diff --git a/tests/auto/qml/qml.pro b/tests/auto/qml/qml.pro
+index e24e30d..a9fa764 100644
+--- a/tests/auto/qml/qml.pro
++++ b/tests/auto/qml/qml.pro
+@@ -19,6 +19,7 @@ PUBLICTESTS += \
+     qqmllocale \
+     qqmlmetaobject \
+     qqmlmoduleplugin \
++    qqmlnotifier \
+     qqmlqt \
+     qqmltranslation \
+     qqmlxmlhttprequest \
+diff --git a/tests/auto/qml/qqmlnotifier/data/connectnotify.qml b/tests/auto/qml/qqmlnotifier/data/connectnotify.qml
+new file mode 100644
+index 0000000..35226ee
+--- /dev/null
++++ b/tests/auto/qml/qqmlnotifier/data/connectnotify.qml
+@@ -0,0 +1,73 @@
++import QtQuick 2.0
++import Test 1.0
++
++Item {
++    id: root
++    ExportedClass {
++        id: exportedClass
++        objectName: "exportedClass"
++        onBoundSignal: {}
++    }
++
++    property int v4Binding: exportedClass.v4BindingProp
++
++    property int v8Binding: {
++        Math.abs(12); // Prevent optimization to v4
++        return exportedClass.v8BindingProp
++    }
++
++    property int scriptBinding: {
++        function innerFunction() {} // Prevent usage of v4 or v8 bindings
++        return exportedClass.scriptBindingProp
++    }
++
++    property int foo: exportedClass.qmlObjectProp
++    property int baz: _exportedObject.cppObjectProp
++
++    // v4 bindings that could share a subscription. They don't, though, and the code
++    // relies on that
++    property int v4Binding2: exportedClass.v4BindingProp2
++    property int bla: exportedClass.v4BindingProp2
++
++    function removeV4Binding() {
++        //console.log("Going to remove v4 binding...")
++        root.v4Binding = 1;
++        //console.log("Binding removed!")
++    }
++
++    function removeV8Binding() {
++        //console.log("Going to remove v8 binding...")
++        root.v8Binding = 1;
++        //console.log("Binding removed!")
++    }
++
++    function removeScriptBinding() {
++        //console.log("Going to remove script binding...")
++        root.scriptBinding = 1;
++        //console.log("Binding removed!")
++    }
++
++    function removeV4Binding2() {
++        //console.log("Going to remove v4 binding 2...")
++        root.v4Binding2 = 1;
++        //console.log("Binding removed!")
++    }
++
++    function readProperty() {
++        var test = exportedClass.unboundProp
++    }
++
++    function changeState() {
++        //console.log("Changing state...")
++        if (root.state == "") root.state = "state1"
++        else                  root.state = ""
++        //console.log("State changed.")
++    }
++
++    property int someValue: 42
++
++    states: State {
++        name: "state1"
++        PropertyChanges { target: root; someValue: exportedClass.unboundProp }
++    }
++}
+diff --git a/tests/auto/qml/qqmlnotifier/qqmlnotifier.pro b/tests/auto/qml/qqmlnotifier/qqmlnotifier.pro
+new file mode 100644
+index 0000000..5fc40a3
+--- /dev/null
++++ b/tests/auto/qml/qqmlnotifier/qqmlnotifier.pro
+@@ -0,0 +1,11 @@
++CONFIG += testcase
++TARGET = tst_qqmlnotifier
++SOURCES += tst_qqmlnotifier.cpp
++
++include (../../shared/util.pri)
++
++macx:CONFIG -= app_bundle
++
++TESTDATA = data/*
++
++QT += qml testlib
+diff --git a/tests/auto/qml/qqmlnotifier/tst_qqmlnotifier.cpp b/tests/auto/qml/qqmlnotifier/tst_qqmlnotifier.cpp
+new file mode 100644
+index 0000000..1fb56db
+--- /dev/null
++++ b/tests/auto/qml/qqmlnotifier/tst_qqmlnotifier.cpp
+@@ -0,0 +1,298 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include <qtest.h>
++#include <QDebug>
++#include <QQmlEngine>
++#include <QQmlComponent>
++#include <QQmlContext>
++#include <qqml.h>
++#include <QMetaMethod>
++
++#include "../../shared/util.h"
++
++class ExportedClass : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(int qmlObjectProp READ qmlObjectProp NOTIFY qmlObjectPropChanged)
++    Q_PROPERTY(int cppObjectProp READ cppObjectProp NOTIFY cppObjectPropChanged)
++    Q_PROPERTY(int unboundProp READ unboundProp NOTIFY unboundPropChanged)
++    Q_PROPERTY(int v8BindingProp READ v8BindingProp NOTIFY v8BindingPropChanged)
++    Q_PROPERTY(int v4BindingProp READ v4BindingProp NOTIFY v4BindingPropChanged)
++    Q_PROPERTY(int v4BindingProp2 READ v4BindingProp2 NOTIFY v4BindingProp2Changed)
++    Q_PROPERTY(int scriptBindingProp READ scriptBindingProp NOTIFY scriptBindingPropChanged)
++public:
++    int qmlObjectPropConnections;
++    int cppObjectPropConnections;
++    int unboundPropConnections;
++    int v8BindingPropConnections;
++    int v4BindingPropConnections;
++    int v4BindingProp2Connections;
++    int scriptBindingPropConnections;
++    int boundSignalConnections;
++    int unusedSignalConnections;
++
++    ExportedClass()
++        : qmlObjectPropConnections(0), cppObjectPropConnections(0), unboundPropConnections(0),
++          v8BindingPropConnections(0), v4BindingPropConnections(0), v4BindingProp2Connections(0),
++          scriptBindingPropConnections(0), boundSignalConnections(0), unusedSignalConnections(0)
++    {}
++
++    ~ExportedClass()
++    {
++        QCOMPARE(qmlObjectPropConnections, 0);
++        QCOMPARE(cppObjectPropConnections, 0);
++        QCOMPARE(unboundPropConnections, 0);
++        QCOMPARE(v8BindingPropConnections, 0);
++        QCOMPARE(v4BindingPropConnections, 0);
++        QCOMPARE(v4BindingProp2Connections, 0);
++        QCOMPARE(scriptBindingPropConnections, 0);
++        QCOMPARE(boundSignalConnections, 0);
++        QCOMPARE(unusedSignalConnections, 0);
++    }
++
++    int qmlObjectProp() const { return 42; }
++    int unboundProp() const { return 42; }
++    int v8BindingProp() const { return 42; }
++    int v4BindingProp() const { return 42; }
++    int v4BindingProp2() const { return 42; }
++    int cppObjectProp() const { return 42; }
++    int scriptBindingProp() const { return 42; }
++protected:
++    void connectNotify(const QMetaMethod &signal) Q_DECL_OVERRIDE {
++        if (signal.name() == "qmlObjectPropChanged") qmlObjectPropConnections++;
++        if (signal.name() == "cppObjectPropChanged") cppObjectPropConnections++;
++        if (signal.name() == "unboundPropChanged") unboundPropConnections++;
++        if (signal.name() == "v8BindingPropChanged") v8BindingPropConnections++;
++        if (signal.name() == "v4BindingPropChanged") v4BindingPropConnections++;
++        if (signal.name() == "v4BindingProp2Changed") v4BindingProp2Connections++;
++        if (signal.name() == "scriptBindingPropChanged") scriptBindingPropConnections++;
++        if (signal.name() == "boundSignal")   boundSignalConnections++;
++        if (signal.name() == "unusedSignal") unusedSignalConnections++;
++        //qDebug() << Q_FUNC_INFO << this << signal.name();
++    }
++
++    void disconnectNotify(const QMetaMethod &signal) Q_DECL_OVERRIDE {
++        if (signal.name() == "qmlObjectPropChanged") qmlObjectPropConnections--;
++        if (signal.name() == "cppObjectPropChanged") cppObjectPropConnections--;
++        if (signal.name() == "unboundPropChanged") unboundPropConnections--;
++        if (signal.name() == "v8BindingPropChanged") v8BindingPropConnections--;
++        if (signal.name() == "v4BindingPropChanged") v4BindingPropConnections--;
++        if (signal.name() == "v4BindingProp2Changed") v4BindingProp2Connections--;
++        if (signal.name() == "scriptBindingPropChanged") scriptBindingPropConnections--;
++        if (signal.name() == "boundSignal")   boundSignalConnections--;
++        if (signal.name() == "unusedSignal") unusedSignalConnections--;
++        //qDebug() << Q_FUNC_INFO << this << signal.methodSignature();
++    }
++
++signals:
++    void qmlObjectPropChanged();
++    void cppObjectPropChanged();
++    void unboundPropChanged();
++    void v8BindingPropChanged();
++    void v4BindingPropChanged();
++    void v4BindingProp2Changed();
++    void scriptBindingPropChanged();
++    void boundSignal();
++    void unusedSignal();
++};
++
++class tst_qqmlnotifier : public QQmlDataTest
++{
++    Q_OBJECT
++public:
++    tst_qqmlnotifier()
++        : root(0), exportedClass(0), exportedObject(0)
++    {}
++
++private slots:
++    void initTestCase() Q_DECL_OVERRIDE;
++    void cleanupTestCase();
++    void connectNotify();
++
++    void removeV4Binding();
++    void removeV4Binding2();
++    void removeV8Binding();
++    void removeScriptBinding();
++    // No need to test value type proxy bindings - the user can't override disconnectNotify() anyway,
++    // as the classes are private to the QML engine
++
++    void readProperty();
++    void propertyChange();
++    void disconnectOnDestroy();
++
++private:
++    void createObjects();
++
++    QQmlEngine engine;
++    QObject *root;
++    ExportedClass *exportedClass;
++    ExportedClass *exportedObject;
++};
++
++void tst_qqmlnotifier::initTestCase()
++{
++    QQmlDataTest::initTestCase();
++    qmlRegisterType<ExportedClass>("Test", 1, 0, "ExportedClass");
++}
++
++void tst_qqmlnotifier::createObjects()
++{
++    delete root;
++    root = 0;
++    exportedClass = exportedObject = 0;
++
++    QQmlComponent component(&engine, testFileUrl("connectnotify.qml"));
++    exportedObject = new ExportedClass();
++    exportedObject->setObjectName("exportedObject");
++    engine.rootContext()->setContextProperty("_exportedObject", exportedObject);
++    root = component.create();
++    QVERIFY(root != 0);
++
++    exportedClass = qobject_cast<ExportedClass *>(
++                root->findChild<ExportedClass*>("exportedClass"));
++    QVERIFY(exportedClass != 0);
++}
++
++void tst_qqmlnotifier::cleanupTestCase()
++{
++    delete root;
++    root = 0;
++    delete exportedObject;
++    exportedObject = 0;
++}
++
++void tst_qqmlnotifier::connectNotify()
++{
++    createObjects();
++
++    QCOMPARE(exportedClass->qmlObjectPropConnections, 1);
++    QCOMPARE(exportedClass->cppObjectPropConnections, 0);
++    QCOMPARE(exportedClass->unboundPropConnections, 0);
++    QCOMPARE(exportedClass->v8BindingPropConnections, 1);
++    QCOMPARE(exportedClass->v4BindingPropConnections, 1);
++    QCOMPARE(exportedClass->v4BindingProp2Connections, 2);
++    QCOMPARE(exportedClass->scriptBindingPropConnections, 1);
++    QCOMPARE(exportedClass->boundSignalConnections, 1);
++    QCOMPARE(exportedClass->unusedSignalConnections, 0);
++
++    QCOMPARE(exportedObject->qmlObjectPropConnections, 0);
++    QCOMPARE(exportedObject->cppObjectPropConnections, 1);
++    QCOMPARE(exportedObject->unboundPropConnections, 0);
++    QCOMPARE(exportedObject->v8BindingPropConnections, 0);
++    QCOMPARE(exportedObject->v4BindingPropConnections, 0);
++    QCOMPARE(exportedObject->v4BindingProp2Connections, 0);
++    QCOMPARE(exportedObject->scriptBindingPropConnections, 0);
++    QCOMPARE(exportedObject->boundSignalConnections, 0);
++    QCOMPARE(exportedObject->unusedSignalConnections, 0);
++}
++
++void tst_qqmlnotifier::removeV4Binding()
++{
++    createObjects();
++
++    // Removing a binding should disconnect all of its guarded properties
++    QVERIFY(QMetaObject::invokeMethod(root, "removeV4Binding"));
++    QCOMPARE(exportedClass->v4BindingPropConnections, 0);
++}
++
++void tst_qqmlnotifier::removeV4Binding2()
++{
++    createObjects();
++
++    // In this case, the v4BindingProp2 property is used by two v4 bindings.
++    // Make sure that removing one binding doesn't by accident disconnect all.
++    QVERIFY(QMetaObject::invokeMethod(root, "removeV4Binding2"));
++    QCOMPARE(exportedClass->v4BindingProp2Connections, 1);
++}
++
++void tst_qqmlnotifier::removeV8Binding()
++{
++    createObjects();
++
++    // Removing a binding should disconnect all of its guarded properties
++    QVERIFY(QMetaObject::invokeMethod(root, "removeV8Binding"));
++    QCOMPARE(exportedClass->v8BindingPropConnections, 0);
++}
++
++void tst_qqmlnotifier::removeScriptBinding()
++{
++    createObjects();
++
++    // Removing a binding should disconnect all of its guarded properties
++    QVERIFY(QMetaObject::invokeMethod(root, "removeScriptBinding"));
++    QCOMPARE(exportedClass->scriptBindingPropConnections, 0);
++}
++
++void tst_qqmlnotifier::readProperty()
++{
++    createObjects();
++
++    // Reading a property should not connect to it
++    QVERIFY(QMetaObject::invokeMethod(root, "readProperty"));
++    QCOMPARE(exportedClass->unboundPropConnections, 0);
++}
++
++void tst_qqmlnotifier::propertyChange()
++{
++    createObjects();
++
++    // Changing the state will trigger the PropertyChange to overwrite a value with a binding.
++    // For this, the new binding needs to be connected, and afterwards disconnected.
++    QVERIFY(QMetaObject::invokeMethod(root, "changeState"));
++    QCOMPARE(exportedClass->unboundPropConnections, 1);
++    QVERIFY(QMetaObject::invokeMethod(root, "changeState"));
++    QCOMPARE(exportedClass->unboundPropConnections, 0);
++}
++
++void tst_qqmlnotifier::disconnectOnDestroy()
++{
++    createObjects();
++
++    // Deleting a QML object should remove all connections. For exportedClass, this is tested in
++    // the destructor, and for exportedObject, it is tested below.
++    delete root;
++    root = 0;
++    QCOMPARE(exportedObject->cppObjectPropConnections, 0);
++}
++
++QTEST_MAIN(tst_qqmlnotifier)
++
++#include "tst_qqmlnotifier.moc"

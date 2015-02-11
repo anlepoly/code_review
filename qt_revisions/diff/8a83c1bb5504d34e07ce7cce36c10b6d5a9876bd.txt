@@ -1,0 +1,164 @@
+diff --git a/src/corelib/mimetypes/qmimeprovider.cpp b/src/corelib/mimetypes/qmimeprovider.cpp
+index 91ef7ef..78cfc46 100644
+--- a/src/corelib/mimetypes/qmimeprovider.cpp
++++ b/src/corelib/mimetypes/qmimeprovider.cpp
+@@ -494,6 +494,29 @@ QString QMimeBinaryProvider::resolveAlias(const QString &name)
+     return name;
+ }
+ 
++QStringList QMimeBinaryProvider::listAliases(const QString &name)
++{
++    checkCache();
++    QStringList result;
++    const QByteArray input = name.toLatin1();
++    foreach (CacheFile *cacheFile, m_cacheFiles) {
++        const int aliasListOffset = cacheFile->getUint32(PosAliasListOffset);
++        const int numEntries = cacheFile->getUint32(aliasListOffset);
++        for (int pos = 0; pos < numEntries; ++pos) {
++            const int off = aliasListOffset + 4 + 8 * pos;
++            const int mimeOffset = cacheFile->getUint32(off + 4);
++            const char *mimeType = cacheFile->getCharStar(mimeOffset);
++
++            if (input == mimeType) {
++                const int aliasOffset = cacheFile->getUint32(off);
++                const char *alias = cacheFile->getCharStar(aliasOffset);
++                result.append(QString::fromLatin1(alias));
++            }
++        }
++    }
++    return result;
++}
++
+ void QMimeBinaryProvider::loadMimeTypeList()
+ {
+     if (!m_mimetypeListLoaded) {
+@@ -815,6 +838,13 @@ void QMimeXMLProvider::addParent(const QString &child, const QString &parent)
+     m_parents[child].append(parent);
+ }
+ 
++QStringList QMimeXMLProvider::listAliases(const QString &name)
++{
++    ensureLoaded();
++    // Iterate through the whole hash. This method is rarely used.
++    return m_aliases.keys(name);
++}
++
+ QString QMimeXMLProvider::resolveAlias(const QString &name)
+ {
+     ensureLoaded();
+diff --git a/src/corelib/mimetypes/qmimeprovider_p.h b/src/corelib/mimetypes/qmimeprovider_p.h
+index dd35f3c..8727820 100644
+--- a/src/corelib/mimetypes/qmimeprovider_p.h
++++ b/src/corelib/mimetypes/qmimeprovider_p.h
+@@ -61,6 +61,7 @@ public:
+     virtual QStringList findByFileName(const QString &fileName, QString *foundSuffix) = 0;
+     virtual QStringList parents(const QString &mime) = 0;
+     virtual QString resolveAlias(const QString &name) = 0;
++    virtual QStringList listAliases(const QString &name) = 0;
+     virtual QMimeType findByMagic(const QByteArray &data, int *accuracyPtr) = 0;
+     virtual QList<QMimeType> allMimeTypes() = 0;
+     virtual void loadMimeTypePrivate(QMimeTypePrivate &) {}
+@@ -87,6 +88,7 @@ public:
+     virtual QStringList findByFileName(const QString &fileName, QString *foundSuffix);
+     virtual QStringList parents(const QString &mime);
+     virtual QString resolveAlias(const QString &name);
++    virtual QStringList listAliases(const QString &name);
+     virtual QMimeType findByMagic(const QByteArray &data, int *accuracyPtr);
+     virtual QList<QMimeType> allMimeTypes();
+     virtual void loadMimeTypePrivate(QMimeTypePrivate &);
+@@ -128,6 +130,7 @@ public:
+     virtual QStringList findByFileName(const QString &fileName, QString *foundSuffix);
+     virtual QStringList parents(const QString &mime);
+     virtual QString resolveAlias(const QString &name);
++    virtual QStringList listAliases(const QString &name);
+     virtual QMimeType findByMagic(const QByteArray &data, int *accuracyPtr);
+     virtual QList<QMimeType> allMimeTypes();
+ 
+diff --git a/src/corelib/mimetypes/qmimetype.cpp b/src/corelib/mimetypes/qmimetype.cpp
+index 9be6139..80510bc 100644
+--- a/src/corelib/mimetypes/qmimetype.cpp
++++ b/src/corelib/mimetypes/qmimetype.cpp
+@@ -350,6 +350,22 @@ QStringList QMimeType::allAncestors() const
+ }
+ 
+ /*!
++    Return the list of aliases of this mimetype.
++
++    For instance, for text/csv, the returned list would be:
++    text/x-csv, text/x-comma-separated-values.
++
++    Note that all QMimeType instances refer to proper mimetypes,
++    never to aliases directly.
++
++    The order of the aliases in the list is undefined.
++*/
++QStringList QMimeType::aliases() const
++{
++    return QMimeDatabasePrivate::instance()->provider()->listAliases(d->name);
++}
++
++/*!
+     Returns the known suffixes for the MIME type.
+     No leading dot is included, so for instance this would return "jpg", "jpeg" for image/jpeg.
+  */
+diff --git a/src/corelib/mimetypes/qmimetype.h b/src/corelib/mimetypes/qmimetype.h
+index e77a7a0..150a799 100644
+--- a/src/corelib/mimetypes/qmimetype.h
++++ b/src/corelib/mimetypes/qmimetype.h
+@@ -90,6 +90,7 @@ public:
+     QStringList globPatterns() const;
+     QStringList parentMimeTypes() const;
+     QStringList allAncestors() const;
++    QStringList aliases() const;
+     QStringList suffixes() const;
+     QString preferredSuffix() const;
+ 
+diff --git a/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.cpp b/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.cpp
+index 740a9ea..a33bb58 100644
+--- a/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.cpp
++++ b/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.cpp
+@@ -355,6 +355,31 @@ void tst_QMimeDatabase::aliases()
+     QVERIFY(!mustWriteMimeType);
+ }
+ 
++void tst_QMimeDatabase::listAliases_data()
++{
++    QTest::addColumn<QString>("inputMime");
++    QTest::addColumn<QString>("expectedAliases");
++
++    QTest::newRow("csv") << "text/csv" << "text/x-csv,text/x-comma-separated-values";
++    QTest::newRow("xml") << "application/xml" << "text/xml";
++    QTest::newRow("xml2") << "text/xml" /* gets resolved to application/xml */ << "text/xml";
++    QTest::newRow("no_mime") << "message/news" << "";
++}
++
++void tst_QMimeDatabase::listAliases()
++{
++    QFETCH(QString, inputMime);
++    QFETCH(QString, expectedAliases);
++    QMimeDatabase db;
++    QStringList expectedAliasesList = expectedAliases.split(',', QString::SkipEmptyParts);
++    expectedAliasesList.sort();
++    QMimeType mime = db.mimeTypeForName(inputMime);
++    QVERIFY(mime.isValid());
++    QStringList aliasList = mime.aliases();
++    aliasList.sort();
++    QCOMPARE(aliasList, expectedAliasesList);
++}
++
+ void tst_QMimeDatabase::icons()
+ {
+     QMimeDatabase db;
+diff --git a/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.h b/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.h
+index 6db09e2..7f620b0 100644
+--- a/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.h
++++ b/tests/auto/corelib/mimetypes/qmimedatabase/tst_qmimedatabase.h
+@@ -62,6 +62,8 @@ private slots:
+     void mimeTypesForFileName();
+     void inheritance();
+     void aliases();
++    void listAliases_data();
++    void listAliases();
+     void icons();
+     void mimeTypeForFileWithContent();
+     void mimeTypeForUrl();

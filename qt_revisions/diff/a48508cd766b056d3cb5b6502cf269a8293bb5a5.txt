@@ -1,0 +1,225 @@
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index 64d2f80..6e367eb 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -105,6 +105,7 @@ QPointF QGuiApplicationPrivate::lastCursorPosition(0.0, 0.0);
+ 
+ bool QGuiApplicationPrivate::tabletState = false;
+ QWindow *QGuiApplicationPrivate::tabletPressTarget = 0;
++QWindow *QGuiApplicationPrivate::currentMouseWindow = 0;
+ 
+ QPlatformIntegration *QGuiApplicationPrivate::platform_integration = 0;
+ QPlatformTheme *QGuiApplicationPrivate::platform_theme = 0;
+@@ -455,6 +456,19 @@ void QGuiApplicationPrivate::showModalWindow(QWindow *modal)
+ {
+     self->modalWindowList.prepend(modal);
+ 
++    // Send leave for currently entered window if it should be blocked
++    if (currentMouseWindow && (currentMouseWindow->windowType() & Qt::Popup) != Qt::Popup) {
++        bool shouldBeBlocked = self->isWindowBlocked(currentMouseWindow);
++        if (shouldBeBlocked) {
++            // Remove the new window from modalWindowList temporarily so leave can go through
++            self->modalWindowList.removeFirst();
++            QEvent e(QEvent::Leave);
++            QGuiApplication::sendEvent(currentMouseWindow, &e);
++            currentMouseWindow = 0;
++            self->modalWindowList.prepend(modal);
++        }
++    }
++
+     QEvent e(QEvent::WindowBlocked);
+     QWindowList windows = QGuiApplication::topLevelWindows();
+     for (int i = 0; i < windows.count(); ++i) {
+@@ -1410,6 +1424,8 @@ void QGuiApplicationPrivate::processEnterEvent(QWindowSystemInterfacePrivate::En
+         return;
+     }
+ 
++    currentMouseWindow = e->enter;
++
+     QEvent event(QEvent::Enter);
+     QCoreApplication::sendSpontaneousEvent(e->enter.data(), &event);
+ }
+@@ -1423,6 +1439,8 @@ void QGuiApplicationPrivate::processLeaveEvent(QWindowSystemInterfacePrivate::Le
+         return;
+     }
+ 
++    currentMouseWindow = 0;
++
+     QEvent event(QEvent::Leave);
+     QCoreApplication::sendSpontaneousEvent(e->leave.data(), &event);
+ }
+diff --git a/src/gui/kernel/qguiapplication_p.h b/src/gui/kernel/qguiapplication_p.h
+index 44a9275..c9eb672 100644
+--- a/src/gui/kernel/qguiapplication_p.h
++++ b/src/gui/kernel/qguiapplication_p.h
+@@ -189,6 +189,7 @@ public:
+     static QPointF lastCursorPosition;
+     static bool tabletState;
+     static QWindow *tabletPressTarget;
++    static QWindow *currentMouseWindow;
+ 
+ #ifndef QT_NO_CLIPBOARD
+     static QClipboard *qt_clipboard;
+diff --git a/src/gui/kernel/qwindow.cpp b/src/gui/kernel/qwindow.cpp
+index 4f1610c..a172709 100644
+--- a/src/gui/kernel/qwindow.cpp
++++ b/src/gui/kernel/qwindow.cpp
+@@ -214,6 +214,8 @@ QWindow::~QWindow()
+ {
+     if (QGuiApplicationPrivate::focus_window == this)
+         QGuiApplicationPrivate::focus_window = 0;
++    if (QGuiApplicationPrivate::currentMouseWindow == this)
++        QGuiApplicationPrivate::currentMouseWindow = 0;
+     QGuiApplicationPrivate::window_list.removeAll(this);
+     destroy();
+ }
+@@ -1445,6 +1447,8 @@ bool QWindow::close()
+ 
+     if (QGuiApplicationPrivate::focus_window == this)
+         QGuiApplicationPrivate::focus_window = 0;
++    if (QGuiApplicationPrivate::currentMouseWindow == this)
++        QGuiApplicationPrivate::currentMouseWindow = 0;
+ 
+     QGuiApplicationPrivate::window_list.removeAll(this);
+     destroy();
+diff --git a/src/widgets/kernel/qwidgetwindow.cpp b/src/widgets/kernel/qwidgetwindow.cpp
+index b3d46d5..b49441b 100644
+--- a/src/widgets/kernel/qwidgetwindow.cpp
++++ b/src/widgets/kernel/qwidgetwindow.cpp
+@@ -234,6 +234,7 @@ void QWidgetWindow::handleEnterLeaveEvent(QEvent *event)
+                 while (enterParent->parent())
+                     enterParent = enterParent->parent();
+                 if (thisParent == enterParent) {
++                    QGuiApplicationPrivate::currentMouseWindow = enterWindow;
+                     enter = enterWindow->widget();
+                     QWindowSystemInterfacePrivate::removeWindowSystemEvent(systemEvent);
+                 }
+diff --git a/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp b/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
+index cc291f7..a7c38d6 100644
+--- a/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
++++ b/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
+@@ -336,12 +336,11 @@ class BlockableWindow : public QWindow
+     Q_OBJECT
+ public:
+     int blocked;
++    int leaves;
++    int enters;
+ 
+     inline BlockableWindow()
+-        : QWindow()
+-    {
+-        blocked = false;
+-    }
++        : QWindow(), blocked(false), enters(0), leaves(0) {}
+ 
+     bool event(QEvent *e)
+     {
+@@ -352,11 +351,23 @@ public:
+         case QEvent::WindowUnblocked:
+             --blocked;
+             break;
++        case QEvent::Leave:
++            leaves++;
++            break;
++        case QEvent::Enter:
++            enters++;
++            break;
+         default:
+             break;
+         }
+         return QWindow::event(e);
+     }
++
++    void resetCounts()
++    {
++        leaves = 0;
++        enters = 0;
++    }
+ };
+ 
+ void tst_QGuiApplication::modalWindow()
+@@ -391,6 +402,12 @@ void tst_QGuiApplication::modalWindow()
+     QCOMPARE(windowModalWindow2->blocked, 0);
+     QCOMPARE(applicationModalWindow1->blocked, 0);
+ 
++    // enter mouse in window1
++    QWindowSystemInterface::handleEnterEvent(window1);
++    QGuiApplication::processEvents();
++    QCOMPARE(window1->enters, 1);
++    QCOMPARE(window1->leaves, 0);
++
+     // show applicationModalWindow1, everything is blocked
+     applicationModalWindow1->show();
+     QCOMPARE(app.modalWindow(), applicationModalWindow1);
+@@ -400,6 +417,24 @@ void tst_QGuiApplication::modalWindow()
+     QCOMPARE(windowModalWindow2->blocked, 1);
+     QCOMPARE(applicationModalWindow1->blocked, 0);
+ 
++    // opening modal causes leave for previously entered window, but not others
++    QGuiApplication::processEvents();
++    QCOMPARE(window1->enters, 1);
++    QCOMPARE(window1->leaves, 1);
++    QCOMPARE(window2->enters, 0);
++    QCOMPARE(window2->leaves, 0);
++    QCOMPARE(applicationModalWindow1->enters, 0);
++    QCOMPARE(applicationModalWindow1->leaves, 0);
++    window1->resetCounts();
++
++    // Try entering/leaving blocked window2 - no events should reach it
++    QWindowSystemInterface::handleEnterEvent(window2);
++    QGuiApplication::processEvents();
++    QWindowSystemInterface::handleLeaveEvent(window2);
++    QGuiApplication::processEvents();
++    QCOMPARE(window2->enters, 0);
++    QCOMPARE(window2->leaves, 0);
++
+     // everything is unblocked when applicationModalWindow1 is hidden
+     applicationModalWindow1->hide();
+     QCOMPARE(app.modalWindow(), static_cast<QWindow *>(0));
+@@ -409,6 +444,12 @@ void tst_QGuiApplication::modalWindow()
+     QCOMPARE(windowModalWindow2->blocked, 0);
+     QCOMPARE(applicationModalWindow1->blocked, 0);
+ 
++    // Enter window2 - should not be blocked
++    QWindowSystemInterface::handleEnterEvent(window2);
++    QGuiApplication::processEvents();
++    QCOMPARE(window2->enters, 1);
++    QCOMPARE(window2->leaves, 0);
++
+     // show the windowModalWindow1, only window1 is blocked
+     windowModalWindow1->show();
+     QCOMPARE(app.modalWindow(), windowModalWindow1);
+@@ -418,6 +459,15 @@ void tst_QGuiApplication::modalWindow()
+     QCOMPARE(windowModalWindow2->blocked, 0);
+     QCOMPARE(applicationModalWindow1->blocked, 0);
+ 
++    // opening window modal window doesn't cause leave for unblocked window
++    QGuiApplication::processEvents();
++    QCOMPARE(window1->enters, 0);
++    QCOMPARE(window1->leaves, 0);
++    QCOMPARE(window2->enters, 1);
++    QCOMPARE(window2->leaves, 0);
++    QCOMPARE(windowModalWindow1->enters, 0);
++    QCOMPARE(windowModalWindow1->leaves, 0);
++
+     // show the windowModalWindow2, windowModalWindow1 is blocked as well
+     windowModalWindow2->show();
+     QCOMPARE(app.modalWindow(), windowModalWindow2);
+@@ -472,6 +522,17 @@ void tst_QGuiApplication::modalWindow()
+     QCOMPARE(windowModalWindow2->blocked, 1);
+     QCOMPARE(applicationModalWindow1->blocked, 0);
+ 
++    // window2 gets finally the leave
++    QGuiApplication::processEvents();
++    QCOMPARE(window1->enters, 0);
++    QCOMPARE(window1->leaves, 0);
++    QCOMPARE(window2->enters, 1);
++    QCOMPARE(window2->leaves, 1);
++    QCOMPARE(windowModalWindow1->enters, 0);
++    QCOMPARE(windowModalWindow1->leaves, 0);
++    QCOMPARE(applicationModalWindow1->enters, 0);
++    QCOMPARE(applicationModalWindow1->leaves, 0);
++
+     // hide applicationModalWindow1, windowModalWindow1 and window1 are blocked
+     applicationModalWindow1->hide();
+     QCOMPARE(app.modalWindow(), windowModalWindow2);

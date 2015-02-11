@@ -1,0 +1,265 @@
+diff --git a/src/quick/items/qquickpathview.cpp b/src/quick/items/qquickpathview.cpp
+index b85a449..962ddda 100644
+--- a/src/quick/items/qquickpathview.cpp
++++ b/src/quick/items/qquickpathview.cpp
+@@ -67,8 +67,16 @@
+ #define QML_FLICK_DISCARDSAMPLES 1
+ #endif
+ 
++// The default maximum velocity of a flick.
++#ifndef QML_FLICK_DEFAULTMAXVELOCITY
++#define QML_FLICK_DEFAULTMAXVELOCITY 2500
++#endif
++
++
+ QT_BEGIN_NAMESPACE
+ 
++const qreal MinimumFlickVelocity = 75.0;
++
+ inline qreal qmlMod(qreal x, qreal y)
+ {
+ #ifdef QT_USE_MATH_H_FLOATS
+@@ -105,6 +113,23 @@ void QQuickPathViewAttached::setValue(const QByteArray &name, const QVariant &va
+     m_metaobject->setValue(name, val);
+ }
+ 
++QQuickPathViewPrivate::QQuickPathViewPrivate()
++  : path(0), currentIndex(0), currentItemOffset(0.0), startPc(0), lastDist(0)
++    , lastElapsed(0), offset(0.0), offsetAdj(0.0), mappedRange(1.0)
++    , stealMouse(false), ownModel(false), interactive(true), haveHighlightRange(true)
++    , autoHighlight(true), highlightUp(false), layoutScheduled(false)
++    , moving(false), flicking(false), requestedOnPath(false), inRequest(false)
++    , dragMargin(0), deceleration(100), maximumFlickVelocity(QML_FLICK_DEFAULTMAXVELOCITY)
++    , moveOffset(this, &QQuickPathViewPrivate::setAdjustedOffset), flickDuration(0)
++    , firstIndex(-1), pathItems(-1), requestedIndex(-1), requestedZ(0)
++    , moveReason(Other), moveDirection(Shortest), attType(0), highlightComponent(0), highlightItem(0)
++    , moveHighlight(this, &QQuickPathViewPrivate::setHighlightPosition)
++    , highlightPosition(0)
++    , highlightRangeStart(0), highlightRangeEnd(0)
++    , highlightRangeMode(QQuickPathView::StrictlyEnforceRange)
++    , highlightMoveDuration(300), modelCount(0)
++{
++}
+ 
+ void QQuickPathViewPrivate::init()
+ {
+@@ -975,6 +1000,28 @@ void QQuickPathView::setFlickDeceleration(qreal dec)
+ }
+ 
+ /*!
++    \qmlproperty real QtQuick2::PathView::maximumFlickVelocity
++    This property holds the approximate maximum velocity that the user can flick the view in pixels/second.
++
++    The default value is platform dependent.
++*/
++qreal QQuickPathView::maximumFlickVelocity() const
++{
++    Q_D(const QQuickPathView);
++    return d->maximumFlickVelocity;
++}
++
++void QQuickPathView::setMaximumFlickVelocity(qreal vel)
++{
++    Q_D(QQuickPathView);
++    if (vel == d->maximumFlickVelocity)
++        return;
++    d->maximumFlickVelocity = vel;
++    emit maximumFlickVelocityChanged();
++}
++
++
++/*!
+     \qmlproperty bool QtQuick2::PathView::interactive
+ 
+     A user cannot drag or flick a PathView that is not interactive.
+@@ -1203,7 +1250,7 @@ void QQuickPathView::mousePressEvent(QMouseEvent *event)
+ void QQuickPathViewPrivate::handleMousePressEvent(QMouseEvent *event)
+ {
+     Q_Q(QQuickPathView);
+-    if (!interactive || !items.count())
++    if (!interactive || !items.count() || !model || !modelCount)
+         return;
+     velocityBuffer.clear();
+     QPointF scenePoint = q->mapToScene(event->localPos());
+@@ -1252,7 +1299,7 @@ void QQuickPathView::mouseMoveEvent(QMouseEvent *event)
+ void QQuickPathViewPrivate::handleMouseMoveEvent(QMouseEvent *event)
+ {
+     Q_Q(QQuickPathView);
+-    if (!interactive || !lastPosTime.isValid())
++    if (!interactive || !lastPosTime.isValid() || !model || !modelCount)
+         return;
+ 
+     qreal newPc;
+@@ -1306,14 +1353,22 @@ void QQuickPathViewPrivate::handleMouseReleaseEvent(QMouseEvent *)
+     Q_Q(QQuickPathView);
+     stealMouse = false;
+     q->setKeepMouseGrab(false);
+-    if (!interactive || !lastPosTime.isValid())
++    if (!interactive || !lastPosTime.isValid() || !model || !modelCount) {
++        lastPosTime.invalidate();
++        if (!tl.isActive())
++            q->movementEnding();
+         return;
++    }
+ 
+     qreal velocity = calcVelocity();
+-    if (model && modelCount && qAbs(velocity) > 0.5) {
+-        qreal count = pathItems == -1 ? modelCount : pathItems;
+-        if (qAbs(velocity) > count * 2) // limit velocity
+-            velocity = (velocity > 0 ? count : -count) * 2;
++    qreal count = modelCount*mappedRange;
++    qreal pixelVelocity = (path->path().length()/count) * velocity;
++    if (qAbs(pixelVelocity) > MinimumFlickVelocity) {
++        if (qAbs(pixelVelocity) > maximumFlickVelocity) {
++            // limit velocity
++            qreal maxVel = velocity < 0 ? -maximumFlickVelocity : maximumFlickVelocity;
++            velocity = maxVel / (path->path().length()/count);
++        }
+         // Calculate the distance to be travelled
+         qreal v2 = velocity*velocity;
+         qreal accel = deceleration/10;
+diff --git a/src/quick/items/qquickpathview_p.h b/src/quick/items/qquickpathview_p.h
+index 8f1ecd6..8b15e85 100644
+--- a/src/quick/items/qquickpathview_p.h
++++ b/src/quick/items/qquickpathview_p.h
+@@ -73,6 +73,7 @@ class Q_AUTOTEST_EXPORT QQuickPathView : public QQuickItem
+     Q_PROPERTY(int highlightMoveDuration READ highlightMoveDuration WRITE setHighlightMoveDuration NOTIFY highlightMoveDurationChanged)
+ 
+     Q_PROPERTY(qreal dragMargin READ dragMargin WRITE setDragMargin NOTIFY dragMarginChanged)
++    Q_PROPERTY(qreal maximumFlickVelocity READ maximumFlickVelocity WRITE setMaximumFlickVelocity NOTIFY maximumFlickVelocityChanged)
+     Q_PROPERTY(qreal flickDeceleration READ flickDeceleration WRITE setFlickDeceleration NOTIFY flickDecelerationChanged)
+     Q_PROPERTY(bool interactive READ isInteractive WRITE setInteractive NOTIFY interactiveChanged)
+ 
+@@ -126,6 +127,9 @@ public:
+     qreal flickDeceleration() const;
+     void setFlickDeceleration(qreal dec);
+ 
++    qreal maximumFlickVelocity() const;
++    void setMaximumFlickVelocity(qreal);
++
+     bool isInteractive() const;
+     void setInteractive(bool);
+ 
+@@ -160,6 +164,7 @@ Q_SIGNALS:
+     void snapPositionChanged();
+     void delegateChanged();
+     void pathItemCountChanged();
++    void maximumFlickVelocityChanged();
+     void flickDecelerationChanged();
+     void interactiveChanged();
+     void movingChanged();
+diff --git a/src/quick/items/qquickpathview_p_p.h b/src/quick/items/qquickpathview_p_p.h
+index 412caa6..ac74e9a 100644
+--- a/src/quick/items/qquickpathview_p_p.h
++++ b/src/quick/items/qquickpathview_p_p.h
+@@ -74,23 +74,7 @@ class QQuickPathViewPrivate : public QQuickItemPrivate, public QQuickItemChangeL
+     Q_DECLARE_PUBLIC(QQuickPathView)
+ 
+ public:
+-    QQuickPathViewPrivate()
+-      : path(0), currentIndex(0), currentItemOffset(0.0), startPc(0), lastDist(0)
+-        , lastElapsed(0), offset(0.0), offsetAdj(0.0), mappedRange(1.0)
+-        , stealMouse(false), ownModel(false), interactive(true), haveHighlightRange(true)
+-        , autoHighlight(true), highlightUp(false), layoutScheduled(false)
+-        , moving(false), flicking(false), requestedOnPath(false), inRequest(false)
+-        , dragMargin(0), deceleration(100)
+-        , moveOffset(this, &QQuickPathViewPrivate::setAdjustedOffset), flickDuration(0)
+-        , firstIndex(-1), pathItems(-1), requestedIndex(-1), requestedZ(0)
+-        , moveReason(Other), moveDirection(Shortest), attType(0), highlightComponent(0), highlightItem(0)
+-        , moveHighlight(this, &QQuickPathViewPrivate::setHighlightPosition)
+-        , highlightPosition(0)
+-        , highlightRangeStart(0), highlightRangeEnd(0)
+-        , highlightRangeMode(QQuickPathView::StrictlyEnforceRange)
+-        , highlightMoveDuration(300), modelCount(0)
+-    {
+-    }
++    QQuickPathViewPrivate();
+ 
+     void init();
+ 
+@@ -169,6 +153,7 @@ public:
+     QPointF lastPos;
+     qreal dragMargin;
+     qreal deceleration;
++    qreal maximumFlickVelocity;
+     QQuickTimeLine tl;
+     QQuickTimeLineValueProxy<QQuickPathViewPrivate> moveOffset;
+     int flickDuration;
+diff --git a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+index 613156b..85d2c3b 100644
+--- a/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
++++ b/tests/auto/quick/qquickpathview/tst_qquickpathview.cpp
+@@ -124,6 +124,7 @@ private slots:
+     void currentOffsetOnInsertion();
+     void asynchronous();
+     void cancelDrag();
++    void maximumFlickVelocity();
+ };
+ 
+ class TestObject : public QObject
+@@ -944,6 +945,13 @@ void tst_QQuickPathView::propertyChanges()
+ 
+     QCOMPARE(snapPositionSpy.count(), 1);
+     QCOMPARE(dragMarginSpy.count(), 1);
++
++    QSignalSpy maximumFlickVelocitySpy(pathView, SIGNAL(maximumFlickVelocityChanged()));
++    pathView->setMaximumFlickVelocity(1000);
++    QCOMPARE(maximumFlickVelocitySpy.count(), 1);
++    pathView->setMaximumFlickVelocity(1000);
++    QCOMPARE(maximumFlickVelocitySpy.count(), 1);
++
+     delete canvas;
+ }
+ 
+@@ -1488,6 +1496,52 @@ void tst_QQuickPathView::cancelDrag()
+     delete canvas;
+ }
+ 
++void tst_QQuickPathView::maximumFlickVelocity()
++{
++    QQuickView *canvas = createView();
++    canvas->setSource(testFileUrl("dragpath.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QTest::qWaitForWindowShown(canvas);
++    QTRY_COMPARE(canvas, qGuiApp->focusWindow());
++
++    QQuickPathView *pathview = qobject_cast<QQuickPathView*>(canvas->rootObject());
++    QVERIFY(pathview != 0);
++
++    pathview->setMaximumFlickVelocity(700);
++    flick(canvas, QPoint(200,10), QPoint(10,10), 180);
++    QVERIFY(pathview->isMoving());
++    QVERIFY(pathview->isFlicking());
++    QTRY_VERIFY(!pathview->isMoving());
++
++    double dist1 = 100 - pathview->offset();
++
++    pathview->setOffset(0.);
++    pathview->setMaximumFlickVelocity(300);
++    flick(canvas, QPoint(200,10), QPoint(10,10), 180);
++    QVERIFY(pathview->isMoving());
++    QVERIFY(pathview->isFlicking());
++    QTRY_VERIFY(!pathview->isMoving());
++
++    double dist2 = 100 - pathview->offset();
++
++    pathview->setOffset(0.);
++    pathview->setMaximumFlickVelocity(500);
++    flick(canvas, QPoint(200,10), QPoint(10,10), 180);
++    QVERIFY(pathview->isMoving());
++    QVERIFY(pathview->isFlicking());
++    QTRY_VERIFY(!pathview->isMoving());
++
++    double dist3 = 100 - pathview->offset();
++
++    QVERIFY(dist1 > dist2);
++    QVERIFY(dist3 > dist2);
++    QVERIFY(dist2 < dist1);
++
++    delete canvas;
++}
++
++
+ 
+ QTEST_MAIN(tst_QQuickPathView)

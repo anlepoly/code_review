@@ -1,0 +1,465 @@
+diff --git a/src/declarative/debugger/qdeclarativedebugserver.cpp b/src/declarative/debugger/qdeclarativedebugserver.cpp
+index ec0a6a5..d4c203f 100644
+--- a/src/declarative/debugger/qdeclarativedebugserver.cpp
++++ b/src/declarative/debugger/qdeclarativedebugserver.cpp
+@@ -221,6 +221,10 @@ void QDeclarativeDebugServerThread::run()
+     }
+ 
+     exec();
++
++    // make sure events still waiting are processed
++    QEventLoop eventLoop;
++    eventLoop.processEvents(QEventLoop::AllEvents);
+ }
+ 
+ bool QDeclarativeDebugServer::hasDebuggingClient() const
+@@ -325,6 +329,7 @@ QDeclarativeDebugServer::~QDeclarativeDebugServer()
+     QReadLocker(&d->pluginsLock);
+     {
+         foreach (QDeclarativeDebugService *service, d->plugins.values()) {
++            service->statusAboutToBeChanged(QDeclarativeDebugService::NotConnected);
+             service->d_func()->server = 0;
+             service->d_func()->status = QDeclarativeDebugService::NotConnected;
+             service->statusChanged(QDeclarativeDebugService::NotConnected);
+@@ -333,8 +338,7 @@ QDeclarativeDebugServer::~QDeclarativeDebugServer()
+ 
+     if (d->thread) {
+         d->thread->exit();
+-        if (!d->thread->wait(1000))
+-            d->thread->terminate();
++        d->thread->wait();
+         delete d->thread;
+     }
+     delete d->connection;
+@@ -487,8 +491,9 @@ bool QDeclarativeDebugServer::removeService(QDeclarativeDebugService *service)
+     }
+     {
+         QReadLocker(&d->pluginsLock);
+-        d->advertisePlugins();
+         QDeclarativeDebugService::Status newStatus = QDeclarativeDebugService::NotConnected;
++        service->statusAboutToBeChanged(newStatus);
++        d->advertisePlugins();
+         service->d_func()->server = 0;
+         service->d_func()->status = newStatus;
+         service->statusChanged(newStatus);
+diff --git a/src/declarative/debugger/qdeclarativedebugservice.cpp b/src/declarative/debugger/qdeclarativedebugservice.cpp
+index 009d217..98d95d7 100644
+--- a/src/declarative/debugger/qdeclarativedebugservice.cpp
++++ b/src/declarative/debugger/qdeclarativedebugservice.cpp
+@@ -253,6 +253,10 @@ bool QDeclarativeDebugService::waitForMessage()
+     return d->server->waitForMessage(this);
+ }
+ 
++void QDeclarativeDebugService::statusAboutToBeChanged(Status)
++{
++}
++
+ void QDeclarativeDebugService::statusChanged(Status)
+ {
+ }
+diff --git a/src/declarative/debugger/qdeclarativedebugservice_p.h b/src/declarative/debugger/qdeclarativedebugservice_p.h
+index 1223b94..7cce2ba 100644
+--- a/src/declarative/debugger/qdeclarativedebugservice_p.h
++++ b/src/declarative/debugger/qdeclarativedebugservice_p.h
+@@ -96,6 +96,7 @@ protected:
+ 
+     Status registerService();
+ 
++    virtual void statusAboutToBeChanged(Status);
+     virtual void statusChanged(Status);
+     virtual void messageReceived(const QByteArray &);
+ 
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace.cpp b/src/declarative/debugger/qdeclarativedebugtrace.cpp
+index dc4a919..5f8a61c 100644
+--- a/src/declarative/debugger/qdeclarativedebugtrace.cpp
++++ b/src/declarative/debugger/qdeclarativedebugtrace.cpp
+@@ -299,14 +299,27 @@ void QDeclarativeDebugTrace::sendMessages()
+     QList<QByteArray> messages;
+     for (int i = 0; i < m_data.count(); ++i)
+         messages << m_data.at(i).toByteArray();
+-    QDeclarativeDebugService::sendMessages(messages);
+     m_data.clear();
+ 
+     //indicate completion
+     QByteArray data;
+     QDataStream ds(&data, QIODevice::WriteOnly);
+     ds << (qint64)-1 << (int)Complete;
+-    sendMessage(data);
++    messages << data;
++
++    QDeclarativeDebugService::sendMessages(messages);
++}
++
++void QDeclarativeDebugTrace::statusAboutToBeChanged(QDeclarativeDebugService::Status newStatus)
++{
++    if (status() == newStatus)
++        return;
++
++    if (status() == Enabled
++            && m_enabled) {
++        stopProfilingImpl();
++        sendMessages();
++    }
+ }
+ 
+ void QDeclarativeDebugTrace::messageReceived(const QByteArray &message)
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace_p.h b/src/declarative/debugger/qdeclarativedebugtrace_p.h
+index e0d04aa..0701f35 100644
+--- a/src/declarative/debugger/qdeclarativedebugtrace_p.h
++++ b/src/declarative/debugger/qdeclarativedebugtrace_p.h
+@@ -100,7 +100,7 @@ public:
+         RangeData,
+         RangeLocation,
+         RangeEnd,
+-        Complete,
++        Complete, // end of transmission
+ 
+         MaximumMessage
+     };
+@@ -145,6 +145,7 @@ public:
+     ~QDeclarativeDebugTrace();
+ 
+ protected:
++    virtual void statusAboutToBeChanged(Status status);
+     virtual void messageReceived(const QByteArray &);
+ 
+ private:
+diff --git a/src/declarative/debugger/qv8profilerservice.cpp b/src/declarative/debugger/qv8profilerservice.cpp
+index 3abec3f..743ee6e 100644
+--- a/src/declarative/debugger/qv8profilerservice.cpp
++++ b/src/declarative/debugger/qv8profilerservice.cpp
+@@ -97,7 +97,7 @@ public:
+     QList<QV8ProfilerData> m_data;
+ 
+     bool initialized;
+-    bool m_enabled;
++    QList<QString> m_ongoing;
+ };
+ 
+ QV8ProfilerService::QV8ProfilerService(QObject *parent)
+@@ -105,8 +105,6 @@ QV8ProfilerService::QV8ProfilerService(QObject *parent)
+ {
+     Q_D(QV8ProfilerService);
+ 
+-    d->m_enabled = false;
+-
+     if (registerService() == Enabled) {
+         // ,block mode, client attached
+         while (!d->initialized)
+@@ -129,6 +127,20 @@ void QV8ProfilerService::initialize()
+     v8ProfilerInstance();
+ }
+ 
++void QV8ProfilerService::statusAboutToBeChanged(QDeclarativeDebugService::Status newStatus)
++{
++    Q_D(QV8ProfilerService);
++
++    if (status() == newStatus)
++        return;
++
++    if (status() == Enabled) {
++        foreach (const QString &title, d->m_ongoing)
++            QMetaObject::invokeMethod(this, "stopProfiling", Qt::QueuedConnection, Q_ARG(QString, title));
++        sendProfilingData();
++    }
++}
++
+ void QV8ProfilerService::messageReceived(const QByteArray &message)
+ {
+     Q_D(QV8ProfilerService);
+@@ -141,13 +153,12 @@ void QV8ProfilerService::messageReceived(const QByteArray &message)
+ 
+     if (command == "V8PROFILER") {
+         ds >>  title;
+-        if (option == "start" && !d->m_enabled) {
+-            QMetaObject::invokeMethod(this, "startProfiling", Qt::QueuedConnection, Q_ARG(QString, QString::fromUtf8(title)));
+-            d->m_enabled = true;
+-        } else if (option == "stop" && d->m_enabled) {
+-            QMetaObject::invokeMethod(this, "stopProfiling", Qt::QueuedConnection, Q_ARG(QString, QString::fromUtf8(title)));
++        QString titleStr = QString::fromUtf8(title);
++        if (option == "start") {
++            QMetaObject::invokeMethod(this, "startProfiling", Qt::QueuedConnection, Q_ARG(QString, titleStr));
++        } else if (option == "stop" && d->initialized) {
++            QMetaObject::invokeMethod(this, "stopProfiling", Qt::QueuedConnection, Q_ARG(QString, titleStr));
+             QMetaObject::invokeMethod(this, "sendProfilingData", Qt::QueuedConnection);
+-            d->m_enabled = false;
+         }
+         d->initialized = true;
+     }
+@@ -165,7 +176,12 @@ void QV8ProfilerService::messageReceived(const QByteArray &message)
+ 
+ void QV8ProfilerService::startProfiling(const QString &title)
+ {
++    Q_D(QV8ProfilerService);
+     // Start Profiling
++
++    if (d->m_ongoing.contains(title))
++        return;
++
+     v8::HandleScope handle_scope;
+     v8::Handle<v8::String> v8title = v8::String::New(reinterpret_cast<const uint16_t*>(title.data()), title.size());
+     v8::CpuProfiler::StartProfiling(v8title);
+@@ -175,6 +191,11 @@ void QV8ProfilerService::stopProfiling(const QString &title)
+ {
+     Q_D(QV8ProfilerService);
+     // Stop profiling
++
++    if (!d->m_ongoing.contains(title))
++        return;
++    d->m_ongoing.removeOne(title);
++
+     v8::HandleScope handle_scope;
+     v8::Handle<v8::String> v8title = v8::String::New(reinterpret_cast<const uint16_t*>(title.data()), title.size());
+     const v8::CpuProfile *cpuProfile = v8::CpuProfiler::StopProfiling(v8title);
+diff --git a/src/declarative/debugger/qv8profilerservice_p.h b/src/declarative/debugger/qv8profilerservice_p.h
+index ef126a0..75589ad 100644
+--- a/src/declarative/debugger/qv8profilerservice_p.h
++++ b/src/declarative/debugger/qv8profilerservice_p.h
+@@ -104,6 +104,7 @@ public slots:
+     void sendProfilingData();
+ 
+ protected:
++    void statusAboutToBeChanged(Status status);
+     void messageReceived(const QByteArray &);
+ 
+ private:
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml b/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml
+new file mode 100644
+index 0000000..b250524
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qdeclarativedebugtrace/data/exit.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++
++Item {
++    Timer {
++        running: true
++        interval: 1
++        onTriggered: Qt.quit();
++    }
++}
+diff --git a/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp b/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp
+index fb24c54..e0c8af7 100644
+--- a/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp
++++ b/tests/auto/declarative/debugger/qdeclarativedebugtrace/tst_qdeclarativedebugtrace.cpp
+@@ -92,7 +92,7 @@ private:
+     QDeclarativeDebugConnection *m_connection;
+     QDeclarativeDebugTraceClient *m_client;
+ 
+-    void connect(bool block);
++    void connect(bool block, const QString &testFile);
+ 
+ private slots:
+     void cleanup();
+@@ -100,6 +100,7 @@ private slots:
+     void blockingConnectWithTraceEnabled();
+     void blockingConnectWithTraceDisabled();
+     void nonBlockingConnect();
++    void profileOnExit();
+ };
+ 
+ void QDeclarativeDebugTraceClient::messageReceived(const QByteArray &message)
+@@ -147,7 +148,6 @@ void QDeclarativeDebugTraceClient::messageReceived(const QByteArray &message)
+     }
+     case QDeclarativeDebugTrace::Complete: {
+         emit complete();
+-        QVERIFY(stream.atEnd());
+         return;
+     }
+     case QDeclarativeDebugTrace::RangeStart: {
+@@ -166,7 +166,7 @@ void QDeclarativeDebugTraceClient::messageReceived(const QByteArray &message)
+         break;
+     }
+     case QDeclarativeDebugTrace::RangeLocation: {
+-        stream >> data.detailType >> data.detailData >> data.line;
++        stream >> data.detailType >> data.detailData >> data.line >> data.column;
+         QVERIFY(data.detailType >= 0 && data.detailType < QDeclarativeDebugTrace::MaximumRangeType);
+         QVERIFY(data.line >= -2);
+         break;
+@@ -180,7 +180,7 @@ void QDeclarativeDebugTraceClient::messageReceived(const QByteArray &message)
+     traceMessages.append(data);
+ }
+ 
+-void tst_QDeclarativeDebugTrace::connect(bool block)
++void tst_QDeclarativeDebugTrace::connect(bool block, const QString &testFile)
+ {
+     const QString executable = QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlscene";
+     QStringList arguments;
+@@ -190,7 +190,7 @@ void tst_QDeclarativeDebugTrace::connect(bool block)
+     else
+         arguments << QString("-qmljsdebugger=port:"STR_PORT);
+ 
+-    arguments << testFile("test.qml");
++    arguments << QDeclarativeDataTest::instance()->testFile(testFile);
+ 
+     m_process = new QDeclarativeDebugProcess(executable);
+     m_process->start(QStringList() << arguments);
+@@ -215,7 +215,7 @@ void tst_QDeclarativeDebugTrace::cleanup()
+ 
+ void tst_QDeclarativeDebugTrace::blockingConnectWithTraceEnabled()
+ {
+-    connect(true);
++    connect(true, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->setTraceStatus(true);
+@@ -238,7 +238,7 @@ void tst_QDeclarativeDebugTrace::blockingConnectWithTraceEnabled()
+ 
+ void tst_QDeclarativeDebugTrace::blockingConnectWithTraceDisabled()
+ {
+-    connect(true);
++    connect(true, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->setTraceStatus(false);
+@@ -263,7 +263,7 @@ void tst_QDeclarativeDebugTrace::blockingConnectWithTraceDisabled()
+ 
+ void tst_QDeclarativeDebugTrace::nonBlockingConnect()
+ {
+-    connect(false);
++    connect(false, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->setTraceStatus(true);
+@@ -283,6 +283,28 @@ void tst_QDeclarativeDebugTrace::nonBlockingConnect()
+     QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
+ }
+ 
++void tst_QDeclarativeDebugTrace::profileOnExit()
++{
++    connect(true, "exit.qml");
++    QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
++
++    m_client->setTraceStatus(true);
++
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++
++    // must start with "StartTrace"
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QDeclarativeDebugTrace::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QDeclarativeDebugTrace::StartTrace);
++
++    // must end with "EndTrace"
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QDeclarativeDebugTrace::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QDeclarativeDebugTrace::EndTrace);
++}
++
+ QTEST_MAIN(tst_QDeclarativeDebugTrace)
+ 
+ #include "tst_qdeclarativedebugtrace.moc"
+diff --git a/tests/auto/declarative/debugger/qv8profilerservice/data/exit.qml b/tests/auto/declarative/debugger/qv8profilerservice/data/exit.qml
+new file mode 100644
+index 0000000..6042653
+--- /dev/null
++++ b/tests/auto/declarative/debugger/qv8profilerservice/data/exit.qml
+@@ -0,0 +1,11 @@
++import QtQuick 2.0
++
++Item {
++    Timer {
++        running: true
++        interval: 1
++        onTriggered: {
++            Qt.quit();
++        }
++    }
++}
+diff --git a/tests/auto/declarative/debugger/qv8profilerservice/tst_qv8profilerservice.cpp b/tests/auto/declarative/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+index c70d726..2556e41 100644
+--- a/tests/auto/declarative/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
++++ b/tests/auto/declarative/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+@@ -115,7 +115,7 @@ private:
+     QDeclarativeDebugConnection *m_connection;
+     QV8ProfilerClient *m_client;
+ 
+-    void connect(bool block);
++    void connect(bool block, const QString &testFile);
+ 
+ private slots:
+     void cleanup();
+@@ -124,6 +124,7 @@ private slots:
+     void blockingConnectWithTraceDisabled();
+     void nonBlockingConnect();
+     void snapshot();
++    void profileOnExit();
+ };
+ 
+ void QV8ProfilerClient::messageReceived(const QByteArray &message)
+@@ -164,7 +165,7 @@ void QV8ProfilerClient::messageReceived(const QByteArray &message)
+     QVERIFY(stream.atEnd());
+ }
+ 
+-void tst_QV8ProfilerService::connect(bool block)
++void tst_QV8ProfilerService::connect(bool block, const QString &testFile)
+ {
+     const QString executable = QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlscene";
+     QStringList arguments;
+@@ -174,7 +175,7 @@ void tst_QV8ProfilerService::connect(bool block)
+     else
+         arguments << QString("-qmljsdebugger=port:"STR_PORT);
+ 
+-    arguments << QDeclarativeDataTest::instance()->testFile("test.qml");
++    arguments << QDeclarativeDataTest::instance()->testFile(testFile);
+ 
+     m_process = new QDeclarativeDebugProcess(executable);
+     m_process->start(QStringList() << arguments);
+@@ -199,7 +200,7 @@ void tst_QV8ProfilerService::cleanup()
+ 
+ void tst_QV8ProfilerService::blockingConnectWithTraceEnabled()
+ {
+-    connect(true);
++    connect(true, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->startProfiling("");
+@@ -213,7 +214,7 @@ void tst_QV8ProfilerService::blockingConnectWithTraceEnabled()
+ 
+ void tst_QV8ProfilerService::blockingConnectWithTraceDisabled()
+ {
+-    connect(true);
++    connect(true, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->stopProfiling("");
+@@ -233,7 +234,7 @@ void tst_QV8ProfilerService::blockingConnectWithTraceDisabled()
+ 
+ void tst_QV8ProfilerService::nonBlockingConnect()
+ {
+-    connect(false);
++    connect(false, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->startProfiling("");
+@@ -247,7 +248,7 @@ void tst_QV8ProfilerService::nonBlockingConnect()
+ 
+ void tst_QV8ProfilerService::snapshot()
+ {
+-    connect(false);
++    connect(false, "test.qml");
+     QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
+ 
+     m_client->takeSnapshot();
+@@ -258,6 +259,20 @@ void tst_QV8ProfilerService::snapshot()
+     }
+ }
+ 
++void tst_QV8ProfilerService::profileOnExit()
++{
++    connect(true, "exit.qml");
++    QTRY_COMPARE(m_client->status(), QDeclarativeDebugClient::Enabled);
++
++    m_client->startProfiling("");
++
++    if (!QDeclarativeDebugTest::waitForSignal(m_client, SIGNAL(complete()))) {
++        QString failMsg
++                = QString("No trace received in time. App output: \n%1\n").arg(m_process->output());
++        QFAIL(qPrintable(failMsg));
++    }
++}
++
+ QTEST_MAIN(tst_QV8ProfilerService)
+ 
+ #include "tst_qv8profilerservice.moc"

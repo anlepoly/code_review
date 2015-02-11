@@ -1,0 +1,293 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 0410658..11b304d 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -750,7 +750,6 @@ void QQuickCanvasPrivate::cleanup(QSGNode *n)
+ 
+     For easily displaying a scene from a QML file, see \l{QQuickView}.
+ 
+-
+     \section1 Scene Graph and Rendering
+ 
+     The QQuickCanvas uses a scene graph on top of OpenGL to render. This scene graph is disconnected
+@@ -762,18 +761,46 @@ void QQuickCanvasPrivate::cleanup(QSGNode *n)
+     rendered to the screen for the first time. If the rendering scene graph has been released
+     the signal will be emitted again before the next frame is rendered.
+ 
+-    Rendering is done by first copying the QML scene's state into the rendering scene graph. This is
+-    done by calling QQuickItem::updatePaintNode() functions on all items that have changed. This phase
+-    is run on the rendering thread with the GUI thread blocked, when a separate rendering thread
+-    is being used. The scene can then be rendered.
++    The rendering of each frame is broken down into the following
++    steps, in the given order:
++
++    \list
++
++    \li Synchronzation of the QML state into the scene graph. This is
++    done by calling the QQuickItem::updatePaintNode() function on all
++    items that have changed since the previous frame. When a dedicated
++    rendering thread is used, the GUI thread is blocked during this
++    synchroniation. This is the only time the QML items and the nodes
++    in the scene graph interact.
++
++    \li The canvas to be rendered is made current using
++    QOpenGLContext::makeCurrent().
++
++    \li The QQuickCanvas::beforeRendering() signal is
++    emitted. Applications can make direct connections
++    (Qt::DirectConnection) to this signal to use custom OpenGL calls
++    which will then stack visually beneath the QML scene.
++
++    \li Items that have specified QSGNode::UsesPreprocess, will have their
++    QSGNode::preprocess() function invoked.
++
++    \li The QQuickCanvas is cleared according to what is specified
++    using QQuickCanvas::setClearBeforeRenderig() and
++    QQuickCanvas::setClearColor().
++
++    \li The scene graph is rendered.
++
++    \li The QQuickCanvas::afterRendering() signal is
++    emitted. Applications can make direct connections
++    (Qt::DirectConnection) to this signal to use custom OpenGL calls
++    which will then stack visually over the QML scene.
++
++    \li The rendered frame is swapped and QQuickCanvas::frameSwapped()
++    is emitted.
++
++    \endlist
+ 
+-    Before the scene graph is rendered, the beforeRendering() signal is emitted. The OpenGL context
+-    is bound at this point and the application is free to do its own rendering. Also
+-    make sure to disable the clearing of the color buffer, using setClearBeforeRendering(). The
+-    default clear color is white and can be changed with setClearColor(). After the scene has
+-    been rendered, the afterRendering() signal is emitted. The application can use this to render
+-    OpenGL on top of a QML application. Once the frame is fully done and has been swapped,
+-    the frameSwapped() signal is emitted.
++    All of the above happen on the rendering thread, when applicable.
+ 
+     While the scene graph is being rendered on the rendering thread, the GUI will process animations
+     for the next frame. This means that as long as users are not using scene graph API
+@@ -790,7 +817,7 @@ void QQuickCanvasPrivate::cleanup(QSGNode *n)
+     connections should be made using Qt::DirectConnection
+ 
+ 
+-    \section1 Resource Management
++    \section2 Resource Management
+ 
+     QML will typically try to cache images, scene graph nodes, etc to improve performance, but in
+     some low-memory scenarios it might be required to aggressively release these resources. The
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 5259b62..a0e1c2a 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -1683,11 +1683,40 @@ void QQuickItemPrivate::updateSubFocusItem(QQuickItem *scope, bool focus)
+     common across visual items - such as the x and y position, the
+     width and height, \l {anchor-layout}{anchoring} and key handling.
+ 
+-    You can subclass QQuickItem to provide your own custom visual item that inherits
+-    these features. Note that, because it does not draw anything, QQuickItem sets the
+-    QGraphicsItem::ItemHasNoContents flag. If you subclass QQuickItem to create a visual
+-    item, you will need to unset this flag.
++    You can subclass QQuickItem to provide your own custom visual item
++    that inherits these features.
+ 
++    \section1 Custom Items using Scene Graph
++
++    All visual QML items are rendered using the scene graph, a
++    low-level, high-performance rendering stack, closely tied to
++    OpenGL. It is possible for subclasses of QQuickItem to add their
++    own custom content into the scene graph by setting the
++    QQuickItem::ItemHasContents flag and reimplementing the
++    QQuickItem::updatePaintNode() function.
++
++    \warning It is crucial that OpenGL operations and interaction with
++    the scene graph happens exclusively on the rendering thread,
++    primarily during the updatePaintNode() call. The best rule of
++    thumb is to only use classes with the "QSG" prefix inside the
++    QQuickItem::updatePaintNode() function.
++
++    To read more about how the scene graph rendering works, see
++    \l{Scene Graph and Rendering}
++
++    \section1 Custom Items using QPainter
++
++    The QQuickItem provides a subclass, QQuickPaintedItem, which
++    allows the users to render content using QPainter.
++
++    \warning Using QQuickPaintedItem uses an indirect 2D surface to
++    render its content, either using software rasterization or using
++    an OpenGL framebuffer object (FBO), so the rendering is a two-step
++    operation. First rasterize the surface, then draw the
++    surface. Using scene graph API directly is always significantly
++    faster.
++
++    \sa QQuickCanvas, QQuickPaintedItem
+ */
+ 
+ /*!
+@@ -3049,16 +3078,40 @@ void QQuickItem::geometryChanged(const QRectF &newGeometry, const QRectF &oldGeo
+ }
+ 
+ /*!
+-    Called by the rendering thread when it is time to sync the state of the QML objects with the
+-    scene graph objects. The function should return the root of the scene graph subtree for
+-    this item. \a oldNode is the node that was returned the last time the function was called.
++    Called by the rendering thread, as a result of
++    QQuickItem::update(), when it is time to sync the state of the QML
++    objects with the scene graph objects.
++
++    The function should return the root of the scene graph subtree for
++    this item. Most implementations will return a single
++    QSGGeometryNode containing the visual representation of this item.
++    \a oldNode is the node that was returned the last time the
++    function was called.
++
++    \code
++    QSGNode *MyItem::updatePaintNode(QSGNode *node, UpdatePaintNodeData *)
++    {
++        QSGSimpleRectNode *n = static_cast<QSGSimpleRectNode *>(node);
++        if (!n) {
++            n = new QSGSimpleRectNode();
++            n->setColor(Qt::red);
++        }
++        n->setRect(boundingRect());
++        return n;
++    }
++    \endcode
+ 
+     The main thread is blocked while this function is executed so it is safe to read
+     values from the QQuickItem instance and other objects in the main thread.
+ 
+-    \warning This is the only function in which it is allowed to make use of scene graph
+-    objects from the main thread. Use of scene graph objects outside this function will
+-    result in race conditions and potential crashes.
++    \warning It is crucial that OpenGL operations and interaction with
++    the scene graph happens exclusively on the rendering thread,
++    primarily during the QQuickItem::updatePaintNode() call. The best
++    rule of thumb is to only use classes with the "QSG" prefix inside
++    the QQuickItem::updatePaintNode() function.
++
++    \sa QSGMaterial, QSGSimpleMaterial, QSGGeometryNode, QSGGeometry,
++    QSGFlatColorMaterial, QSGTextureMaterial
+  */
+ 
+ QSGNode *QQuickItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
+diff --git a/src/quick/scenegraph/coreapi/qsgnode.cpp b/src/quick/scenegraph/coreapi/qsgnode.cpp
+index 5c14bd5..de44631 100644
+--- a/src/quick/scenegraph/coreapi/qsgnode.cpp
++++ b/src/quick/scenegraph/coreapi/qsgnode.cpp
+@@ -562,6 +562,25 @@ void QSGBasicGeometryNode::setGeometry(QSGGeometry *geometry)
+     the vertices and their structure, to be drawn. The Material defines how the shape is
+     filled.
+ 
++    The following is a code snipped illustrating how to create a red
++    line using a QSGGeometryNode:
++    \code
++        QSGGeometry *geometry = new QSGGeometry(QSGGeometry::defaultAttributes_Point2D(), 2);
++        geometry->setDrawingMode(GL_LINES);
++        geometry->setLineWidth(3);
++        geometry->vertexDataAsPoint2D()[0].set(0, 0);
++        geometry->vertexDataAsPoint2D()[1].set(width(), height());
++
++        QSGFlatColorMaterial *material = new QSGFlatColorMaterial;
++        material->setColor(QColor(255, 0, 0));
++
++        QSGGeometryNode *node = new QSGGeometryNode;
++        node->setGeometry(geometry);
++        node->setFlag(QSGNode::OwnsGeometry);
++        node->setMaterial(material);
++        node->setFlag(QSGNode::OwnsMaterial);
++    \endcode
++
+     A geometry node must have both geometry and a normal material before it is added to
+     the scene graph.
+ 
+@@ -571,6 +590,7 @@ void QSGBasicGeometryNode::setGeometry(QSGGeometry *geometry)
+     to avoid an extra operation in the fragment shader can have significant performance
+     impact on embedded graphics chips. The opaque material is optional.
+ 
++    \sa QSGGeometry, QSGMaterial, QSGSimpleMaterial
+  */
+ 
+ 
+diff --git a/src/quick/scenegraph/util/qsgtexture.cpp b/src/quick/scenegraph/util/qsgtexture.cpp
+index 7be38ff..69ae317 100644
+--- a/src/quick/scenegraph/util/qsgtexture.cpp
++++ b/src/quick/scenegraph/util/qsgtexture.cpp
+@@ -165,6 +165,75 @@ static void qt_debug_remove_texture(QSGTexture* texture)
+ 
+ #endif // QT_NO_DEBUG
+ 
++/*!
++    \class QSGTexture
++
++    \inmodule QtQuick
++
++    \brief The QSGTexture class is a baseclass for textures used in
++    the scene graph.
++
++
++    Users can freely implement their own texture classes to support
++    arbitrary input textures, such as YUV video frames or 8 bit alpha
++    masks. The scene graph backend provides a default implementation
++    of normal color textures. As the implementation of these may be
++    hardware specific, they are are constructed via the factory
++    function QQuickCanvas::createTextureFromImage().
++
++    The texture is a wrapper around an OpenGL texture, which texture
++    id is given by textureId() and which size in pixels is given by
++    textureSize(). hasAlphaChannel() reports if the texture contains
++    opacity values and hasMipmaps() reports if the texture contains
++    mipmap levels.
++
++    To use a texture, call the bind() function. The texture parameters
++    specifying how the texture is bound, can be specified with
++    setMipmapFiltering(), setFiltering(), setHorizontalWrapMode() and
++    setVerticalWrapMode(). The texture will internally try to store
++    these values to minimize the OpenGL state changes when the texture
++    is bound.
++
++    \section1 Texture Atlasses
++
++    Some scene graph backens use texture atlasses, grouping multiple
++    small textures into one large texture. If this is the case, the
++    function isAtlasTexture() will return true. Atlasses are used to
++    aid the rendering algorithm to do better sorting which increases
++    performance. The location of the texture inside the atlas is
++    given with the normalizedTextureSubRect() function.
++
++    If the texture is used in such a way that atlas is not preferable,
++    the function removedFromAtlas() can be used to extract a
++    non-atlassed copy.
++ */
++
++/*!
++    \enum QSGTexture::WrapMode
++
++    Specifies how the texture should treat texture coordinates.
++
++    \value Repeat Only the factional part of the texture coordiante is
++    used, causing values above 1 and below 0 to repeat.
++
++    \value ClampToEdge Values above 1 are clamped to 1 and values
++    below 0 are clamped to 0.
++ */
++
++/*!
++    \enum QSGTexture::Filtering
++
++    Specifies how sampling of texels should filter when texture
++    coordinates are not pixel aligned.
++
++    \value None No filtering should occur. This value is only used
++    together with setMipmapFiltering().
++
++    \value Nearest Sampling returns the nearest texel.
++
++    \value Linear Sampling returns a linear interpolation of the
++    neighboring texels.
++*/
+ 
+ QSGTexture::QSGTexture()
+     : QObject(*(new QSGTexturePrivate))

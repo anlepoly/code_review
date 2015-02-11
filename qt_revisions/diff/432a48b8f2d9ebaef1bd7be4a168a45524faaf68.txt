@@ -1,0 +1,2996 @@
+diff --git a/src/qml/qml/ftw/qqmlthread.cpp b/src/qml/qml/ftw/qqmlthread.cpp
+index 423012b..054d485 100644
+--- a/src/qml/qml/ftw/qqmlthread.cpp
++++ b/src/qml/qml/ftw/qqmlthread.cpp
+@@ -235,6 +235,11 @@ void QQmlThread::shutdown()
+     d->QThread::wait();
+ }
+ 
++bool QQmlThread::isShutdown() const
++{
++    return d->m_shutdown;
++}
++
+ void QQmlThread::lock()
+ {
+     d->lock();
+diff --git a/src/qml/qml/ftw/qqmlthread_p.h b/src/qml/qml/ftw/qqmlthread_p.h
+index 8a0ec6c..131cb4d 100644
+--- a/src/qml/qml/ftw/qqmlthread_p.h
++++ b/src/qml/qml/ftw/qqmlthread_p.h
+@@ -69,6 +69,7 @@ public:
+     QQmlThread();
+     virtual ~QQmlThread();
+     void shutdown();
++    bool isShutdown() const;
+ 
+     void lock();
+     void unlock();
+diff --git a/src/qml/qml/qqmldirparser_p.h b/src/qml/qml/qqmldirparser_p.h
+index a4fbf57..c38a3e1 100644
+--- a/src/qml/qml/qqmldirparser_p.h
++++ b/src/qml/qml/qqmldirparser_p.h
+@@ -149,6 +149,7 @@ private:
+ 
+ typedef QHash<QHashedStringRef,QQmlDirParser::Component> QQmlDirComponents;
+ typedef QList<QQmlDirParser::Script> QQmlDirScripts;
++typedef QList<QQmlDirParser::Plugin> QQmlDirPlugins;
+ 
+ QDebug &operator<< (QDebug &, const QQmlDirParser::Component &);
+ QDebug &operator<< (QDebug &, const QQmlDirParser::Script &);
+diff --git a/src/qml/qml/qqmlimport.cpp b/src/qml/qml/qqmlimport.cpp
+index 5ea45f2..937d2df 100644
+--- a/src/qml/qml/qqmlimport.cpp
++++ b/src/qml/qml/qqmlimport.cpp
+@@ -58,19 +58,27 @@ QT_BEGIN_NAMESPACE
+ DEFINE_BOOL_CONFIG_OPTION(qmlImportTrace, QML_IMPORT_TRACE)
+ DEFINE_BOOL_CONFIG_OPTION(qmlCheckTypes, QML_CHECK_TYPES)
+ 
+-static QString dotqml_string(QLatin1String(".qml"));
++static const QLatin1Char Dot('.');
++static const QLatin1Char Slash('/');
++static const QLatin1Char Backslash('\\');
++static const QLatin1Char Colon(':');
++static const QLatin1String Slash_qmldir("/qmldir");
++static const QLatin1String String_qmldir("qmldir");
++static const QString dotqml_string(QLatin1String(".qml"));
++
++namespace {
+ 
+ QString resolveLocalUrl(const QString &url, const QString &relative)
+ {
+-    if (relative.contains(QLatin1Char(':'))) {
++    if (relative.contains(Colon)) {
+         // contains a host name
+         return QUrl(url).resolved(QUrl(relative)).toString();
+     } else if (relative.isEmpty()) {
+         return url;
+-    } else if (relative.at(0) == QLatin1Char('/') || !url.contains(QLatin1Char('/'))) {
++    } else if (relative.at(0) == Slash || !url.contains(Slash)) {
+         return relative;
+     } else {
+-        QString base(url.left(url.lastIndexOf(QLatin1Char('/')) + 1));
++        QString base(url.left(url.lastIndexOf(Slash) + 1));
+ 
+         if (relative == QLatin1String("."))
+             return base;
+@@ -78,16 +86,13 @@ QString resolveLocalUrl(const QString &url, const QString &relative)
+         base.append(relative);
+ 
+         // Remove any relative directory elements in the path
+-        const QLatin1Char dot('.');
+-        const QLatin1Char slash('/');
+-
+         int length = base.length();
+         int index = 0;
+         while ((index = base.indexOf(QLatin1String("/."), index)) != -1) {
+-            if ((length > (index + 2)) && (base.at(index + 2) == dot) &&
+-                (length == (index + 3) || (base.at(index + 3) == slash))) {
++            if ((length > (index + 2)) && (base.at(index + 2) == Dot) &&
++                (length == (index + 3) || (base.at(index + 3) == Slash))) {
+                 // Either "/../" or "/..<END>"
+-                int previous = base.lastIndexOf(slash, index - 1);
++                int previous = base.lastIndexOf(Slash, index - 1);
+                 if (previous == -1)
+                     break;
+ 
+@@ -95,7 +100,7 @@ QString resolveLocalUrl(const QString &url, const QString &relative)
+                 base.remove(previous + 1, removeLength);
+                 length -= removeLength;
+                 index = previous;
+-            } else if ((length == (index + 2)) || (base.at(index + 2) == slash)) {
++            } else if ((length == (index + 2)) || (base.at(index + 2) == Slash)) {
+                 // Either "/./" or "/.<END>"
+                 base.remove(index, 2);
+                 length -= 2;
+@@ -108,6 +113,18 @@ QString resolveLocalUrl(const QString &url, const QString &relative)
+     }
+ }
+ 
++bool isPathAbsolute(const QString &path)
++{
++#if defined(Q_OS_UNIX)
++    return (path.at(0) == Slash);
++#else
++    QFileInfo fi(path);
++    return fi.isAbsolute();
++#endif
++}
++
++}
++
+ typedef QMap<QString, QString> StringStringMap;
+ Q_GLOBAL_STATIC(StringStringMap, qmlEnginePluginsWithRegisteredTypes); // stores the uri
+ 
+@@ -115,6 +132,7 @@ class QQmlImportNamespace
+ {
+ public:
+     QQmlImportNamespace() : nextNamespace(0) {}
++    ~QQmlImportNamespace() { qDeleteAll(imports); }
+ 
+     struct Import {
+         QString uri;
+@@ -125,12 +143,19 @@ public:
+         QQmlDirComponents qmlDirComponents;
+         QQmlDirScripts qmlDirScripts;
+ 
++        bool setQmldirContent(const QString &resolvedUrl, const QQmlTypeLoader::QmldirContent *qmldir,
++                              QQmlImportNamespace *nameSpace, QList<QQmlError> *errors);
++
++        static QQmlDirScripts getVersionedScripts(const QQmlDirScripts &qmldirscripts, int vmaj, int vmin);
++
+         bool resolveType(QQmlTypeLoader *typeLoader, const QHashedStringRef &type,
+                          int *vmajor, int *vminor,
+                          QQmlType** type_return, QString* url_return,
+                          QString *base = 0, bool *typeRecursionDetected = 0) const;
+     };
+-    QList<Import> imports;
++    QList<Import *> imports;
++
++    Import *findImport(const QString &uri);
+ 
+     bool resolveType(QQmlTypeLoader *typeLoader, const QHashedStringRef& type,
+                      int *vmajor, int *vminor,
+@@ -150,11 +175,22 @@ public:
+     QQmlImportsPrivate(QQmlTypeLoader *loader);
+     ~QQmlImportsPrivate();
+ 
+-    bool addImport(const QQmlDirComponents &qmldircomponentsnetwork,
+-                   const QString &importedUri, const QString& prefix,
+-                   int vmaj, int vmin, QQmlScript::Import::Type importType,
+-                   bool isImplicitImport, QQmlImportDatabase *database,
+-                   QString *, QList<QQmlError> *errors);
++    QQmlImportNamespace *importNamespace(const QString &prefix) const;
++
++    bool addLibraryImport(const QString& uri, const QString &prefix,
++                          int vmaj, int vmin, const QString &qmldirIdentifier, const QString &qmldirUrl, bool incomplete,
++                          QQmlImportDatabase *database,
++                          QList<QQmlError> *errors);
++
++    bool addFileImport(const QString &uri, const QString &prefix,
++                       int vmaj, int vmin,
++                       bool isImplicitImport, bool incomplete, QQmlImportDatabase *database,
++                       QList<QQmlError> *errors);
++
++    bool updateQmldirContent(const QString &uri, const QString &prefix,
++                             const QString &qmldirIdentifier, const QString& qmldirUrl,
++                             QQmlImportDatabase *database,
++                             QList<QQmlError> *errors);
+ 
+     bool resolveType(const QHashedStringRef &type, int *vmajor, int *vminor,
+                      QQmlType** type_return, QString* url_return,
+@@ -164,10 +200,10 @@ public:
+     QString base;
+     int ref;
+ 
+-    QQmlImportNamespace unqualifiedset;
++    mutable QQmlImportNamespace unqualifiedset;
+ 
+-    QQmlImportNamespace *findQualifiedNamespace(const QHashedStringRef &);
+-    QFieldList<QQmlImportNamespace, &QQmlImportNamespace::nextNamespace> qualifiedSets;
++    QQmlImportNamespace *findQualifiedNamespace(const QHashedStringRef &) const;
++    mutable QFieldList<QQmlImportNamespace, &QQmlImportNamespace::nextNamespace> qualifiedSets;
+ 
+     QQmlTypeLoader *typeLoader;
+ 
+@@ -175,15 +211,27 @@ public:
+         return QQmlImportDatabase::tr(str);
+     }
+ 
+-private:
+     static bool locateQmldir(const QString &uri, int vmaj, int vmin,
+                              QQmlImportDatabase *database,
+                              QString *outQmldirFilePath, QString *outUrl);
++
++    static bool validateQmldirVersion(const QQmlTypeLoader::QmldirContent *qmldir, const QString &uri, int vmaj, int vmin,
++                                      QList<QQmlError> *errors);
++
+     bool importExtension(const QString &absoluteFilePath, const QString &uri,
+-                         QQmlImportDatabase *database, QQmlDirComponents* components,
+-                         QQmlDirScripts *scripts,
+-                         QString *url, QList<QQmlError> *errors);
++                         QQmlImportDatabase *database,
++                         const QQmlTypeLoader::QmldirContent *qmldir,
++                         QList<QQmlError> *errors);
++
++    bool getQmldirContent(const QString &qmldirIdentifier, const QString &uri,
++                          const QQmlTypeLoader::QmldirContent **qmldir, QList<QQmlError> *errors);
++
+     QString resolvedUri(const QString &dir_arg, QQmlImportDatabase *database);
++
++    QQmlImportNamespace::Import *addImportToNamespace(QQmlImportNamespace *nameSpace,
++                                                      const QString &uri, const QString &url,
++                                                      int vmaj, int vmin, QQmlScript::Import::Type type,
++                                                      QList<QQmlError> *errors);
+ };
+ 
+ /*!
+@@ -246,10 +294,10 @@ void QQmlImports::populateCache(QQmlTypeNameCache *cache, QQmlEngine *engine) co
+     const QQmlImportNamespace &set = d->unqualifiedset;
+ 
+     for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
+-        const QQmlImportNamespace::Import &import = set.imports.at(ii);
+-        QQmlTypeModule *module = QQmlMetaType::typeModule(import.uri, import.majversion);
++        const QQmlImportNamespace::Import *import = set.imports.at(ii);
++        QQmlTypeModule *module = QQmlMetaType::typeModule(import->uri, import->majversion);
+         if (module)
+-            cache->m_anonymousImports.append(QQmlTypeModuleVersion(module, import.minversion));
++            cache->m_anonymousImports.append(QQmlTypeModuleVersion(module, import->minversion));
+     }
+ 
+     for (QQmlImportNamespace *ns = d->qualifiedSets.first(); ns; ns = d->qualifiedSets.next(ns)) {
+@@ -257,15 +305,15 @@ void QQmlImports::populateCache(QQmlTypeNameCache *cache, QQmlEngine *engine) co
+         const QQmlImportNamespace &set = *ns;
+ 
+         for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
+-            const QQmlImportNamespace::Import &import = set.imports.at(ii);
+-            QQmlTypeModule *module = QQmlMetaType::typeModule(import.uri, import.majversion);
++            const QQmlImportNamespace::Import *import = set.imports.at(ii);
++            QQmlTypeModule *module = QQmlMetaType::typeModule(import->uri, import->majversion);
+             if (module) {
+                 QQmlTypeNameCache::Import &typeimport = cache->m_namedImports[set.prefix];
+-                typeimport.modules.append(QQmlTypeModuleVersion(module, import.minversion));
++                typeimport.modules.append(QQmlTypeModuleVersion(module, import->minversion));
+             }
+ 
+-            QQmlMetaType::ModuleApi moduleApi = QQmlMetaType::moduleApi(import.uri, import.majversion,
+-                                                                        import.minversion);
++            QQmlMetaType::ModuleApi moduleApi = QQmlMetaType::moduleApi(import->uri, import->majversion,
++                                                                        import->minversion);
+             if (moduleApi.script || moduleApi.qobject) {
+                 QQmlTypeNameCache::Import &import = cache->m_namedImports[set.prefix];
+                 QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
+@@ -282,12 +330,12 @@ QList<QQmlImports::ScriptReference> QQmlImports::resolvedScripts() const
+     const QQmlImportNamespace &set = d->unqualifiedset;
+ 
+     for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
+-        const QQmlImportNamespace::Import &import = set.imports.at(ii);
++        const QQmlImportNamespace::Import *import = set.imports.at(ii);
+ 
+-        foreach (const QQmlDirParser::Script &script, import.qmlDirScripts) {
++        foreach (const QQmlDirParser::Script &script, import->qmlDirScripts) {
+             ScriptReference ref;
+             ref.nameSpace = script.nameSpace;
+-            ref.location = QUrl(import.url).resolved(QUrl(script.fileName));
++            ref.location = QUrl(import->url).resolved(QUrl(script.fileName));
+             scripts.append(ref);
+         }
+     }
+@@ -296,13 +344,13 @@ QList<QQmlImports::ScriptReference> QQmlImports::resolvedScripts() const
+         const QQmlImportNamespace &set = *ns;
+ 
+         for (int ii = set.imports.count() - 1; ii >= 0; --ii) {
+-            const QQmlImportNamespace::Import &import = set.imports.at(ii);
++            const QQmlImportNamespace::Import *import = set.imports.at(ii);
+ 
+-            foreach (const QQmlDirParser::Script &script, import.qmlDirScripts) {
++            foreach (const QQmlDirParser::Script &script, import->qmlDirScripts) {
+                 ScriptReference ref;
+                 ref.nameSpace = script.nameSpace;
+                 ref.qualifier = set.prefix;
+-                ref.location = QUrl(import.url).resolved(QUrl(script.fileName));
++                ref.location = QUrl(import->url).resolved(QUrl(script.fileName));
+                 scripts.append(ref);
+             }
+         }
+@@ -312,6 +360,31 @@ QList<QQmlImports::ScriptReference> QQmlImports::resolvedScripts() const
+ }
+ 
+ /*!
++    Form a complete path to a qmldir file, from a base URL, a module URI and version specification.
++*/
++QString QQmlImports::completeQmldirPath(const QString &uri, const QString &base, int vmaj, int vmin,
++                                        ImportVersion version)
++{
++    QString url = uri;
++    url.replace(Dot, Slash);
++
++    QString dir = base;
++    if (!dir.endsWith(Slash) && !dir.endsWith(Backslash))
++        dir += Slash;
++    dir += url;
++
++    if (version == QQmlImports::FullyVersioned) {
++        // extension with fully encoded version number (eg. MyModule.3.2)
++        dir += QString(QLatin1String(".%1.%2")).arg(vmaj).arg(vmin);
++    } else if (version == QQmlImports::PartiallyVersioned) {
++        // extension with encoded version major (eg. MyModule.3)
++        dir += QString(QLatin1String(".%1")).arg(vmaj);
++    } // else extension without version number (eg. MyModule)
++
++    return dir + Slash_qmldir;
++}
++
++/*!
+   \internal
+ 
+   The given (namespace qualified) \a type is resolved to either
+@@ -323,7 +396,7 @@ QList<QQmlImports::ScriptReference> QQmlImports::resolvedScripts() const
+ 
+   If any return pointer is 0, the corresponding search is not done.
+ 
+-  \sa addImport()
++  \sa addFileImport(), addLibraryImport
+ */
+ bool QQmlImports::resolveType(const QHashedStringRef &type,
+                               QQmlType** type_return, QString* url_return, int *vmaj, int *vmin,
+@@ -342,11 +415,11 @@ bool QQmlImports::resolveType(const QHashedStringRef &type,
+                                               << ')' << "::resolveType: " << type.toString() << " => "
+ 
+                 if (type_return && *type_return && url_return && !url_return->isEmpty())
+-                    RESOLVE_TYPE_DEBUG << (*type_return)->typeName() << ' ' << *url_return;
++                    RESOLVE_TYPE_DEBUG << (*type_return)->typeName() << ' ' << *url_return << " TYPE/URL";
+                 if (type_return && *type_return)
+-                    RESOLVE_TYPE_DEBUG << (*type_return)->typeName();
++                    RESOLVE_TYPE_DEBUG << (*type_return)->typeName() << " TYPE";
+                 if (url_return && !url_return->isEmpty())
+-                    RESOLVE_TYPE_DEBUG << *url_return;
++                    RESOLVE_TYPE_DEBUG << *url_return << " URL";
+ 
+ #undef RESOLVE_TYPE_DEBUG
+             }
+@@ -356,6 +429,52 @@ bool QQmlImports::resolveType(const QHashedStringRef &type,
+     return false;
+ }
+ 
++bool QQmlImportNamespace::Import::setQmldirContent(const QString &resolvedUrl, const QQmlTypeLoader::QmldirContent *qmldir, QQmlImportNamespace *nameSpace, QList<QQmlError> *errors)
++{
++    Q_ASSERT(resolvedUrl.endsWith(Slash));
++    url = resolvedUrl;
++
++    qmlDirComponents = qmldir->components();
++
++    const QQmlDirScripts &scripts = qmldir->scripts();
++    if (!scripts.isEmpty()) {
++        // Verify that we haven't imported these scripts already
++        for (QList<QQmlImportNamespace::Import *>::const_iterator it = nameSpace->imports.constBegin();
++             it != nameSpace->imports.constEnd(); ++it) {
++            if ((*it != this) && ((*it)->uri == uri)) {
++                QQmlError error;
++                error.setDescription(QQmlImportDatabase::tr("\"%1\" is ambiguous. Found in %2 and in %3").arg(uri).arg(url).arg((*it)->url));
++                errors->prepend(error);
++                return false;
++            }
++        }
++
++        qmlDirScripts = getVersionedScripts(scripts, majversion, minversion);
++    }
++
++    return true;
++}
++
++QQmlDirScripts QQmlImportNamespace::Import::getVersionedScripts(const QQmlDirScripts &qmldirscripts, int vmaj, int vmin)
++{
++    QMap<QString, QQmlDirParser::Script> versioned;
++
++    for (QList<QQmlDirParser::Script>::const_iterator sit = qmldirscripts.constBegin();
++         sit != qmldirscripts.constEnd(); ++sit) {
++        // Only include scripts that match our requested version
++        if (((vmaj == -1) || (sit->majorVersion == vmaj)) &&
++            ((vmin == -1) || (sit->minorVersion <= vmin))) {
++            // Load the highest version that matches
++            QMap<QString, QQmlDirParser::Script>::iterator vit = versioned.find(sit->nameSpace);
++            if (vit == versioned.end() || (vit->minorVersion < sit->minorVersion)) {
++                versioned.insert(sit->nameSpace, *sit);
++            }
++        }
++    }
++
++    return versioned.values();
++}
++
+ /*!
+   \internal
+ 
+@@ -454,7 +573,7 @@ bool QQmlImportsPrivate::resolveType(const QHashedStringRef& type, int *vmajor,
+                                      QList<QQmlError> *errors)
+ {
+     QQmlImportNamespace *s = 0;
+-    int dot = type.indexOf(QLatin1Char('.'));
++    int dot = type.indexOf(Dot);
+     if (dot >= 0) {
+         QHashedStringRef namespaceName(type.constData(), dot);
+         s = findQualifiedNamespace(namespaceName);
+@@ -466,7 +585,7 @@ bool QQmlImportsPrivate::resolveType(const QHashedStringRef& type, int *vmajor,
+             }
+             return false;
+         }
+-        int ndot = type.indexOf(QLatin1Char('.'),dot+1);
++        int ndot = type.indexOf(Dot,dot+1);
+         if (ndot > 0) {
+             if (errors) {
+                 QQmlError error;
+@@ -482,9 +601,9 @@ bool QQmlImportsPrivate::resolveType(const QHashedStringRef& type, int *vmajor,
+     if (s) {
+         if (s->resolveType(typeLoader,unqualifiedtype,vmajor,vminor,type_return,url_return, &base, errors))
+             return true;
+-        if (s->imports.count() == 1 && !s->imports.at(0).isLibrary && url_return && s != &unqualifiedset) {
++        if (s->imports.count() == 1 && !s->imports.at(0)->isLibrary && url_return && s != &unqualifiedset) {
+             // qualified, and only 1 url
+-            *url_return = resolveLocalUrl(s->imports.at(0).url, unqualifiedtype.toString() + QLatin1String(".qml"));
++            *url_return = resolveLocalUrl(s->imports.at(0)->url, unqualifiedtype.toString() + QLatin1String(".qml"));
+             return true;
+         }
+     }
+@@ -492,26 +611,36 @@ bool QQmlImportsPrivate::resolveType(const QHashedStringRef& type, int *vmajor,
+     return false;
+ }
+ 
++QQmlImportNamespace::Import *QQmlImportNamespace::findImport(const QString &uri)
++{
++    for (QList<Import *>::iterator it = imports.begin(), end = imports.end(); it != end; ++it) {
++        if ((*it)->uri == uri)
++            return *it;
++    }
++
++    return 0;
++}
++
+ bool QQmlImportNamespace::resolveType(QQmlTypeLoader *typeLoader, const QHashedStringRef &type,
+                                       int *vmajor, int *vminor, QQmlType** type_return,
+                                       QString* url_return, QString *base, QList<QQmlError> *errors)
+ {
+     bool typeRecursionDetected = false;
+     for (int i=0; i<imports.count(); ++i) {
+-        const Import &import = imports.at(i);
+-        if (import.resolveType(typeLoader, type, vmajor, vminor, type_return, url_return,
++        const Import *import = imports.at(i);
++        if (import->resolveType(typeLoader, type, vmajor, vminor, type_return, url_return,
+                                base, &typeRecursionDetected)) {
+             if (qmlCheckTypes()) {
+                 // check for type clashes
+                 for (int j = i+1; j<imports.count(); ++j) {
+-                    const Import &import2 = imports.at(j);
+-                    if (import2.resolveType(typeLoader, type, vmajor, vminor, 0, 0, base)) {
++                    const Import *import2 = imports.at(j);
++                    if (import2->resolveType(typeLoader, type, vmajor, vminor, 0, 0, base)) {
+                         if (errors) {
+-                            QString u1 = imports.at(i).url;
+-                            QString u2 = imports.at(j).url;
++                            QString u1 = import->url;
++                            QString u2 = import2->url;
+                             if (base) {
+                                 QString b = *base;
+-                                int dot = b.lastIndexOf(QLatin1Char('.'));
++                                int dot = b.lastIndexOf(Dot);
+                                 if (dot >= 0) {
+                                     b = b.left(dot+1);
+                                     QString l = b.left(dot);
+@@ -532,8 +661,8 @@ bool QQmlImportNamespace::resolveType(QQmlTypeLoader *typeLoader, const QHashedS
+                             } else {
+                                 error.setDescription(QQmlImportDatabase::tr("is ambiguous. Found in %1 in version %2.%3 and %4.%5")
+                                                         .arg(u1)
+-                                                        .arg(imports.at(i).majversion).arg(imports.at(i).minversion)
+-                                                        .arg(imports.at(j).majversion).arg(imports.at(j).minversion));
++                                                        .arg(import->majversion).arg(import->minversion)
++                                                        .arg(import2->majversion).arg(import2->minversion));
+                             }
+                             errors->prepend(error);
+                         }
+@@ -565,7 +694,7 @@ QQmlImportsPrivate::~QQmlImportsPrivate()
+         delete ns;
+ }
+ 
+-QQmlImportNamespace *QQmlImportsPrivate::findQualifiedNamespace(const QHashedStringRef &prefix)
++QQmlImportNamespace *QQmlImportsPrivate::findQualifiedNamespace(const QHashedStringRef &prefix) const
+ {
+     for (QQmlImportNamespace *ns = qualifiedSets.first(); ns; ns = qualifiedSets.next(ns)) {
+         if (prefix == ns->prefix)
+@@ -578,55 +707,28 @@ QQmlImportNamespace *QQmlImportsPrivate::findQualifiedNamespace(const QHashedStr
+ Import an extension defined by a qmldir file.
+ 
+ \a qmldirFilePath is either a raw file path, or a bundle url.
+-
+-This call will modify the \a url parameter if importing the extension redirects to
+-a bundle path.
+ */
+ bool QQmlImportsPrivate::importExtension(const QString &qmldirFilePath,
+                                          const QString &uri,
+                                          QQmlImportDatabase *database,
+-                                         QQmlDirComponents* components,
+-                                         QQmlDirScripts* scripts,
+-                                         QString *url,
++                                         const QQmlTypeLoader::QmldirContent *qmldir,
+                                          QList<QQmlError> *errors)
+ {
+-    // As qmldirFilePath is always local, this method can always return synchronously
+-    const QQmlDirParser *qmldirParser = typeLoader->qmlDirParser(qmldirFilePath, uri, url);
+-    if (qmldirParser->hasError()) {
+-        if (errors) {
+-            QUrl url;
+-
+-            if (QQmlFile::isBundle(qmldirFilePath))
+-                url = QUrl(qmldirFilePath);
+-            else
+-                url = QUrl::fromLocalFile(qmldirFilePath);
+-
+-            const QList<QQmlError> qmldirErrors = qmldirParser->errors(uri);
+-            for (int i = 0; i < qmldirErrors.size(); ++i) {
+-                QQmlError error = qmldirErrors.at(i);
+-                error.setUrl(url);
+-                errors->append(error);
+-            }
+-        }
+-        return false;
+-    }
++    Q_ASSERT(qmldir);
+ 
+     if (qmlImportTrace())
+-        qDebug().nospace() << "QQmlImports(" << qPrintable(base) << "::importExtension: "
++        qDebug().nospace() << "QQmlImports(" << qPrintable(base) << ")::importExtension: "
+                            << "loaded " << qmldirFilePath;
+ 
+     if (!database->qmlDirFilesForWhichPluginsHaveBeenLoaded.contains(qmldirFilePath)) {
+ 
+         QString qmldirPath = qmldirFilePath;
+ 
+-        if (QQmlFile::isBundle(*url))
+-            qmldirPath = QQmlFile::bundleFileName(*url, typeLoader->engine());
+-
+-        int slash = qmldirFilePath.lastIndexOf(QLatin1Char('/'));
++        int slash = qmldirPath.lastIndexOf(Slash);
+         if (slash > 0)
+             qmldirPath.truncate(slash);
+ 
+-        foreach (const QQmlDirParser::Plugin &plugin, qmldirParser->plugins()) {
++        foreach (const QQmlDirParser::Plugin &plugin, qmldir->plugins()) {
+             QString resolvedFilePath = database->resolvePlugin(typeLoader, qmldirPath,
+                                                                plugin.path, plugin.name);
+             if (!resolvedFilePath.isEmpty()) {
+@@ -657,10 +759,35 @@ bool QQmlImportsPrivate::importExtension(const QString &qmldirFilePath,
+         database->qmlDirFilesForWhichPluginsHaveBeenLoaded.insert(qmldirFilePath);
+     }
+ 
+-    if (components)
+-        *components = qmldirParser->components();
+-    if (scripts)
+-        *scripts = qmldirParser->scripts();
++    return true;
++}
++
++bool QQmlImportsPrivate::getQmldirContent(const QString &qmldirIdentifier, const QString &uri,
++                                          const QQmlTypeLoader::QmldirContent **qmldir, QList<QQmlError> *errors)
++{
++    Q_ASSERT(errors);
++    Q_ASSERT(qmldir);
++
++    *qmldir = typeLoader->qmldirContent(qmldirIdentifier, uri);
++    if (*qmldir) {
++        // Ensure that parsing was successful
++        if ((*qmldir)->hasError()) {
++            QUrl url;
++
++            if (QQmlFile::isBundle(qmldirIdentifier))
++                url = QUrl(qmldirIdentifier);
++            else
++                url = QUrl::fromLocalFile(qmldirIdentifier);
++
++            const QList<QQmlError> qmldirErrors = (*qmldir)->errors(uri);
++            for (int i = 0; i < qmldirErrors.size(); ++i) {
++                QQmlError error = qmldirErrors.at(i);
++                error.setUrl(url);
++                errors->append(error);
++            }
++            return false;
++        }
++    }
+ 
+     return true;
+ }
+@@ -672,7 +799,7 @@ QString QQmlImportsPrivate::resolvedUri(const QString &dir_arg, QQmlImportDataba
+     } };
+ 
+     QString dir = dir_arg;
+-    if (dir.endsWith(QLatin1Char('/')) || dir.endsWith(QLatin1Char('\\')))
++    if (dir.endsWith(Slash) || dir.endsWith(Backslash))
+         dir.chop(1);
+ 
+     QStringList paths = database->fileImportPath;
+@@ -686,17 +813,17 @@ QString QQmlImportsPrivate::resolvedUri(const QString &dir_arg, QQmlImportDataba
+         }
+     }
+ 
+-    stableRelativePath.replace(QLatin1Char('\\'), QLatin1Char('/'));
++    stableRelativePath.replace(Backslash, Slash);
+ 
+     // remove optional versioning in dot notation from uri
+-    int lastSlash = stableRelativePath.lastIndexOf(QLatin1Char('/'));
++    int lastSlash = stableRelativePath.lastIndexOf(Slash);
+     if (lastSlash >= 0) {
+-        int versionDot = stableRelativePath.indexOf(QLatin1Char('.'), lastSlash);
++        int versionDot = stableRelativePath.indexOf(Dot, lastSlash);
+         if (versionDot >= 0)
+             stableRelativePath = stableRelativePath.left(versionDot);
+     }
+ 
+-    stableRelativePath.replace(QLatin1Char('/'), QLatin1Char('.'));
++    stableRelativePath.replace(Slash, Dot);
+ 
+     return stableRelativePath;
+ }
+@@ -706,10 +833,8 @@ Locates the qmldir file for \a uri version \a vmaj.vmin.  Returns true if found,
+ and fills in outQmldirFilePath and outQmldirUrl appropriately.  Otherwise returns
+ false.
+ */
+-bool QQmlImportsPrivate::locateQmldir(const QString &uri, int vmaj, int vmin,
+-                                      QQmlImportDatabase *database,
+-                                      QString *outQmldirFilePath,
+-                                      QString *outQmldirPathUrl)
++bool QQmlImportsPrivate::locateQmldir(const QString &uri, int vmaj, int vmin, QQmlImportDatabase *database,
++                                      QString *outQmldirFilePath, QString *outQmldirPathUrl)
+ {
+     Q_ASSERT(vmaj >= 0 && vmin >= 0); // Versions are always specified for libraries
+ 
+@@ -732,29 +857,20 @@ bool QQmlImportsPrivate::locateQmldir(const QString &uri, int vmaj, int vmin,
+     }
+     }
+ 
+-    static QLatin1Char Slash('/');
+-    static QLatin1String Slash_qmldir("/qmldir");
++    QQmlTypeLoader &typeLoader = QQmlEnginePrivate::get(database->engine)->typeLoader;
+ 
+-    QString url = uri;
+-    url.replace(QLatin1Char('.'), Slash);
+-
+-    // step 0: search for extension with fully encoded version number (eg. MyModule.3.2)
+-    // step 1: search for extension with encoded version major (eg. MyModule.3)
+-    // step 2: search for extension without version number (eg. MyModule)
+-    for (int step = 0; step <= 2; ++step) {
+-        foreach (const QString &p, database->fileImportPath) {
+-            QString dir = p + Slash + url;
+-
+-            QString qmldirFile = dir;
+-            if (step == 0) qmldirFile += QString(QLatin1String(".%1.%2")).arg(vmaj).arg(vmin);
+-            else if (step == 1) qmldirFile += QString(QLatin1String(".%1")).arg(vmaj);
+-            qmldirFile += Slash_qmldir;
+-
+-            QQmlTypeLoader &typeLoader = QQmlEnginePrivate::get(database->engine)->typeLoader;
+-            QString absoluteFilePath = typeLoader.absoluteFilePath(qmldirFile);
++    QStringList localImportPaths = database->importPathList(QQmlImportDatabase::Local);
++
++    // Search local import paths for a matching version
++    for (int version = QQmlImports::FullyVersioned; version <= QQmlImports::Unversioned; ++version) {
++        foreach (const QString &path, localImportPaths) {
++            QString qmldirPath = QQmlImports::completeQmldirPath(uri, path, vmaj, vmin, static_cast<QQmlImports::ImportVersion>(version));
++
++            QString absoluteFilePath = typeLoader.absoluteFilePath(qmldirPath);
+             if (!absoluteFilePath.isEmpty()) {
++                QString url;
+                 QString absolutePath = absoluteFilePath.left(absoluteFilePath.lastIndexOf(Slash)+1);
+-                if (absolutePath.at(0) == QLatin1Char(':'))
++                if (absolutePath.at(0) == Colon)
+                     url = QLatin1String("qrc://") + absolutePath.mid(1);
+                 else
+                     url = QUrl::fromLocalFile(absolutePath).toString();
+@@ -784,264 +900,328 @@ bool QQmlImportsPrivate::locateQmldir(const QString &uri, int vmaj, int vmin,
+     return false;
+ }
+ 
+-bool QQmlImportsPrivate::addImport(const QQmlDirComponents &qmldircomponentsnetwork,
+-                                   const QString& importedUri, const QString& prefix,
+-                                   int vmaj, int vmin, QQmlScript::Import::Type importType,
+-                                   bool isImplicitImport, QQmlImportDatabase *database,
+-                                   QString *outUrl, QList<QQmlError> *errors)
++bool QQmlImportsPrivate::validateQmldirVersion(const QQmlTypeLoader::QmldirContent *qmldir, const QString &uri, int vmaj, int vmin,
++                                               QList<QQmlError> *errors)
+ {
+-    Q_ASSERT(errors);
+-    Q_ASSERT(importType == QQmlScript::Import::File || importType == QQmlScript::Import::Library);
+-
+-    static QLatin1String String_qmldir("qmldir");
+-    static QLatin1String Slash_qmldir("/qmldir");
+-    static QLatin1Char Slash('/');
+-
+-    // The list of components defined by a qmldir file for this import.
+-    QQmlDirComponents qmldircomponents;
+-    // The list of scripts defined by a qmldir file for this import.
+-    QQmlDirScripts qmldirscripts;
+-    // The namespace that this import affects.
+-    QQmlImportNamespace *importSet = 0;
+-    // The uri for this import.  For library imports this is the same as importedUri
+-    // specified by the user, but it may be different in the case of file imports.
+-    QString uri;
+-    // The url for the path containing files for this import.
+-    QString url;
++    int lowest_min = INT_MAX;
++    int highest_min = INT_MIN;
++
++    typedef QQmlDirComponents::const_iterator ConstIterator;
++    const QQmlDirComponents &components = qmldir->components();
++
++    ConstIterator cend = components.constEnd();
++    for (ConstIterator cit = components.constBegin(); cit != cend; ++cit) {
++        for (ConstIterator cit2 = components.constBegin(); cit2 != cit; ++cit2) {
++            if ((cit2->typeName == cit->typeName) &&
++                (cit2->majorVersion == cit->majorVersion) &&
++                (cit2->minorVersion == cit->minorVersion)) {
++                // This entry clashes with a predecessor
++                QQmlError error;
++                error.setDescription(QQmlImportDatabase::tr("\"%1\" version %2.%3 is already defined in module \"%4\"")
++                                     .arg(cit->typeName).arg(cit->majorVersion).arg(cit->minorVersion).arg(uri));
++                errors->prepend(error);
++                return false;
++            }
++        }
++
++        if (cit->majorVersion == vmaj) {
++            lowest_min = qMin(lowest_min, cit->minorVersion);
++            highest_min = qMax(highest_min, cit->minorVersion);
++        }
++    }
++
++    typedef QList<QQmlDirParser::Script>::const_iterator SConstIterator;
++    const QQmlDirScripts &scripts = qmldir->scripts();
++
++    SConstIterator send = scripts.constEnd();
++    for (SConstIterator sit = scripts.constBegin(); sit != send; ++sit) {
++        for (SConstIterator sit2 = scripts.constBegin(); sit2 != sit; ++sit2) {
++            if ((sit2->nameSpace == sit->nameSpace) &&
++                (sit2->majorVersion == sit->majorVersion) &&
++                (sit2->minorVersion == sit->minorVersion)) {
++                // This entry clashes with a predecessor
++                QQmlError error;
++                error.setDescription(QQmlImportDatabase::tr("\"%1\" version %2.%3 is already defined in module \"%4\"")
++                                     .arg(sit->nameSpace).arg(sit->majorVersion).arg(sit->minorVersion).arg(uri));
++                errors->prepend(error);
++                return false;
++            }
++        }
++
++        if (sit->majorVersion == vmaj) {
++            lowest_min = qMin(lowest_min, sit->minorVersion);
++            highest_min = qMax(highest_min, sit->minorVersion);
++        }
++    }
++
++    if (lowest_min > vmin || highest_min < vmin) {
++        QQmlError error;
++        error.setDescription(QQmlImportDatabase::tr("module \"%1\" version %2.%3 is not installed").arg(uri).arg(vmaj).arg(vmin));
++        errors->prepend(error);
++        return false;
++    }
++
++    return true;
++}
++
++QQmlImportNamespace *QQmlImportsPrivate::importNamespace(const QString &prefix) const
++{
++    QQmlImportNamespace *nameSpace = 0;
+ 
+-    qmldircomponents = qmldircomponentsnetwork;
+-    uri = importedUri;
+     if (prefix.isEmpty()) {
+-        importSet = &unqualifiedset;
++        nameSpace = &unqualifiedset;
+     } else {
+-        importSet = findQualifiedNamespace(prefix);
++        nameSpace = findQualifiedNamespace(prefix);
+ 
+-        if (!importSet) {
+-            importSet = new QQmlImportNamespace;
+-            importSet->prefix = prefix;
+-            qualifiedSets.append(importSet);
++        if (!nameSpace) {
++            nameSpace = new QQmlImportNamespace;
++            nameSpace->prefix = prefix;
++            qualifiedSets.append(nameSpace);
+         }
+     }
+ 
+-    if (importType == QQmlScript::Import::Library) {
+-        Q_ASSERT(vmaj >= 0 && vmin >= 0);
++    return nameSpace;
++}
++
++QQmlImportNamespace::Import *QQmlImportsPrivate::addImportToNamespace(QQmlImportNamespace *nameSpace,
++                                                                      const QString &uri, const QString &url, int vmaj, int vmin,
++                                                                      QQmlScript::Import::Type type,
++                                                                      QList<QQmlError> *errors)
++{
++    Q_ASSERT(nameSpace);
++    Q_ASSERT(errors);
++    Q_ASSERT(url.isEmpty() || url.endsWith(Slash));
++
++    QQmlImportNamespace::Import *import = new QQmlImportNamespace::Import;
++    import->uri = uri;
++    import->url = url;
++    import->majversion = vmaj;
++    import->minversion = vmin;
++    import->isLibrary = (type == QQmlScript::Import::Library);
+ 
+-        QString qmldirFilePath;
++    nameSpace->imports.prepend(import);
++    return import;
++}
++
++bool QQmlImportsPrivate::addLibraryImport(const QString& uri, const QString &prefix,
++                                          int vmaj, int vmin, const QString &qmldirIdentifier, const QString &qmldirUrl, bool incomplete,
++                                          QQmlImportDatabase *database,
++                                          QList<QQmlError> *errors)
++{
++    Q_ASSERT(database);
++    Q_ASSERT(errors);
+ 
+-        if (locateQmldir(uri, vmaj, vmin, database, &qmldirFilePath, &url)) {
++    QQmlImportNamespace *nameSpace = importNamespace(prefix);
++    Q_ASSERT(nameSpace);
+ 
+-            if (!importExtension(qmldirFilePath, uri, database, &qmldircomponents,
+-                                 &qmldirscripts, &url, errors))
++    QQmlImportNamespace::Import *inserted = addImportToNamespace(nameSpace, uri, qmldirUrl, vmaj, vmin, QQmlScript::Import::Library, errors);
++    Q_ASSERT(inserted);
++
++    if (!incomplete) {
++        const QQmlTypeLoader::QmldirContent *qmldir = 0;
++
++        if (!qmldirIdentifier.isEmpty()) {
++            if (!getQmldirContent(qmldirIdentifier, uri, &qmldir, errors))
+                 return false;
+ 
+-        }
++            if (qmldir) {
++                if (!importExtension(qmldir->pluginLocation(), uri, database, qmldir, errors))
++                    return false;
+ 
+-        if (!QQmlMetaType::isModule(uri, vmaj, vmin)) {
++                if (!inserted->setQmldirContent(qmldirUrl, qmldir, nameSpace, errors))
++                    return false;
++            }
++        }
+ 
+-            if (qmldircomponents.isEmpty() && qmldirscripts.isEmpty()) {
++        // Ensure that we are actually providing something
++        if ((vmaj < 0) || (vmin < 0) || !QQmlMetaType::isModule(uri, vmaj, vmin)) {
++            if (inserted->qmlDirComponents.isEmpty() && inserted->qmlDirScripts.isEmpty()) {
+                 QQmlError error;
+                 if (QQmlMetaType::isAnyModule(uri))
+-                    error.setDescription(tr("module \"%1\" version %2.%3 is not installed").arg(importedUri).arg(vmaj).arg(vmin));
++                    error.setDescription(tr("module \"%1\" version %2.%3 is not installed").arg(uri).arg(vmaj).arg(vmin));
+                 else
+-                    error.setDescription(tr("module \"%1\" is not installed").arg(importedUri));
++                    error.setDescription(tr("module \"%1\" is not installed").arg(uri));
+                 errors->prepend(error);
+                 return false;
+-            } else {
+-                int lowest_min = INT_MAX;
+-                int highest_min = INT_MIN;
+-                typedef QQmlDirComponents::const_iterator ConstIterator;
+-                typedef QList<QQmlDirParser::Script>::const_iterator SConstIterator;
+-
+-                ConstIterator cend = qmldircomponents.constEnd();
+-                for (ConstIterator cit = qmldircomponents.constBegin(); cit != cend; ++cit) {
+-                    for (ConstIterator cit2 = qmldircomponents.constBegin(); cit2 != cit; ++cit2) {
+-                        if ((cit2->typeName == cit->typeName) &&
+-                            (cit2->majorVersion == cit->majorVersion) &&
+-                            (cit2->minorVersion == cit->minorVersion)) {
+-                            // This is entry clashes with a predecessor
+-                            QQmlError error;
+-                            error.setDescription(tr("\"%1\" version %2.%3 is already defined in module \"%4\"")
+-                                                 .arg(cit->typeName).arg(cit->majorVersion).arg(cit->minorVersion).arg(importedUri));
+-                            errors->prepend(error);
+-                            return false;
+-                        }
+-                    }
++            } else if ((vmaj >= 0) && (vmin >= 0) && qmldir) {
++                // Verify that the qmldir content is valid for this version
++                if (!validateQmldirVersion(qmldir, uri, vmaj, vmin, errors))
++                    return false;
++            }
++        }
++    }
+ 
+-                    if (cit->majorVersion == vmaj) {
+-                        lowest_min = qMin(lowest_min, cit->minorVersion);
+-                        highest_min = qMax(highest_min, cit->minorVersion);
+-                    }
+-                }
++    return true;
++}
+ 
+-                SConstIterator send = qmldirscripts.constEnd();
+-                for (SConstIterator sit = qmldirscripts.constBegin(); sit != send; ++sit) {
+-                    for (SConstIterator sit2 = qmldirscripts.constBegin(); sit2 != sit; ++sit2) {
+-                        if ((sit2->nameSpace == sit->nameSpace) &&
+-                            (sit2->majorVersion == sit->majorVersion) &&
+-                            (sit2->minorVersion == sit->minorVersion)) {
+-                            // This is entry clashes with a predecessor
+-                            QQmlError error;
+-                            error.setDescription(tr("\"%1\" version %2.%3 is already defined in module \"%4\"")
+-                                                 .arg(sit->nameSpace).arg(sit->majorVersion).arg(sit->minorVersion).arg(importedUri));
+-                            errors->prepend(error);
+-                            return false;
+-                        }
+-                    }
++bool QQmlImportsPrivate::addFileImport(const QString& uri, const QString &prefix,
++                                       int vmaj, int vmin,
++                                       bool isImplicitImport, bool incomplete, QQmlImportDatabase *database,
++                                       QList<QQmlError> *errors)
++{
++    Q_ASSERT(errors);
+ 
+-                    if (sit->majorVersion == vmaj) {
+-                        lowest_min = qMin(lowest_min, sit->minorVersion);
+-                        highest_min = qMax(highest_min, sit->minorVersion);
+-                    }
+-                }
++    QQmlImportNamespace *nameSpace = importNamespace(prefix);
++    Q_ASSERT(nameSpace);
+ 
+-                if (lowest_min > vmin || highest_min < vmin) {
+-                    QQmlError error;
+-                    error.setDescription(tr("module \"%1\" version %2.%3 is not installed").arg(importedUri).arg(vmaj).arg(vmin));
+-                    errors->prepend(error);
+-                    return false;
+-                }
+-            }
++    // The uri for this import.  For library imports this is the same as uri
++    // specified by the user, but it may be different in the case of file imports.
++    QString importUri = uri;
++
++    QString qmldirPath = importUri;
++    if (importUri.endsWith(Slash))
++        qmldirPath += String_qmldir;
++    else
++        qmldirPath += Slash_qmldir;
++
++    QString qmldirUrl = resolveLocalUrl(base, qmldirPath);
++
++    QString qmldirIdentifier;
+ 
++    if (QQmlFile::isBundle(qmldirUrl)) {
++
++        QString dir = resolveLocalUrl(base, importUri);
++        Q_ASSERT(QQmlFile::isBundle(dir));
++        if (!QQmlFile::bundleDirectoryExists(dir, typeLoader->engine())) {
++            if (!isImplicitImport) {
++                QQmlError error;
++                error.setDescription(tr("\"%1\": no such directory").arg(uri));
++                error.setUrl(QUrl(qmldirUrl));
++                errors->prepend(error);
++            }
++            return false;
+         }
+-    } else {
+ 
+-        Q_ASSERT(importType == QQmlScript::Import::File);
++        // Transforms the (possible relative) uri into our best guess relative to the
++        // import paths.
++        importUri = resolvedUri(dir, database);
++        if (importUri.endsWith(Slash))
++            importUri.chop(1);
+ 
+-        if (qmldircomponents.isEmpty()) {
++        if (QQmlFile::bundleFileExists(qmldirUrl, typeLoader->engine()))
++            qmldirIdentifier = qmldirUrl;
+ 
+-            QString qmldirPath = uri;
+-            if (uri.endsWith(Slash)) qmldirPath += String_qmldir;
+-            else qmldirPath += Slash_qmldir;
+-            QString qmldirUrl = resolveLocalUrl(base, qmldirPath);
++    } else if (QQmlFile::isLocalFile(qmldirUrl)) {
+ 
+-            if (QQmlFile::isBundle(qmldirUrl)) {
++        QString localFileOrQrc = QQmlFile::urlToLocalFileOrQrc(qmldirUrl);
++        Q_ASSERT(!localFileOrQrc.isEmpty());
+ 
+-                QString dir = resolveLocalUrl(base, uri);
+-                Q_ASSERT(QQmlFile::isBundle(dir));
+-                if (!QQmlFile::bundleDirectoryExists(dir, typeLoader->engine())) {
+-                    if (!isImplicitImport) {
+-                        QQmlError error;
+-                        error.setDescription(tr("\"%1\": no such directory").arg(importedUri));
+-                        error.setUrl(QUrl(qmldirUrl));
+-                        errors->prepend(error);
+-                    }
+-                    return false;
+-                }
++        QString dir = QQmlFile::urlToLocalFileOrQrc(resolveLocalUrl(base, importUri));
++        if (!typeLoader->directoryExists(dir)) {
++            if (!isImplicitImport) {
++                QQmlError error;
++                error.setDescription(tr("\"%1\": no such directory").arg(uri));
++                error.setUrl(QUrl(qmldirUrl));
++                errors->prepend(error);
++            }
++            return false;
++        }
+ 
+-                // Transforms the (possible relative) uri into our best guess relative to the
+-                // import paths.
+-                uri = resolvedUri(dir, database);
++        // Transforms the (possible relative) uri into our best guess relative to the
++        // import paths.
++        importUri = resolvedUri(dir, database);
++        if (importUri.endsWith(Slash))
++            importUri.chop(1);
+ 
+-                if (uri.endsWith(Slash))
+-                    uri.chop(1);
+-                if (QQmlFile::bundleFileExists(qmldirUrl, typeLoader->engine())) {
+-                    if (!importExtension(qmldirUrl, uri, database, &qmldircomponents,
+-                                         &qmldirscripts, &url, errors))
+-                        return false;
+-                }
++        if (!typeLoader->absoluteFilePath(localFileOrQrc).isEmpty())
++            qmldirIdentifier = localFileOrQrc;
+ 
+-            } else if (QQmlFile::isLocalFile(qmldirUrl)) {
++    } else if (nameSpace->prefix.isEmpty() && !incomplete) {
+ 
+-                QString localFileOrQrc = QQmlFile::urlToLocalFileOrQrc(qmldirUrl);
+-                Q_ASSERT(!localFileOrQrc.isEmpty());
++        if (!isImplicitImport) {
++            QQmlError error;
++            error.setDescription(tr("import \"%1\" has no qmldir and no namespace").arg(importUri));
++            error.setUrl(QUrl(qmldirUrl));
++            errors->prepend(error);
++        }
+ 
+-                QString dir = QQmlFile::urlToLocalFileOrQrc(resolveLocalUrl(base, uri));
+-                if (!typeLoader->directoryExists(dir)) {
+-                    if (!isImplicitImport) {
+-                        QQmlError error;
+-                        error.setDescription(tr("\"%1\": no such directory").arg(importedUri));
+-                        error.setUrl(QUrl(qmldirUrl));
+-                        errors->prepend(error);
+-                    }
+-                    return false;
+-                }
++        return false;
+ 
+-                // Transforms the (possible relative) uri into our best guess relative to the
+-                // import paths.
+-                uri = resolvedUri(dir, database);
++    }
+ 
+-                if (uri.endsWith(Slash))
+-                    uri.chop(1);
+-                if (!typeLoader->absoluteFilePath(localFileOrQrc).isEmpty()) {
+-                    if (!importExtension(localFileOrQrc, uri, database, &qmldircomponents,
+-                                         &qmldirscripts, &url, errors))
+-                        return false;
+-                }
++    // The url for the path containing files for this import
++    QString url = resolveLocalUrl(base, uri);
++    if (!url.endsWith(Slash) && !url.endsWith(Backslash))
++        url += Slash;
+ 
+-            } else if (prefix.isEmpty()) {
++    QQmlImportNamespace::Import *inserted = addImportToNamespace(nameSpace, importUri, url, vmaj, vmin, QQmlScript::Import::File, errors);
++    Q_ASSERT(inserted);
+ 
+-                if (!isImplicitImport) {
+-                    QQmlError error;
+-                    error.setDescription(tr("import \"%1\" has no qmldir and no namespace").arg(uri));
+-                    error.setUrl(QUrl(qmldirUrl));
+-                    errors->prepend(error);
+-                }
++    if (!incomplete && !qmldirIdentifier.isEmpty()) {
++        const QQmlTypeLoader::QmldirContent *qmldir = 0;
++        if (!getQmldirContent(qmldirIdentifier, importUri, &qmldir, errors))
++            return false;
+ 
++        if (qmldir) {
++            if (!importExtension(qmldir->pluginLocation(), importUri, database, qmldir, errors))
+                 return false;
+ 
+-            }
++            if (!inserted->setQmldirContent(url, qmldir, nameSpace, errors))
++                return false;
+         }
+-
+-        url = resolveLocalUrl(base, importedUri);
+-        if (!url.endsWith(Slash))
+-            url += Slash;
+     }
+ 
+-    Q_ASSERT(url.isEmpty() || url.endsWith(Slash));
++    return true;
++}
+ 
+-    QMap<QString, QQmlDirParser::Script> scripts;
+-    if (!qmldirscripts.isEmpty()) {
+-        // Verify that we haven't imported these scripts already
+-        for (QList<QQmlImportNamespace::Import>::const_iterator it = importSet->imports.constBegin();
+-             it != importSet->imports.constEnd(); ++it) {
+-            if (it->uri == uri) {
+-                QQmlError error;
+-                error.setDescription(tr("\"%1\" is ambiguous. Found in %2 and in %3").arg(uri).arg(url).arg(it->url));
+-                errors->prepend(error);
++bool QQmlImportsPrivate::updateQmldirContent(const QString &uri, const QString &prefix,
++                                             const QString &qmldirIdentifier, const QString& qmldirUrl,
++                                             QQmlImportDatabase *database, QList<QQmlError> *errors)
++{
++    QQmlImportNamespace *nameSpace = importNamespace(prefix);
++    Q_ASSERT(nameSpace);
++
++    if (QQmlImportNamespace::Import *import = nameSpace->findImport(uri)) {
++        const QQmlTypeLoader::QmldirContent *qmldir = 0;
++        if (!getQmldirContent(qmldirIdentifier, uri, &qmldir, errors))
++            return false;
++
++        if (qmldir) {
++            if (!importExtension(qmldir->pluginLocation(), uri, database, qmldir, errors))
+                 return false;
+-            }
+-        }
+ 
+-        for (QList<QQmlDirParser::Script>::const_iterator sit = qmldirscripts.constBegin();
+-             sit != qmldirscripts.constEnd(); ++sit) {
+-            // Only include scripts that match our requested version
+-            if (((vmaj == -1) || (sit->majorVersion == vmaj)) &&
+-                ((vmin == -1) || (sit->minorVersion <= vmin))) {
++            if (import->setQmldirContent(qmldirUrl, qmldir, nameSpace, errors)) {
++                // Ensure that we are actually providing something
++                int vmaj = import->majversion;
++                int vmin = import->minversion;
+ 
+-                // Load the highest version that matches
+-                QMap<QString, QQmlDirParser::Script>::iterator it = scripts.find(sit->nameSpace);
+-                if (it == scripts.end() || (it->minorVersion < sit->minorVersion)) {
+-                    scripts.insert(sit->nameSpace, *sit);
++                if (import->qmlDirComponents.isEmpty() && import->qmlDirScripts.isEmpty()) {
++                    // The implicit import qmldir can be empty
++                    if (uri != QLatin1String(".")) {
++                        QQmlError error;
++                        if (QQmlMetaType::isAnyModule(uri))
++                            error.setDescription(tr("module \"%1\" version %2.%3 is not installed").arg(uri).arg(vmaj).arg(vmin));
++                        else
++                            error.setDescription(tr("module \"%1\" is not installed").arg(uri));
++                        errors->prepend(error);
++                        return false;
++                    }
++                } else if ((vmaj >= 0) && (vmin >= 0)) {
++                    // Verify that the qmldir content is valid for this version
++                    if (!validateQmldirVersion(qmldir, uri, vmaj, vmin, errors))
++                        return false;
+                 }
++                return true;
+             }
+         }
+     }
+ 
+-    QQmlImportNamespace::Import import;
+-    import.uri = uri;
+-    import.url = url;
+-    import.majversion = vmaj;
+-    import.minversion = vmin;
+-    import.isLibrary = importType == QQmlScript::Import::Library;
+-    import.qmlDirComponents = qmldircomponents;
+-    import.qmlDirScripts = scripts.values();
+-
+-    importSet->imports.prepend(import);
+-
+-    if (outUrl) *outUrl = url;
++    if (errors->isEmpty()) {
++        QQmlError error;
++        error.setDescription(QQmlTypeLoader::tr("Cannot update qmldir content for '%1'").arg(uri));
++        errors->prepend(error);
++    }
+ 
+-    return true;
++    return false;
+ }
+ 
+ /*!
+   \internal
+ 
+-  Adds an implicit "." file import.  This is equivalent to calling addImport(), but error
++  Adds an implicit "." file import.  This is equivalent to calling addFileImport(), but error
+   messages related to the path or qmldir file not existing are suppressed.
+ */
+-bool QQmlImports::addImplicitImport(QQmlImportDatabase *importDb,
+-                                    const QQmlDirComponents &qmldircomponentsnetwork,
+-                                    QList<QQmlError> *errors)
++bool QQmlImports::addImplicitImport(QQmlImportDatabase *importDb, QList<QQmlError> *errors)
+ {
+     Q_ASSERT(errors);
+ 
+@@ -1049,9 +1229,8 @@ bool QQmlImports::addImplicitImport(QQmlImportDatabase *importDb,
+         qDebug().nospace() << "QQmlImports(" << qPrintable(baseUrl().toString())
+                            << ")::addImplicitImport";
+ 
+-
+-    return d->addImport(qmldircomponentsnetwork, QLatin1String("."), QString(), -1, -1,
+-                        QQmlScript::Import::File, true, importDb, 0, errors);
++    bool incomplete = !isLocal(baseUrl());
++    return d->addFileImport(QLatin1String("."), QString(), -1, -1, true, incomplete, importDb, errors);
+ }
+ 
+ /*!
+@@ -1075,24 +1254,66 @@ bool QQmlImports::addImplicitImport(QQmlImportDatabase *importDb,
+   Returns true on success, and false on failure.  In case of failure, the errors array will
+   filled appropriately.
+ */
+-bool QQmlImports::addImport(QQmlImportDatabase *importDb,
+-                            const QString& uri, const QString& prefix, int vmaj, int vmin,
+-                            QQmlScript::Import::Type importType,
+-                            const QQmlDirComponents &qmldircomponentsnetwork,
+-                            QString *url, QList<QQmlError> *errors)
++bool QQmlImports::addFileImport(QQmlImportDatabase *importDb,
++                                const QString& uri, const QString& prefix, int vmaj, int vmin,
++                                bool incomplete, QList<QQmlError> *errors)
++{
++    Q_ASSERT(importDb);
++    Q_ASSERT(errors);
++
++    if (qmlImportTrace())
++        qDebug().nospace() << "QQmlImports(" << qPrintable(baseUrl().toString()) << ')' << "::addFileImport: "
++                           << uri << ' ' << vmaj << '.' << vmin << " as " << prefix;
++
++    return d->addFileImport(uri, prefix, vmaj, vmin, false, incomplete, importDb, errors);
++}
++
++bool QQmlImports::addLibraryImport(QQmlImportDatabase *importDb,
++                                   const QString &uri, const QString &prefix, int vmaj, int vmin,
++                                   const QString &qmldirIdentifier, const QString& qmldirUrl, bool incomplete, QList<QQmlError> *errors)
+ {
++    Q_ASSERT(importDb);
+     Q_ASSERT(errors);
+ 
+     if (qmlImportTrace())
+-        qDebug().nospace() << "QQmlImports(" << qPrintable(baseUrl().toString()) << ')' << "::addImport: "
+-                           << uri << ' ' << vmaj << '.' << vmin << ' '
+-                           << (importType==QQmlScript::Import::Library? "Library" : "File")
+-                           << " as " << prefix;
++        qDebug().nospace() << "QQmlImports(" << qPrintable(baseUrl().toString()) << ')' << "::addLibraryImport: "
++                           << uri << ' ' << vmaj << '.' << vmin << " as " << prefix;
++
++    return d->addLibraryImport(uri, prefix, vmaj, vmin, qmldirIdentifier, qmldirUrl, incomplete, importDb, errors);
++}
++
++bool QQmlImports::updateQmldirContent(QQmlImportDatabase *importDb,
++                                      const QString &uri, const QString &prefix,
++                                      const QString &qmldirIdentifier, const QString& qmldirUrl, QList<QQmlError> *errors)
++{
++    Q_ASSERT(importDb);
++    Q_ASSERT(errors);
++
++    if (qmlImportTrace())
++        qDebug().nospace() << "QQmlImports(" << qPrintable(baseUrl().toString()) << ')' << "::updateQmldirContent: "
++                           << uri << " to " << qmldirUrl << " as " << prefix;
++
++    return d->updateQmldirContent(uri, prefix, qmldirIdentifier, qmldirUrl, importDb, errors);
++}
++
++bool QQmlImports::locateQmldir(QQmlImportDatabase *importDb,
++                               const QString& uri, int vmaj, int vmin,
++                               QString *qmldirFilePath, QString *url)
++{
++    return d->locateQmldir(uri, vmaj, vmin, importDb, qmldirFilePath, url);
++}
+ 
+-    return d->addImport(qmldircomponentsnetwork, uri, prefix, vmaj, vmin, importType, false,
+-                        importDb, url, errors);
++bool QQmlImports::isLocal(const QString &url)
++{
++    return QQmlFile::isBundle(url) || !QQmlFile::urlToLocalFileOrQrc(url).isEmpty();
++}
++
++bool QQmlImports::isLocal(const QUrl &url)
++{
++    return QQmlFile::isBundle(url) || !QQmlFile::urlToLocalFileOrQrc(url).isEmpty();
+ }
+ 
++
+ /*!
+ \class QQmlImportDatabase
+ \brief The QQmlImportDatabase class manages the QML imports for a QQmlEngine.
+@@ -1126,16 +1347,7 @@ QQmlImportDatabase::QQmlImportDatabase(QQmlEngine *e)
+ 
+ QQmlImportDatabase::~QQmlImportDatabase()
+ {
+-    for (QStringHash<QmldirCache *>::ConstIterator iter = qmldirCache.begin();
+-         iter != qmldirCache.end(); ++iter) {
+-
+-        QmldirCache *c = *iter;
+-        while (c) {
+-            QmldirCache *n = c->next;
+-            delete c;
+-            c = n;
+-        }
+-    }
++    qmldirCache.clear();
+ }
+ 
+ /*!
+@@ -1162,22 +1374,22 @@ QString QQmlImportDatabase::resolvePlugin(QQmlTypeLoader *typeLoader,
+         QString resolvedPath;
+         if (pluginPath == QLatin1String(".")) {
+             if (qmldirPluginPathIsRelative && !qmldirPluginPath.isEmpty() && qmldirPluginPath != QLatin1String("."))
+-                resolvedPath = QDir::cleanPath(qmldirPath + QLatin1Char('/') + qmldirPluginPath);
++                resolvedPath = QDir::cleanPath(qmldirPath + Slash + qmldirPluginPath);
+             else
+                 resolvedPath = qmldirPath;
+         } else {
+             if (QDir::isRelativePath(pluginPath))
+-                resolvedPath = QDir::cleanPath(qmldirPath + QLatin1Char('/') + pluginPath);
++                resolvedPath = QDir::cleanPath(qmldirPath + Slash + pluginPath);
+             else
+                 resolvedPath = pluginPath;
+         }
+ 
+         // hack for resources, should probably go away
+-        if (resolvedPath.startsWith(QLatin1Char(':')))
++        if (resolvedPath.startsWith(Colon))
+             resolvedPath = QCoreApplication::applicationDirPath();
+ 
+-        if (!resolvedPath.endsWith(QLatin1Char('/')))
+-            resolvedPath += QLatin1Char('/');
++        if (!resolvedPath.endsWith(Slash))
++            resolvedPath += Slash;
+ 
+         foreach (const QString &suffix, suffixes) {
+             QString pluginFileName = prefix;
+@@ -1320,13 +1532,15 @@ void QQmlImportDatabase::addImportPath(const QString& path)
+     QUrl url = QUrl(path);
+     QString cPath;
+ 
+-    if (url.isRelative() || url.scheme() == QLatin1String("file")
+-            || (url.scheme().length() == 1 && QFile::exists(path)) ) {  // windows path
++    if (url.scheme() == QLatin1String("file")) {
++        cPath = QQmlFile::urlToLocalFileOrQrc(url);
++    } else if (url.isRelative() ||
++               (url.scheme().length() == 1 && QFile::exists(path)) ) {  // windows path
+         QDir dir = QDir(path);
+         cPath = dir.canonicalPath();
+     } else {
+         cPath = path;
+-        cPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
++        cPath.replace(Backslash, Slash);
+     }
+ 
+     if (!cPath.isEmpty()
+@@ -1337,9 +1551,19 @@ void QQmlImportDatabase::addImportPath(const QString& path)
+ /*!
+     \internal
+ */
+-QStringList QQmlImportDatabase::importPathList() const
++QStringList QQmlImportDatabase::importPathList(PathType type) const
+ {
+-    return fileImportPath;
++    if (type == LocalOrRemote)
++        return fileImportPath;
++
++    QStringList list;
++    foreach (const QString &path, fileImportPath) {
++        bool localPath = isPathAbsolute(path) || QQmlFile::isLocalFile(path);
++        if (localPath == (type == Local))
++            list.append(path);
++    }
++
++    return list;
+ }
+ 
+ /*!
+@@ -1351,6 +1575,9 @@ void QQmlImportDatabase::setImportPathList(const QStringList &paths)
+         qDebug().nospace() << "QQmlImportDatabase::setImportPathList: " << paths;
+ 
+     fileImportPath = paths;
++
++    // Our existing cached paths may have been invalidated
++    qmldirCache.clear();
+ }
+ 
+ /*!
+@@ -1370,7 +1597,7 @@ bool QQmlImportDatabase::importPlugin(const QString &filePath, const QString &ur
+ 
+     if (typesRegistered) {
+         Q_ASSERT_X(qmlEnginePluginsWithRegisteredTypes()->value(absoluteFilePath) == uri,
+-                   "QQmlImportDatabase::importExtension",
++                   "QQmlImportDatabase::importPlugin",
+                    "Internal error: Plugin imported previously with different uri");
+     }
+ 
+diff --git a/src/qml/qml/qqmlimport_p.h b/src/qml/qml/qqmlimport_p.h
+index c88516d..dbff6fd 100644
+--- a/src/qml/qml/qqmlimport_p.h
++++ b/src/qml/qml/qqmlimport_p.h
+@@ -74,6 +74,8 @@ class QQmlTypeLoader;
+ class Q_QML_PRIVATE_EXPORT QQmlImports
+ {
+ public:
++    enum ImportVersion { FullyVersioned, PartiallyVersioned, Unversioned };
++
+     QQmlImports(QQmlTypeLoader *);
+     QQmlImports(const QQmlImports &);
+     ~QQmlImports();
+@@ -92,15 +94,23 @@ public:
+                      QQmlType** type_return, QString* url_return,
+                      int *version_major, int *version_minor) const;
+ 
+-    bool addImplicitImport(QQmlImportDatabase *importDb,
+-                           const QQmlDirComponents &qmldircomponentsnetwork,
+-                           QList<QQmlError> *errors);
++    bool addImplicitImport(QQmlImportDatabase *importDb, QList<QQmlError> *errors);
++
++    bool addFileImport(QQmlImportDatabase *,
++                       const QString& uri, const QString& prefix, int vmaj, int vmin, bool incomplete,
++                       QList<QQmlError> *errors);
++
++    bool addLibraryImport(QQmlImportDatabase *importDb,
++                          const QString &uri, const QString &prefix, int vmaj, int vmin,
++                          const QString &qmldirIdentifier, const QString &qmldirUrl, bool incomplete, QList<QQmlError> *errors);
++
++    bool updateQmldirContent(QQmlImportDatabase *importDb,
++                             const QString &uri, const QString &prefix,
++                             const QString &qmldirIdentifier, const QString &qmldirUrl, QList<QQmlError> *errors);
+ 
+-    bool addImport(QQmlImportDatabase *,
+-                   const QString& uri, const QString& prefix, int vmaj, int vmin, 
+-                   QQmlScript::Import::Type importType,
+-                   const QQmlDirComponents &qmldircomponentsnetwork, 
+-                   QString *url, QList<QQmlError> *errors);
++    bool locateQmldir(QQmlImportDatabase *,
++                      const QString &uri, int vmaj, int vmin,
++                      QString *qmldirFilePath, QString *url);
+ 
+     void populateCache(QQmlTypeNameCache *cache, QQmlEngine *) const;
+ 
+@@ -113,6 +123,12 @@ public:
+ 
+     QList<ScriptReference> resolvedScripts() const;
+ 
++    static QString completeQmldirPath(const QString &uri, const QString &base, int vmaj, int vmin,
++                                      QQmlImports::ImportVersion version);
++
++    static bool isLocal(const QString &url);
++    static bool isLocal(const QUrl &url);
++
+ private:
+     friend class QQmlImportDatabase;
+     QQmlImportsPrivate *d;
+@@ -122,12 +138,14 @@ class QQmlImportDatabase
+ {
+     Q_DECLARE_TR_FUNCTIONS(QQmlImportDatabase)
+ public:
++    enum PathType { Local, Remote, LocalOrRemote };
++
+     QQmlImportDatabase(QQmlEngine *);
+     ~QQmlImportDatabase();
+ 
+     bool importPlugin(const QString &filePath, const QString &uri, QList<QQmlError> *errors);
+ 
+-    QStringList importPathList() const;
++    QStringList importPathList(PathType type = LocalOrRemote) const;
+     void setImportPathList(const QStringList &paths);
+     void addImportPath(const QString& dir);
+ 
+diff --git a/src/qml/qml/qqmlmetatype.cpp b/src/qml/qml/qqmlmetatype.cpp
+index 34c9cce..c1147b0 100644
+--- a/src/qml/qml/qqmlmetatype.cpp
++++ b/src/qml/qml/qqmlmetatype.cpp
+@@ -993,12 +993,18 @@ bool QQmlMetaType::isAnyModule(const QString &uri)
+     QReadLocker lock(metaTypeDataLock());
+     QQmlMetaTypeData *data = metaTypeData();
+ 
++    // first, check Types
+     for (QQmlMetaTypeData::TypeModules::ConstIterator iter = data->uriToModule.begin();
+          iter != data->uriToModule.end(); ++iter) {
+         if ((*iter)->module() == uri)
+             return true;
+     }
+ 
++    // then, check ModuleApis
++    QQmlMetaTypeData::ModuleApiList *apiList = data->moduleApis.value(uri);
++    if (apiList)
++        return true;
++
+     return false;
+ }
+ 
+diff --git a/src/qml/qml/qqmltypeloader.cpp b/src/qml/qml/qqmltypeloader.cpp
+index 3a24625..1d70706 100644
+--- a/src/qml/qml/qqmltypeloader.cpp
++++ b/src/qml/qml/qqmltypeloader.cpp
+@@ -631,13 +631,14 @@ void QQmlDataBlob::notifyComplete(QQmlDataBlob *blob)
+ 
+     m_inCallback = true;
+ 
++    m_waitingFor.removeOne(blob);
++
+     if (blob->status() == Error) {
+         dependencyError(blob);
+     } else if (blob->status() == Complete) {
+         dependencyComplete(blob);
+     }
+ 
+-    m_waitingFor.removeOne(blob);
+     blob->release();
+ 
+     if (!isError() && m_waitingFor.isEmpty()) 
+@@ -857,7 +858,7 @@ QQmlDataLoader::~QQmlDataLoader()
+     for (NetworkReplies::Iterator iter = m_networkReplies.begin(); iter != m_networkReplies.end(); ++iter) 
+         (*iter)->release();
+ 
+-    m_thread->shutdown();
++    shutdownThread();
+     delete m_thread;
+ }
+ 
+@@ -956,6 +957,14 @@ void QQmlDataLoader::loadThread(QQmlDataBlob *blob)
+ {
+     ASSERT_LOADTHREAD();
+ 
++    // Don't continue loading if we've been shutdown
++    if (m_thread->isShutdown()) {
++        QQmlError error;
++        error.setDescription(QLatin1String("Interrupted by shutdown"));
++        blob->setError(error);
++        return;
++    }
++
+     if (blob->m_url.isEmpty()) {
+         QQmlError error;
+         error.setDescription(QLatin1String("Invalid null URL"));
+@@ -1005,6 +1014,9 @@ void QQmlDataLoader::loadThread(QQmlDataBlob *blob)
+         QObject::connect(reply, SIGNAL(finished()), 
+                          nrp, SLOT(finished()));
+         m_networkReplies.insert(reply, blob);
++#ifdef DATABLOB_DEBUG
++        qWarning("QQmlDataBlob: requested %s", qPrintable(blob->url().toString()));
++#endif
+ 
+         blob->addref();
+     }
+@@ -1034,6 +1046,9 @@ void QQmlDataLoader::networkReplyFinished(QNetworkReply *reply)
+             QObject *nrp = m_thread->networkReplyProxy();
+             QObject::connect(reply, SIGNAL(finished()), nrp, SLOT(finished()));
+             m_networkReplies.insert(reply, blob);
++#ifdef DATABLOB_DEBUG
++            qWarning("QQmlDataBlob: redirected to %s", qPrintable(blob->m_finalUrl.toString()));
++#endif
+             return;
+         }
+     }
+@@ -1125,6 +1140,279 @@ void QQmlDataLoader::setData(QQmlDataBlob *blob, const QQmlDataBlob::Data &d)
+     blob->tryDone();
+ }
+ 
++void QQmlDataLoader::shutdownThread()
++{
++    if (!m_thread->isShutdown())
++        m_thread->shutdown();
++}
++
++QQmlTypeLoader::Blob::Blob(const QUrl &url, QQmlDataBlob::Type type, QQmlTypeLoader *loader)
++: QQmlDataBlob(url, type), m_typeLoader(loader), m_imports(loader)
++{
++}
++
++QQmlTypeLoader::Blob::~Blob()
++{
++    for (int ii = 0; ii < m_qmldirs.count(); ++ii)
++        m_qmldirs.at(ii)->release();
++}
++
++bool QQmlTypeLoader::Blob::fetchQmldir(const QUrl &url, const QQmlScript::Import *import, int priority, QList<QQmlError> *errors)
++{
++    QQmlQmldirData *data = typeLoader()->getQmldir(url);
++
++    data->setImport(import);
++    data->setPriority(priority);
++
++    if (data->status() == Error) {
++        // This qmldir must not exist - which is not an error
++        data->release();
++        return true;
++    } else if (data->status() == Complete) {
++        // This data is already available
++        return qmldirDataAvailable(data, errors);
++    }
++
++    // Wait for this data to become available
++    addDependency(data);
++    return true;
++}
++
++bool QQmlTypeLoader::Blob::updateQmldir(QQmlQmldirData *data, const QQmlScript::Import *import, QList<QQmlError> *errors)
++{
++    QString qmldirIdentifier = data->url().toString();
++    QString qmldirUrl = qmldirIdentifier.left(qmldirIdentifier.lastIndexOf(QLatin1Char('/')) + 1);
++
++    typeLoader()->setQmldirContent(qmldirIdentifier, data->content());
++
++    if (!m_imports.updateQmldirContent(typeLoader()->importDatabase(), import->uri, import->qualifier, qmldirIdentifier, qmldirUrl, errors))
++        return false;
++
++    QHash<const QQmlScript::Import *, int>::iterator it = m_unresolvedImports.find(import);
++    if (it != m_unresolvedImports.end()) {
++        *it = data->priority();
++    }
++
++    // Release this reference at destruction
++    m_qmldirs << data;
++
++    if (!import->qualifier.isEmpty()) {
++        // Does this library contain any qualified scripts?
++        QUrl libraryUrl(qmldirUrl);
++        const QmldirContent *qmldir = typeLoader()->qmldirContent(qmldirIdentifier, qmldirUrl);
++        foreach (const QQmlDirParser::Script &script, qmldir->scripts()) {
++            QUrl scriptUrl = libraryUrl.resolved(QUrl(script.fileName));
++            QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
++            addDependency(blob);
++
++            scriptImported(blob, import->location.start, script.nameSpace, import->qualifier);
++        }
++    }
++
++    return true;
++}
++
++bool QQmlTypeLoader::Blob::addImport(const QQmlScript::Import &import, QList<QQmlError> *errors)
++{
++    Q_ASSERT(errors);
++
++    QQmlImportDatabase *importDatabase = typeLoader()->importDatabase();
++
++    if (import.type == QQmlScript::Import::Script) {
++        QUrl scriptUrl = finalUrl().resolved(QUrl(import.uri));
++        QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
++        addDependency(blob);
++
++        scriptImported(blob, import.location.start, import.qualifier, QString());
++    } else if (import.type == QQmlScript::Import::Library) {
++        QString qmldirFilePath;
++        QString qmldirUrl;
++
++        if (m_imports.locateQmldir(importDatabase, import.uri, import.majorVersion, import.minorVersion,
++                                 &qmldirFilePath, &qmldirUrl)) {
++            // This is a local library import
++            if (!m_imports.addLibraryImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
++                                          import.minorVersion, qmldirFilePath, qmldirUrl, false, errors))
++                return false;
++
++            if (!import.qualifier.isEmpty()) {
++                // Does this library contain any qualified scripts?
++                QUrl libraryUrl(qmldirUrl);
++                const QmldirContent *qmldir = typeLoader()->qmldirContent(qmldirFilePath, qmldirUrl);
++                foreach (const QQmlDirParser::Script &script, qmldir->scripts()) {
++                    QUrl scriptUrl = libraryUrl.resolved(QUrl(script.fileName));
++                    QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
++                    addDependency(blob);
++
++                    scriptImported(blob, import.location.start, script.nameSpace, import.qualifier);
++                }
++            }
++        } else {
++            // Is this a module?
++            if (QQmlMetaType::isAnyModule(import.uri)) {
++                if (!m_imports.addLibraryImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
++                                              import.minorVersion, QString(), QString(), false, errors))
++                    return false;
++            } else {
++                // We haven't yet resolved this import
++                m_unresolvedImports.insert(&import, 0);
++
++                // Query any network import paths for this library
++                QStringList remotePathList = importDatabase->importPathList(QQmlImportDatabase::Remote);
++                if (!remotePathList.isEmpty()) {
++                    // Add this library and request the possible locations for it
++                    if (!m_imports.addLibraryImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
++                                                  import.minorVersion, QString(), QString(), true, errors))
++                        return false;
++
++                    // Probe for all possible locations
++                    int priority = 0;
++                    for (int version = QQmlImports::FullyVersioned; version <= QQmlImports::Unversioned; ++version) {
++                        foreach (const QString &path, remotePathList) {
++                            QString qmldirUrl = QQmlImports::completeQmldirPath(import.uri, path, import.majorVersion, import.minorVersion,
++                                                                                static_cast<QQmlImports::ImportVersion>(version));
++                            if (!fetchQmldir(QUrl(qmldirUrl), &import, ++priority, errors))
++                                return false;
++                        }
++                    }
++                }
++            }
++        }
++    } else {
++        Q_ASSERT(import.type == QQmlScript::Import::File);
++
++        bool incomplete = false;
++
++        QUrl qmldirUrl;
++        if (import.qualifier.isEmpty()) {
++            qmldirUrl = finalUrl().resolved(QUrl(import.uri + QLatin1String("/qmldir")));
++            if (!QQmlImports::isLocal(qmldirUrl)) {
++                // This is a remote file; the import is currently incomplete
++                incomplete = true;
++            }
++        }
++
++        if (!m_imports.addFileImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
++                                   import.minorVersion, incomplete, errors))
++            return false;
++
++        if (incomplete) {
++            if (!fetchQmldir(qmldirUrl, &import, 1, errors))
++                return false;
++        }
++    }
++
++    return true;
++}
++
++void QQmlTypeLoader::Blob::dependencyError(QQmlDataBlob *blob)
++{
++    if (blob->type() == QQmlDataBlob::QmldirFile) {
++        QQmlQmldirData *data = static_cast<QQmlQmldirData *>(blob);
++        data->release();
++    }
++}
++
++void QQmlTypeLoader::Blob::dependencyComplete(QQmlDataBlob *blob)
++{
++    if (blob->type() == QQmlDataBlob::QmldirFile) {
++        QQmlQmldirData *data = static_cast<QQmlQmldirData *>(blob);
++
++        const QQmlScript::Import *import = data->import();
++
++        QList<QQmlError> errors;
++        if (!qmldirDataAvailable(data, &errors)) {
++            Q_ASSERT(errors.size());
++            QQmlError error(errors.takeFirst());
++            error.setUrl(m_imports.baseUrl());
++            error.setLine(import->location.start.line);
++            error.setColumn(import->location.start.column);
++            errors.prepend(error); // put it back on the list after filling out information.
++            setError(errors);
++        }
++    }
++}
++
++bool QQmlTypeLoader::Blob::qmldirDataAvailable(QQmlQmldirData *data, QList<QQmlError> *errors)
++{
++    bool resolve = true;
++
++    const QQmlScript::Import *import = data->import();
++    data->setImport(0);
++
++    int priority = data->priority();
++    data->setPriority(0);
++
++    if (import) {
++        // Do we need to resolve this import?
++        QHash<const QQmlScript::Import *, int>::iterator it = m_unresolvedImports.find(import);
++        if (it != m_unresolvedImports.end()) {
++            resolve = (*it == 0) || (*it > priority);
++        }
++
++        if (resolve) {
++            // This is the (current) best resolution for this import
++            if (!updateQmldir(data, import, errors)) {
++                data->release();
++                return false;
++            }
++
++            *it = priority;
++            return true;
++        }
++    }
++
++    data->release();
++    return true;
++}
++
++
++QQmlTypeLoader::QmldirContent::QmldirContent()
++{
++}
++
++bool QQmlTypeLoader::QmldirContent::hasError() const
++{
++    return m_parser.hasError();
++}
++
++QList<QQmlError> QQmlTypeLoader::QmldirContent::errors(const QString &uri) const
++{
++    return m_parser.errors(uri);
++}
++
++void QQmlTypeLoader::QmldirContent::setContent(const QString &location, const QString &content)
++{
++    m_location = location;
++    m_parser.parse(content);
++}
++
++void QQmlTypeLoader::QmldirContent::setError(const QQmlError &error)
++{
++    m_parser.setError(error);
++}
++
++QQmlDirComponents QQmlTypeLoader::QmldirContent::components() const
++{
++    return m_parser.components();
++}
++
++QQmlDirScripts QQmlTypeLoader::QmldirContent::scripts() const
++{
++    return m_parser.scripts();
++}
++
++QQmlDirPlugins QQmlTypeLoader::QmldirContent::plugins() const
++{
++    return m_parser.plugins();
++}
++
++QString QQmlTypeLoader::QmldirContent::pluginLocation() const
++{
++    return m_location;
++}
++
++
+ /*!
+ Constructs a new type loader that uses the given \a engine.
+ */
+@@ -1139,9 +1427,17 @@ loaded files.
+ */
+ QQmlTypeLoader::~QQmlTypeLoader()
+ {
++    // Stop the loader thread before releasing resources
++    shutdownThread();
++
+     clearCache();
+ }
+ 
++QQmlImportDatabase *QQmlTypeLoader::importDatabase()
++{
++    return &QQmlEnginePrivate::get(engine())->importDatabase;
++}
++
+ /*!
+ \enum QQmlTypeLoader::Option
+ 
+@@ -1232,7 +1528,7 @@ QQmlQmldirData *QQmlTypeLoader::getQmldir(const QUrl &url)
+     QQmlQmldirData *qmldirData = m_qmldirCache.value(url);
+ 
+     if (!qmldirData) {
+-        qmldirData = new QQmlQmldirData(url);
++        qmldirData = new QQmlQmldirData(url, this);
+         m_qmldirCache.insert(url, qmldirData);
+         QQmlDataLoader::load(qmldirData);
+     }
+@@ -1428,20 +1724,18 @@ bool QQmlTypeLoader::directoryExists(const QString &path)
+ 
+ 
+ /*!
+-Return a QQmlDirParser for absoluteFilePath.  The QQmlDirParser may be cached.
++Return a QmldirContent for absoluteFilePath.  The QmldirContent may be cached.
+ 
+ \a filePath is either a bundle URL, or a local file path.
+ */
+-const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+-                                                  const QString &uriHint,
+-                                                  QString *outUrl)
++const QQmlTypeLoader::QmldirContent *QQmlTypeLoader::qmldirContent(const QString &filePath, const QString &uriHint)
+ {
+-    DirParser *qmldirParser;
+-    DirParser **val = m_importQmlDirCache.value(filePath);
++    QmldirContent *qmldir;
++    QmldirContent **val = m_importQmlDirCache.value(filePath);
+     if (!val) {
+-        qmldirParser = new DirParser;
++        qmldir = new QmldirContent;
+ 
+-#define ERROR(description) { QQmlError e; e.setDescription(description); qmldirParser->setError(e); }
++#define ERROR(description) { QQmlError e; e.setDescription(description); qmldir->setError(e); }
+ #define NOT_READABLE_ERROR QString(QLatin1String("module \"$$URI$$\" definition \"%1\" not readable"))
+ #define CASE_MISMATCH_ERROR QString(QLatin1String("cannot load module \"$$URI$$\": File name case mismatch for \"%1\""))
+ 
+@@ -1453,7 +1747,8 @@ const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+             if (file.isError()) {
+                 ERROR(NOT_READABLE_ERROR.arg(filePath));
+             } else {
+-                qmldirParser->parse(QString::fromUtf8(file.data(), file.size()));
++                QString content(QString::fromUtf8(file.data(), file.size()));
++                qmldir->setContent(filePath, content);
+             }
+ 
+         } else {
+@@ -1468,7 +1763,6 @@ const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+                     QString id = bundleIdForQmldir(filePath, uriHint);
+ 
+                     QString bundleUrl = QLatin1String("bundle://") + id + QLatin1Char('/');
+-                    qmldirParser->adjustedUrl = bundleUrl;
+ 
+                     QUrl url(bundleUrl + QLatin1String("qmldir"));
+ 
+@@ -1476,11 +1770,12 @@ const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+                     if (file.isError()) {
+                         ERROR(NOT_READABLE_ERROR.arg(filePath));
+                     } else {
+-                        qmldirParser->parse(QString::fromUtf8(file.data(), file.size()));
++                        QString content(QString::fromUtf8(file.data(), file.size()));
++                        qmldir->setContent(QQmlFile::bundleFileName(bundleUrl, engine()), content);
+                     }
+                 } else {
+                     data += file.readAll();
+-                    qmldirParser->parse(QString::fromUtf8(data));
++                    qmldir->setContent(filePath, QString::fromUtf8(data));
+                 }
+             } else {
+                 ERROR(NOT_READABLE_ERROR.arg(filePath));
+@@ -1492,16 +1787,27 @@ const QQmlDirParser *QQmlTypeLoader::qmlDirParser(const QString &filePath,
+ #undef NOT_READABLE_ERROR
+ #undef CASE_MISMATCH_ERROR
+ 
+-        m_importQmlDirCache.insert(filePath, qmldirParser);
++        m_importQmlDirCache.insert(filePath, qmldir);
+     } else {
+-        qmldirParser = *val;
++        qmldir = *val;
+     }
+ 
+-    if (!qmldirParser->adjustedUrl.isEmpty())
+-        *outUrl = qmldirParser->adjustedUrl;
+-    return qmldirParser;
++    return qmldir;
+ }
+ 
++void QQmlTypeLoader::setQmldirContent(const QString &url, const QString &content)
++{
++    QmldirContent *qmldir;
++    QmldirContent **val = m_importQmlDirCache.value(url);
++    if (val) {
++        qmldir = *val;
++    } else {
++        qmldir = new QmldirContent;
++        m_importQmlDirCache.insert(url, qmldir);
++    }
++
++    qmldir->setContent(url, content);
++}
+ 
+ /*!
+ Clears cached information about loaded files, including any type data, scripts
+@@ -1509,12 +1815,11 @@ and qmldir information.
+ */
+ void QQmlTypeLoader::clearCache()
+ {
+-    for (TypeCache::Iterator iter = m_typeCache.begin(); iter != m_typeCache.end(); ++iter) {
++    for (TypeCache::Iterator iter = m_typeCache.begin(); iter != m_typeCache.end(); ++iter)
+         (*iter)->release();
+-    }
+     for (ScriptCache::Iterator iter = m_scriptCache.begin(); iter != m_scriptCache.end(); ++iter) 
+         (*iter)->release();
+-    for (QmldirCache::Iterator iter = m_qmldirCache.begin(); iter != m_qmldirCache.end(); ++iter) 
++    for (QmldirCache::Iterator iter = m_qmldirCache.begin(); iter != m_qmldirCache.end(); ++iter)
+         (*iter)->release();
+     qDeleteAll(m_importDirCache);
+     qDeleteAll(m_importQmlDirCache);
+@@ -1568,8 +1873,8 @@ bool QQmlTypeLoader::isScriptLoaded(const QUrl &url) const
+ 
+ QQmlTypeData::QQmlTypeData(const QUrl &url, QQmlTypeLoader::Options options, 
+                                            QQmlTypeLoader *manager)
+-: QQmlDataBlob(url, QmlFile), m_options(options), m_imports(manager), m_typesResolved(false),
+-   m_compiledData(0), m_typeLoader(manager)
++: QQmlTypeLoader::Blob(url, QmlFile, manager), m_options(options),
++   m_typesResolved(false), m_compiledData(0), m_implicitImport(0)
+ {
+ }
+ 
+@@ -1577,22 +1882,11 @@ QQmlTypeData::~QQmlTypeData()
+ {
+     for (int ii = 0; ii < m_scripts.count(); ++ii) 
+         m_scripts.at(ii).script->release();
+-    for (int ii = 0; ii < m_qmldirs.count(); ++ii) 
+-        m_qmldirs.at(ii)->release();
+     for (int ii = 0; ii < m_types.count(); ++ii) 
+         if (m_types.at(ii).typeData) m_types.at(ii).typeData->release();
+     if (m_compiledData)
+         m_compiledData->release();
+-}
+-
+-QQmlTypeLoader *QQmlTypeData::typeLoader() const
+-{
+-    return m_typeLoader;
+-}
+-
+-const QQmlImports &QQmlTypeData::imports() const
+-{
+-    return m_imports;
++    delete m_implicitImport;
+ }
+ 
+ const QQmlScript::Parser &QQmlTypeData::parser() const
+@@ -1700,33 +1994,48 @@ void QQmlTypeData::dataReceived(const Data &data)
+ 
+     m_imports.setBaseUrl(finalUrl(), finalUrlString());
+ 
+-    foreach (const QQmlScript::Import &import, scriptParser.imports()) {
+-        if (import.type == QQmlScript::Import::File && import.qualifier.isEmpty()) {
+-            QUrl importUrl = finalUrl().resolved(QUrl(import.uri + QLatin1String("/qmldir")));
+-            if (QQmlFile::urlToLocalFileOrQrc(importUrl).isEmpty()) {
+-                QQmlQmldirData *data = typeLoader()->getQmldir(importUrl);
+-                addDependency(data);
+-                m_qmldirs << data;
+-            }
+-        } else if (import.type == QQmlScript::Import::Script) {
+-            QUrl scriptUrl = finalUrl().resolved(QUrl(import.uri));
+-            QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
+-            addDependency(blob);
++    QQmlImportDatabase *importDatabase = typeLoader()->importDatabase();
+ 
+-            ScriptReference ref;
+-            ref.location = import.location.start;
+-            ref.qualifier = import.qualifier;
+-            ref.script = blob;
+-            m_scripts << ref;
+-        }
++    // For local urls, add an implicit import "." as first (most overridden) lookup.
++    // This will also trigger the loading of the qmldir and the import of any native
++    // types from available plugins.
++    QList<QQmlError> implicitImportErrors;
++    m_imports.addImplicitImport(importDatabase, &implicitImportErrors);
++
++    if (!implicitImportErrors.isEmpty()) {
++        setError(implicitImportErrors);
++        return;
+     }
+ 
++    QList<QQmlError> errors;
++
+     if (!finalUrl().scheme().isEmpty()) {
+-        QUrl importUrl = finalUrl().resolved(QUrl(QLatin1String("qmldir")));
+-        if (QQmlFile::urlToLocalFileOrQrc(importUrl).isEmpty()) {
+-            QQmlQmldirData *data = typeLoader()->getQmldir(importUrl);
+-            addDependency(data);
+-            m_qmldirs << data;
++        QUrl qmldirUrl = finalUrl().resolved(QUrl(QLatin1String("qmldir")));
++        if (!QQmlImports::isLocal(qmldirUrl)) {
++            // This qmldir is for the implicit import
++            m_implicitImport = new QQmlScript::Import;
++            m_implicitImport->uri = QLatin1String(".");
++            m_implicitImport->qualifier = QString();
++            m_implicitImport->majorVersion = -1;
++            m_implicitImport->minorVersion = -1;
++
++            if (!fetchQmldir(qmldirUrl, m_implicitImport, 1, &errors)) {
++                setError(errors);
++                return;
++            }
++        }
++    }
++
++    foreach (const QQmlScript::Import &import, scriptParser.imports()) {
++        if (!addImport(import, &errors)) {
++            Q_ASSERT(errors.size());
++            QQmlError error(errors.takeFirst());
++            error.setUrl(m_imports.baseUrl());
++            error.setLine(import.location.start.line);
++            error.setColumn(import.location.start.column);
++            errors.prepend(error); // put it back on the list after filling out information.
++            setError(errors);
++            return;
+         }
+     }
+ }
+@@ -1734,6 +2043,27 @@ void QQmlTypeData::dataReceived(const Data &data)
+ void QQmlTypeData::allDependenciesDone()
+ {
+     if (!m_typesResolved) {
++        // Check that all imports were resolved
++        QList<QQmlError> errors;
++        QHash<const QQmlScript::Import *, int>::const_iterator it = m_unresolvedImports.constBegin(), end = m_unresolvedImports.constEnd();
++        for ( ; it != end; ++it) {
++            if (*it == 0) {
++                // This import was not resolved
++                foreach (const QQmlScript::Import *import, m_unresolvedImports.keys()) {
++                    QQmlError error;
++                    error.setDescription(QQmlTypeLoader::tr("module \"%1\" is not installed").arg(import->uri));
++                    error.setUrl(m_imports.baseUrl());
++                    error.setLine(import->location.start.line);
++                    error.setColumn(import->location.start.column);
++                    errors.prepend(error);
++                }
++            }
++        }
++        if (errors.size()) {
++            setError(errors);
++            return;
++        }
++
+         resolveTypes();
+         m_typesResolved = true;
+     }
+@@ -1767,57 +2097,6 @@ void QQmlTypeData::compile()
+ 
+ void QQmlTypeData::resolveTypes()
+ {
+-    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(m_typeLoader->engine());
+-    QQmlImportDatabase *importDatabase = &ep->importDatabase;
+-
+-    // For local urls, add an implicit import "." as first (most overridden) lookup. 
+-    // This will also trigger the loading of the qmldir and the import of any native 
+-    // types from available plugins.
+-    QList<QQmlError> implicitImportErrors;
+-    if (QQmlQmldirData *qmldir = qmldirForUrl(finalUrl().resolved(QUrl(QLatin1String("./qmldir"))))) {
+-        m_imports.addImplicitImport(importDatabase, qmldir->dirComponents(), &implicitImportErrors);
+-    } else {
+-        m_imports.addImplicitImport(importDatabase, QQmlDirComponents(), &implicitImportErrors);
+-    }
+-
+-    if (!implicitImportErrors.isEmpty()) {
+-        setError(implicitImportErrors);
+-        return;
+-    }
+-
+-    foreach (const QQmlScript::Import &import, scriptParser.imports()) {
+-        QQmlDirComponents qmldircomponentsnetwork;
+-        if (import.type == QQmlScript::Import::Script)
+-            continue;
+-
+-        if (import.type == QQmlScript::Import::File && import.qualifier.isEmpty()) {
+-            QUrl qmldirUrl = finalUrl().resolved(QUrl(import.uri + QLatin1String("/qmldir")));
+-            if (QQmlQmldirData *qmldir = qmldirForUrl(qmldirUrl))
+-                qmldircomponentsnetwork = qmldir->dirComponents();
+-        }
+-
+-        QList<QQmlError> errors;
+-        if (!m_imports.addImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
+-                                 import.minorVersion, import.type, qmldircomponentsnetwork, 0,
+-                                 &errors)) {
+-            QQmlError error;
+-            if (errors.size()) {
+-                error = errors.takeFirst();
+-            } else {
+-                // this should not be possible!
+-                // Description should come from error provided by addImport() function.
+-                error.setDescription(QQmlTypeLoader::tr("Unreported error adding script import to import database"));
+-            }
+-            error.setUrl(m_imports.baseUrl());
+-            error.setLine(import.location.start.line);
+-            error.setColumn(import.location.start.column);
+-            errors.prepend(error); // put it back on the list after filling out information.
+-
+-            setError(errors);
+-            return;
+-        }
+-    }
+-
+     // Add any imported scripts to our resolved set
+     foreach (const QQmlImports::ScriptReference &script, m_imports.resolvedScripts())
+     {
+@@ -1892,13 +2171,14 @@ void QQmlTypeData::resolveTypes()
+     }
+ }
+ 
+-QQmlQmldirData *QQmlTypeData::qmldirForUrl(const QUrl &url)
++void QQmlTypeData::scriptImported(QQmlScriptBlob *blob, const QQmlScript::Location &location, const QString &qualifier, const QString &/*nameSpace*/)
+ {
+-    for (int ii = 0; ii < m_qmldirs.count(); ++ii) {
+-        if (m_qmldirs.at(ii)->url() == url)
+-            return m_qmldirs.at(ii);
+-    }
+-    return 0;
++    ScriptReference ref;
++    ref.script = blob;
++    ref.location = location;
++    ref.qualifier = qualifier;
++
++    m_scripts << ref;
+ }
+ 
+ QQmlScriptData::QQmlScriptData()
+@@ -1929,8 +2209,7 @@ void QQmlScriptData::clear()
+ }
+ 
+ QQmlScriptBlob::QQmlScriptBlob(const QUrl &url, QQmlTypeLoader *loader)
+-: QQmlDataBlob(url, JavaScriptFile), m_pragmas(QQmlScript::Object::ScriptBlock::None),
+-  m_imports(loader), m_scriptData(0), m_typeLoader(loader)
++: QQmlTypeLoader::Blob(url, JavaScriptFile, loader), m_scriptData(0)
+ {
+ }
+ 
+@@ -1944,17 +2223,7 @@ QQmlScriptBlob::~QQmlScriptBlob()
+ 
+ QQmlScript::Object::ScriptBlock::Pragmas QQmlScriptBlob::pragmas() const
+ {
+-    return m_pragmas;
+-}
+-
+-QQmlTypeLoader *QQmlScriptBlob::typeLoader() const
+-{
+-    return m_typeLoader;
+-}
+-
+-const QQmlImports &QQmlScriptBlob::imports() const
+-{
+-    return m_imports;
++    return m_metadata.pragmas;
+ }
+ 
+ QQmlScriptData *QQmlScriptBlob::scriptData() const
+@@ -1964,9 +2233,6 @@ QQmlScriptData *QQmlScriptBlob::scriptData() const
+ 
+ void QQmlScriptBlob::dataReceived(const Data &data)
+ {
+-    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(m_typeLoader->engine());
+-    QQmlImportDatabase *importDatabase = &ep->importDatabase;
+-
+     m_source = QString::fromUtf8(data.data(), data.size());
+ 
+     m_scriptData = new QQmlScriptData();
+@@ -1974,8 +2240,7 @@ void QQmlScriptBlob::dataReceived(const Data &data)
+     m_scriptData->urlString = finalUrlString();
+ 
+     QQmlError metaDataError;
+-    QQmlScript::Parser::JavaScriptMetaData metadata =
+-        QQmlScript::Parser::extractMetaData(m_source, &metaDataError);
++    m_metadata = QQmlScript::Parser::extractMetaData(m_source, &metaDataError);
+     if (metaDataError.isValid()) {
+         metaDataError.setUrl(finalUrl());
+         m_scriptData->setError(metaDataError);
+@@ -1983,58 +2248,18 @@ void QQmlScriptBlob::dataReceived(const Data &data)
+ 
+     m_imports.setBaseUrl(finalUrl(), finalUrlString());
+ 
+-    m_pragmas = metadata.pragmas;
+-
+-    foreach (const QQmlScript::Import &import, metadata.imports) {
+-        Q_ASSERT(import.type != QQmlScript::Import::File);
+-
+-        if (import.type == QQmlScript::Import::Script) {
+-            QUrl scriptUrl = finalUrl().resolved(QUrl(import.uri));
+-            QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
+-            addDependency(blob);
+-
+-            ScriptReference ref;
+-            ref.location = import.location.start;
+-            ref.qualifier = import.qualifier;
+-            ref.script = blob;
+-            m_scripts << ref;
+-        } else {
+-            Q_ASSERT(import.type == QQmlScript::Import::Library);
+-            QList<QQmlError> errors;
+-            QString importUrl;
+-            if (!m_imports.addImport(importDatabase, import.uri, import.qualifier, import.majorVersion,
+-                                     import.minorVersion, import.type, QQmlDirComponents(), &importUrl,
+-                                     &errors)) {
+-                QQmlError error = errors.takeFirst();
+-                // description should be set by addImport().
+-                error.setUrl(m_imports.baseUrl());
+-                error.setLine(import.location.start.line);
+-                error.setColumn(import.location.start.column);
+-                errors.prepend(error);
++    QList<QQmlError> errors;
+ 
+-                setError(errors);
+-                return;
+-            }
+-
+-            // Does this library contain any scripts?
+-            if (!importUrl.isEmpty()) {
+-                QUrl libraryUrl(importUrl);
+-                // XXX is this logic even correct???
+-                QString adjustedUrl;
+-                const QQmlDirParser *dirParser = typeLoader()->qmlDirParser(libraryUrl.path() + QLatin1String("qmldir"), QString(), &adjustedUrl);
+-                foreach (const QQmlDirParser::Script &script, dirParser->scripts()) {
+-                    QUrl scriptUrl = libraryUrl.resolved(QUrl(script.fileName));
+-                    QQmlScriptBlob *blob = typeLoader()->getScript(scriptUrl);
+-                    addDependency(blob);
+-
+-                    ScriptReference ref;
+-                    ref.location = import.location.start;
+-                    ref.qualifier = script.nameSpace;
+-                    ref.nameSpace = import.qualifier;
+-                    ref.script = blob;
+-                    m_scripts << ref;
+-                }
+-            }
++    foreach (const QQmlScript::Import &import, m_metadata.imports) {
++        if (!addImport(import, &errors)) {
++            Q_ASSERT(errors.size());
++            QQmlError error(errors.takeFirst());
++            error.setUrl(m_imports.baseUrl());
++            error.setLine(import.location.start.line);
++            error.setColumn(import.location.start.column);
++            errors.prepend(error); // put it back on the list after filling out information.
++            setError(errors);
++            return;
+         }
+     }
+ }
+@@ -2082,26 +2307,55 @@ void QQmlScriptBlob::done()
+ 
+     m_imports.populateCache(m_scriptData->importCache, engine);
+ 
+-    m_scriptData->pragmas = m_pragmas;
++    m_scriptData->pragmas = m_metadata.pragmas;
+     m_scriptData->m_programSource = m_source.toUtf8();
+     m_source.clear();
+ }
+ 
+-QQmlQmldirData::QQmlQmldirData(const QUrl &url)
+-: QQmlDataBlob(url, QmldirFile)
++void QQmlScriptBlob::scriptImported(QQmlScriptBlob *blob, const QQmlScript::Location &location, const QString &qualifier, const QString &nameSpace)
++{
++    ScriptReference ref;
++    ref.script = blob;
++    ref.location = location;
++    ref.qualifier = qualifier;
++    ref.nameSpace = nameSpace;
++
++    m_scripts << ref;
++}
++
++QQmlQmldirData::QQmlQmldirData(const QUrl &url, QQmlTypeLoader *loader)
++: QQmlTypeLoader::Blob(url, QmldirFile, loader), m_import(0), m_priority(0)
++{
++}
++
++const QString &QQmlQmldirData::content() const
++{
++    return m_content;
++}
++
++const QQmlScript::Import *QQmlQmldirData::import() const
++{
++    return m_import;
++}
++
++void QQmlQmldirData::setImport(const QQmlScript::Import *import)
++{
++    m_import = import;
++}
++
++int QQmlQmldirData::priority() const
+ {
++    return m_priority;
+ }
+ 
+-const QQmlDirComponents &QQmlQmldirData::dirComponents() const
++void QQmlQmldirData::setPriority(int priority)
+ {
+-    return m_components;
++    m_priority = priority;
+ }
+ 
+ void QQmlQmldirData::dataReceived(const Data &data)
+ {
+-    QQmlDirParser parser;
+-    parser.parse(QString::fromUtf8(data.data(), data.size()));
+-    m_components = parser.components();
++    m_content = QString::fromUtf8(data.data(), data.size());
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmltypeloader_p.h b/src/qml/qml/qqmltypeloader_p.h
+index c05b437..6461c1c 100644
+--- a/src/qml/qml/qqmltypeloader_p.h
++++ b/src/qml/qml/qqmltypeloader_p.h
+@@ -223,6 +223,9 @@ public:
+     QQmlEngine *engine() const;
+     void initializeEngine(QQmlExtensionInterface *, const char *);
+ 
++protected:
++    void shutdownThread();
++
+ private:
+     friend class QQmlDataBlob;
+     friend class QQmlDataLoaderThread;
+@@ -256,6 +259,60 @@ class QQmlTypeLoader : public QQmlDataLoader
+ {
+     Q_DECLARE_TR_FUNCTIONS(QQmlTypeLoader)
+ public:
++    class Q_QML_PRIVATE_EXPORT Blob : public QQmlDataBlob
++    {
++    public:
++        Blob(const QUrl &url, QQmlDataBlob::Type type, QQmlTypeLoader *loader);
++        ~Blob();
++
++        QQmlTypeLoader *typeLoader() const { return m_typeLoader; }
++        const QQmlImports &imports() const { return m_imports; }
++
++    protected:
++        bool addImport(const QQmlScript::Import &import, QList<QQmlError> *errors);
++
++        bool fetchQmldir(const QUrl &url, const QQmlScript::Import *import, int priority, QList<QQmlError> *errors);
++        bool updateQmldir(QQmlQmldirData *data, const QQmlScript::Import *import, QList<QQmlError> *errors);
++
++    private:
++        virtual bool qmldirDataAvailable(QQmlQmldirData *, QList<QQmlError> *);
++
++        virtual void scriptImported(QQmlScriptBlob *, const QQmlScript::Location &, const QString &, const QString &) {}
++
++        virtual void dependencyError(QQmlDataBlob *);
++        virtual void dependencyComplete(QQmlDataBlob *);
++
++    protected:
++        QQmlTypeLoader *m_typeLoader;
++        QQmlImports m_imports;
++        QHash<const QQmlScript::Import *, int> m_unresolvedImports;
++        QList<QQmlQmldirData *> m_qmldirs;
++    };
++
++    class QmldirContent
++    {
++    private:
++        friend class QQmlTypeLoader;
++        QmldirContent();
++
++        void setContent(const QString &location, const QString &content);
++        void setError(const QQmlError &);
++
++    public:
++        bool hasError() const;
++        QList<QQmlError> errors(const QString &uri) const;
++
++        QQmlDirComponents components() const;
++        QQmlDirScripts scripts() const;
++        QQmlDirPlugins plugins() const;
++
++        QString pluginLocation() const;
++
++    private:
++        QQmlDirParser m_parser;
++        QString m_location;
++    };
++
+     QQmlTypeLoader(QQmlEngine *);
+     ~QQmlTypeLoader();
+ 
+@@ -265,6 +322,8 @@ public:
+     };
+     Q_DECLARE_FLAGS(Options, Option)
+ 
++    QQmlImportDatabase *importDatabase();
++
+     QQmlTypeData *getType(const QUrl &url, Mode mode = PreferSynchronous);
+     QQmlTypeData *getType(const QByteArray &, const QUrl &url, Options = None);
+ 
+@@ -277,7 +336,9 @@ public:
+ 
+     QString absoluteFilePath(const QString &path);
+     bool directoryExists(const QString &path);
+-    const QQmlDirParser *qmlDirParser(const QString &filePath, const QString &uriHint, QString *outUrl);
++
++    const QmldirContent *qmldirContent(const QString &filePath, const QString &uriHint);
++    void setQmldirContent(const QString &filePath, const QString &content);
+ 
+     void clearCache();
+     void trimCache();
+@@ -305,14 +366,12 @@ private:
+         void (T::*mf)(QQmlTypeData *);
+     };
+ 
+-    struct DirParser : public QQmlDirParser { QString adjustedUrl; };
+-
+     typedef QHash<QUrl, QQmlTypeData *> TypeCache;
+     typedef QHash<QUrl, QQmlScriptBlob *> ScriptCache;
+     typedef QHash<QUrl, QQmlQmldirData *> QmldirCache;
+     typedef QStringHash<bool> StringSet;
+     typedef QStringHash<StringSet*> ImportDirCache;
+-    typedef QStringHash<DirParser*> ImportQmlDirCache;
++    typedef QStringHash<QmldirContent *> ImportQmlDirCache;
+     typedef QStringHash<QQmlBundleData *> BundleCache;
+     typedef QStringHash<QString> QmldirBundleIdCache;
+ 
+@@ -327,7 +386,7 @@ private:
+ 
+ Q_DECLARE_OPERATORS_FOR_FLAGS(QQmlTypeLoader::Options)
+ 
+-class Q_AUTOTEST_EXPORT QQmlTypeData : public QQmlDataBlob
++class Q_AUTOTEST_EXPORT QQmlTypeData : public QQmlTypeLoader::Blob
+ {
+ public:
+     struct TypeReference
+@@ -358,9 +417,6 @@ private:
+ public:
+     ~QQmlTypeData();
+ 
+-    QQmlTypeLoader *typeLoader() const;
+-
+-    const QQmlImports &imports() const;
+     const QQmlScript::Parser &parser() const;
+ 
+     const QList<TypeReference> &resolvedTypes() const;
+@@ -389,15 +445,13 @@ private:
+     void resolveTypes();
+     void compile();
+ 
+-    QQmlTypeLoader::Options m_options;
++    virtual void scriptImported(QQmlScriptBlob *blob, const QQmlScript::Location &location, const QString &qualifier, const QString &nameSpace);
+ 
+-    QQmlQmldirData *qmldirForUrl(const QUrl &);
++    QQmlTypeLoader::Options m_options;
+ 
+     QQmlScript::Parser scriptParser;
+-    QQmlImports m_imports;
+ 
+     QList<ScriptReference> m_scripts;
+-    QList<QQmlQmldirData *> m_qmldirs;
+ 
+     QSet<QString> m_namespaces;
+ 
+@@ -407,8 +461,8 @@ private:
+     QQmlCompiledData *m_compiledData;
+ 
+     QList<TypeDataCallback *> m_callbacks;
+-   
+-    QQmlTypeLoader *m_typeLoader;
++
++    QQmlScript::Import *m_implicitImport;
+ };
+ 
+ // QQmlScriptData instances are created, uninitialized, by the loader in the 
+@@ -455,7 +509,7 @@ private:
+     QQmlError m_error;
+ };
+ 
+-class Q_AUTOTEST_EXPORT QQmlScriptBlob : public QQmlDataBlob
++class Q_AUTOTEST_EXPORT QQmlScriptBlob : public QQmlTypeLoader::Blob
+ {
+ private:
+     friend class QQmlTypeLoader;
+@@ -477,9 +531,6 @@ public:
+ 
+     QQmlScript::Object::ScriptBlock::Pragmas pragmas() const;
+ 
+-    QQmlTypeLoader *typeLoader() const;
+-    const QQmlImports &imports() const;
+-
+     QQmlScriptData *scriptData() const;
+ 
+ protected:
+@@ -487,31 +538,38 @@ protected:
+     virtual void done();
+ 
+ private:
+-    QQmlScript::Object::ScriptBlock::Pragmas m_pragmas;
++    virtual void scriptImported(QQmlScriptBlob *blob, const QQmlScript::Location &location, const QString &qualifier, const QString &nameSpace);
++
+     QString m_source;
++    QQmlScript::Parser::JavaScriptMetaData m_metadata;
+ 
+-    QQmlImports m_imports;
+     QList<ScriptReference> m_scripts;
+     QQmlScriptData *m_scriptData;
+-
+-    QQmlTypeLoader *m_typeLoader;
+ };
+ 
+-class Q_AUTOTEST_EXPORT QQmlQmldirData : public QQmlDataBlob
++class Q_AUTOTEST_EXPORT QQmlQmldirData : public QQmlTypeLoader::Blob
+ {
+ private:
+     friend class QQmlTypeLoader;
+ 
+-    QQmlQmldirData(const QUrl &);
++    QQmlQmldirData(const QUrl &, QQmlTypeLoader *);
+ 
+ public:
+-    const QQmlDirComponents &dirComponents() const;
++    const QString &content() const;
++
++    const QQmlScript::Import *import() const;
++    void setImport(const QQmlScript::Import *);
++
++    int priority() const;
++    void setPriority(int);
+ 
+ protected:
+     virtual void dataReceived(const Data &);
+ 
+ private:
+-    QQmlDirComponents m_components;
++    QString m_content;
++    const QQmlScript::Import *m_import;
++    int m_priority;
+ };
+ 
+ QQmlDataBlob::Data::Data()
+diff --git a/tests/auto/qml/qqmlecmascript/data/jsimport/testJsModuleRemoteImport.js b/tests/auto/qml/qqmlecmascript/data/jsimport/testJsModuleRemoteImport.js
+new file mode 100644
+index 0000000..e6e41bc
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/jsimport/testJsModuleRemoteImport.js
+@@ -0,0 +1,5 @@
++.import com.nokia.JsRemoteModule 1.0 as JsModule
++
++function importedValue() {
++    return JsModule.ScriptAPI.greeting();
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/jsimport/testJsRemoteImport.qml b/tests/auto/qml/qqmlecmascript/data/jsimport/testJsRemoteImport.qml
+new file mode 100644
+index 0000000..4199bb0
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/jsimport/testJsRemoteImport.qml
+@@ -0,0 +1,13 @@
++import QtQuick 2.0
++
++import com.nokia.JsModule 1.0
++import com.nokia.JsModule 1.0 as RenamedModule
++import "testJsModuleRemoteImport.js" as TestJsModuleImport
++
++QtObject {
++    id: testQtObject
++
++    property string importedScriptStringValue: ScriptAPI.greeting();
++    property string renamedScriptStringValue: RenamedModule.ScriptAPI.greeting();
++    property string reimportedScriptStringValue: TestJsModuleImport.importedValue();
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/ScriptAPI.js b/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/ScriptAPI.js
+new file mode 100644
+index 0000000..b90033e
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/ScriptAPI.js
+@@ -0,0 +1,5 @@
++var major = 1
++var minor = 0
++
++function greeting() { return "Hello" }
++
+diff --git a/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/qmldir b/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/qmldir
+new file mode 100644
+index 0000000..c33d1e7
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/remote/com/nokia/JsRemoteModule/qmldir
+@@ -0,0 +1 @@
++ScriptAPI 1.0 ScriptAPI.js
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index aaa6d36..c7763fc 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -3784,6 +3784,17 @@ void tst_qqmlecmascript::importScripts_data()
+                                << QVariant(QString("Hello"))
+                                << QVariant(QString("Hello")));
+ 
++    QTest::newRow("import module which exports a script which imports a remote module")
++            << testFileUrl("jsimport/testJsRemoteImport.qml")
++            << QString()
++            << QStringList()
++            << (QStringList() << QLatin1String("importedScriptStringValue")
++                              << QLatin1String("renamedScriptStringValue")
++                              << QLatin1String("reimportedScriptStringValue"))
++            << (QVariantList() << QVariant(QString("Hello"))
++                               << QVariant(QString("Hello"))
++                               << QVariant(QString("Hello")));
++
+     QTest::newRow("malformed import statement")
+             << testFileUrl("jsimportfail/malformedImport.qml")
+             << QString()
+@@ -3870,6 +3881,15 @@ void tst_qqmlecmascript::importScripts()
+     QFETCH(QStringList, propertyNames);
+     QFETCH(QVariantList, propertyValues);
+ 
++    TestHTTPServer server(8111);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory() + "/remote");
++
++    QStringList importPathList = engine.importPathList();
++
++    QString remotePath(QLatin1String("http://127.0.0.1:8111/"));
++    engine.addImportPath(remotePath);
++
+     QQmlComponent component(&engine, testfile);
+ 
+     if (!errorMessage.isEmpty())
+@@ -3879,6 +3899,8 @@ void tst_qqmlecmascript::importScripts()
+         foreach (const QString &warning, warningMessages)
+             QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
+ 
++    QTRY_VERIFY(component.isReady());
++
+     QObject *object = component.create();
+     if (!errorMessage.isEmpty()) {
+         QVERIFY(object == 0);
+@@ -3888,6 +3910,8 @@ void tst_qqmlecmascript::importScripts()
+             QCOMPARE(object->property(propertyNames.at(i).toLatin1().constData()), propertyValues.at(i));
+         delete object;
+     }
++
++    engine.setImportPathList(importPathList);
+ }
+ 
+ void tst_qqmlecmascript::scarceResources_other()
+diff --git a/tests/auto/qml/qqmllanguage/data/lib/testModule/Test.qml b/tests/auto/qml/qqmllanguage/data/lib/testModule/Test.qml
+new file mode 100644
+index 0000000..f533828
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib/testModule/Test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string test: 'foo'
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/lib/testModule/qmldir b/tests/auto/qml/qqmllanguage/data/lib/testModule/qmldir
+new file mode 100644
+index 0000000..d6a9461
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib/testModule/qmldir
+@@ -0,0 +1 @@
++Test 1.0 Test.qml
+diff --git a/tests/auto/qml/qqmllanguage/data/lib2/testModule/Test.qml b/tests/auto/qml/qqmllanguage/data/lib2/testModule/Test.qml
+new file mode 100644
+index 0000000..cb44ffd
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib2/testModule/Test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string test: 'bar'
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/lib2/testModule/qmldir b/tests/auto/qml/qqmllanguage/data/lib2/testModule/qmldir
+new file mode 100644
+index 0000000..d6a9461
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib2/testModule/qmldir
+@@ -0,0 +1 @@
++Test 1.0 Test.qml
+diff --git a/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/Test.qml b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/Test.qml
+new file mode 100644
+index 0000000..2c597ba
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/Test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string test: 'baz'
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/qmldir b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/qmldir
+new file mode 100644
+index 0000000..d6a9461
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1.0/qmldir
+@@ -0,0 +1 @@
++Test 1.0 Test.qml
+diff --git a/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/Test.qml b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/Test.qml
+new file mode 100644
+index 0000000..6feec2e
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/Test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string test: 'unused'
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/qmldir b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/qmldir
+new file mode 100644
+index 0000000..d6a9461
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib3/testModule.1/qmldir
+@@ -0,0 +1 @@
++Test 1.0 Test.qml
+diff --git a/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/Test.qml b/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/Test.qml
+new file mode 100644
+index 0000000..b6b45ae
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/Test.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property string test: 'qux'
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/qmldir b/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/qmldir
+new file mode 100644
+index 0000000..d6a9461
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/lib4/testModule.1/qmldir
+@@ -0,0 +1 @@
++Test 1.0 Test.qml
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 689a076..1878156 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -41,6 +41,7 @@
+ #include <qtest.h>
+ #include <QtQml/qqmlengine.h>
+ #include <QtQml/qqmlcomponent.h>
++#include <QtQml/qqmlincubator.h>
+ #include <QtCore/qcoreapplication.h>
+ #include <QtCore/qfile.h>
+ #include <QtCore/qdebug.h>
+@@ -146,6 +147,10 @@ private slots:
+     void importsRemote();
+     void importsInstalled_data();
+     void importsInstalled();
++    void importsInstalledRemote_data();
++    void importsInstalledRemote();
++    void importsPath_data();
++    void importsPath();
+     void importsOrder_data();
+     void importsOrder();
+     void importIncorrectCase();
+@@ -176,6 +181,8 @@ private slots:
+ 
+ private:
+     QQmlEngine engine;
++    QStringList defaultImportPathList;
++
+     void testType(const QString& qml, const QString& type, const QString& error, bool partialMatch = false);
+ };
+ 
+@@ -1837,6 +1844,9 @@ void tst_qqmllanguage::reservedWords()
+ // Check that first child of qml is of given type. Empty type insists on error.
+ void tst_qqmllanguage::testType(const QString& qml, const QString& type, const QString& expectederror, bool partialMatch)
+ {
++    if (engine.importPathList() == defaultImportPathList)
++        engine.addImportPath(testFile("lib"));
++
+     QQmlComponent component(&engine);
+     component.setData(qml.toUtf8(), testFileUrl("empty.qml")); // just a file for relative local imports
+ 
+@@ -1858,6 +1868,8 @@ void tst_qqmllanguage::testType(const QString& qml, const QString& type, const Q
+         QCOMPARE(QString(object->metaObject()->className()), type);
+         delete object;
+     }
++
++    engine.setImportPathList(defaultImportPathList);
+ }
+ 
+ // QTBUG-17276
+@@ -2200,6 +2212,102 @@ void tst_qqmllanguage::importsInstalled()
+     testType(qml,type,error);
+ }
+ 
++void tst_qqmllanguage::importsInstalledRemote_data()
++{
++    // Repeat the tests for local installed data
++    importsInstalled_data();
++}
++
++void tst_qqmllanguage::importsInstalledRemote()
++{
++    QFETCH(QString, qml);
++    QFETCH(QString, type);
++    QFETCH(QString, error);
++
++    TestHTTPServer server(14447);
++    server.serveDirectory(dataDirectory());
++
++    QString serverdir = "http://127.0.0.1:14447/lib/";
++    engine.setImportPathList(QStringList(defaultImportPathList) << serverdir);
++
++    testType(qml,type,error);
++
++    engine.setImportPathList(defaultImportPathList);
++}
++
++void tst_qqmllanguage::importsPath_data()
++{
++    QTest::addColumn<QStringList>("importPath");
++    QTest::addColumn<QString>("qml");
++    QTest::addColumn<QString>("value");
++
++    QTest::newRow("local takes priority normal")
++        << (QStringList() << testFile("lib") << "http://127.0.0.1:14447/lib2/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "foo";
++
++    QTest::newRow("local takes priority reversed")
++        << (QStringList() << "http://127.0.0.1:14447/lib/" << testFile("lib2"))
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "bar";
++
++    QTest::newRow("earlier takes priority 1")
++        << (QStringList() << "http://127.0.0.1:14447/lib/" << "http://127.0.0.1:14447/lib2/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "foo";
++
++    QTest::newRow("earlier takes priority 2")
++        << (QStringList() << "http://127.0.0.1:14447/lib2/" << "http://127.0.0.1:14447/lib/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "bar";
++
++    QTest::newRow("major version takes priority over unversioned")
++        << (QStringList() << "http://127.0.0.1:14447/lib/" << "http://127.0.0.1:14447/lib3/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "baz";
++
++    QTest::newRow("major version takes priority over minor")
++        << (QStringList() << "http://127.0.0.1:14447/lib4/" << "http://127.0.0.1:14447/lib3/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "baz";
++
++    QTest::newRow("minor version takes priority over unversioned")
++        << (QStringList() << "http://127.0.0.1:14447/lib/" << "http://127.0.0.1:14447/lib4/")
++        << "import testModule 1.0\n"
++           "Test {}"
++        << "qux";
++}
++
++void tst_qqmllanguage::importsPath()
++{
++    QFETCH(QStringList, importPath);
++    QFETCH(QString, qml);
++    QFETCH(QString, value);
++
++    TestHTTPServer server(14447);
++    server.serveDirectory(dataDirectory());
++
++    engine.setImportPathList(QStringList(defaultImportPathList) << importPath);
++
++    QQmlComponent component(&engine);
++    component.setData(qml.toUtf8(), testFileUrl("empty.qml"));
++
++    QTRY_VERIFY(component.isReady());
++    VERIFY_ERRORS(0);
++
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QCOMPARE(object->property("test").toString(), value);
++    delete object;
++
++    engine.setImportPathList(defaultImportPathList);
++}
+ 
+ void tst_qqmllanguage::importsOrder_data()
+ {
+@@ -2298,6 +2406,9 @@ void tst_qqmllanguage::importsOrder()
+ 
+ void tst_qqmllanguage::importIncorrectCase()
+ {
++    if (engine.importPathList() == defaultImportPathList)
++        engine.addImportPath(testFile("lib"));
++
+     QQmlComponent component(&engine, testFileUrl("importIncorrectCase.qml"));
+ 
+     QList<QQmlError> errors = component.errors();
+@@ -2310,6 +2421,8 @@ void tst_qqmllanguage::importIncorrectCase()
+ #endif
+ 
+     QCOMPARE(errors.at(0).description(), expectedError);
++
++    engine.setImportPathList(defaultImportPathList);
+ }
+ 
+ void tst_qqmllanguage::importJs_data()
+@@ -2375,6 +2488,7 @@ void tst_qqmllanguage::importJs()
+     QFETCH(QString, errorFile);
+     QFETCH(bool, performTest);
+ 
++    engine.setImportPathList(QStringList(defaultImportPathList) << testFile("lib"));
+ 
+     QQmlComponent component(&engine, testFileUrl(file));
+ 
+@@ -2394,6 +2508,8 @@ void tst_qqmllanguage::importJs()
+         QCOMPARE(object->property("test").toBool(),true);
+         delete object;
+     }
++
++    engine.setImportPathList(defaultImportPathList);
+ }
+ 
+ void tst_qqmllanguage::qmlAttachedPropertiesObjectMethod()
+@@ -2576,8 +2692,9 @@ void tst_qqmllanguage::initTestCase()
+     QQmlDataTest::initTestCase();
+     QVERIFY2(QDir::setCurrent(dataDirectory()), qPrintable("Could not chdir to " + dataDirectory()));
+ 
++    defaultImportPathList = engine.importPathList();
++
+     QQmlMetaType::registerCustomStringConverter(qMetaTypeId<MyCustomVariantType>(), myCustomVariantTypeConverter);
+-    engine.addImportPath(testFile("lib"));
+ 
+     registerTypes();

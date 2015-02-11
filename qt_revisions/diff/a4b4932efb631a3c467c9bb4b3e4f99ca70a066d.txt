@@ -1,0 +1,116 @@
+diff --git a/src/declarative/qml/qdeclarativeexpression.cpp b/src/declarative/qml/qdeclarativeexpression.cpp
+index 94ed7b7..97afaa8 100644
+--- a/src/declarative/qml/qdeclarativeexpression.cpp
++++ b/src/declarative/qml/qdeclarativeexpression.cpp
+@@ -148,13 +148,33 @@ QDeclarativeExpressionPrivate::evalFunction(QDeclarativeContextData *ctxt, QObje
+     // QtScript days
+     v8::HandleScope handle_scope;
+     v8::Context::Scope ctxtscope(ep->v8engine()->context());
+-    
++
+     v8::TryCatch tc;
+     v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
+     v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, filename, line);
+-    if (tc.HasCaught()) return v8::Persistent<v8::Function>();
++    if (tc.HasCaught()) {
++        QDeclarativeError error;
++        error.setDescription(QLatin1String("Exception occurred during function compilation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QDeclarativeExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
+     v8::Local<v8::Value> result = script->Run(scopeobject);
+-    if (tc.HasCaught()) return v8::Persistent<v8::Function>();
++    if (tc.HasCaught()) {
++        QDeclarativeError error;
++        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QDeclarativeExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
+     if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
+     return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
+ }
+diff --git a/src/declarative/qml/qdeclarativevmemetaobject.cpp b/src/declarative/qml/qdeclarativevmemetaobject.cpp
+index e5c798e..18b29f3 100644
+--- a/src/declarative/qml/qdeclarativevmemetaobject.cpp
++++ b/src/declarative/qml/qdeclarativevmemetaobject.cpp
+@@ -730,6 +730,17 @@ int QDeclarativeVMEMetaObject::metaCall(QMetaObject::Call c, int _id, void **a)
+                 ep->referenceScarceResources(); // "hold" scarce resources in memory during evaluation.
+ 
+                 v8::Handle<v8::Function> function = method(id);
++                if (function.IsEmpty()) {
++                    // The function was not compiled.  There are some exceptional cases which the
++                    // expression rewriter does not rewrite properly (e.g., \r-terminated lines
++                    // are not rewritten correctly but this bug is deemed out-of-scope to fix for
++                    // performance reasons; see QTBUG-24064) and thus compilation will have failed.
++                    QDeclarativeError e;
++                    e.setDescription(QString(QLatin1String("Exception occurred during compilation of function: %1")).arg(QMetaObject::method(_id).signature()));
++                    ep->warning(e);
++                    return -1; // The dynamic method with that id is not available.
++                }
++
+                 QDeclarativeVMEMetaData::MethodData *data = metaData->methodData() + id;
+ 
+                 v8::HandleScope handle_scope;
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/data/v8functionException.qml b/tests/auto/declarative/qdeclarativeecmascript/data/v8functionException.qml
+new file mode 100644
+index 0000000..51df1c6
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativeecmascript/data/v8functionException.qml
+@@ -0,0 +1,15 @@
++import QtQuick 2.0
++
++// This test uses a multi-line string which has \r-terminated
++// string fragments.  The expression rewriter deliberately doesn't
++// handle \r-terminated string fragments (see QTBUG-24064) and thus
++// this test ensures that we don't crash when the client attempts
++// to invoke a non-compiled dynamic slot.
++
++Item {
++    id: root
++
++    function dynamicSlot() {
++        var someString = "Hello,        this is a        multiline string";
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+index 1c42d9d..02f79d2 100644
+--- a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
++++ b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+@@ -196,6 +196,7 @@ private slots:
+     void functionAssignmentfromJS_invalid();
+     void eval();
+     void function();
++    void functionException();
+     void qtbug_10696();
+     void qtbug_11606();
+     void qtbug_11600();
+@@ -5071,6 +5072,19 @@ void tst_qdeclarativeecmascript::function()
+     delete o;
+ }
+ 
++void tst_qdeclarativeecmascript::functionException()
++{
++    // QTBUG-24037 - shouldn't crash.
++    QString errstr = testFileUrl("v8functionException.qml").toString() + QLatin1String(":13: SyntaxError: Unexpected token ILLEGAL");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(errstr));
++    QTest::ignoreMessage(QtWarningMsg, "<Unknown File>: Exception occurred during compilation of function: dynamicSlot()");
++    QDeclarativeComponent component(&engine, testFileUrl("v8functionException.qml"));
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++    QMetaObject::invokeMethod(o, "dynamicSlot");
++    delete o;
++}
++
+ // Test the "Qt.include" method
+ void tst_qdeclarativeecmascript::include()
+ {

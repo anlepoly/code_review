@@ -1,0 +1,3208 @@
+diff --git a/src/plugins/qmltooling/qmldbg_tcp/qmldbg_tcp.pro b/src/plugins/qmltooling/qmldbg_tcp/qmldbg_tcp.pro
+index 0c5e196..fdd1f6e 100644
+--- a/src/plugins/qmltooling/qmldbg_tcp/qmldbg_tcp.pro
++++ b/src/plugins/qmltooling/qmldbg_tcp/qmldbg_tcp.pro
+@@ -9,10 +9,14 @@ DESTDIR = $$QT.qml.plugins/qmltooling
+ QTDIR_build:REQUIRES += "contains(QT_CONFIG, qml)"
+ 
+ SOURCES += \
+-    qtcpserverconnection.cpp
++    qtcpserverconnection.cpp \
++    ../shared/qpacketprotocol.cpp
+ 
+ HEADERS += \
+-    qtcpserverconnection.h
++    qtcpserverconnection.h \
++    ../shared/qpacketprotocol.h
++
++INCLUDEPATH += ../shared
+ 
+ OTHER_FILES += qtcpserverconnection.json
+ 
+diff --git a/src/plugins/qmltooling/qmldbg_tcp/qtcpserverconnection.cpp b/src/plugins/qmltooling/qmldbg_tcp/qtcpserverconnection.cpp
+index 4eccd0d..e5f31b6 100644
+--- a/src/plugins/qmltooling/qmldbg_tcp/qtcpserverconnection.cpp
++++ b/src/plugins/qmltooling/qmldbg_tcp/qtcpserverconnection.cpp
+@@ -40,13 +40,13 @@
+ ****************************************************************************/
+ 
+ #include "qtcpserverconnection.h"
++#include "qpacketprotocol.h"
+ 
+ #include <QtCore/qplugin.h>
+ #include <QtNetwork/qtcpserver.h>
+ #include <QtNetwork/qtcpsocket.h>
+ 
+ #include <private/qqmldebugserver_p.h>
+-#include <private/qpacketprotocol_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+diff --git a/src/plugins/qmltooling/shared/qpacketprotocol.cpp b/src/plugins/qmltooling/shared/qpacketprotocol.cpp
+new file mode 100644
+index 0000000..a6a4e0e
+--- /dev/null
++++ b/src/plugins/qmltooling/shared/qpacketprotocol.cpp
+@@ -0,0 +1,550 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qpacketprotocol.h"
++
++#include <QtCore/QBuffer>
++#include <QtCore/QElapsedTimer>
++
++QT_BEGIN_NAMESPACE
++
++static const unsigned int MAX_PACKET_SIZE = 0x7FFFFFFF;
++
++/*!
++  \class QPacketProtocol
++  \internal
++
++  \brief The QPacketProtocol class encapsulates communicating discrete packets
++  across fragmented IO channels, such as TCP sockets.
++
++  QPacketProtocol makes it simple to send arbitrary sized data "packets" across
++  fragmented transports such as TCP and UDP.
++
++  As transmission boundaries are not respected, sending packets over protocols
++  like TCP frequently involves "stitching" them back together at the receiver.
++  QPacketProtocol makes this easier by performing this task for you.  Packet
++  data sent using QPacketProtocol is prepended with a 4-byte size header
++  allowing the receiving QPacketProtocol to buffer the packet internally until
++  it has all been received.  QPacketProtocol does not perform any sanity
++  checking on the size or on the data, so this class should only be used in
++  prototyping or trusted situations where DOS attacks are unlikely.
++
++  QPacketProtocol does not perform any communications itself.  Instead it can
++  operate on any QIODevice that supports the QIODevice::readyRead() signal.  A
++  logical "packet" is encapsulated by the companion QPacket class.  The
++  following example shows two ways to send data using QPacketProtocol.  The
++  transmitted data is equivalent in both.
++
++  \code
++  QTcpSocket socket;
++  // ... connect socket ...
++
++  QPacketProtocol protocol(&socket);
++
++  // Send packet the quick way
++  protocol.send() << "Hello world" << 123;
++
++  // Send packet the longer way
++  QPacket packet;
++  packet << "Hello world" << 123;
++  protocol.send(packet);
++  \endcode
++
++  Likewise, the following shows how to read data from QPacketProtocol, assuming
++  that the QPacketProtocol::readyRead() signal has been emitted.
++
++  \code
++  // ... QPacketProtocol::readyRead() is emitted ...
++
++  int a;
++  QByteArray b;
++
++  // Receive packet the quick way
++  protocol.read() >> a >> b;
++
++  // Receive packet the longer way
++  QPacket packet = protocol.read();
++  p >> a >> b;
++  \endcode
++
++  \ingroup io
++  \sa QPacket
++*/
++
++class QPacketProtocolPrivate : public QObject
++{
++    Q_OBJECT
++public:
++    QPacketProtocolPrivate(QPacketProtocol *parent, QIODevice *_dev)
++        : QObject(parent), inProgressSize(-1), maxPacketSize(MAX_PACKET_SIZE),
++          waitingForPacket(false), dev(_dev)
++    {
++        Q_ASSERT(4 == sizeof(qint32));
++
++        QObject::connect(this, SIGNAL(readyRead()),
++                         parent, SIGNAL(readyRead()));
++        QObject::connect(this, SIGNAL(packetWritten()),
++                         parent, SIGNAL(packetWritten()));
++        QObject::connect(this, SIGNAL(invalidPacket()),
++                         parent, SIGNAL(invalidPacket()));
++        QObject::connect(dev, SIGNAL(readyRead()),
++                         this, SLOT(readyToRead()));
++        QObject::connect(dev, SIGNAL(aboutToClose()),
++                         this, SLOT(aboutToClose()));
++        QObject::connect(dev, SIGNAL(bytesWritten(qint64)),
++                         this, SLOT(bytesWritten(qint64)));
++    }
++
++Q_SIGNALS:
++    void readyRead();
++    void packetWritten();
++    void invalidPacket();
++
++public Q_SLOTS:
++    void aboutToClose()
++    {
++        inProgress.clear();
++        sendingPackets.clear();
++        inProgressSize = -1;
++    }
++
++    void bytesWritten(qint64 bytes)
++    {
++        Q_ASSERT(!sendingPackets.isEmpty());
++
++        while (bytes) {
++            if (sendingPackets.at(0) > bytes) {
++                sendingPackets[0] -= bytes;
++                bytes = 0;
++            } else {
++                bytes -= sendingPackets.at(0);
++                sendingPackets.removeFirst();
++                emit packetWritten();
++            }
++        }
++    }
++
++    void readyToRead()
++    {
++        while (true) {
++            // Need to get trailing data
++            if (-1 == inProgressSize) {
++                // We need a size header of sizeof(qint32)
++                if (sizeof(qint32) > (uint)dev->bytesAvailable())
++                    return;
++
++                // Read size header
++                int read = dev->read((char *)&inProgressSize, sizeof(qint32));
++                Q_ASSERT(read == sizeof(qint32));
++                Q_UNUSED(read);
++
++                // Check sizing constraints
++                if (inProgressSize > maxPacketSize) {
++                    QObject::disconnect(dev, SIGNAL(readyRead()),
++                                        this, SLOT(readyToRead()));
++                    QObject::disconnect(dev, SIGNAL(aboutToClose()),
++                                        this, SLOT(aboutToClose()));
++                    QObject::disconnect(dev, SIGNAL(bytesWritten(qint64)),
++                                        this, SLOT(bytesWritten(qint64)));
++                    dev = 0;
++                    emit invalidPacket();
++                    return;
++                }
++
++                inProgressSize -= sizeof(qint32);
++            } else {
++                inProgress.append(dev->read(inProgressSize - inProgress.size()));
++
++                if (inProgressSize == inProgress.size()) {
++                    // Packet has arrived!
++                    packets.append(inProgress);
++                    inProgressSize = -1;
++                    inProgress.clear();
++
++                    waitingForPacket = false;
++                    emit readyRead();
++                } else
++                    return;
++            }
++        }
++    }
++
++public:
++    QList<qint64> sendingPackets;
++    QList<QByteArray> packets;
++    QByteArray inProgress;
++    qint32 inProgressSize;
++    qint32 maxPacketSize;
++    bool waitingForPacket;
++    QIODevice *dev;
++};
++
++/*!
++  Construct a QPacketProtocol instance that works on \a dev with the
++  specified \a parent.
++ */
++QPacketProtocol::QPacketProtocol(QIODevice *dev, QObject *parent)
++    : QObject(parent), d(new QPacketProtocolPrivate(this, dev))
++{
++    Q_ASSERT(dev);
++}
++
++/*!
++  Destroys the QPacketProtocol instance.
++ */
++QPacketProtocol::~QPacketProtocol()
++{
++}
++
++/*!
++  Returns the maximum packet size allowed.  By default this is
++  2,147,483,647 bytes.
++  
++  If a packet claiming to be larger than the maximum packet size is received,
++  the QPacketProtocol::invalidPacket() signal is emitted.
++
++  \sa QPacketProtocol::setMaximumPacketSize()
++ */
++qint32 QPacketProtocol::maximumPacketSize() const
++{
++    return d->maxPacketSize;
++}
++
++/*!
++  Sets the maximum allowable packet size to \a max.
++
++  \sa QPacketProtocol::maximumPacketSize()
++ */
++qint32 QPacketProtocol::setMaximumPacketSize(qint32 max)
++{
++    if (max > (signed)sizeof(qint32))
++        d->maxPacketSize = max;
++    return d->maxPacketSize;
++}
++
++/*!
++  Returns a streamable object that is transmitted on destruction.  For example
++
++  \code
++  protocol.send() << "Hello world" << 123;
++  \endcode
++
++  will send a packet containing "Hello world" and 123.  To construct more
++  complex packets, explicitly construct a QPacket instance.
++ */
++QPacketAutoSend QPacketProtocol::send()
++{
++    return QPacketAutoSend(this);
++}
++
++/*!
++  \fn void QPacketProtocol::send(const QPacket & packet)
++
++  Transmit the \a packet.
++ */
++void QPacketProtocol::send(const QPacket & p)
++{
++    if (p.b.isEmpty())
++        return; // We don't send empty packets
++
++    qint64 sendSize = p.b.size() + sizeof(qint32);
++
++    d->sendingPackets.append(sendSize);
++    qint32 sendSize32 = sendSize;
++    qint64 writeBytes = d->dev->write((char *)&sendSize32, sizeof(qint32));
++    Q_ASSERT(writeBytes == sizeof(qint32));
++    writeBytes = d->dev->write(p.b);
++    Q_ASSERT(writeBytes == p.b.size());
++}
++
++/*!
++  Returns the number of received packets yet to be read.
++  */
++qint64 QPacketProtocol::packetsAvailable() const
++{
++    return d->packets.count();
++}
++
++/*!
++  Discard any unread packets.
++  */
++void QPacketProtocol::clear()
++{
++    d->packets.clear();
++}
++
++/*!
++  Return the next unread packet, or an invalid QPacket instance if no packets
++  are available.  This method does NOT block.
++  */
++QPacket QPacketProtocol::read()
++{
++    if (0 == d->packets.count())
++        return QPacket();
++
++    QPacket rv(d->packets.at(0));
++    d->packets.removeFirst();
++    return rv;
++}
++
++/*
++   Returns the difference between msecs and elapsed. If msecs is -1,
++   however, -1 is returned.
++*/
++static int qt_timeout_value(int msecs, int elapsed)
++{
++    if (msecs == -1)
++        return -1;
++
++    int timeout = msecs - elapsed;
++    return timeout < 0 ? 0 : timeout;
++}
++
++/*!
++  This function locks until a new packet is available for reading and the
++  \l{QIODevice::}{readyRead()} signal has been emitted. The function
++  will timeout after \a msecs milliseconds; the default timeout is
++  30000 milliseconds.
++
++  The function returns true if the readyRead() signal is emitted and
++  there is new data available for reading; otherwise it returns false
++  (if an error occurred or the operation timed out).
++  */
++
++bool QPacketProtocol::waitForReadyRead(int msecs)
++{
++    if (!d->packets.isEmpty())
++        return true;
++
++    QElapsedTimer stopWatch;
++    stopWatch.start();
++
++    d->waitingForPacket = true;
++    do {
++        if (!d->dev->waitForReadyRead(msecs))
++            return false;
++        if (!d->waitingForPacket)
++            return true;
++        msecs = qt_timeout_value(msecs, stopWatch.elapsed());
++    } while (true);
++}
++
++/*!
++  Return the QIODevice passed to the QPacketProtocol constructor.
++*/
++QIODevice *QPacketProtocol::device()
++{
++    return d->dev;
++}
++
++/*!
++  \fn void QPacketProtocol::readyRead()
++
++  Emitted whenever a new packet is received.  Applications may use
++  QPacketProtocol::read() to retrieve this packet.
++ */
++
++/*!
++  \fn void QPacketProtocol::invalidPacket()
++
++  A packet larger than the maximum allowable packet size was received.  The
++  packet will be discarded and, as it indicates corruption in the protocol, no
++  further packets will be received.
++ */
++
++/*!
++  \fn void QPacketProtocol::packetWritten()
++
++  Emitted each time a packet is completing written to the device.  This signal
++  may be used for communications flow control.
++ */
++
++/*!
++  \class QPacket
++  \internal
++
++  \brief The QPacket class encapsulates an unfragmentable packet of data to be
++  transmitted by QPacketProtocol.
++
++  The QPacket class works together with QPacketProtocol to make it simple to
++  send arbitrary sized data "packets" across fragmented transports such as TCP
++  and UDP.
++
++  QPacket provides a QDataStream interface to an unfragmentable packet.
++  Applications should construct a QPacket, propagate it with data and then
++  transmit it over a QPacketProtocol instance.  For example:
++  \code
++  QPacketProtocol protocol(...);
++
++  QPacket myPacket;
++  myPacket << "Hello world!" << 123;
++  protocol.send(myPacket);
++  \endcode
++
++  As long as both ends of the connection are using the QPacketProtocol class,
++  the data within this packet will be delivered unfragmented at the other end,
++  ready for extraction.
++
++  \code
++  QByteArray greeting;
++  int count;
++
++  QPacket myPacket = protocol.read();
++
++  myPacket >> greeting >> count;
++  \endcode
++
++  Only packets returned from QPacketProtocol::read() may be read from.  QPacket
++  instances constructed by directly by applications are for transmission only
++  and are considered "write only".  Attempting to read data from them will
++  result in undefined behavior.
++
++  \ingroup io
++  \sa QPacketProtocol
++ */
++
++/*!
++  Constructs an empty write-only packet.
++  */
++QPacket::QPacket()
++    : QDataStream(), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(QIODevice::WriteOnly);
++    setDevice(buf);
++    setVersion(QDataStream::Qt_4_7);
++}
++
++/*!
++  Destroys the QPacket instance.
++  */
++QPacket::~QPacket()
++{
++    if (buf) {
++        delete buf;
++        buf = 0;
++    }
++}
++
++/*!
++  Creates a copy of \a other.  The initial stream positions are shared, but the
++  two packets are otherwise independent.
++ */
++QPacket::QPacket(const QPacket & other)
++    : QDataStream(), b(other.b), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(other.buf->openMode());
++    setDevice(buf);
++}
++
++/*!
++  \internal
++  */
++QPacket::QPacket(const QByteArray & ba)
++    : QDataStream(), b(ba), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(QIODevice::ReadOnly);
++    setDevice(buf);
++}
++
++/*!
++  Returns true if this packet is empty - that is, contains no data.
++  */
++bool QPacket::isEmpty() const
++{
++    return b.isEmpty();
++}
++
++/*!
++  Returns raw packet data.
++  */
++QByteArray QPacket::data() const
++{
++    return b;
++}
++
++/*!
++  Clears data in the packet.  This is useful for reusing one writable packet.
++  For example
++  \code
++  QPacketProtocol protocol(...);
++
++  QPacket packet;
++
++  packet << "Hello world!" << 123;
++  protocol.send(packet);
++
++  packet.clear();
++  packet << "Goodbyte world!" << 789;
++  protocol.send(packet);
++  \endcode
++ */
++void QPacket::clear()
++{
++    QBuffer::OpenMode oldMode = buf->openMode();
++    buf->close();
++    b.clear();
++    buf->setBuffer(&b); // reset QBuffer internals with new size of b.
++    buf->open(oldMode);
++}
++
++/*!
++  \class QPacketAutoSend
++  \internal
++
++  \internal
++  */
++QPacketAutoSend::QPacketAutoSend(QPacketProtocol *_p)
++    : QPacket(), p(_p)
++{
++}
++
++QPacketAutoSend::~QPacketAutoSend()
++{
++    if (!b.isEmpty())
++        p->send(*this);
++}
++
++QT_END_NAMESPACE
++
++#include <qpacketprotocol.moc>
+diff --git a/src/plugins/qmltooling/shared/qpacketprotocol.h b/src/plugins/qmltooling/shared/qpacketprotocol.h
+new file mode 100644
+index 0000000..0470c74
+--- /dev/null
++++ b/src/plugins/qmltooling/shared/qpacketprotocol.h
+@@ -0,0 +1,119 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QPACKETPROTOCOL_H
++#define QPACKETPROTOCOL_H
++
++#include <QtCore/qobject.h>
++#include <QtCore/qdatastream.h>
++
++QT_BEGIN_NAMESPACE
++
++class QIODevice;
++class QBuffer;
++class QPacket;
++class QPacketAutoSend;
++class QPacketProtocolPrivate;
++
++class QPacketProtocol : public QObject
++{
++    Q_OBJECT
++public:
++    explicit QPacketProtocol(QIODevice *dev, QObject *parent = 0);
++    virtual ~QPacketProtocol();
++
++    qint32 maximumPacketSize() const;
++    qint32 setMaximumPacketSize(qint32);
++
++    QPacketAutoSend send();
++    void send(const QPacket &);
++
++    qint64 packetsAvailable() const;
++    QPacket read();
++
++    bool waitForReadyRead(int msecs = 3000);
++
++    void clear();
++
++    QIODevice *device();
++
++Q_SIGNALS:
++    void readyRead();
++    void invalidPacket();
++    void packetWritten();
++
++private:
++    QPacketProtocolPrivate *d;
++};
++
++
++class QPacket : public QDataStream
++{
++public:
++    QPacket();
++    QPacket(const QPacket &);
++    virtual ~QPacket();
++
++    void clear();
++    bool isEmpty() const;
++    QByteArray data() const;
++
++protected:
++    friend class QPacketProtocol;
++    QPacket(const QByteArray &ba);
++    QByteArray b;
++    QBuffer *buf;
++};
++
++class QPacketAutoSend : public QPacket
++{
++public:
++    virtual ~QPacketAutoSend();
++
++private:
++    friend class QPacketProtocol;
++    QPacketAutoSend(QPacketProtocol *);
++    QPacketProtocol *p;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/qml/debugger/debugger.pri b/src/qml/debugger/debugger.pri
+index f5abd2c..f16e225 100644
+--- a/src/qml/debugger/debugger.pri
++++ b/src/qml/debugger/debugger.pri
+@@ -1,5 +1,4 @@
+ SOURCES += \
+-    $$PWD/qpacketprotocol.cpp \
+     $$PWD/qqmldebugservice.cpp \
+     $$PWD/qqmlprofilerservice.cpp \
+     $$PWD/qqmldebugserver.cpp \
+@@ -10,7 +9,6 @@ SOURCES += \
+     $$PWD/qdebugmessageservice.cpp
+ 
+ HEADERS += \
+-    $$PWD/qpacketprotocol_p.h \
+     $$PWD/qqmldebugservice_p.h \
+     $$PWD/qqmldebugservice_p_p.h \
+     $$PWD/qqmlprofilerservice_p.h \
+diff --git a/src/qml/debugger/qpacketprotocol.cpp b/src/qml/debugger/qpacketprotocol.cpp
+deleted file mode 100644
+index 978054a..0000000
+--- a/src/qml/debugger/qpacketprotocol.cpp
++++ /dev/null
+@@ -1,550 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the QtQml module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "qpacketprotocol_p.h"
+-
+-#include <QtCore/QBuffer>
+-#include <QtCore/QElapsedTimer>
+-
+-QT_BEGIN_NAMESPACE
+-
+-static const unsigned int MAX_PACKET_SIZE = 0x7FFFFFFF;
+-
+-/*!
+-  \class QPacketProtocol
+-  \internal
+-
+-  \brief The QPacketProtocol class encapsulates communicating discrete packets
+-  across fragmented IO channels, such as TCP sockets.
+-
+-  QPacketProtocol makes it simple to send arbitrary sized data "packets" across
+-  fragmented transports such as TCP and UDP.
+-
+-  As transmission boundaries are not respected, sending packets over protocols
+-  like TCP frequently involves "stitching" them back together at the receiver.
+-  QPacketProtocol makes this easier by performing this task for you.  Packet
+-  data sent using QPacketProtocol is prepended with a 4-byte size header
+-  allowing the receiving QPacketProtocol to buffer the packet internally until
+-  it has all been received.  QPacketProtocol does not perform any sanity
+-  checking on the size or on the data, so this class should only be used in
+-  prototyping or trusted situations where DOS attacks are unlikely.
+-
+-  QPacketProtocol does not perform any communications itself.  Instead it can
+-  operate on any QIODevice that supports the QIODevice::readyRead() signal.  A
+-  logical "packet" is encapsulated by the companion QPacket class.  The
+-  following example shows two ways to send data using QPacketProtocol.  The
+-  transmitted data is equivalent in both.
+-
+-  \code
+-  QTcpSocket socket;
+-  // ... connect socket ...
+-
+-  QPacketProtocol protocol(&socket);
+-
+-  // Send packet the quick way
+-  protocol.send() << "Hello world" << 123;
+-
+-  // Send packet the longer way
+-  QPacket packet;
+-  packet << "Hello world" << 123;
+-  protocol.send(packet);
+-  \endcode
+-
+-  Likewise, the following shows how to read data from QPacketProtocol, assuming
+-  that the QPacketProtocol::readyRead() signal has been emitted.
+-
+-  \code
+-  // ... QPacketProtocol::readyRead() is emitted ...
+-
+-  int a;
+-  QByteArray b;
+-
+-  // Receive packet the quick way
+-  protocol.read() >> a >> b;
+-
+-  // Receive packet the longer way
+-  QPacket packet = protocol.read();
+-  p >> a >> b;
+-  \endcode
+-
+-  \ingroup io
+-  \sa QPacket
+-*/
+-
+-class QPacketProtocolPrivate : public QObject
+-{
+-    Q_OBJECT
+-public:
+-    QPacketProtocolPrivate(QPacketProtocol *parent, QIODevice *_dev)
+-        : QObject(parent), inProgressSize(-1), maxPacketSize(MAX_PACKET_SIZE),
+-          waitingForPacket(false), dev(_dev)
+-    {
+-        Q_ASSERT(4 == sizeof(qint32));
+-
+-        QObject::connect(this, SIGNAL(readyRead()),
+-                         parent, SIGNAL(readyRead()));
+-        QObject::connect(this, SIGNAL(packetWritten()),
+-                         parent, SIGNAL(packetWritten()));
+-        QObject::connect(this, SIGNAL(invalidPacket()),
+-                         parent, SIGNAL(invalidPacket()));
+-        QObject::connect(dev, SIGNAL(readyRead()),
+-                         this, SLOT(readyToRead()));
+-        QObject::connect(dev, SIGNAL(aboutToClose()),
+-                         this, SLOT(aboutToClose()));
+-        QObject::connect(dev, SIGNAL(bytesWritten(qint64)),
+-                         this, SLOT(bytesWritten(qint64)));
+-    }
+-
+-Q_SIGNALS:
+-    void readyRead();
+-    void packetWritten();
+-    void invalidPacket();
+-
+-public Q_SLOTS:
+-    void aboutToClose()
+-    {
+-        inProgress.clear();
+-        sendingPackets.clear();
+-        inProgressSize = -1;
+-    }
+-
+-    void bytesWritten(qint64 bytes)
+-    {
+-        Q_ASSERT(!sendingPackets.isEmpty());
+-
+-        while (bytes) {
+-            if (sendingPackets.at(0) > bytes) {
+-                sendingPackets[0] -= bytes;
+-                bytes = 0;
+-            } else {
+-                bytes -= sendingPackets.at(0);
+-                sendingPackets.removeFirst();
+-                emit packetWritten();
+-            }
+-        }
+-    }
+-
+-    void readyToRead()
+-    {
+-        while (true) {
+-            // Need to get trailing data
+-            if (-1 == inProgressSize) {
+-                // We need a size header of sizeof(qint32)
+-                if (sizeof(qint32) > (uint)dev->bytesAvailable())
+-                    return;
+-
+-                // Read size header
+-                int read = dev->read((char *)&inProgressSize, sizeof(qint32));
+-                Q_ASSERT(read == sizeof(qint32));
+-                Q_UNUSED(read);
+-
+-                // Check sizing constraints
+-                if (inProgressSize > maxPacketSize) {
+-                    QObject::disconnect(dev, SIGNAL(readyRead()),
+-                                        this, SLOT(readyToRead()));
+-                    QObject::disconnect(dev, SIGNAL(aboutToClose()),
+-                                        this, SLOT(aboutToClose()));
+-                    QObject::disconnect(dev, SIGNAL(bytesWritten(qint64)),
+-                                        this, SLOT(bytesWritten(qint64)));
+-                    dev = 0;
+-                    emit invalidPacket();
+-                    return;
+-                }
+-
+-                inProgressSize -= sizeof(qint32);
+-            } else {
+-                inProgress.append(dev->read(inProgressSize - inProgress.size()));
+-
+-                if (inProgressSize == inProgress.size()) {
+-                    // Packet has arrived!
+-                    packets.append(inProgress);
+-                    inProgressSize = -1;
+-                    inProgress.clear();
+-
+-                    waitingForPacket = false;
+-                    emit readyRead();
+-                } else
+-                    return;
+-            }
+-        }
+-    }
+-
+-public:
+-    QList<qint64> sendingPackets;
+-    QList<QByteArray> packets;
+-    QByteArray inProgress;
+-    qint32 inProgressSize;
+-    qint32 maxPacketSize;
+-    bool waitingForPacket;
+-    QIODevice *dev;
+-};
+-
+-/*!
+-  Construct a QPacketProtocol instance that works on \a dev with the
+-  specified \a parent.
+- */
+-QPacketProtocol::QPacketProtocol(QIODevice *dev, QObject *parent)
+-    : QObject(parent), d(new QPacketProtocolPrivate(this, dev))
+-{
+-    Q_ASSERT(dev);
+-}
+-
+-/*!
+-  Destroys the QPacketProtocol instance.
+- */
+-QPacketProtocol::~QPacketProtocol()
+-{
+-}
+-
+-/*!
+-  Returns the maximum packet size allowed.  By default this is
+-  2,147,483,647 bytes.
+-  
+-  If a packet claiming to be larger than the maximum packet size is received,
+-  the QPacketProtocol::invalidPacket() signal is emitted.
+-
+-  \sa QPacketProtocol::setMaximumPacketSize()
+- */
+-qint32 QPacketProtocol::maximumPacketSize() const
+-{
+-    return d->maxPacketSize;
+-}
+-
+-/*!
+-  Sets the maximum allowable packet size to \a max.
+-
+-  \sa QPacketProtocol::maximumPacketSize()
+- */
+-qint32 QPacketProtocol::setMaximumPacketSize(qint32 max)
+-{
+-    if (max > (signed)sizeof(qint32))
+-        d->maxPacketSize = max;
+-    return d->maxPacketSize;
+-}
+-
+-/*!
+-  Returns a streamable object that is transmitted on destruction.  For example
+-
+-  \code
+-  protocol.send() << "Hello world" << 123;
+-  \endcode
+-
+-  will send a packet containing "Hello world" and 123.  To construct more
+-  complex packets, explicitly construct a QPacket instance.
+- */
+-QPacketAutoSend QPacketProtocol::send()
+-{
+-    return QPacketAutoSend(this);
+-}
+-
+-/*!
+-  \fn void QPacketProtocol::send(const QPacket & packet)
+-
+-  Transmit the \a packet.
+- */
+-void QPacketProtocol::send(const QPacket & p)
+-{
+-    if (p.b.isEmpty())
+-        return; // We don't send empty packets
+-
+-    qint64 sendSize = p.b.size() + sizeof(qint32);
+-
+-    d->sendingPackets.append(sendSize);
+-    qint32 sendSize32 = sendSize;
+-    qint64 writeBytes = d->dev->write((char *)&sendSize32, sizeof(qint32));
+-    Q_ASSERT(writeBytes == sizeof(qint32));
+-    writeBytes = d->dev->write(p.b);
+-    Q_ASSERT(writeBytes == p.b.size());
+-}
+-
+-/*!
+-  Returns the number of received packets yet to be read.
+-  */
+-qint64 QPacketProtocol::packetsAvailable() const
+-{
+-    return d->packets.count();
+-}
+-
+-/*!
+-  Discard any unread packets.
+-  */
+-void QPacketProtocol::clear()
+-{
+-    d->packets.clear();
+-}
+-
+-/*!
+-  Return the next unread packet, or an invalid QPacket instance if no packets
+-  are available.  This method does NOT block.
+-  */
+-QPacket QPacketProtocol::read()
+-{
+-    if (0 == d->packets.count())
+-        return QPacket();
+-
+-    QPacket rv(d->packets.at(0));
+-    d->packets.removeFirst();
+-    return rv;
+-}
+-
+-/*
+-   Returns the difference between msecs and elapsed. If msecs is -1,
+-   however, -1 is returned.
+-*/
+-static int qt_timeout_value(int msecs, int elapsed)
+-{
+-    if (msecs == -1)
+-        return -1;
+-
+-    int timeout = msecs - elapsed;
+-    return timeout < 0 ? 0 : timeout;
+-}
+-
+-/*!
+-  This function locks until a new packet is available for reading and the
+-  \l{QIODevice::}{readyRead()} signal has been emitted. The function
+-  will timeout after \a msecs milliseconds; the default timeout is
+-  30000 milliseconds.
+-
+-  The function returns true if the readyRead() signal is emitted and
+-  there is new data available for reading; otherwise it returns false
+-  (if an error occurred or the operation timed out).
+-  */
+-
+-bool QPacketProtocol::waitForReadyRead(int msecs)
+-{
+-    if (!d->packets.isEmpty())
+-        return true;
+-
+-    QElapsedTimer stopWatch;
+-    stopWatch.start();
+-
+-    d->waitingForPacket = true;
+-    do {
+-        if (!d->dev->waitForReadyRead(msecs))
+-            return false;
+-        if (!d->waitingForPacket)
+-            return true;
+-        msecs = qt_timeout_value(msecs, stopWatch.elapsed());
+-    } while (true);
+-}
+-
+-/*!
+-  Return the QIODevice passed to the QPacketProtocol constructor.
+-*/
+-QIODevice *QPacketProtocol::device()
+-{
+-    return d->dev;
+-}
+-
+-/*!
+-  \fn void QPacketProtocol::readyRead()
+-
+-  Emitted whenever a new packet is received.  Applications may use
+-  QPacketProtocol::read() to retrieve this packet.
+- */
+-
+-/*!
+-  \fn void QPacketProtocol::invalidPacket()
+-
+-  A packet larger than the maximum allowable packet size was received.  The
+-  packet will be discarded and, as it indicates corruption in the protocol, no
+-  further packets will be received.
+- */
+-
+-/*!
+-  \fn void QPacketProtocol::packetWritten()
+-
+-  Emitted each time a packet is completing written to the device.  This signal
+-  may be used for communications flow control.
+- */
+-
+-/*!
+-  \class QPacket
+-  \internal
+-
+-  \brief The QPacket class encapsulates an unfragmentable packet of data to be
+-  transmitted by QPacketProtocol.
+-
+-  The QPacket class works together with QPacketProtocol to make it simple to
+-  send arbitrary sized data "packets" across fragmented transports such as TCP
+-  and UDP.
+-
+-  QPacket provides a QDataStream interface to an unfragmentable packet.
+-  Applications should construct a QPacket, propagate it with data and then
+-  transmit it over a QPacketProtocol instance.  For example:
+-  \code
+-  QPacketProtocol protocol(...);
+-
+-  QPacket myPacket;
+-  myPacket << "Hello world!" << 123;
+-  protocol.send(myPacket);
+-  \endcode
+-
+-  As long as both ends of the connection are using the QPacketProtocol class,
+-  the data within this packet will be delivered unfragmented at the other end,
+-  ready for extraction.
+-
+-  \code
+-  QByteArray greeting;
+-  int count;
+-
+-  QPacket myPacket = protocol.read();
+-
+-  myPacket >> greeting >> count;
+-  \endcode
+-
+-  Only packets returned from QPacketProtocol::read() may be read from.  QPacket
+-  instances constructed by directly by applications are for transmission only
+-  and are considered "write only".  Attempting to read data from them will
+-  result in undefined behavior.
+-
+-  \ingroup io
+-  \sa QPacketProtocol
+- */
+-
+-/*!
+-  Constructs an empty write-only packet.
+-  */
+-QPacket::QPacket()
+-    : QDataStream(), buf(0)
+-{
+-    buf = new QBuffer(&b);
+-    buf->open(QIODevice::WriteOnly);
+-    setDevice(buf);
+-    setVersion(QDataStream::Qt_4_7);
+-}
+-
+-/*!
+-  Destroys the QPacket instance.
+-  */
+-QPacket::~QPacket()
+-{
+-    if (buf) {
+-        delete buf;
+-        buf = 0;
+-    }
+-}
+-
+-/*!
+-  Creates a copy of \a other.  The initial stream positions are shared, but the
+-  two packets are otherwise independent.
+- */
+-QPacket::QPacket(const QPacket & other)
+-    : QDataStream(), b(other.b), buf(0)
+-{
+-    buf = new QBuffer(&b);
+-    buf->open(other.buf->openMode());
+-    setDevice(buf);
+-}
+-
+-/*!
+-  \internal
+-  */
+-QPacket::QPacket(const QByteArray & ba)
+-    : QDataStream(), b(ba), buf(0)
+-{
+-    buf = new QBuffer(&b);
+-    buf->open(QIODevice::ReadOnly);
+-    setDevice(buf);
+-}
+-
+-/*!
+-  Returns true if this packet is empty - that is, contains no data.
+-  */
+-bool QPacket::isEmpty() const
+-{
+-    return b.isEmpty();
+-}
+-
+-/*!
+-  Returns raw packet data.
+-  */
+-QByteArray QPacket::data() const
+-{
+-    return b;
+-}
+-
+-/*!
+-  Clears data in the packet.  This is useful for reusing one writable packet.
+-  For example
+-  \code
+-  QPacketProtocol protocol(...);
+-
+-  QPacket packet;
+-
+-  packet << "Hello world!" << 123;
+-  protocol.send(packet);
+-
+-  packet.clear();
+-  packet << "Goodbyte world!" << 789;
+-  protocol.send(packet);
+-  \endcode
+- */
+-void QPacket::clear()
+-{
+-    QBuffer::OpenMode oldMode = buf->openMode();
+-    buf->close();
+-    b.clear();
+-    buf->setBuffer(&b); // reset QBuffer internals with new size of b.
+-    buf->open(oldMode);
+-}
+-
+-/*!
+-  \class QPacketAutoSend
+-  \internal
+-
+-  \internal
+-  */
+-QPacketAutoSend::QPacketAutoSend(QPacketProtocol *_p)
+-    : QPacket(), p(_p)
+-{
+-}
+-
+-QPacketAutoSend::~QPacketAutoSend()
+-{
+-    if (!b.isEmpty())
+-        p->send(*this);
+-}
+-
+-QT_END_NAMESPACE
+-
+-#include <qpacketprotocol.moc>
+diff --git a/src/qml/debugger/qpacketprotocol_p.h b/src/qml/debugger/qpacketprotocol_p.h
+deleted file mode 100644
+index c6123d2..0000000
+--- a/src/qml/debugger/qpacketprotocol_p.h
++++ /dev/null
+@@ -1,137 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the QtQml module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QPACKETPROTOCOL_H
+-#define QPACKETPROTOCOL_H
+-
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists purely as an
+-// implementation detail.  This header file may change from version to
+-// version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+-#include <QtCore/qobject.h>
+-#include <QtCore/qdatastream.h>
+-
+-#include <private/qtqmlglobal_p.h>
+-
+-QT_BEGIN_HEADER
+-
+-QT_BEGIN_NAMESPACE
+-
+-
+-class QIODevice;
+-class QBuffer;
+-class QPacket;
+-class QPacketAutoSend;
+-class QPacketProtocolPrivate;
+-
+-class Q_QML_PRIVATE_EXPORT QPacketProtocol : public QObject
+-{
+-    Q_OBJECT
+-public:
+-    explicit QPacketProtocol(QIODevice *dev, QObject *parent = 0);
+-    virtual ~QPacketProtocol();
+-
+-    qint32 maximumPacketSize() const;
+-    qint32 setMaximumPacketSize(qint32);
+-
+-    QPacketAutoSend send();
+-    void send(const QPacket &);
+-
+-    qint64 packetsAvailable() const;
+-    QPacket read();
+-
+-    bool waitForReadyRead(int msecs = 3000);
+-
+-    void clear();
+-
+-    QIODevice *device();
+-
+-Q_SIGNALS:
+-    void readyRead();
+-    void invalidPacket();
+-    void packetWritten();
+-
+-private:
+-    QPacketProtocolPrivate *d;
+-};
+-
+-
+-class Q_QML_PRIVATE_EXPORT QPacket : public QDataStream
+-{
+-public:
+-    QPacket();
+-    QPacket(const QPacket &);
+-    virtual ~QPacket();
+-
+-    void clear();
+-    bool isEmpty() const;
+-    QByteArray data() const;
+-
+-protected:
+-    friend class QPacketProtocol;
+-    QPacket(const QByteArray &ba);
+-    QByteArray b;
+-    QBuffer *buf;
+-};
+-
+-class Q_QML_PRIVATE_EXPORT QPacketAutoSend : public QPacket
+-{
+-public:
+-    virtual ~QPacketAutoSend();
+-
+-private:
+-    friend class QPacketProtocol;
+-    QPacketAutoSend(QPacketProtocol *);
+-    QPacketProtocol *p;
+-};
+-
+-QT_END_NAMESPACE
+-
+-QT_END_HEADER
+-
+-#endif
+diff --git a/tests/auto/qml/debugger/debugger.pro b/tests/auto/qml/debugger/debugger.pro
+index 7669aaa..81ca29a 100644
+--- a/tests/auto/qml/debugger/debugger.pro
++++ b/tests/auto/qml/debugger/debugger.pro
+@@ -1,9 +1,7 @@
+ TEMPLATE = subdirs
+ 
+-PRIVATETESTS += \
++PUBLICTESTS += \
+     qqmlenginedebugservice \
+-    qqmldebugclient \
+-    qqmldebugservice \
+     qqmldebugjs \
+     qqmlinspector \
+     qqmlprofilerservice \
+@@ -11,6 +9,12 @@ PRIVATETESTS += \
+     qv8profilerservice \
+     qdebugmessageservice
+ 
++PRIVATETESTS += \
++    qqmldebugclient \
++    qqmldebugservice
++
++SUBDIRS += $$PUBLICTESTS
++
+ contains(QT_CONFIG, private_tests) {
+     SUBDIRS += $$PRIVATETESTS
+ }
+diff --git a/tests/auto/qml/debugger/qdebugmessageservice/qdebugmessageservice.pro b/tests/auto/qml/debugger/qdebugmessageservice/qdebugmessageservice.pro
+index 4b5bf60..64f7274 100644
+--- a/tests/auto/qml/debugger/qdebugmessageservice/qdebugmessageservice.pro
++++ b/tests/auto/qml/debugger/qdebugmessageservice/qdebugmessageservice.pro
+@@ -1,6 +1,6 @@
+ CONFIG += testcase
+ TARGET = tst_qdebugmessageservice
+-QT += network qml-private testlib
++QT += qml network testlib
+ macx:CONFIG -= app_bundle
+ 
+ SOURCES +=     tst_qdebugmessageservice.cpp
+diff --git a/tests/auto/qml/debugger/qpacketprotocol/qpacketprotocol.pro b/tests/auto/qml/debugger/qpacketprotocol/qpacketprotocol.pro
+index f631929..e6869fe 100644
+--- a/tests/auto/qml/debugger/qpacketprotocol/qpacketprotocol.pro
++++ b/tests/auto/qml/debugger/qpacketprotocol/qpacketprotocol.pro
+@@ -8,4 +8,4 @@ INCLUDEPATH += ../shared
+ include(../shared/debugutil.pri)
+ 
+ CONFIG += parallel_test
+-QT += qml-private network testlib
++QT += qml network testlib
+diff --git a/tests/auto/qml/debugger/qpacketprotocol/tst_qpacketprotocol.cpp b/tests/auto/qml/debugger/qpacketprotocol/tst_qpacketprotocol.cpp
+index 4a6efb4..8a8c0e5 100644
+--- a/tests/auto/qml/debugger/qpacketprotocol/tst_qpacketprotocol.cpp
++++ b/tests/auto/qml/debugger/qpacketprotocol/tst_qpacketprotocol.cpp
+@@ -46,7 +46,7 @@
+ #include <QDebug>
+ #include <QBuffer>
+ 
+-#include <private/qpacketprotocol_p.h>
++#include "../../../../../src/plugins/qmltooling/shared/qpacketprotocol.h"
+ 
+ #include "debugutil_p.h"
+ 
+diff --git a/tests/auto/qml/debugger/qqmldebugclient/qqmldebugclient.pro b/tests/auto/qml/debugger/qqmldebugclient/qqmldebugclient.pro
+index 22a4df7..60355f1 100644
+--- a/tests/auto/qml/debugger/qqmldebugclient/qqmldebugclient.pro
++++ b/tests/auto/qml/debugger/qqmldebugclient/qqmldebugclient.pro
+@@ -2,7 +2,10 @@ CONFIG += testcase
+ TARGET = tst_qqmldebugclient
+ macx:CONFIG -= app_bundle
+ 
+-SOURCES += tst_qqmldebugclient.cpp
++HEADERS += ../shared/qqmldebugtestservice.h
++
++SOURCES += tst_qqmldebugclient.cpp \
++           ../shared/qqmldebugtestservice.cpp
+ 
+ INCLUDEPATH += ../shared
+ include(../shared/debugutil.pri)
+diff --git a/tests/auto/qml/debugger/qqmldebugclient/tst_qqmldebugclient.cpp b/tests/auto/qml/debugger/qqmldebugclient/tst_qqmldebugclient.cpp
+index 1682913..2d52ea9 100644
+--- a/tests/auto/qml/debugger/qqmldebugclient/tst_qqmldebugclient.cpp
++++ b/tests/auto/qml/debugger/qqmldebugclient/tst_qqmldebugclient.cpp
+@@ -48,6 +48,7 @@
+ #include <QtQml/qqmlengine.h>
+ 
+ #include "debugutil_p.h"
++#include "qqmldebugtestservice.h"
+ 
+ #define PORT 13770
+ #define STR_PORT "13770"
+diff --git a/tests/auto/qml/debugger/qqmldebugjs/qqmldebugjs.pro b/tests/auto/qml/debugger/qqmldebugjs/qqmldebugjs.pro
+index 7c3a2ea..c06fd84 100644
+--- a/tests/auto/qml/debugger/qqmldebugjs/qqmldebugjs.pro
++++ b/tests/auto/qml/debugger/qqmldebugjs/qqmldebugjs.pro
+@@ -1,6 +1,6 @@
+ CONFIG += testcase
+ TARGET = tst_qqmldebugjs
+-QT += qml-private testlib
++QT += qml testlib
+ macx:CONFIG -= app_bundle
+ 
+ SOURCES +=     tst_qqmldebugjs.cpp
+diff --git a/tests/auto/qml/debugger/qqmldebugservice/qqmldebugservice.pro b/tests/auto/qml/debugger/qqmldebugservice/qqmldebugservice.pro
+index dc20396..bbf05b1 100644
+--- a/tests/auto/qml/debugger/qqmldebugservice/qqmldebugservice.pro
++++ b/tests/auto/qml/debugger/qqmldebugservice/qqmldebugservice.pro
+@@ -2,7 +2,11 @@ CONFIG += testcase
+ TARGET = tst_qqmldebugservice
+ macx:CONFIG -= app_bundle
+ 
+-SOURCES += tst_qqmldebugservice.cpp
++HEADERS += ../shared/qqmldebugtestservice.h
++
++SOURCES += tst_qqmldebugservice.cpp \
++           ../shared/qqmldebugtestservice.cpp
++
+ INCLUDEPATH += ../shared
+ include(../../../shared/util.pri)
+ include(../shared/debugutil.pri)
+diff --git a/tests/auto/qml/debugger/qqmldebugservice/tst_qqmldebugservice.cpp b/tests/auto/qml/debugger/qqmldebugservice/tst_qqmldebugservice.cpp
+index 6e14c03..a75a122 100644
+--- a/tests/auto/qml/debugger/qqmldebugservice/tst_qqmldebugservice.cpp
++++ b/tests/auto/qml/debugger/qqmldebugservice/tst_qqmldebugservice.cpp
+@@ -47,11 +47,10 @@
+ 
+ #include <QtQml/qqmlengine.h>
+ 
+-#include <private/qqmldebugservice_p.h>
+-
+ #include "../../../shared/util.h"
+ #include "debugutil_p.h"
+ #include "qqmldebugclient.h"
++#include "qqmldebugtestservice.h"
+ 
+ #define PORT 13769
+ #define STR_PORT "13769"
+diff --git a/tests/auto/qml/debugger/qqmlinspector/tst_qqmlinspector.pro b/tests/auto/qml/debugger/qqmlinspector/tst_qqmlinspector.pro
+index b4ca60b..6d47581 100644
+--- a/tests/auto/qml/debugger/qqmlinspector/tst_qqmlinspector.pro
++++ b/tests/auto/qml/debugger/qqmlinspector/tst_qqmlinspector.pro
+@@ -9,4 +9,4 @@ include(../shared/debugutil.pri)
+ 
+ CONFIG += parallel_test declarative_debug
+ 
+-QT += qml-private testlib
++QT += qml testlib
+diff --git a/tests/auto/qml/debugger/qqmlprofilerservice/qqmlprofilerservice.pro b/tests/auto/qml/debugger/qqmlprofilerservice/qqmlprofilerservice.pro
+index 2bf43c9..a83590c 100644
+--- a/tests/auto/qml/debugger/qqmlprofilerservice/qqmlprofilerservice.pro
++++ b/tests/auto/qml/debugger/qqmlprofilerservice/qqmlprofilerservice.pro
+@@ -12,4 +12,4 @@ OTHER_FILES += data/test.qml
+ 
+ CONFIG += parallel_test declarative_debug
+ 
+-QT += core-private v8-private qml-private testlib
++QT += core qml testlib
+diff --git a/tests/auto/qml/debugger/qqmlprofilerservice/tst_qqmlprofilerservice.cpp b/tests/auto/qml/debugger/qqmlprofilerservice/tst_qqmlprofilerservice.cpp
+index 2b33ab3..972c3ac 100644
+--- a/tests/auto/qml/debugger/qqmlprofilerservice/tst_qqmlprofilerservice.cpp
++++ b/tests/auto/qml/debugger/qqmlprofilerservice/tst_qqmlprofilerservice.cpp
+@@ -42,7 +42,6 @@
+ #include <qtest.h>
+ #include <QLibraryInfo>
+ 
+-#include "QtQml/private/qqmlprofilerservice_p.h"
+ #include "debugutil_p.h"
+ #include "qqmldebugclient.h"
+ #include "../../../shared/util.h"
+@@ -50,11 +49,59 @@
+ #define PORT 13773
+ #define STR_PORT "13773"
+ 
++struct QQmlProfilerData
++{
++    qint64 time;
++    int messageType;
++    int detailType;
++
++    //###
++    QString detailData; //used by RangeData and RangeLocation
++    int line;           //used by RangeLocation
++    int column;         //used by RangeLocation
++    int framerate;      //used by animation events
++    int animationcount; //used by animation events
++
++    QByteArray toByteArray() const;
++};
++
+ class QQmlProfilerClient : public QQmlDebugClient
+ {
+     Q_OBJECT
+ 
+ public:
++    enum Message {
++        Event,
++        RangeStart,
++        RangeData,
++        RangeLocation,
++        RangeEnd,
++        Complete, // end of transmission
++
++        MaximumMessage
++    };
++
++    enum EventType {
++        FramePaint,
++        Mouse,
++        Key,
++        AnimationFrame,
++        EndTrace,
++        StartTrace,
++
++        MaximumEventType
++    };
++
++    enum RangeType {
++        Painting,
++        Compiling,
++        Creating,
++        Binding,            //running a binding
++        HandlingSignal,     //running a signal handler
++
++        MaximumRangeType
++    };
++
+     QQmlProfilerClient(QQmlDebugConnection *connection)
+         : QQmlDebugClient(QLatin1String("CanvasFrameRate"), connection)
+     {
+@@ -123,21 +170,21 @@ void QQmlProfilerClient::messageReceived(const QByteArray &message)
+     QVERIFY(data.time >= -1);
+ 
+     switch (data.messageType) {
+-    case (QQmlProfilerService::Event): {
++    case (QQmlProfilerClient::Event): {
+         stream >> data.detailType;
+ 
+         switch (data.detailType) {
+-        case QQmlProfilerService::AnimationFrame: {
++        case QQmlProfilerClient::AnimationFrame: {
+             stream >> data.framerate >> data.animationcount;
+             QVERIFY(data.framerate != -1);
+             QVERIFY(data.animationcount != -1);
+             break;
+         }
+-        case QQmlProfilerService::FramePaint:
+-        case QQmlProfilerService::Mouse:
+-        case QQmlProfilerService::Key:
+-        case QQmlProfilerService::StartTrace:
+-        case QQmlProfilerService::EndTrace:
++        case QQmlProfilerClient::FramePaint:
++        case QQmlProfilerClient::Mouse:
++        case QQmlProfilerClient::Key:
++        case QQmlProfilerClient::StartTrace:
++        case QQmlProfilerClient::EndTrace:
+             break;
+         default: {
+             QString failMsg = QString("Unknown event type:") + data.detailType;
+@@ -147,28 +194,28 @@ void QQmlProfilerClient::messageReceived(const QByteArray &message)
+         }
+         break;
+     }
+-    case QQmlProfilerService::Complete: {
++    case QQmlProfilerClient::Complete: {
+         emit complete();
+         return;
+     }
+-    case QQmlProfilerService::RangeStart: {
++    case QQmlProfilerClient::RangeStart: {
+         stream >> data.detailType;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerService::MaximumRangeType);
++        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerClient::MaximumRangeType);
+         break;
+     }
+-    case QQmlProfilerService::RangeEnd: {
++    case QQmlProfilerClient::RangeEnd: {
+         stream >> data.detailType;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerService::MaximumRangeType);
++        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerClient::MaximumRangeType);
+         break;
+     }
+-    case QQmlProfilerService::RangeData: {
++    case QQmlProfilerClient::RangeData: {
+         stream >> data.detailType >> data.detailData;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerService::MaximumRangeType);
++        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerClient::MaximumRangeType);
+         break;
+     }
+-    case QQmlProfilerService::RangeLocation: {
++    case QQmlProfilerClient::RangeLocation: {
+         stream >> data.detailType >> data.detailData >> data.line >> data.column;
+-        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerService::MaximumRangeType);
++        QVERIFY(data.detailType >= 0 && data.detailType < QQmlProfilerClient::MaximumRangeType);
+         QVERIFY(data.line >= -2);
+         break;
+     }
+@@ -229,12 +276,12 @@ void tst_QQmlProfilerService::blockingConnectWithTraceEnabled()
+ 
+     QVERIFY(m_client->traceMessages.count());
+     // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerService::StartTrace);
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerClient::StartTrace);
+ 
+     // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerService::EndTrace);
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerClient::EndTrace);
+ }
+ 
+ void tst_QQmlProfilerService::blockingConnectWithTraceDisabled()
+@@ -254,12 +301,12 @@ void tst_QQmlProfilerService::blockingConnectWithTraceDisabled()
+     QVERIFY(m_client->traceMessages.count());
+ 
+     // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerService::StartTrace);
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerClient::StartTrace);
+ 
+     // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerService::EndTrace);
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerClient::EndTrace);
+ }
+ 
+ void tst_QQmlProfilerService::nonBlockingConnect()
+@@ -276,12 +323,12 @@ void tst_QQmlProfilerService::nonBlockingConnect()
+     }
+ 
+     // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerService::StartTrace);
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerClient::StartTrace);
+ 
+     // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerService::EndTrace);
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerClient::EndTrace);
+ }
+ 
+ void tst_QQmlProfilerService::profileOnExit()
+@@ -298,12 +345,12 @@ void tst_QQmlProfilerService::profileOnExit()
+     }
+ 
+     // must start with "StartTrace"
+-    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerService::StartTrace);
++    QCOMPARE(m_client->traceMessages.first().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.first().detailType, (int)QQmlProfilerClient::StartTrace);
+ 
+     // must end with "EndTrace"
+-    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerService::Event);
+-    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerService::EndTrace);
++    QCOMPARE(m_client->traceMessages.last().messageType, (int)QQmlProfilerClient::Event);
++    QCOMPARE(m_client->traceMessages.last().detailType, (int)QQmlProfilerClient::EndTrace);
+ }
+ 
+ QTEST_MAIN(tst_QQmlProfilerService)
+diff --git a/tests/auto/qml/debugger/qv8profilerservice/qv8profilerservice.pro b/tests/auto/qml/debugger/qv8profilerservice/qv8profilerservice.pro
+index a8dd634..5088953 100644
+--- a/tests/auto/qml/debugger/qv8profilerservice/qv8profilerservice.pro
++++ b/tests/auto/qml/debugger/qv8profilerservice/qv8profilerservice.pro
+@@ -12,4 +12,4 @@ OTHER_FILES += data/test.qml
+ 
+ CONFIG += parallel_test declarative_debug
+ 
+-QT += qml-private testlib
++QT += qml testlib
+diff --git a/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp b/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+index 7b9cda9..497d544 100644
+--- a/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
++++ b/tests/auto/qml/debugger/qv8profilerservice/tst_qv8profilerservice.cpp
+@@ -42,7 +42,6 @@
+ #include <qtest.h>
+ #include <QLibraryInfo>
+ 
+-#include "QtQml/private/qv8profilerservice_p.h"
+ #include "debugutil_p.h"
+ #include "qqmldebugclient.h"
+ #include "../../../shared/util.h"
+@@ -50,11 +49,34 @@
+ #define PORT 13774
+ #define STR_PORT "13774"
+ 
++struct QV8ProfilerData
++{
++    int messageType;
++    QString filename;
++    QString functionname;
++    int lineNumber;
++    double totalTime;
++    double selfTime;
++    int treeLevel;
++
++    QByteArray toByteArray() const;
++};
++
+ class QV8ProfilerClient : public QQmlDebugClient
+ {
+     Q_OBJECT
+ 
+ public:
++    enum MessageType {
++        V8Entry,
++        V8Complete,
++        V8SnapshotChunk,
++        V8SnapshotComplete,
++        V8Started,
++
++        V8MaximumMessage
++    };
++
+     QV8ProfilerClient(QQmlDebugConnection *connection)
+         : QQmlDebugClient(QLatin1String("V8Profiler"), connection)
+     {
+@@ -139,28 +161,28 @@ void QV8ProfilerClient::messageReceived(const QByteArray &message)
+     stream >> messageType;
+ 
+     QVERIFY(messageType >= 0);
+-    QVERIFY(messageType < QV8ProfilerService::V8MaximumMessage);
++    QVERIFY(messageType < QV8ProfilerClient::V8MaximumMessage);
+ 
+     switch (messageType) {
+-    case QV8ProfilerService::V8Entry: {
++    case QV8ProfilerClient::V8Entry: {
+         QV8ProfilerData entry;
+         stream >> entry.filename >> entry.functionname >> entry.lineNumber >> entry.totalTime >> entry.selfTime >> entry.treeLevel;
+         traceMessages.append(entry);
+         break;
+     }
+-    case QV8ProfilerService::V8Complete:
++    case QV8ProfilerClient::V8Complete:
+         emit complete();
+         break;
+-    case QV8ProfilerService::V8SnapshotChunk: {
++    case QV8ProfilerClient::V8SnapshotChunk: {
+         QByteArray json;
+         stream >> json;
+         snapshotMessages.append(json);
+         break;
+     }
+-    case QV8ProfilerService::V8SnapshotComplete:
++    case QV8ProfilerClient::V8SnapshotComplete:
+         emit snapshot();
+         break;
+-    case QV8ProfilerService::V8Started:
++    case QV8ProfilerClient::V8Started:
+         emit started();
+         break;
+     default:
+diff --git a/tests/auto/qml/debugger/shared/debugutil.cpp b/tests/auto/qml/debugger/shared/debugutil.cpp
+index 3d2f460..ac9fa5f 100644
+--- a/tests/auto/qml/debugger/shared/debugutil.cpp
++++ b/tests/auto/qml/debugger/shared/debugutil.cpp
+@@ -55,23 +55,6 @@ bool QQmlDebugTest::waitForSignal(QObject *receiver, const char *member, int tim
+     return timer.isActive();
+ }
+ 
+-QQmlDebugTestService::QQmlDebugTestService(const QString &s, float version, QObject *parent)
+-    : QQmlDebugService(s, version, parent)
+-{
+-    registerService();
+-}
+-
+-void QQmlDebugTestService::messageReceived(const QByteArray &ba)
+-{
+-    sendMessage(ba);
+-}
+-
+-void QQmlDebugTestService::stateChanged(State)
+-{
+-    emit stateHasChanged();
+-}
+-
+-
+ QQmlDebugTestClient::QQmlDebugTestClient(const QString &s, QQmlDebugConnection *c)
+     : QQmlDebugClient(s, c)
+ {
+diff --git a/tests/auto/qml/debugger/shared/debugutil.pri b/tests/auto/qml/debugger/shared/debugutil.pri
+index b74f6b0..ddce647 100644
+--- a/tests/auto/qml/debugger/shared/debugutil.pri
++++ b/tests/auto/qml/debugger/shared/debugutil.pri
+@@ -1,9 +1,10 @@
+-QT += core-private
+-
+ HEADERS += $$PWD/debugutil_p.h \
+            $$PWD/qqmldebugclient.h \
+-           $$PWD/qqmlenginedebug_p.h
++           $$PWD/qqmlenginedebug_p.h \
++           $$PWD/../../../../../src/plugins/qmltooling/shared/qpacketprotocol.h
++
+ SOURCES += $$PWD/debugutil.cpp \
+            $$PWD/qqmldebugclient.cpp \
+-           $$PWD/qqmlenginedebug.cpp
++           $$PWD/qqmlenginedebug.cpp \
++           $$PWD/../../../../../src/plugins/qmltooling/shared/qpacketprotocol.cpp
+ 
+diff --git a/tests/auto/qml/debugger/shared/debugutil_p.h b/tests/auto/qml/debugger/shared/debugutil_p.h
+index 177c712..2ea295b 100644
+--- a/tests/auto/qml/debugger/shared/debugutil_p.h
++++ b/tests/auto/qml/debugger/shared/debugutil_p.h
+@@ -52,7 +52,6 @@
+ #include <QtQml/qqmlengine.h>
+ 
+ #include "qqmldebugclient.h"
+-#include <private/qqmldebugservice_p.h>
+ 
+ class QQmlDebugTest
+ {
+@@ -60,20 +59,6 @@ public:
+     static bool waitForSignal(QObject *receiver, const char *member, int timeout = 5000);
+ };
+ 
+-class QQmlDebugTestService : public QQmlDebugService
+-{
+-    Q_OBJECT
+-public:
+-    QQmlDebugTestService(const QString &s, float version = 1, QObject *parent = 0);
+-
+-signals:
+-    void stateHasChanged();
+-
+-protected:
+-    virtual void messageReceived(const QByteArray &ba);
+-    virtual void stateChanged(State state);
+-};
+-
+ class QQmlDebugTestClient : public QQmlDebugClient
+ {
+     Q_OBJECT
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugclient.cpp b/tests/auto/qml/debugger/shared/qqmldebugclient.cpp
+index 0453f88..50feb95 100644
+--- a/tests/auto/qml/debugger/shared/qqmldebugclient.cpp
++++ b/tests/auto/qml/debugger/shared/qqmldebugclient.cpp
+@@ -40,8 +40,7 @@
+ ****************************************************************************/
+ 
+ #include "qqmldebugclient.h"
+-
+-#include <private/qpacketprotocol_p.h>
++#include "../../../../../src/plugins/qmltooling/shared/qpacketprotocol.h"
+ 
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qstringlist.h>
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugclient.h b/tests/auto/qml/debugger/shared/qqmldebugclient.h
+index 1b05e86..0f140a1 100644
+--- a/tests/auto/qml/debugger/shared/qqmldebugclient.h
++++ b/tests/auto/qml/debugger/shared/qqmldebugclient.h
+@@ -44,8 +44,6 @@
+ 
+ #include <QtNetwork/qtcpsocket.h>
+ 
+-#include <private/qtqmlglobal_p.h>
+-
+ class QQmlDebugConnectionPrivate;
+ class QQmlDebugConnection : public QIODevice
+ {
+@@ -84,7 +82,6 @@ class QQmlDebugClientPrivate;
+ class QQmlDebugClient : public QObject
+ {
+     Q_OBJECT
+-    Q_DECLARE_PRIVATE(QQmlDebugClient)
+     Q_DISABLE_COPY(QQmlDebugClient)
+ 
+ public:
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp b/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp
+new file mode 100644
+index 0000000..1c8afd8
+--- /dev/null
++++ b/tests/auto/qml/debugger/shared/qqmldebugtestservice.cpp
+@@ -0,0 +1,58 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qqmldebugtestservice.h"
++
++QQmlDebugTestService::QQmlDebugTestService(const QString &s, float version, QObject *parent)
++    : QQmlDebugService(s, version, parent)
++{
++    registerService();
++}
++
++void QQmlDebugTestService::messageReceived(const QByteArray &ba)
++{
++    sendMessage(ba);
++}
++
++void QQmlDebugTestService::stateChanged(State)
++{
++    emit stateHasChanged();
++}
+diff --git a/tests/auto/qml/debugger/shared/qqmldebugtestservice.h b/tests/auto/qml/debugger/shared/qqmldebugtestservice.h
+new file mode 100644
+index 0000000..14fda55
+--- /dev/null
++++ b/tests/auto/qml/debugger/shared/qqmldebugtestservice.h
+@@ -0,0 +1,62 @@
++
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QQMLDEBUGTESTSERVICE_H
++#define QQMLDEBUGTESTSERVICE_H
++
++#include <private/qqmldebugservice_p.h>
++
++class QQmlDebugTestService : public QQmlDebugService
++{
++    Q_OBJECT
++public:
++    QQmlDebugTestService(const QString &s, float version = 1, QObject *parent = 0);
++
++signals:
++    void stateHasChanged();
++
++protected:
++    virtual void messageReceived(const QByteArray &ba);
++    virtual void stateChanged(State state);
++};
++
++#endif // QQMLDEBUGTESTSERVICE_H
+diff --git a/tests/auto/qml/debugger/shared/qqmlenginedebug.cpp b/tests/auto/qml/debugger/shared/qqmlenginedebug.cpp
+index 8a46c76..bf763c8 100644
+--- a/tests/auto/qml/debugger/shared/qqmlenginedebug.cpp
++++ b/tests/auto/qml/debugger/shared/qqmlenginedebug.cpp
+@@ -43,9 +43,42 @@
+ 
+ #include "qqmldebugclient.h"
+ 
+-#include <private/qqmlenginedebugservice_p.h>
++struct QmlObjectData {
++    QUrl url;
++    int lineNumber;
++    int columnNumber;
++    QString idString;
++    QString objectName;
++    QString objectType;
++    int objectId;
++    int contextId;
++};
++
++QDataStream &operator>>(QDataStream &ds, QmlObjectData &data)
++{
++    ds >> data.url >> data.lineNumber >> data.columnNumber >> data.idString
++       >> data.objectName >> data.objectType >> data.objectId >> data.contextId;
++    return ds;
++}
++
++struct QmlObjectProperty {
++    enum Type { Unknown, Basic, Object, List, SignalProperty };
++    Type type;
++    QString name;
++    QVariant value;
++    QString valueTypeName;
++    QString binding;
++    bool hasNotifySignal;
++};
+ 
+-#include <QtCore/private/qobject_p.h>
++QDataStream &operator>>(QDataStream &ds, QmlObjectProperty &data)
++{
++    int type;
++    ds >> type >> data.name >> data.value >> data.valueTypeName
++       >> data.binding >> data.hasNotifySignal;
++    data.type = (QmlObjectProperty::Type)type;
++    return ds;
++}
+ 
+ class QQmlEngineDebugClient : public QQmlDebugClient
+ {
+@@ -61,16 +94,16 @@ private:
+     friend class QQmlEngineDebugPrivate;
+ };
+ 
+-class QQmlEngineDebugPrivate : public QObjectPrivate
++class QQmlEngineDebugPrivate
+ {
+-    Q_DECLARE_PUBLIC(QQmlEngineDebug)
+ public:
+-    QQmlEngineDebugPrivate(QQmlDebugConnection *);
++    QQmlEngineDebugPrivate(QQmlEngineDebug *, QQmlDebugConnection *);
+     ~QQmlEngineDebugPrivate();
+ 
+     void stateChanged(QQmlEngineDebug::State status);
+     void message(const QByteArray &);
+ 
++    QQmlEngineDebug *q;
+     QQmlEngineDebugClient *client;
+     int nextId;
+     int getId();
+@@ -110,8 +143,9 @@ void QQmlEngineDebugClient::messageReceived(const QByteArray &data)
+         priv->message(data);
+ }
+ 
+-QQmlEngineDebugPrivate::QQmlEngineDebugPrivate(QQmlDebugConnection *c)
+-    : client(new QQmlEngineDebugClient(c, this)), nextId(0)
++QQmlEngineDebugPrivate::QQmlEngineDebugPrivate(QQmlEngineDebug *p, QQmlDebugConnection *c)
++    : q(p),
++      client(new QQmlEngineDebugClient(c, this)), nextId(0)
+ {
+ }
+ 
+@@ -164,7 +198,7 @@ int QQmlEngineDebugPrivate::getId()
+ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugEnginesQuery *q)
+ {
+     if (c && q) {
+-        QQmlEngineDebugPrivate *p = (QQmlEngineDebugPrivate *)QObjectPrivate::get(c);
++        QQmlEngineDebugPrivate *p = c->getPrivate();
+         p->enginesQuery.remove(q->m_queryId);
+     }
+ }
+@@ -173,7 +207,7 @@ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c,
+                                             QQmlDebugRootContextQuery *q)
+ {
+     if (c && q) {
+-        QQmlEngineDebugPrivate *p = (QQmlEngineDebugPrivate *)QObjectPrivate::get(c);
++        QQmlEngineDebugPrivate *p = c->getPrivate();
+         p->rootContextQuery.remove(q->m_queryId);
+     }
+ }
+@@ -181,7 +215,7 @@ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c,
+ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugObjectQuery *q)
+ {
+     if (c && q) {
+-        QQmlEngineDebugPrivate *p = (QQmlEngineDebugPrivate *)QObjectPrivate::get(c);
++        QQmlEngineDebugPrivate *p = c->getPrivate();
+         p->objectQuery.remove(q->m_queryId);
+     }
+ }
+@@ -189,7 +223,7 @@ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugObjectQuery *q)
+ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugExpressionQuery *q)
+ {
+     if (c && q) {
+-        QQmlEngineDebugPrivate *p = (QQmlEngineDebugPrivate *)QObjectPrivate::get(c);
++        QQmlEngineDebugPrivate *p = c->getPrivate();
+         p->expressionQuery.remove(q->m_queryId);
+     }
+ }
+@@ -197,7 +231,7 @@ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugExpressionQuery
+ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugWatch *w)
+ {
+     if (c && w) {
+-        QQmlEngineDebugPrivate *p = (QQmlEngineDebugPrivate *)QObjectPrivate::get(c);
++        QQmlEngineDebugPrivate *p = c->getPrivate();
+         p->watched.remove(w->m_queryId);
+     }
+ }
+@@ -205,7 +239,7 @@ void QQmlEngineDebugPrivate::remove(QQmlEngineDebug *c, QQmlDebugWatch *w)
+ void QQmlEngineDebugPrivate::decode(QDataStream &ds, QQmlDebugObjectReference &o,
+                                             bool simple)
+ {
+-    QQmlEngineDebugService::QQmlObjectData data;
++    QmlObjectData data;
+     ds >> data;
+     o.m_debugId = data.objectId;
+     o.m_class = data.objectType;
+@@ -232,7 +266,7 @@ void QQmlEngineDebugPrivate::decode(QDataStream &ds, QQmlDebugObjectReference &o
+     ds >> propCount;
+ 
+     for (int ii = 0; ii < propCount; ++ii) {
+-        QQmlEngineDebugService::QQmlObjectProperty data;
++        QmlObjectProperty data;
+         ds >> data;
+         QQmlDebugPropertyReference prop;
+         prop.m_objectDebugId = o.m_debugId;
+@@ -241,21 +275,21 @@ void QQmlEngineDebugPrivate::decode(QDataStream &ds, QQmlDebugObjectReference &o
+         prop.m_hasNotifySignal = data.hasNotifySignal;
+         prop.m_valueTypeName = data.valueTypeName;
+         switch (data.type) {
+-        case QQmlEngineDebugService::QQmlObjectProperty::Basic:
+-        case QQmlEngineDebugService::QQmlObjectProperty::List:
+-        case QQmlEngineDebugService::QQmlObjectProperty::SignalProperty:
++        case QmlObjectProperty::Basic:
++        case QmlObjectProperty::List:
++        case QmlObjectProperty::SignalProperty:
+         {
+             prop.m_value = data.value;
+             break;
+         }
+-        case QQmlEngineDebugService::QQmlObjectProperty::Object:
++        case QmlObjectProperty::Object:
+         {
+             QQmlDebugObjectReference obj;
+             obj.m_debugId = prop.m_value.toInt();
+             prop.m_value = QVariant::fromValue(obj);
+             break;
+         }
+-        case QQmlEngineDebugService::QQmlObjectProperty::Unknown:
++        case QmlObjectProperty::Unknown:
+             break;
+         }
+         o.m_properties << prop;
+@@ -288,7 +322,7 @@ void QQmlEngineDebugPrivate::decode(QDataStream &ds, QQmlDebugContextReference &
+ 
+ void QQmlEngineDebugPrivate::stateChanged(QQmlEngineDebug::State status)
+ {
+-    emit q_func()->stateChanged(status);
++    emit q->stateChanged(status);
+ }
+ 
+ void QQmlEngineDebugPrivate::message(const QByteArray &data)
+@@ -404,30 +438,28 @@ void QQmlEngineDebugPrivate::message(const QByteArray &data)
+             return;
+         emit watch->valueChanged(name, value);
+     } else if (type == "OBJECT_CREATED") {
+-        emit q_func()->newObjects();
++        emit q->newObjects();
+     }
+ }
+ 
+ QQmlEngineDebug::QQmlEngineDebug(QQmlDebugConnection *client, QObject *parent)
+-    : QObject(*(new QQmlEngineDebugPrivate(client)), parent)
++    : QObject(parent),
++      d(new QQmlEngineDebugPrivate(this, client))
+ {
+ }
+ 
+ QQmlEngineDebug::~QQmlEngineDebug()
+ {
++    delete d;
+ }
+ 
+ QQmlEngineDebug::State QQmlEngineDebug::state() const
+ {
+-    Q_D(const QQmlEngineDebug);
+-
+     return static_cast<QQmlEngineDebug::State>(d->client->state());
+ }
+ 
+ QQmlDebugPropertyWatch *QQmlEngineDebug::addWatch(const QQmlDebugPropertyReference &property, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugPropertyWatch *watch = new QQmlDebugPropertyWatch(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled) {
+         int queryId = d->getId();
+@@ -456,7 +488,6 @@ QQmlDebugWatch *QQmlEngineDebug::addWatch(const QQmlDebugContextReference &, con
+ 
+ QQmlDebugObjectExpressionWatch *QQmlEngineDebug::addWatch(const QQmlDebugObjectReference &object, const QString &expr, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+     QQmlDebugObjectExpressionWatch *watch = new QQmlDebugObjectExpressionWatch(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled) {
+         int queryId = d->getId();
+@@ -478,8 +509,6 @@ QQmlDebugObjectExpressionWatch *QQmlEngineDebug::addWatch(const QQmlDebugObjectR
+ 
+ QQmlDebugWatch *QQmlEngineDebug::addWatch(const QQmlDebugObjectReference &object, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugWatch *watch = new QQmlDebugWatch(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled) {
+         int queryId = d->getId();
+@@ -507,8 +536,6 @@ QQmlDebugWatch *QQmlEngineDebug::addWatch(const QQmlDebugFileReference &, QObjec
+ 
+ void QQmlEngineDebug::removeWatch(QQmlDebugWatch *watch)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     if (!watch || !watch->m_client)
+         return;
+ 
+@@ -527,8 +554,6 @@ void QQmlEngineDebug::removeWatch(QQmlDebugWatch *watch)
+ 
+ QQmlDebugEnginesQuery *QQmlEngineDebug::queryAvailableEngines(QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugEnginesQuery *query = new QQmlDebugEnginesQuery(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled) {
+         query->m_client = this;
+@@ -549,8 +574,6 @@ QQmlDebugEnginesQuery *QQmlEngineDebug::queryAvailableEngines(QObject *parent)
+ 
+ QQmlDebugRootContextQuery *QQmlEngineDebug::queryRootContexts(const QQmlDebugEngineReference &engine, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugRootContextQuery *query = new QQmlDebugRootContextQuery(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled && engine.debugId() != -1) {
+         query->m_client = this;
+@@ -571,8 +594,6 @@ QQmlDebugRootContextQuery *QQmlEngineDebug::queryRootContexts(const QQmlDebugEng
+ 
+ QQmlDebugObjectQuery *QQmlEngineDebug::queryObject(const QQmlDebugObjectReference &object, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugObjectQuery *query = new QQmlDebugObjectQuery(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled && object.debugId() != -1) {
+         query->m_client = this;
+@@ -594,8 +615,6 @@ QQmlDebugObjectQuery *QQmlEngineDebug::queryObject(const QQmlDebugObjectReferenc
+ 
+ QQmlDebugObjectQuery *QQmlEngineDebug::queryObjectRecursive(const QQmlDebugObjectReference &object, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugObjectQuery *query = new QQmlDebugObjectQuery(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled && object.debugId() != -1) {
+         query->m_client = this;
+@@ -617,8 +636,6 @@ QQmlDebugObjectQuery *QQmlEngineDebug::queryObjectRecursive(const QQmlDebugObjec
+ 
+ QQmlDebugExpressionQuery *QQmlEngineDebug::queryExpressionResult(int objectDebugId, const QString &expr, QObject *parent)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     QQmlDebugExpressionQuery *query = new QQmlDebugExpressionQuery(parent);
+     if (d->client->state() == QQmlDebugClient::Enabled && objectDebugId != -1) {
+         query->m_client = this;
+@@ -643,8 +660,6 @@ bool QQmlEngineDebug::setBindingForObject(int objectDebugId, const QString &prop
+                                                   bool isLiteralValue,
+                                                   QString source, int line)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     if (d->client->state() == QQmlDebugClient::Enabled && objectDebugId != -1) {
+         QByteArray message;
+         QDataStream ds(&message, QIODevice::WriteOnly);
+@@ -658,8 +673,6 @@ bool QQmlEngineDebug::setBindingForObject(int objectDebugId, const QString &prop
+ 
+ bool QQmlEngineDebug::resetBindingForObject(int objectDebugId, const QString &propertyName)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     if (d->client->state() == QQmlDebugClient::Enabled && objectDebugId != -1) {
+         QByteArray message;
+         QDataStream ds(&message, QIODevice::WriteOnly);
+@@ -674,8 +687,6 @@ bool QQmlEngineDebug::resetBindingForObject(int objectDebugId, const QString &pr
+ bool QQmlEngineDebug::setMethodBody(int objectDebugId, const QString &methodName,
+                                             const QString &methodBody)
+ {
+-    Q_D(QQmlEngineDebug);
+-
+     if (d->client->state() == QQmlDebugClient::Enabled && objectDebugId != -1) {
+         QByteArray message;
+         QDataStream ds(&message, QIODevice::WriteOnly);
+diff --git a/tests/auto/qml/debugger/shared/qqmlenginedebug_p.h b/tests/auto/qml/debugger/shared/qqmlenginedebug_p.h
+index 2ebdebc..2644346 100644
+--- a/tests/auto/qml/debugger/shared/qqmlenginedebug_p.h
++++ b/tests/auto/qml/debugger/shared/qqmlenginedebug_p.h
+@@ -42,23 +42,10 @@
+ #ifndef QQMLENGINEDEBUG_H
+ #define QQMLENGINEDEBUG_H
+ 
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists purely as an
+-// implementation detail.  This header file may change from version to
+-// version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+ #include <QtCore/qobject.h>
+ #include <QtCore/qurl.h>
+ #include <QtCore/qvariant.h>
+ 
+-#include <private/qtqmlglobal_p.h>
+-
+ class QQmlDebugConnection;
+ class QQmlDebugWatch;
+ class QQmlDebugPropertyWatch;
+@@ -113,12 +100,14 @@ public:
+     bool resetBindingForObject(int objectDebugId, const QString &propertyName);
+     bool setMethodBody(int objectDebugId, const QString &methodName, const QString &methodBody);
+ 
++    QQmlEngineDebugPrivate *getPrivate() const { return d; }
++
+ Q_SIGNALS:
+     void newObjects();
+     void stateChanged(State state);
+ 
+ private:
+-    Q_DECLARE_PRIVATE(QQmlEngineDebug)
++    QQmlEngineDebugPrivate *d;
+ };
+ 
+ class QQmlDebugWatch : public QObject
+diff --git a/tools/qmlprofiler/qmlprofiler.pro b/tools/qmlprofiler/qmlprofiler.pro
+index c35c487..60c2e70 100644
+--- a/tools/qmlprofiler/qmlprofiler.pro
++++ b/tools/qmlprofiler/qmlprofiler.pro
+@@ -16,7 +16,8 @@ SOURCES += main.cpp \
+     commandlistener.cpp \
+     qqmldebugclient.cpp \
+     qmlprofilerdata.cpp \
+-    qmlprofilerclient.cpp
++    qmlprofilerclient.cpp \
++    qpacketprotocol.cpp
+ 
+ HEADERS += \
+     qmlprofilerapplication.h \
+@@ -25,4 +26,5 @@ HEADERS += \
+     qmlprofilerdata.h \
+     qmlprofilerclient.h \
+     qmlprofilereventlocation.h \
+-    qqmldebugclient.h
++    qqmldebugclient.h \
++    qpacketprotocol.h
+diff --git a/tools/qmlprofiler/qpacketprotocol.cpp b/tools/qmlprofiler/qpacketprotocol.cpp
+new file mode 100644
+index 0000000..1dd079c
+--- /dev/null
++++ b/tools/qmlprofiler/qpacketprotocol.cpp
+@@ -0,0 +1,546 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qpacketprotocol.h"
++
++#include <QtCore/QBuffer>
++#include <QtCore/QElapsedTimer>
++
++static const unsigned int MAX_PACKET_SIZE = 0x7FFFFFFF;
++
++/*!
++  \class QPacketProtocol
++  \internal
++
++  \brief The QPacketProtocol class encapsulates communicating discrete packets
++  across fragmented IO channels, such as TCP sockets.
++
++  QPacketProtocol makes it simple to send arbitrary sized data "packets" across
++  fragmented transports such as TCP and UDP.
++
++  As transmission boundaries are not respected, sending packets over protocols
++  like TCP frequently involves "stitching" them back together at the receiver.
++  QPacketProtocol makes this easier by performing this task for you.  Packet
++  data sent using QPacketProtocol is prepended with a 4-byte size header
++  allowing the receiving QPacketProtocol to buffer the packet internally until
++  it has all been received.  QPacketProtocol does not perform any sanity
++  checking on the size or on the data, so this class should only be used in
++  prototyping or trusted situations where DOS attacks are unlikely.
++
++  QPacketProtocol does not perform any communications itself.  Instead it can
++  operate on any QIODevice that supports the QIODevice::readyRead() signal.  A
++  logical "packet" is encapsulated by the companion QPacket class.  The
++  following example shows two ways to send data using QPacketProtocol.  The
++  transmitted data is equivalent in both.
++
++  \code
++  QTcpSocket socket;
++  // ... connect socket ...
++
++  QPacketProtocol protocol(&socket);
++
++  // Send packet the quick way
++  protocol.send() << "Hello world" << 123;
++
++  // Send packet the longer way
++  QPacket packet;
++  packet << "Hello world" << 123;
++  protocol.send(packet);
++  \endcode
++
++  Likewise, the following shows how to read data from QPacketProtocol, assuming
++  that the QPacketProtocol::readyRead() signal has been emitted.
++
++  \code
++  // ... QPacketProtocol::readyRead() is emitted ...
++
++  int a;
++  QByteArray b;
++
++  // Receive packet the quick way
++  protocol.read() >> a >> b;
++
++  // Receive packet the longer way
++  QPacket packet = protocol.read();
++  p >> a >> b;
++  \endcode
++
++  \ingroup io
++  \sa QPacket
++*/
++
++class QPacketProtocolPrivate : public QObject
++{
++    Q_OBJECT
++public:
++    QPacketProtocolPrivate(QPacketProtocol *parent, QIODevice *_dev)
++        : QObject(parent), inProgressSize(-1), maxPacketSize(MAX_PACKET_SIZE),
++          waitingForPacket(false), dev(_dev)
++    {
++        Q_ASSERT(4 == sizeof(qint32));
++
++        QObject::connect(this, SIGNAL(readyRead()),
++                         parent, SIGNAL(readyRead()));
++        QObject::connect(this, SIGNAL(packetWritten()),
++                         parent, SIGNAL(packetWritten()));
++        QObject::connect(this, SIGNAL(invalidPacket()),
++                         parent, SIGNAL(invalidPacket()));
++        QObject::connect(dev, SIGNAL(readyRead()),
++                         this, SLOT(readyToRead()));
++        QObject::connect(dev, SIGNAL(aboutToClose()),
++                         this, SLOT(aboutToClose()));
++        QObject::connect(dev, SIGNAL(bytesWritten(qint64)),
++                         this, SLOT(bytesWritten(qint64)));
++    }
++
++Q_SIGNALS:
++    void readyRead();
++    void packetWritten();
++    void invalidPacket();
++
++public Q_SLOTS:
++    void aboutToClose()
++    {
++        inProgress.clear();
++        sendingPackets.clear();
++        inProgressSize = -1;
++    }
++
++    void bytesWritten(qint64 bytes)
++    {
++        Q_ASSERT(!sendingPackets.isEmpty());
++
++        while (bytes) {
++            if (sendingPackets.at(0) > bytes) {
++                sendingPackets[0] -= bytes;
++                bytes = 0;
++            } else {
++                bytes -= sendingPackets.at(0);
++                sendingPackets.removeFirst();
++                emit packetWritten();
++            }
++        }
++    }
++
++    void readyToRead()
++    {
++        while (true) {
++            // Need to get trailing data
++            if (-1 == inProgressSize) {
++                // We need a size header of sizeof(qint32)
++                if (sizeof(qint32) > (uint)dev->bytesAvailable())
++                    return;
++
++                // Read size header
++                int read = dev->read((char *)&inProgressSize, sizeof(qint32));
++                Q_ASSERT(read == sizeof(qint32));
++                Q_UNUSED(read);
++
++                // Check sizing constraints
++                if (inProgressSize > maxPacketSize) {
++                    QObject::disconnect(dev, SIGNAL(readyRead()),
++                                        this, SLOT(readyToRead()));
++                    QObject::disconnect(dev, SIGNAL(aboutToClose()),
++                                        this, SLOT(aboutToClose()));
++                    QObject::disconnect(dev, SIGNAL(bytesWritten(qint64)),
++                                        this, SLOT(bytesWritten(qint64)));
++                    dev = 0;
++                    emit invalidPacket();
++                    return;
++                }
++
++                inProgressSize -= sizeof(qint32);
++            } else {
++                inProgress.append(dev->read(inProgressSize - inProgress.size()));
++
++                if (inProgressSize == inProgress.size()) {
++                    // Packet has arrived!
++                    packets.append(inProgress);
++                    inProgressSize = -1;
++                    inProgress.clear();
++
++                    waitingForPacket = false;
++                    emit readyRead();
++                } else
++                    return;
++            }
++        }
++    }
++
++public:
++    QList<qint64> sendingPackets;
++    QList<QByteArray> packets;
++    QByteArray inProgress;
++    qint32 inProgressSize;
++    qint32 maxPacketSize;
++    bool waitingForPacket;
++    QIODevice *dev;
++};
++
++/*!
++  Construct a QPacketProtocol instance that works on \a dev with the
++  specified \a parent.
++ */
++QPacketProtocol::QPacketProtocol(QIODevice *dev, QObject *parent)
++    : QObject(parent), d(new QPacketProtocolPrivate(this, dev))
++{
++    Q_ASSERT(dev);
++}
++
++/*!
++  Destroys the QPacketProtocol instance.
++ */
++QPacketProtocol::~QPacketProtocol()
++{
++}
++
++/*!
++  Returns the maximum packet size allowed.  By default this is
++  2,147,483,647 bytes.
++  
++  If a packet claiming to be larger than the maximum packet size is received,
++  the QPacketProtocol::invalidPacket() signal is emitted.
++
++  \sa QPacketProtocol::setMaximumPacketSize()
++ */
++qint32 QPacketProtocol::maximumPacketSize() const
++{
++    return d->maxPacketSize;
++}
++
++/*!
++  Sets the maximum allowable packet size to \a max.
++
++  \sa QPacketProtocol::maximumPacketSize()
++ */
++qint32 QPacketProtocol::setMaximumPacketSize(qint32 max)
++{
++    if (max > (signed)sizeof(qint32))
++        d->maxPacketSize = max;
++    return d->maxPacketSize;
++}
++
++/*!
++  Returns a streamable object that is transmitted on destruction.  For example
++
++  \code
++  protocol.send() << "Hello world" << 123;
++  \endcode
++
++  will send a packet containing "Hello world" and 123.  To construct more
++  complex packets, explicitly construct a QPacket instance.
++ */
++QPacketAutoSend QPacketProtocol::send()
++{
++    return QPacketAutoSend(this);
++}
++
++/*!
++  \fn void QPacketProtocol::send(const QPacket & packet)
++
++  Transmit the \a packet.
++ */
++void QPacketProtocol::send(const QPacket & p)
++{
++    if (p.b.isEmpty())
++        return; // We don't send empty packets
++
++    qint64 sendSize = p.b.size() + sizeof(qint32);
++
++    d->sendingPackets.append(sendSize);
++    qint32 sendSize32 = sendSize;
++    qint64 writeBytes = d->dev->write((char *)&sendSize32, sizeof(qint32));
++    Q_ASSERT(writeBytes == sizeof(qint32));
++    writeBytes = d->dev->write(p.b);
++    Q_ASSERT(writeBytes == p.b.size());
++}
++
++/*!
++  Returns the number of received packets yet to be read.
++  */
++qint64 QPacketProtocol::packetsAvailable() const
++{
++    return d->packets.count();
++}
++
++/*!
++  Discard any unread packets.
++  */
++void QPacketProtocol::clear()
++{
++    d->packets.clear();
++}
++
++/*!
++  Return the next unread packet, or an invalid QPacket instance if no packets
++  are available.  This method does NOT block.
++  */
++QPacket QPacketProtocol::read()
++{
++    if (0 == d->packets.count())
++        return QPacket();
++
++    QPacket rv(d->packets.at(0));
++    d->packets.removeFirst();
++    return rv;
++}
++
++/*
++   Returns the difference between msecs and elapsed. If msecs is -1,
++   however, -1 is returned.
++*/
++static int qt_timeout_value(int msecs, int elapsed)
++{
++    if (msecs == -1)
++        return -1;
++
++    int timeout = msecs - elapsed;
++    return timeout < 0 ? 0 : timeout;
++}
++
++/*!
++  This function locks until a new packet is available for reading and the
++  \l{QIODevice::}{readyRead()} signal has been emitted. The function
++  will timeout after \a msecs milliseconds; the default timeout is
++  30000 milliseconds.
++
++  The function returns true if the readyRead() signal is emitted and
++  there is new data available for reading; otherwise it returns false
++  (if an error occurred or the operation timed out).
++  */
++
++bool QPacketProtocol::waitForReadyRead(int msecs)
++{
++    if (!d->packets.isEmpty())
++        return true;
++
++    QElapsedTimer stopWatch;
++    stopWatch.start();
++
++    d->waitingForPacket = true;
++    do {
++        if (!d->dev->waitForReadyRead(msecs))
++            return false;
++        if (!d->waitingForPacket)
++            return true;
++        msecs = qt_timeout_value(msecs, stopWatch.elapsed());
++    } while (true);
++}
++
++/*!
++  Return the QIODevice passed to the QPacketProtocol constructor.
++*/
++QIODevice *QPacketProtocol::device()
++{
++    return d->dev;
++}
++
++/*!
++  \fn void QPacketProtocol::readyRead()
++
++  Emitted whenever a new packet is received.  Applications may use
++  QPacketProtocol::read() to retrieve this packet.
++ */
++
++/*!
++  \fn void QPacketProtocol::invalidPacket()
++
++  A packet larger than the maximum allowable packet size was received.  The
++  packet will be discarded and, as it indicates corruption in the protocol, no
++  further packets will be received.
++ */
++
++/*!
++  \fn void QPacketProtocol::packetWritten()
++
++  Emitted each time a packet is completing written to the device.  This signal
++  may be used for communications flow control.
++ */
++
++/*!
++  \class QPacket
++  \internal
++
++  \brief The QPacket class encapsulates an unfragmentable packet of data to be
++  transmitted by QPacketProtocol.
++
++  The QPacket class works together with QPacketProtocol to make it simple to
++  send arbitrary sized data "packets" across fragmented transports such as TCP
++  and UDP.
++
++  QPacket provides a QDataStream interface to an unfragmentable packet.
++  Applications should construct a QPacket, propagate it with data and then
++  transmit it over a QPacketProtocol instance.  For example:
++  \code
++  QPacketProtocol protocol(...);
++
++  QPacket myPacket;
++  myPacket << "Hello world!" << 123;
++  protocol.send(myPacket);
++  \endcode
++
++  As long as both ends of the connection are using the QPacketProtocol class,
++  the data within this packet will be delivered unfragmented at the other end,
++  ready for extraction.
++
++  \code
++  QByteArray greeting;
++  int count;
++
++  QPacket myPacket = protocol.read();
++
++  myPacket >> greeting >> count;
++  \endcode
++
++  Only packets returned from QPacketProtocol::read() may be read from.  QPacket
++  instances constructed by directly by applications are for transmission only
++  and are considered "write only".  Attempting to read data from them will
++  result in undefined behavior.
++
++  \ingroup io
++  \sa QPacketProtocol
++ */
++
++/*!
++  Constructs an empty write-only packet.
++  */
++QPacket::QPacket()
++    : QDataStream(), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(QIODevice::WriteOnly);
++    setDevice(buf);
++    setVersion(QDataStream::Qt_4_7);
++}
++
++/*!
++  Destroys the QPacket instance.
++  */
++QPacket::~QPacket()
++{
++    if (buf) {
++        delete buf;
++        buf = 0;
++    }
++}
++
++/*!
++  Creates a copy of \a other.  The initial stream positions are shared, but the
++  two packets are otherwise independent.
++ */
++QPacket::QPacket(const QPacket & other)
++    : QDataStream(), b(other.b), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(other.buf->openMode());
++    setDevice(buf);
++}
++
++/*!
++  \internal
++  */
++QPacket::QPacket(const QByteArray & ba)
++    : QDataStream(), b(ba), buf(0)
++{
++    buf = new QBuffer(&b);
++    buf->open(QIODevice::ReadOnly);
++    setDevice(buf);
++}
++
++/*!
++  Returns true if this packet is empty - that is, contains no data.
++  */
++bool QPacket::isEmpty() const
++{
++    return b.isEmpty();
++}
++
++/*!
++  Returns raw packet data.
++  */
++QByteArray QPacket::data() const
++{
++    return b;
++}
++
++/*!
++  Clears data in the packet.  This is useful for reusing one writable packet.
++  For example
++  \code
++  QPacketProtocol protocol(...);
++
++  QPacket packet;
++
++  packet << "Hello world!" << 123;
++  protocol.send(packet);
++
++  packet.clear();
++  packet << "Goodbyte world!" << 789;
++  protocol.send(packet);
++  \endcode
++ */
++void QPacket::clear()
++{
++    QBuffer::OpenMode oldMode = buf->openMode();
++    buf->close();
++    b.clear();
++    buf->setBuffer(&b); // reset QBuffer internals with new size of b.
++    buf->open(oldMode);
++}
++
++/*!
++  \class QPacketAutoSend
++  \internal
++
++  \internal
++  */
++QPacketAutoSend::QPacketAutoSend(QPacketProtocol *_p)
++    : QPacket(), p(_p)
++{
++}
++
++QPacketAutoSend::~QPacketAutoSend()
++{
++    if (!b.isEmpty())
++        p->send(*this);
++}
++
++#include <qpacketprotocol.moc>
+diff --git a/tools/qmlprofiler/qpacketprotocol.h b/tools/qmlprofiler/qpacketprotocol.h
+new file mode 100644
+index 0000000..be5fa28
+--- /dev/null
++++ b/tools/qmlprofiler/qpacketprotocol.h
+@@ -0,0 +1,117 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QPACKETPROTOCOL_H
++#define QPACKETPROTOCOL_H
++
++#include <QtCore/qobject.h>
++#include <QtCore/qdatastream.h>
++
++QT_BEGIN_NAMESPACE
++class QIODevice;
++class QBuffer;
++QT_END_NAMESPACE
++class QPacket;
++class QPacketAutoSend;
++class QPacketProtocolPrivate;
++
++class QPacketProtocol : public QObject
++{
++    Q_OBJECT
++public:
++    explicit QPacketProtocol(QIODevice *dev, QObject *parent = 0);
++    virtual ~QPacketProtocol();
++
++    qint32 maximumPacketSize() const;
++    qint32 setMaximumPacketSize(qint32);
++
++    QPacketAutoSend send();
++    void send(const QPacket &);
++
++    qint64 packetsAvailable() const;
++    QPacket read();
++
++    bool waitForReadyRead(int msecs = 3000);
++
++    void clear();
++
++    QIODevice *device();
++
++Q_SIGNALS:
++    void readyRead();
++    void invalidPacket();
++    void packetWritten();
++
++private:
++    QPacketProtocolPrivate *d;
++};
++
++
++class QPacket : public QDataStream
++{
++public:
++    QPacket();
++    QPacket(const QPacket &);
++    virtual ~QPacket();
++
++    void clear();
++    bool isEmpty() const;
++    QByteArray data() const;
++
++protected:
++    friend class QPacketProtocol;
++    QPacket(const QByteArray &ba);
++    QByteArray b;
++    QBuffer *buf;
++};
++
++class QPacketAutoSend : public QPacket
++{
++public:
++    virtual ~QPacketAutoSend();
++
++private:
++    friend class QPacketProtocol;
++    QPacketAutoSend(QPacketProtocol *);
++    QPacketProtocol *p;
++};
++
++#endif
+diff --git a/tools/qmlprofiler/qqmldebugclient.cpp b/tools/qmlprofiler/qqmldebugclient.cpp
+index 0453f88..36402be 100644
+--- a/tools/qmlprofiler/qqmldebugclient.cpp
++++ b/tools/qmlprofiler/qqmldebugclient.cpp
+@@ -40,8 +40,7 @@
+ ****************************************************************************/
+ 
+ #include "qqmldebugclient.h"
+-
+-#include <private/qpacketprotocol_p.h>
++#include "qpacketprotocol.h"
+ 
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qstringlist.h>

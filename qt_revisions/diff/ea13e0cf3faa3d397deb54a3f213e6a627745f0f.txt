@@ -1,0 +1,325 @@
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 5c0b592..15d7b1f 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -218,7 +218,7 @@ void QV8QObjectWrapper::destroy()
+     for (; i != m_javaScriptOwnedWeakQObjects.end(); ++i) {
+         QV8QObjectResource *resource = *i;
+         Q_ASSERT(resource);
+-        deleteWeakQObject(resource);
++        deleteWeakQObject(resource, true);
+     }
+ }
+ 
+@@ -909,9 +909,11 @@ void QV8QObjectWrapper::WeakQObjectReferenceCallback(v8::Persistent<v8::Value> h
+     Q_ASSERT(resource);
+ 
+     static_cast<QV8QObjectWrapper*>(wrapper)->unregisterWeakQObjectReference(resource);
+-    static_cast<QV8QObjectWrapper*>(wrapper)->deleteWeakQObject(resource);
+-
+-    qPersistentDispose(handle);
++    if (static_cast<QV8QObjectWrapper*>(wrapper)->deleteWeakQObject(resource, false)) {
++        qPersistentDispose(handle); // dispose.
++    } else {
++        handle.MakeWeak(0, WeakQObjectReferenceCallback); // revive.
++    }
+ }
+ 
+ static void WeakQObjectInstanceCallback(v8::Persistent<v8::Value> handle, void *data)
+@@ -1122,15 +1124,20 @@ v8::Handle<v8::Value> QV8QObjectWrapper::newQObject(QObject *object)
+         return v8::Local<v8::Object>::New((*iter)->v8object);
+     }
+ }
+-void QV8QObjectWrapper::deleteWeakQObject(QV8QObjectResource *resource)
++
++// returns true if the object's qqmldata v8object handle should
++// be disposed by the caller, false if it should not be (due to
++// creation status, etc).
++bool QV8QObjectWrapper::deleteWeakQObject(QV8QObjectResource *resource, bool calledFromEngineDtor)
+ {
+     QObject *object = resource->object;
+     if (object) {
+         QQmlData *ddata = QQmlData::get(object, false);
+         if (ddata) {
+-            if (ddata->rootObjectInCreation) {
+-                ddata->v8object.MakeWeak(0, WeakQObjectReferenceCallback);
+-                return;
++            if (!calledFromEngineDtor && ddata->rootObjectInCreation) {
++                // if weak ref callback is triggered (by gc) for a root object
++                // prior to completion of creation, we should NOT delete it.
++                return false;
+             }
+ 
+             ddata->v8object.Clear();
+@@ -1143,6 +1150,8 @@ void QV8QObjectWrapper::deleteWeakQObject(QV8QObjectResource *resource)
+             }
+         }
+     }
++
++    return true;
+ }
+ 
+ QPair<QObject *, int> QV8QObjectWrapper::ExtractQtSignal(QV8Engine *engine, v8::Handle<v8::Object> object)
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper_p.h b/src/qml/qml/v8/qv8qobjectwrapper_p.h
+index ab037ee..47023ff 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper_p.h
++++ b/src/qml/qml/v8/qv8qobjectwrapper_p.h
+@@ -119,7 +119,7 @@ private:
+     friend class QV8QObjectInstance;
+ 
+     v8::Local<v8::Object> newQObject(QObject *, QQmlData *, QV8Engine *);
+-    void deleteWeakQObject(QV8QObjectResource *resource);
++    bool deleteWeakQObject(QV8QObjectResource *resource, bool calledFromEngineDtor = false);
+     static v8::Handle<v8::Value> GetProperty(QV8Engine *, QObject *, v8::Handle<v8::Value> *, 
+                                              const QHashedV8String &, QV8QObjectWrapper::RevisionMode);
+     static bool SetProperty(QV8Engine *, QObject *, const QHashedV8String &,
+diff --git a/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentBase.qml b/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentBase.qml
+new file mode 100644
+index 0000000..ce542d3
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentBase.qml
+@@ -0,0 +1,24 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as ModApi
++
++Rectangle {
++    id: base
++    color: "red"
++
++    function flipOwnership() {
++        ModApi.trackObject(base);
++        ModApi.trackedObject(); // flip the ownership.
++        if (!ModApi.trackedObjectHasJsOwnership())
++            derived.testConditionsMet = false;
++        else
++            derived.testConditionsMet = true;
++    }
++
++    onColorChanged: {
++        // will be triggered during beginCreate of derived
++        flipOwnership();
++        gc();
++        gc();
++        gc();
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentDerived.qml b/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentDerived.qml
+new file mode 100644
+index 0000000..c627346
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/DeleteRootObjectInCreationComponentDerived.qml
+@@ -0,0 +1,11 @@
++import QtQuick 2.0
++
++DeleteRootObjectInCreationComponentBase {
++    id: derived
++    color: "black" // will trigger change signal during beginCreate.
++
++    property bool testConditionsMet: false // will be set by base
++    function setTestConditionsMet(obj) {
++        obj.testConditionsMet = derived.testConditionsMet;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent.qml b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent.qml
+new file mode 100644
+index 0000000..f5c0ce6
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property int a: 50
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Base.qml b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Base.qml
+new file mode 100644
+index 0000000..486e88a
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Base.qml
+@@ -0,0 +1,26 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as ModApi
++
++Rectangle {
++    id: base
++    x: 1
++    color: "red"
++    property bool testConditionsMet: false
++
++    onXChanged: {
++        ModApi.trackObject(base);
++        ModApi.trackedObject(); // flip the ownership.
++        if (!ModApi.trackedObjectHasJsOwnership())
++            testConditionsMet = false;
++        else
++            testConditionsMet = true;
++   }
++
++    onColorChanged: {
++        // will be triggered during beginCreate of derived
++        test.testConditionsMet = testConditionsMet;
++        gc();
++        gc();
++        gc();
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Derived.qml b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Derived.qml
+new file mode 100644
+index 0000000..b736e70
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/QQmlDataDestroyedComponent2Derived.qml
+@@ -0,0 +1,7 @@
++import QtQuick 2.0
++
++QQmlDataDestroyedComponent2Base {
++    id: derived
++    color: "black" // will trigger change signal during beginCreate.
++    x: 2 // flip ownership of base
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.2.qml b/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.2.qml
+new file mode 100644
+index 0000000..b67e8bb
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.2.qml
+@@ -0,0 +1,10 @@
++import QtQuick 2.0
++
++Item {
++    id: test
++    property bool testConditionsMet: false
++    Component.onCompleted: {
++        var c = Qt.createComponent("DeleteRootObjectInCreationComponentDerived.qml")
++        c.createObject(null).setTestConditionsMet(test); // JS ownership, but it will be a RootObjectInCreation until finished beginCreate.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.2.qml b/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.2.qml
+new file mode 100644
+index 0000000..1922271
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.2.qml
+@@ -0,0 +1,10 @@
++import QtQuick 2.0
++
++Item {
++    id: test
++    property bool testConditionsMet: false
++    Component.onCompleted: {
++        var c = Qt.createComponent("QQmlDataDestroyedComponent2Derived.qml")
++        c.createObject(test); // Cpp ownership, but it will be a RootObjectInCreation until finished beginCreate.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.qml b/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.qml
+new file mode 100644
+index 0000000..84308ec
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/qqmldataDestroyed.qml
+@@ -0,0 +1,8 @@
++import QtQuick 2.0
++
++Item {
++    Component.onCompleted: {
++        var c = Qt.createComponent("QQmlDataDestroyedComponent.qml")
++        var o = c.createObject(null); // JS ownership
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 5fb78e8..4740c47 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1033,6 +1033,19 @@ public:
+     int qobjectTestWritableFinalProperty() const { return m_testWritableFinalProperty; }
+     void setQObjectTestWritableFinalProperty(int tp) { m_testWritableFinalProperty = tp; emit qobjectTestWritableFinalPropertyChanged(); }
+ 
++    Q_INVOKABLE bool trackedObjectHasJsOwnership() {
++        QObject * object = m_trackedObject;
++
++        if (!object)
++            return false;
++
++        QQmlData *ddata = QQmlData::get(object, false);
++        if (!ddata)
++            return false;
++        else
++            return ddata->indestructible?false:true;
++    }
++
+ signals:
+     void qobjectTestPropertyChanged(int testProperty);
+     void qobjectTestWritablePropertyChanged(int testWritableProperty);
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index b910ec7..0ea4e2a 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -263,6 +263,7 @@ private slots:
+     void bindingSuppression();
+     void signalEmitted();
+     void threadSignal();
++    void qqmldataDestroyed();
+ 
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+@@ -6648,6 +6649,7 @@ void tst_qqmlecmascript::replaceBinding()
+ 
+ void tst_qqmlecmascript::deleteRootObjectInCreation()
+ {
++    {
+     QQmlEngine engine;
+     QQmlComponent c(&engine, testFileUrl("deleteRootObjectInCreation.qml"));
+     QObject *obj = c.create();
+@@ -6657,6 +6659,15 @@ void tst_qqmlecmascript::deleteRootObjectInCreation()
+     QTest::qWait(1);
+     QVERIFY(obj->property("childDestructible").toBool());
+     delete obj;
++    }
++
++    {
++    QQmlComponent c(&engine, testFileUrl("deleteRootObjectInCreation.2.qml"));
++    QObject *object = c.create();
++    QVERIFY(object != 0);
++    QVERIFY(object->property("testConditionsMet").toBool());
++    delete object;
++    }
+ }
+ 
+ void tst_qqmlecmascript::onDestruction()
+@@ -6768,6 +6779,40 @@ void tst_qqmlecmascript::threadSignal()
+     delete object;
+ }
+ 
++// ensure that the qqmldata::destroyed() handler doesn't cause problems
++void tst_qqmlecmascript::qqmldataDestroyed()
++{
++    // gc cleans up a qobject, later the qqmldata destroyed handler will run.
++    {
++        QQmlComponent c(&engine, testFileUrl("qqmldataDestroyed.qml"));
++        QObject *object = c.create();
++        QVERIFY(object != 0);
++        // now gc causing the collection of the dynamically constructed object.
++        engine.collectGarbage();
++        engine.collectGarbage();
++        // now process events to allow deletion (calling qqmldata::destroyed())
++        QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++        QCoreApplication::processEvents();
++        // shouldn't crash.
++        delete object;
++    }
++
++    // in this case, the object has CPP ownership, and the gc will
++    // be triggered during its beginCreate stage.
++    {
++        QQmlComponent c(&engine, testFileUrl("qqmldataDestroyed.2.qml"));
++        QObject *object = c.create();
++        QVERIFY(object != 0);
++        QVERIFY(object->property("testConditionsMet").toBool());
++        // the gc() within the handler will have triggered the weak
++        // qobject reference callback.  If that incorrectly disposes
++        // the handle, when the qqmldata::destroyed() handler is
++        // called due to object deletion we will see a crash.
++        delete object;
++        // shouldn't have crashed.
++    }
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

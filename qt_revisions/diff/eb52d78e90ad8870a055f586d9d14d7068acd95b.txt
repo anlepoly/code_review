@@ -1,0 +1,678 @@
+diff --git a/src/testlib/qtestcase.cpp b/src/testlib/qtestcase.cpp
+index 8b9ba6d..56959ba 100644
+--- a/src/testlib/qtestcase.cpp
++++ b/src/testlib/qtestcase.cpp
+@@ -1490,6 +1490,7 @@ static void qInvokeTestMethodDataEntry(char *slot)
+ {
+     /* Benchmarking: for each median iteration*/
+ 
++    bool isBenchmark = false;
+     int i = (QBenchmarkGlobalData::current->measurer->needsWarmupIteration()) ? -1 : 0;
+ 
+     QList<QBenchmarkResult> results;
+@@ -1516,25 +1517,30 @@ static void qInvokeTestMethodDataEntry(char *slot)
+             if (!invokeOk)
+                 QTestResult::addFailure("Unable to execute slot", __FILE__, __LINE__);
+ 
++            isBenchmark = QBenchmarkTestMethodData::current->isBenchmark();
++
+             QTestResult::finishedCurrentTestData();
+ 
+             invokeMethod(QTest::currentTestObject, "cleanup()");
+-            QTestResult::finishedCurrentTestDataCleanup();
++
++            // If the test isn't a benchmark, finalize the result after cleanup() has finished.
++            if (!isBenchmark)
++                QTestResult::finishedCurrentTestDataCleanup();
+ 
+             // If this test method has a benchmark, repeat until all measurements are
+             // acceptable.
+             // The QBENCHMARK macro increases the number of iterations for each run until
+             // this happens.
+-        } while (invokeOk
+-                 && QBenchmarkTestMethodData::current->isBenchmark()
+-                 && QBenchmarkTestMethodData::current->resultsAccepted() == false);
++        } while (invokeOk && isBenchmark
++                 && QBenchmarkTestMethodData::current->resultsAccepted() == false
++                 && !QTestResult::skipCurrentTest() && !QTestResult::currentTestFailed());
+ 
+         QBenchmarkTestMethodData::current->endDataRun();
+-        if (i > -1)  // iteration -1 is the warmup iteration.
+-            results.append(QBenchmarkTestMethodData::current->result);
++        if (!QTestResult::skipCurrentTest() && !QTestResult::currentTestFailed()) {
++            if (i > -1)  // iteration -1 is the warmup iteration.
++                results.append(QBenchmarkTestMethodData::current->result);
+ 
+-        if (QBenchmarkTestMethodData::current->isBenchmark() &&
+-            QBenchmarkGlobalData::current->verboseOutput) {
++            if (isBenchmark && QBenchmarkGlobalData::current->verboseOutput) {
+                 if (i == -1) {
+                     QTestLog::info(qPrintable(
+                         QString::fromLatin1("warmup stage result      : %1")
+@@ -1545,12 +1551,19 @@ static void qInvokeTestMethodDataEntry(char *slot)
+                             .arg(QBenchmarkTestMethodData::current->result.value)), 0, 0);
+                 }
+             }
+-    } while (QBenchmarkTestMethodData::current->isBenchmark()
+-             && (++i < QBenchmarkGlobalData::current->adjustMedianIterationCount()));
++        }
++    } while (isBenchmark
++             && (++i < QBenchmarkGlobalData::current->adjustMedianIterationCount())
++             && !QTestResult::skipCurrentTest() && !QTestResult::currentTestFailed());
+ 
+-    if (QBenchmarkTestMethodData::current->isBenchmark()
+-        && QBenchmarkTestMethodData::current->resultsAccepted())
+-        QTestLog::addBenchmarkResult(qMedian(results));
++    // If the test is a benchmark, finalize the result after all iterations have finished.
++    if (isBenchmark) {
++        bool testPassed = !QTestResult::skipCurrentTest() && !QTestResult::currentTestFailed();
++        QTestResult::finishedCurrentTestDataCleanup();
++        // Only report benchmark figures if the test passed
++        if (testPassed && QBenchmarkTestMethodData::current->resultsAccepted())
++            QTestLog::addBenchmarkResult(qMedian(results));
++    }
+ }
+ 
+ /*!
+diff --git a/tests/auto/testlib/selftests/badxml/tst_badxml.cpp b/tests/auto/testlib/selftests/badxml/tst_badxml.cpp
+index 1c9a0d9..1a143e5 100644
+--- a/tests/auto/testlib/selftests/badxml/tst_badxml.cpp
++++ b/tests/auto/testlib/selftests/badxml/tst_badxml.cpp
+@@ -106,15 +106,18 @@ void tst_BadXml::badDataTag() const
+     QBENCHMARK {
+     }
+ 
+-    QFAIL("a failure");
++    QFETCH(bool, shouldFail);
++    if (shouldFail)
++        QFAIL("a failure");
+ }
+ 
+ void tst_BadXml::badDataTag_data() const
+ {
+-    QTest::addColumn<int>("dummy");
++    QTest::addColumn<bool>("shouldFail");
+ 
+     foreach (char const* str, badStrings()) {
+-        QTest::newRow(str) << 0;
++        QTest::newRow(qPrintable(QString("fail %1").arg(str))) << true;
++        QTest::newRow(qPrintable(QString("pass %1").arg(str))) << false;
+     }
+ }
+ 
+diff --git a/tests/auto/testlib/selftests/benchlibcounting/benchlibcounting.pro b/tests/auto/testlib/selftests/benchlibcounting/benchlibcounting.pro
+new file mode 100644
+index 0000000..b495995
+--- /dev/null
++++ b/tests/auto/testlib/selftests/benchlibcounting/benchlibcounting.pro
+@@ -0,0 +1,7 @@
++SOURCES += tst_benchlibcounting.cpp
++QT = core testlib
++
++mac:CONFIG -= app_bundle
++CONFIG -= debug_and_release_target
++
++TARGET = benchlibcounting
+diff --git a/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp b/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp
+new file mode 100644
+index 0000000..847bc1a
+--- /dev/null
++++ b/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp
+@@ -0,0 +1,76 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <QtCore/QCoreApplication>
++#include <QtTest/QtTest>
++
++class tst_BenchlibCounting : public QObject
++{
++    Q_OBJECT
++
++private slots:
++    void passingBenchmark();
++    void skippingBenchmark();
++    void failingBenchmark();
++};
++
++void tst_BenchlibCounting::passingBenchmark()
++{
++    QBENCHMARK {
++    }
++}
++
++void tst_BenchlibCounting::skippingBenchmark()
++{
++    QBENCHMARK {
++        QSKIP("This is a skipping benchmark");
++    }
++}
++
++void tst_BenchlibCounting::failingBenchmark()
++{
++    QBENCHMARK {
++        QFAIL("This is a failing benchmark");
++    };
++}
++
++QTEST_MAIN(tst_BenchlibCounting)
++#include "tst_benchlibcounting.moc"
+diff --git a/tests/auto/testlib/selftests/expected_badxml.lightxml b/tests/auto/testlib/selftests/expected_badxml.lightxml
+index a8cdf56..08ba497 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.lightxml
++++ b/tests/auto/testlib/selftests/expected_badxml.lightxml
+@@ -7,41 +7,69 @@
+ </TestFunction>
+ <TestFunction name="badDataTag">
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++    <DataTag><![CDATA[fail end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="end cdata ]]&gt; text ]]&gt; more text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[quotes " text" more text]]></DataTag>
++    <DataTag><![CDATA[pass end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[quotes " text" more text]]></DataTag>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass end cdata ]]&gt; text ]]&gt; more text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail quotes " text" more text]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail quotes " text" more text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="quotes &quot; text&quot; more text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[xml close > open < tags < text]]></DataTag>
++    <DataTag><![CDATA[pass quotes " text" more text]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass quotes " text" more text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass quotes &quot; text&quot; more text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[xml close > open < tags < text]]></DataTag>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="xml close &gt; open &lt; tags &lt; text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <DataTag><![CDATA[pass xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass xml close > open < tags < text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass xml close &gt; open &lt; tags &lt; text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[pass all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" value="0" iterations="1" />
+ </TestFunction>
+ <TestFunction name="badMessage">
+ <Message type="qdebug" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_badxml.txt b/tests/auto/testlib/selftests/expected_badxml.txt
+index d4f4432..68d333e 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.txt
++++ b/tests/auto/testlib/selftests/expected_badxml.txt
+@@ -1,25 +1,33 @@
+ ********* Start testing of tst_BadXml *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BadXml::initTestCase()
+-QDEBUG : tst_BadXml::badDataTag(end cdata ]]> text ]]> more text) a message
+-FAIL!  : tst_BadXml::badDataTag(end cdata ]]> text ]]> more text) a failure
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(109)]
+-RESULT : tst_BadXml::badDataTag():"end cdata ]]> text ]]> more text":
++QDEBUG : tst_BadXml::badDataTag(fail end cdata ]]> text ]]> more text) a message
++FAIL!  : tst_BadXml::badDataTag(fail end cdata ]]> text ]]> more text) a failure
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(111)]
++QDEBUG : tst_BadXml::badDataTag(pass end cdata ]]> text ]]> more text) a message
++PASS   : tst_BadXml::badDataTag(pass end cdata ]]> text ]]> more text)
++RESULT : tst_BadXml::badDataTag():"pass end cdata ]]> text ]]> more text":
+      0 events per iteration (total: 0, iterations: 1)
+-QDEBUG : tst_BadXml::badDataTag(quotes " text" more text) a message
+-FAIL!  : tst_BadXml::badDataTag(quotes " text" more text) a failure
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(109)]
+-RESULT : tst_BadXml::badDataTag():"quotes " text" more text":
++QDEBUG : tst_BadXml::badDataTag(fail quotes " text" more text) a message
++FAIL!  : tst_BadXml::badDataTag(fail quotes " text" more text) a failure
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(111)]
++QDEBUG : tst_BadXml::badDataTag(pass quotes " text" more text) a message
++PASS   : tst_BadXml::badDataTag(pass quotes " text" more text)
++RESULT : tst_BadXml::badDataTag():"pass quotes " text" more text":
+      0 events per iteration (total: 0, iterations: 1)
+-QDEBUG : tst_BadXml::badDataTag(xml close > open < tags < text) a message
+-FAIL!  : tst_BadXml::badDataTag(xml close > open < tags < text) a failure
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(109)]
+-RESULT : tst_BadXml::badDataTag():"xml close > open < tags < text":
++QDEBUG : tst_BadXml::badDataTag(fail xml close > open < tags < text) a message
++FAIL!  : tst_BadXml::badDataTag(fail xml close > open < tags < text) a failure
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(111)]
++QDEBUG : tst_BadXml::badDataTag(pass xml close > open < tags < text) a message
++PASS   : tst_BadXml::badDataTag(pass xml close > open < tags < text)
++RESULT : tst_BadXml::badDataTag():"pass xml close > open < tags < text":
+      0 events per iteration (total: 0, iterations: 1)
+-QDEBUG : tst_BadXml::badDataTag(all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs) a message
+-FAIL!  : tst_BadXml::badDataTag(all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs) a failure
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(109)]
+-RESULT : tst_BadXml::badDataTag():"all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs":
++QDEBUG : tst_BadXml::badDataTag(fail all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs) a message
++FAIL!  : tst_BadXml::badDataTag(fail all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs) a failure
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp(111)]
++QDEBUG : tst_BadXml::badDataTag(pass all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs) a message
++PASS   : tst_BadXml::badDataTag(pass all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs)
++RESULT : tst_BadXml::badDataTag():"pass all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs":
+      0 events per iteration (total: 0, iterations: 1)
+ QDEBUG : tst_BadXml::badMessage(string 0) end cdata ]]> text ]]> more text
+ PASS   : tst_BadXml::badMessage(string 0)
+@@ -31,5 +39,5 @@ QDEBUG : tst_BadXml::badMessage(string 3) all > " mixed ]]> up > " in < the ]]>
+ PASS   : tst_BadXml::badMessage(string 3)
+ FAIL!  : tst_BadXml::failWithNoFile() failure message
+ PASS   : tst_BadXml::cleanupTestCase()
+-Totals: 6 passed, 5 failed, 0 skipped
++Totals: 10 passed, 5 failed, 0 skipped
+ ********* Finished testing of tst_BadXml *********
+diff --git a/tests/auto/testlib/selftests/expected_badxml.xml b/tests/auto/testlib/selftests/expected_badxml.xml
+index 9f083d3..849bc07 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.xml
++++ b/tests/auto/testlib/selftests/expected_badxml.xml
+@@ -9,41 +9,69 @@
+ </TestFunction>
+ <TestFunction name="badDataTag">
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++    <DataTag><![CDATA[fail end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="end cdata ]]&gt; text ]]&gt; more text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[quotes " text" more text]]></DataTag>
++    <DataTag><![CDATA[pass end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[quotes " text" more text]]></DataTag>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass end cdata ]]&gt; text ]]&gt; more text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail quotes " text" more text]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail quotes " text" more text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="quotes &quot; text&quot; more text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[xml close > open < tags < text]]></DataTag>
++    <DataTag><![CDATA[pass quotes " text" more text]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass quotes " text" more text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass quotes &quot; text&quot; more text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[xml close > open < tags < text]]></DataTag>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="xml close &gt; open &lt; tags &lt; text" value="0" iterations="1" />
+ <Message type="qdebug" file="" line="0">
+-    <DataTag><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <DataTag><![CDATA[pass xml close > open < tags < text]]></DataTag>
+     <Description><![CDATA[a message]]></Description>
+ </Message>
+-<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="109">
+-    <DataTag><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass xml close > open < tags < text]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass xml close &gt; open &lt; tags &lt; text" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[fail all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/badxml/tst_badxml.cpp" line="111">
++    <DataTag><![CDATA[fail all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
+     <Description><![CDATA[a failure]]></Description>
+ </Incident>
+-<BenchmarkResult metric="Events" tag="all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" value="0" iterations="1" />
++<Message type="qdebug" file="" line="0">
++    <DataTag><![CDATA[pass all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++    <Description><![CDATA[a message]]></Description>
++</Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[pass all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></DataTag>
++</Incident>
++<BenchmarkResult metric="Events" tag="pass all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" value="0" iterations="1" />
+ </TestFunction>
+ <TestFunction name="badMessage">
+ <Message type="qdebug" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_badxml.xunitxml b/tests/auto/testlib/selftests/expected_badxml.xunitxml
+index 724aed5..939e887 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.xunitxml
++++ b/tests/auto/testlib/selftests/expected_badxml.xunitxml
+@@ -1,19 +1,23 @@
+ <?xml version="1.0" encoding="UTF-8" ?>
+-<testsuite errors="8" failures="5" tests="5" name="tst_BadXml">
++<testsuite errors="12" failures="5" tests="5" name="tst_BadXml">
+   <properties>
+     <property value="@INSERT_QT_VERSION_HERE@" name="QTestVersion"/>
+     <property value="@INSERT_QT_VERSION_HERE@" name="QtVersion"/>
+   </properties>
+   <testcase result="pass" name="initTestCase"/>
+   <testcase result="fail" name="badDataTag">
+-    <!-- tag="end cdata ]]&gt; text ]]&gt; more text" message="a message" type="qdebug" -->
+-    <failure tag="end cdata ]]&gt; text ]]&gt; more text" message="a failure" result="fail"/>
+-    <!-- tag="quotes &quot; text&quot; more text" message="a message" type="qdebug" -->
+-    <failure tag="quotes &quot; text&quot; more text" message="a failure" result="fail"/>
+-    <!-- tag="xml close &gt; open &lt; tags &lt; text" message="a message" type="qdebug" -->
+-    <failure tag="xml close &gt; open &lt; tags &lt; text" message="a failure" result="fail"/>
+-    <!-- tag="all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" message="a message" type="qdebug" -->
+-    <failure tag="all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" message="a failure" result="fail"/>
++    <!-- tag="fail end cdata ]]&gt; text ]]&gt; more text" message="a message" type="qdebug" -->
++    <failure tag="fail end cdata ]]&gt; text ]]&gt; more text" message="a failure" result="fail"/>
++    <!-- tag="pass end cdata ]]&gt; text ]]&gt; more text" message="a message" type="qdebug" -->
++    <!-- tag="fail quotes &quot; text&quot; more text" message="a message" type="qdebug" -->
++    <failure tag="fail quotes &quot; text&quot; more text" message="a failure" result="fail"/>
++    <!-- tag="pass quotes &quot; text&quot; more text" message="a message" type="qdebug" -->
++    <!-- tag="fail xml close &gt; open &lt; tags &lt; text" message="a message" type="qdebug" -->
++    <failure tag="fail xml close &gt; open &lt; tags &lt; text" message="a failure" result="fail"/>
++    <!-- tag="pass xml close &gt; open &lt; tags &lt; text" message="a message" type="qdebug" -->
++    <!-- tag="fail all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" message="a message" type="qdebug" -->
++    <failure tag="fail all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" message="a failure" result="fail"/>
++    <!-- tag="pass all &gt; &quot; mixed ]]&gt; up &gt; &quot; in &lt; the ]]&gt; hopes &lt; of triggering &quot;&lt; ]]&gt; bugs" message="a message" type="qdebug" -->
+   </testcase>
+   <testcase result="pass" name="badMessage">
+     <!-- tag="string 0" message="end cdata ]]&gt; text ]]&gt; more text" type="qdebug" -->
+@@ -30,6 +34,10 @@
+ <![CDATA[a message]]>
+ <![CDATA[a message]]>
+ <![CDATA[a message]]>
++<![CDATA[a message]]>
++<![CDATA[a message]]>
++<![CDATA[a message]]>
++<![CDATA[a message]]>
+ <![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]>
+ <![CDATA[quotes " text" more text]]>
+ <![CDATA[xml close > open < tags < text]]>
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt b/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
+index 714b67f..13e9a39 100644
+--- a/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
++++ b/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
+@@ -2,9 +2,8 @@
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibCallgrind::initTestCase()
+ PASS   : tst_BenchlibCallgrind::twoHundredMillionInstructions()
+-PASS   : tst_BenchlibCallgrind::twoHundredMillionInstructions()
+ RESULT : tst_BenchlibCallgrind::twoHundredMillionInstructions():
+      200,000,158 instruction reads per iteration (total: 200,000,158, iterations: 1)
+ PASS   : tst_BenchlibCallgrind::cleanupTestCase()
+-Totals: 4 passed, 0 failed, 0 skipped
++Totals: 3 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibCallgrind *********
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcounting.lightxml b/tests/auto/testlib/selftests/expected_benchlibcounting.lightxml
+new file mode 100644
+index 0000000..5c436a5
+--- /dev/null
++++ b/tests/auto/testlib/selftests/expected_benchlibcounting.lightxml
+@@ -0,0 +1,24 @@
++<Environment>
++    <QtVersion>@INSERT_QT_VERSION_HERE@</QtVersion>
++    <QTestVersion>@INSERT_QT_VERSION_HERE@</QTestVersion>
++</Environment>
++<TestFunction name="initTestCase">
++<Incident type="pass" file="" line="0" />
++</TestFunction>
++<TestFunction name="passingBenchmark">
++<Incident type="pass" file="" line="0" />
++<BenchmarkResult metric="Events" tag="" value="0" iterations="1" />
++</TestFunction>
++<TestFunction name="skippingBenchmark">
++<Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp" line="64">
++    <Description><![CDATA[This is a skipping benchmark]]></Description>
++</Message>
++</TestFunction>
++<TestFunction name="failingBenchmark">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp" line="71">
++    <Description><![CDATA[This is a failing benchmark]]></Description>
++</Incident>
++</TestFunction>
++<TestFunction name="cleanupTestCase">
++<Incident type="pass" file="" line="0" />
++</TestFunction>
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcounting.txt b/tests/auto/testlib/selftests/expected_benchlibcounting.txt
+new file mode 100644
+index 0000000..e1af40b
+--- /dev/null
++++ b/tests/auto/testlib/selftests/expected_benchlibcounting.txt
+@@ -0,0 +1,13 @@
++********* Start testing of tst_BenchlibCounting *********
++Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
++PASS   : tst_BenchlibCounting::initTestCase()
++PASS   : tst_BenchlibCounting::passingBenchmark()
++RESULT : tst_BenchlibCounting::passingBenchmark():
++     0 events per iteration (total: 0, iterations: 1)
++SKIP   : tst_BenchlibCounting::skippingBenchmark() This is a skipping benchmark
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp(64)]
++FAIL!  : tst_BenchlibCounting::failingBenchmark() This is a failing benchmark
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp(71)]
++PASS   : tst_BenchlibCounting::cleanupTestCase()
++Totals: 3 passed, 1 failed, 1 skipped
++********* Finished testing of tst_BenchlibCounting *********
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcounting.xml b/tests/auto/testlib/selftests/expected_benchlibcounting.xml
+new file mode 100644
+index 0000000..5bf71fb
+--- /dev/null
++++ b/tests/auto/testlib/selftests/expected_benchlibcounting.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="ISO-8859-1"?>
++<TestCase name="tst_BenchlibCounting">
++<Environment>
++    <QtVersion>@INSERT_QT_VERSION_HERE@</QtVersion>
++    <QTestVersion>@INSERT_QT_VERSION_HERE@</QTestVersion>
++</Environment>
++<TestFunction name="initTestCase">
++<Incident type="pass" file="" line="0" />
++</TestFunction>
++<TestFunction name="passingBenchmark">
++<Incident type="pass" file="" line="0" />
++<BenchmarkResult metric="Events" tag="" value="0" iterations="1" />
++</TestFunction>
++<TestFunction name="skippingBenchmark">
++<Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp" line="64">
++    <Description><![CDATA[This is a skipping benchmark]]></Description>
++</Message>
++</TestFunction>
++<TestFunction name="failingBenchmark">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/benchlibcounting/tst_benchlibcounting.cpp" line="71">
++    <Description><![CDATA[This is a failing benchmark]]></Description>
++</Incident>
++</TestFunction>
++<TestFunction name="cleanupTestCase">
++<Incident type="pass" file="" line="0" />
++</TestFunction>
++</TestCase>
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcounting.xunitxml b/tests/auto/testlib/selftests/expected_benchlibcounting.xunitxml
+new file mode 100644
+index 0000000..83e429a
+--- /dev/null
++++ b/tests/auto/testlib/selftests/expected_benchlibcounting.xunitxml
+@@ -0,0 +1,20 @@
++<?xml version="1.0" encoding="UTF-8" ?>
++<testsuite errors="1" failures="1" tests="5" name="tst_BenchlibCounting">
++  <properties>
++    <property value="@INSERT_QT_VERSION_HERE@" name="QTestVersion"/>
++    <property value="@INSERT_QT_VERSION_HERE@" name="QtVersion"/>
++  </properties>
++  <testcase result="pass" name="initTestCase"/>
++  <testcase result="pass" name="passingBenchmark">
++  </testcase>
++  <testcase name="skippingBenchmark">
++    <!-- message="This is a skipping benchmark" type="skip" -->
++  </testcase>
++  <testcase result="fail" name="failingBenchmark">
++    <failure message="This is a failing benchmark" result="fail"/>
++  </testcase>
++  <testcase result="pass" name="cleanupTestCase"/>
++  <system-err>
++<![CDATA[This is a skipping benchmark]]>
++  </system-err>
++</testsuite>
+diff --git a/tests/auto/testlib/selftests/expected_benchliboptions.txt b/tests/auto/testlib/selftests/expected_benchliboptions.txt
+index 6d6d91c..ef9f0c5 100644
+--- a/tests/auto/testlib/selftests/expected_benchliboptions.txt
++++ b/tests/auto/testlib/selftests/expected_benchliboptions.txt
+@@ -20,14 +20,8 @@ Totals: 3 passed, 0 failed, 0 skipped
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibOneHundredMinimum::initTestCase()
+ PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+ RESULT : tst_BenchlibOneHundredMinimum::threeEvents():
+      3.00 events per iteration (total: 192, iterations: 64)
+ PASS   : tst_BenchlibOneHundredMinimum::cleanupTestCase()
+-Totals: 9 passed, 0 failed, 0 skipped
++Totals: 3 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibOneHundredMinimum *********
+diff --git a/tests/auto/testlib/selftests/selftests.pri b/tests/auto/testlib/selftests/selftests.pri
+index 2297186..0809c4d 100644
+--- a/tests/auto/testlib/selftests/selftests.pri
++++ b/tests/auto/testlib/selftests/selftests.pri
+@@ -3,6 +3,7 @@ SUBPROGRAMS = \
+      assert \
+      badxml \
+      benchlibcallgrind \
++     benchlibcounting \
+      benchlibeventcounter \
+      benchliboptions \
+      benchlibtickcounter \
+diff --git a/tests/auto/testlib/selftests/selftests.qrc b/tests/auto/testlib/selftests/selftests.qrc
+index d2f0a50..baa539a 100644
+--- a/tests/auto/testlib/selftests/selftests.qrc
++++ b/tests/auto/testlib/selftests/selftests.qrc
+@@ -10,6 +10,10 @@
+         <file>expected_badxml.xml</file>
+         <file>expected_badxml.xunitxml</file>
+         <file>expected_benchlibcallgrind.txt</file>
++        <file>expected_benchlibcounting.lightxml</file>
++        <file>expected_benchlibcounting.txt</file>
++        <file>expected_benchlibcounting.xml</file>
++        <file>expected_benchlibcounting.xunitxml</file>
+         <file>expected_benchlibeventcounter.lightxml</file>
+         <file>expected_benchlibeventcounter.txt</file>
+         <file>expected_benchlibeventcounter.xml</file>
+diff --git a/tests/auto/testlib/selftests/tst_selftests.cpp b/tests/auto/testlib/selftests/tst_selftests.cpp
+index 7e671a5..decaa55 100644
+--- a/tests/auto/testlib/selftests/tst_selftests.cpp
++++ b/tests/auto/testlib/selftests/tst_selftests.cpp
+@@ -323,6 +323,7 @@ void tst_Selftests::runSubTest_data()
+         // Only run on platforms where callgrind is available.
+         << "benchlibcallgrind"
+ #endif
++        << "benchlibcounting"
+         << "benchlibeventcounter"
+         << "benchliboptions"
+         << "cmptest"
+@@ -399,6 +400,9 @@ void tst_Selftests::runSubTest_data()
+             else if (subtest == "badxml") {
+                 arguments << "-eventcounter";
+             }
++            else if (subtest == "benchlibcounting") {
++                arguments << "-eventcounter";
++            }
+             else if (subtest == "printdatatags") {
+                 arguments << "-datatags";
+             }

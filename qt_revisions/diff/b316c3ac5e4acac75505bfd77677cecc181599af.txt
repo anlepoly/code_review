@@ -1,0 +1,609 @@
+diff --git a/src/plugins/platforms/windows/qwindowsintegration.cpp b/src/plugins/platforms/windows/qwindowsintegration.cpp
+index 69ae653..255cf14 100644
+--- a/src/plugins/platforms/windows/qwindowsintegration.cpp
++++ b/src/plugins/platforms/windows/qwindowsintegration.cpp
+@@ -244,8 +244,10 @@ QPlatformWindow *QWindowsIntegration::createPlatformWindow(QWindow *window) cons
+             = QWindowsWindow::WindowData::create(window, requested, window->windowTitle());
+     if (QWindowsContext::verboseIntegration || QWindowsContext::verboseWindows)
+         qDebug().nospace()
+-            << __FUNCTION__ << ' ' << window << '\n'
+-            << "    Requested: " << requested.geometry << " Flags="
++            << __FUNCTION__ << '<' << window << '\n'
++            << "    Requested: " << requested.geometry << "frame incl.: "
++            << QWindowsGeometryHint::positionIncludesFrame(window)
++            <<   " Flags="
+             << QWindowsWindow::debugWindowFlags(requested.flags) << '\n'
+             << "    Obtained : " << obtained.geometry << " Margins "
+             << obtained.frame  << " Flags="
+@@ -255,8 +257,6 @@ QPlatformWindow *QWindowsIntegration::createPlatformWindow(QWindow *window) cons
+         return 0;
+     if (requested.flags != obtained.flags)
+         window->setWindowFlags(obtained.flags);
+-    if (requested.geometry != obtained.geometry)
+-        QWindowSystemInterface::handleGeometryChange(window, obtained.geometry);
+     return new QWindowsWindow(window, obtained);
+ }
+ 
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index 8798048..c300f0f 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -542,6 +542,12 @@ void QWindowsGeometryHint::applyToMinMaxInfo(DWORD style, DWORD exStyle, MINMAXI
+                            << " out " << *mmi;
+ }
+ 
++bool QWindowsGeometryHint::positionIncludesFrame(const QWindow *w)
++{
++    return qt_window_private(const_cast<QWindow *>(w))->positionPolicy
++           == QWindowPrivate::WindowFrameInclusive;
++}
++
+ /*!
+     \class QWindowCreationContext
+     \brief Active Context for creating windows.
+@@ -576,17 +582,24 @@ QWindowCreationContext::QWindowCreationContext(const QWindow *w,
+     // CW_USEDEFAULT unless set. For now, assume that 0,0 means 'default'
+     // for toplevels.
+     if (geometry.isValid()) {
+-        if (!w->isTopLevel() || geometry.y() >= margins.top()) {
+-            frameX = geometry.x() - margins.left();
+-            frameY = geometry.y() - margins.top();
++        frameX = geometry.x();
++        frameY = geometry.y();
++        frameWidth = margins.left() + geometry.width() + margins.right();
++        frameHeight = margins.top() + geometry.height() + margins.bottom();
++        const bool isDefaultPosition = !frameX && !frameY && w->isTopLevel();
++        if (!QWindowsGeometryHint::positionIncludesFrame(w) && !isDefaultPosition) {
++            frameX -= margins.left();
++            frameY -= margins.top();
+         }
+-        frameWidth = geometry.width() + margins.left() + margins.right();
+-        frameHeight = geometry.height() + margins.top() + margins.bottom();
+     }
+     if (QWindowsContext::verboseWindows)
+         qDebug().nospace()
+-                << __FUNCTION__ << ' ' << w << " min" << geometryHint.minimumSize
+-                << " min" << geometryHint.maximumSize;
++                << __FUNCTION__ << ' ' << w << geometry
++                << " pos incl. frame" << QWindowsGeometryHint::positionIncludesFrame(w)
++                << " frame: " << frameWidth << 'x' << frameHeight << '+'
++                << frameX << '+' << frameY
++                << " min" << geometryHint.minimumSize
++                << " max" << geometryHint.maximumSize;
+ }
+ 
+ /*!
+@@ -819,7 +832,7 @@ void QWindowsWindow::setGeometry(const QRect &rectIn)
+     QRect rect = rectIn;
+     // This means it is a call from QWindow::setFramePos() and
+     // the coordinates include the frame (size is still the contents rectangle).
+-    if (qt_window_private(window())->positionPolicy == QWindowPrivate::WindowFrameInclusive) {
++    if (QWindowsGeometryHint::positionIncludesFrame(window())) {
+         const QMargins margins = frameMargins();
+         rect.moveTopLeft(rect.topLeft() + QPoint(margins.left(), margins.top()));
+     }
+@@ -1004,21 +1017,30 @@ Qt::WindowFlags QWindowsWindow::setWindowFlags(Qt::WindowFlags flags)
+         qDebug() << '>' << __FUNCTION__ << this << window() << "\n    from: "
+                  << QWindowsWindow::debugWindowFlags(m_data.flags)
+                  << "\n    to: " << QWindowsWindow::debugWindowFlags(flags);
++    const QRect oldGeometry = geometry();
+     if (m_data.flags != flags) {
+         m_data.flags = flags;
+         if (m_data.hwnd)
+             m_data = setWindowFlags_sys(flags);
+     }
++    // When switching to a frameless window, geometry
++    // may change without a WM_MOVE. Report change manually.
++    // Do not send synchronously as not to clobber the widget
++    // geometry in a sequence of setting flags and geometry.
++    const QRect newGeometry = geometry_sys();
++    if (oldGeometry != newGeometry)
++        handleGeometryChange();
++
+     if (QWindowsContext::verboseWindows)
+         qDebug() << '<' << __FUNCTION__ << "\n    returns: "
+-                 << QWindowsWindow::debugWindowFlags(m_data.flags);
++                 << QWindowsWindow::debugWindowFlags(m_data.flags)
++                 << " geometry " << oldGeometry << "->" << newGeometry;
+     return m_data.flags;
+ }
+ 
+ QWindowsWindow::WindowData QWindowsWindow::setWindowFlags_sys(Qt::WindowFlags wt,
+                                                               unsigned flags) const
+ {
+-    // Geometry changes have not been observed here. Frames change, though.
+     WindowCreationData creationData;
+     creationData.fromWindow(window(), wt, flags);
+     creationData.applyWindowFlags(m_data.hwnd);
+diff --git a/src/plugins/platforms/windows/qwindowswindow.h b/src/plugins/platforms/windows/qwindowswindow.h
+index 87c22c7..64fd78d 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.h
++++ b/src/plugins/platforms/windows/qwindowswindow.h
+@@ -66,6 +66,8 @@ struct QWindowsGeometryHint
+     static inline QPoint mapFromGlobal(const HWND hwnd, const QPoint &);
+     static inline QPoint mapFromGlobal(const QWindow *w, const QPoint &);
+ 
++    static bool positionIncludesFrame(const QWindow *w);
++
+     QSize minimumSize;
+     QSize maximumSize;
+ };
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.cpp b/src/plugins/platforms/xcb/qxcbwindow.cpp
+index 2355043..93f1159 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.cpp
++++ b/src/plugins/platforms/xcb/qxcbwindow.cpp
+@@ -138,10 +138,16 @@ static inline QImage::Format imageFormatForDepth(int depth)
+     }
+ }
+ 
++static inline bool positionIncludesFrame(QWindow *w)
++{
++    return qt_window_private(w)->positionPolicy == QWindowPrivate::WindowFrameInclusive;
++}
++
+ QXcbWindow::QXcbWindow(QWindow *window)
+     : QPlatformWindow(window)
+     , m_window(0)
+     , m_syncCounter(0)
++    , m_gravity(XCB_GRAVITY_STATIC)
+     , m_mapped(false)
+     , m_transparent(false)
+     , m_deferredActivation(false)
+@@ -176,6 +182,11 @@ void QXcbWindow::create()
+         return;
+     }
+ 
++    // Determine gravity from initial position. Do not change
++    // later as it will cause the window to move uncontrollably.
++    m_gravity = positionIncludesFrame(window()) ?
++                XCB_GRAVITY_NORTH_WEST : XCB_GRAVITY_STATIC;
++
+     const quint32 mask = XCB_CW_BACK_PIXMAP | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_SAVE_UNDER | XCB_CW_EVENT_MASK;
+     const quint32 values[] = {
+         // XCB_CW_BACK_PIXMAP
+@@ -199,6 +210,9 @@ void QXcbWindow::create()
+         | XCB_EVENT_MASK_FOCUS_CHANGE
+     };
+ 
++    // Parameters to XCreateWindow() are frame corner + inner size.
++    // This fits in case position policy is frame inclusive. There is
++    // currently no way to implement it for frame-exclusive geometries.
+     QRect rect = window()->geometry();
+     QPlatformWindow::setGeometry(rect);
+ 
+@@ -398,13 +412,14 @@ void QXcbWindow::setGeometry(const QRect &rect)
+     QPlatformWindow::setGeometry(rect);
+ 
+     propagateSizeHints();
++    const QRect wmGeometry = windowToWmGeometry(rect);
+ 
+     const quint32 mask = XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT;
+     const qint32 values[] = {
+-        qBound<qint32>(-XCOORD_MAX, rect.x(),      XCOORD_MAX),
+-        qBound<qint32>(-XCOORD_MAX, rect.y(),      XCOORD_MAX),
+-        qBound<qint32>(1,           rect.width(),  XCOORD_MAX),
+-        qBound<qint32>(1,           rect.height(), XCOORD_MAX),
++        qBound<qint32>(-XCOORD_MAX, wmGeometry.x(),      XCOORD_MAX),
++        qBound<qint32>(-XCOORD_MAX, wmGeometry.y(),      XCOORD_MAX),
++        qBound<qint32>(1,           wmGeometry.width(),  XCOORD_MAX),
++        qBound<qint32>(1,           wmGeometry.height(), XCOORD_MAX),
+     };
+ 
+     Q_XCB_CALL(xcb_configure_window(xcb_connection(), m_window, mask, reinterpret_cast<const quint32*>(values)));
+@@ -1118,20 +1133,36 @@ void QXcbWindow::lower()
+     Q_XCB_CALL(xcb_configure_window(xcb_connection(), m_window, mask, values));
+ }
+ 
++// Adapt the geometry to match the WM expection with regards
++// to gravity.
++QRect QXcbWindow::windowToWmGeometry(QRect r) const
++{
++    if (m_dirtyFrameMargins || m_frameMargins.isNull())
++        return r;
++    const bool frameInclusive = positionIncludesFrame(window());
++    // XCB_GRAVITY_STATIC requires the inner geometry, whereas
++    // XCB_GRAVITY_NORTH_WEST requires the frame geometry
++    if (frameInclusive && m_gravity == XCB_GRAVITY_STATIC) {
++        r.translate(m_frameMargins.left(), m_frameMargins.top());
++    } else if (!frameInclusive && m_gravity == XCB_GRAVITY_NORTH_WEST) {
++        r.translate(-m_frameMargins.left(), -m_frameMargins.top());
++    }
++    return r;
++}
++
+ void QXcbWindow::propagateSizeHints()
+ {
+     // update WM_NORMAL_HINTS
+     xcb_size_hints_t hints;
+     memset(&hints, 0, sizeof(hints));
+ 
+-    QRect rect = geometry();
++    const QRect rect = windowToWmGeometry(geometry());
+ 
+     QWindow *win = window();
+ 
+     xcb_size_hints_set_position(&hints, true, rect.x(), rect.y());
+     xcb_size_hints_set_size(&hints, true, rect.width(), rect.height());
+-    xcb_size_hints_set_win_gravity(&hints, qt_window_private(win)->positionPolicy == QWindowPrivate::WindowFrameInclusive
+-                                           ? XCB_GRAVITY_NORTH_WEST : XCB_GRAVITY_STATIC);
++    xcb_size_hints_set_win_gravity(&hints, m_gravity);
+ 
+     QSize minimumSize = win->minimumSize();
+     QSize maximumSize = win->maximumSize();
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.h b/src/plugins/platforms/xcb/qxcbwindow.h
+index 0b82196..43eb9e8 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.h
++++ b/src/plugins/platforms/xcb/qxcbwindow.h
+@@ -148,6 +148,8 @@ private:
+     void setTransparentForMouseEvents(bool transparent);
+     void updateDoesNotAcceptFocus(bool doesNotAcceptFocus);
+ 
++    QRect windowToWmGeometry(QRect r) const;
++
+     void create();
+     void destroy();
+ 
+@@ -166,6 +168,8 @@ private:
+ 
+     Qt::WindowState m_windowState;
+ 
++    xcb_gravity_t m_gravity;
++
+     bool m_mapped;
+     bool m_transparent;
+     bool m_deferredActivation;
+diff --git a/src/widgets/kernel/qwidget.cpp b/src/widgets/kernel/qwidget.cpp
+index dcd052a..2a8a25e 100644
+--- a/src/widgets/kernel/qwidget.cpp
++++ b/src/widgets/kernel/qwidget.cpp
+@@ -1530,7 +1530,7 @@ void QWidgetPrivate::createTLExtra()
+         x->normalGeometry = QRect(0,0,-1,-1);
+         x->savedFlags = 0;
+         x->opacity = 255;
+-        x->posFromMove = false;
++        x->posIncludesFrame = 0;
+         x->sizeAdjusted = false;
+         x->inTopLevelResize = false;
+         x->inRepaint = false;
+@@ -3242,11 +3242,11 @@ int QWidget::y() const
+ QPoint QWidget::pos() const
+ {
+     Q_D(const QWidget);
+-    if (isWindow() && ! (windowType() == Qt::Popup)) {
+-        QRect fs = d->frameStrut();
+-        return QPoint(data->crect.x() - fs.left(), data->crect.y() - fs.top());
+-    }
+-    return data->crect.topLeft();
++    QPoint result = data->crect.topLeft();
++    if (isWindow() && ! (windowType() == Qt::Popup))
++        if (!d->maybeTopData() || !d->maybeTopData()->posIncludesFrame)
++            result -= d->frameStrut().topLeft();
++    return result;
+ }
+ 
+ /*!
+@@ -6475,14 +6475,17 @@ void QWidget::move(const QPoint &p)
+ {
+     Q_D(QWidget);
+     setAttribute(Qt::WA_Moved);
+-    if (isWindow())
+-        d->topData()->posFromMove = true;
+     if (testAttribute(Qt::WA_WState_Created)) {
++        if (isWindow())
++            d->topData()->posIncludesFrame = false;
+         d->setGeometry_sys(p.x() + geometry().x() - QWidget::x(),
+                        p.y() + geometry().y() - QWidget::y(),
+                        width(), height(), true);
+         d->setDirtyOpaqueRegion();
+     } else {
++        // no frame yet: see also QWidgetPrivate::fixPosIncludesFrame(), QWindowPrivate::PositionPolicy.
++        if (isWindow())
++            d->topData()->posIncludesFrame = true;
+         data->crect.moveTopLeft(p); // no frame yet
+         setAttribute(Qt::WA_PendingMoveEvent);
+     }
+@@ -6499,6 +6502,7 @@ void QWidget::resize(const QSize &s)
+     Q_D(QWidget);
+     setAttribute(Qt::WA_Resized);
+     if (testAttribute(Qt::WA_WState_Created)) {
++        d->fixPosIncludesFrame();
+         d->setGeometry_sys(geometry().x(), geometry().y(), s.width(), s.height(), false);
+         d->setDirtyOpaqueRegion();
+     } else {
+@@ -6513,7 +6517,7 @@ void QWidget::setGeometry(const QRect &r)
+     setAttribute(Qt::WA_Resized);
+     setAttribute(Qt::WA_Moved);
+     if (isWindow())
+-        d->topData()->posFromMove = false;
++        d->topData()->posIncludesFrame = 0;
+     if (testAttribute(Qt::WA_WState_Created)) {
+         d->setGeometry_sys(r.x(), r.y(), r.width(), r.height(), true);
+         d->setDirtyOpaqueRegion();
+@@ -6681,11 +6685,11 @@ bool QWidget::restoreGeometry(const QByteArray &geometry)
+     restoredNormalGeometry.moveTop(qMax(restoredNormalGeometry.top(), availableGeometry.top() + frameHeight));
+ 
+     if (maximized || fullScreen) {
+-        // set geomerty before setting the window state to make
++        // set geometry before setting the window state to make
+         // sure the window is maximized to the right screen.
+         // Skip on windows: the window is restored into a broken
+         // half-maximized state.
+-#ifndef Q_WS_WIN
++#ifndef Q_OS_WIN
+         setGeometry(restoredNormalGeometry);
+ #endif
+         Qt::WindowStates ws = windowState();
+diff --git a/src/widgets/kernel/qwidget_p.h b/src/widgets/kernel/qwidget_p.h
+index d7c0ec7..4b3216c 100644
+--- a/src/widgets/kernel/qwidget_p.h
++++ b/src/widgets/kernel/qwidget_p.h
+@@ -157,7 +157,7 @@ struct QTLWExtra {
+ 
+     // *************************** Cross-platform bit fields ****************************
+     uint opacity : 8;
+-    uint posFromMove : 1;
++    uint posIncludesFrame : 1;
+     uint sizeAdjusted : 1;
+     uint inTopLevelResize : 1;
+     uint inRepaint : 1;
+@@ -432,6 +432,7 @@ public:
+     void scroll_sys(int dx, int dy, const QRect &r);
+     void deactivateWidgetCleanup();
+     void setGeometry_sys(int, int, int, int, bool);
++    void fixPosIncludesFrame();
+     void sendPendingMoveAndResizeEvents(bool recursive = false, bool disableUpdates = false);
+     void activateChildLayoutsRecursively();
+     void show_recursive();
+diff --git a/src/widgets/kernel/qwidget_qpa.cpp b/src/widgets/kernel/qwidget_qpa.cpp
+index 97cf921..3666764 100644
+--- a/src/widgets/kernel/qwidget_qpa.cpp
++++ b/src/widgets/kernel/qwidget_qpa.cpp
+@@ -55,6 +55,7 @@
+ #include <qpa/qplatformcursor.h>
+ #include <QtGui/QGuiApplication>
+ #include <QtGui/QScreen>
++#include <QtCore/QMargins>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -105,6 +106,7 @@ void QWidgetPrivate::create_sys(WId window, bool initializeWindow, bool destroyO
+     }
+ 
+     win->setWindowFlags(data.window_flags);
++    fixPosIncludesFrame();
+     win->setGeometry(q->geometry());
+     win->setScreen(QGuiApplication::screens().value(topData()->screenIndex, 0));
+ 
+@@ -126,7 +128,8 @@ void QWidgetPrivate::create_sys(WId window, bool initializeWindow, bool destroyO
+         }
+     }
+ 
+-    qt_window_private(win)->positionPolicy = topData()->posFromMove ? QWindowPrivate::WindowFrameInclusive : QWindowPrivate::WindowFrameExclusive;
++    qt_window_private(win)->positionPolicy = topData()->posIncludesFrame ?
++        QWindowPrivate::WindowFrameInclusive : QWindowPrivate::WindowFrameExclusive;
+     win->create();
+ 
+     data.window_flags = win->windowFlags();
+@@ -438,6 +441,31 @@ static inline QRect positionTopLevelWindow(QRect geometry, const QScreen *screen
+     return geometry;
+ }
+ 
++// move() was invoked with Qt::WA_WState_Created not set (frame geometry
++// unknown), that is, crect has a position including the frame.
++// If we can determine the frame strut, fix that and clear the flag.
++void QWidgetPrivate::fixPosIncludesFrame()
++{
++    Q_Q(QWidget);
++    if (QTLWExtra *te = maybeTopData()) {
++        if (te->posIncludesFrame) {
++            // For Qt::WA_DontShowOnScreen, assume a frame of 0 (for
++            // example, in QGraphicsProxyWidget).
++            if (q->testAttribute(Qt::WA_DontShowOnScreen)) {
++                te->posIncludesFrame = 0;
++            } else {
++                if (q->windowHandle()) {
++                    updateFrameStrut();
++                    if (!q->data->fstrut_dirty) {
++                        data.crect.translate(te->frameStrut.x(), te->frameStrut.y());
++                        te->posIncludesFrame = 0;
++                    }
++                } // windowHandle()
++            } // !WA_DontShowOnScreen
++        } // posIncludesFrame
++    } // QTLWExtra
++}
++
+ void QWidgetPrivate::show_sys()
+ {
+     Q_Q(QWidget);
+@@ -460,6 +488,8 @@ void QWidgetPrivate::show_sys()
+         return;
+ 
+     if (window) {
++        if (q->isWindow())
++            fixPosIncludesFrame();
+         QRect geomRect = q->geometry();
+         if (q->isWindow()) {
+             if (!q->testAttribute(Qt::WA_Moved))
+@@ -545,7 +575,7 @@ void QWidgetPrivate::setFullScreenSize_helper()
+     data.in_set_window_state = old_state;
+ }
+ 
+-static Qt::WindowState effectiveState(Qt::WindowStates state)
++Qt::WindowState effectiveState(Qt::WindowStates state)
+  {
+      if (state & Qt::WindowMinimized)
+          return Qt::WindowMinimized;
+@@ -707,7 +737,6 @@ void QWidgetPrivate::setGeometry_sys(int x, int y, int w, int h, bool isMove)
+         if (!q->testAttribute(Qt::WA_DontShowOnScreen) && !q->testAttribute(Qt::WA_OutsideWSRange)) {
+             if (q->windowHandle()) {
+                 if (q->isWindow()) {
+-                    qt_window_private(q->windowHandle())->positionPolicy = topData()->posFromMove ? QWindowPrivate::WindowFrameInclusive : QWindowPrivate::WindowFrameExclusive;
+                     q->windowHandle()->setGeometry(q->geometry());
+                 } else {
+                     QPoint posInNativeParent =  q->mapTo(q->nativeParentWidget(),QPoint());
+@@ -763,8 +792,10 @@ void QWidgetPrivate::setConstraints_sys()
+             winp->sizeIncrement = QSize(extra->topextra->incw, extra->topextra->inch);
+         }
+ 
+-        if (winp->platformWindow)
++        if (winp->platformWindow) {
++            fixPosIncludesFrame();
+             winp->platformWindow->propagateSizeHints();
++        }
+     }
+ }
+ 
+@@ -895,7 +926,20 @@ void QWidgetPrivate::setMask_sys(const QRegion &region)
+ 
+ void QWidgetPrivate::updateFrameStrut()
+ {
+-    // XXX
++    Q_Q(QWidget);
++    if (q->data->fstrut_dirty) {
++        if (QTLWExtra *te = maybeTopData()) {
++            if (te->window) {
++                if (const QPlatformWindow *pw = te->window->handle()) {
++                    const QMargins margins = pw->frameMargins();
++                    if (!margins.isNull()) {
++                        te->frameStrut.setCoords(margins.left(), margins.top(), margins.right(), margins.bottom());
++                        q->data->fstrut_dirty = false;
++                    }
++                }
++            }
++        }
++    }
+ }
+ 
+ void QWidgetPrivate::setWindowOpacity_sys(qreal level)
+diff --git a/src/widgets/kernel/qwidgetwindow_qpa.cpp b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+index 0a45cce..34b56b7 100644
+--- a/src/widgets/kernel/qwidgetwindow_qpa.cpp
++++ b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+@@ -327,10 +327,13 @@ void QWidgetWindow::updateGeometry()
+     if (m_widget->testAttribute(Qt::WA_OutsideWSRange))
+         return;
+ 
+-    QMargins margins = frameMargins();
++    const QMargins margins = frameMargins();
+ 
+     m_widget->data->crect = geometry();
+-    m_widget->d_func()->topData()->frameStrut.setCoords(margins.left(), margins.top(), margins.right(), margins.bottom());
++    QTLWExtra *te = m_widget->d_func()->topData();
++    te->posIncludesFrame= false;
++    te->frameStrut.setCoords(margins.left(), margins.top(), margins.right(), margins.bottom());
++    m_widget->data->fstrut_dirty = false;
+ }
+ 
+ void QWidgetWindow::handleMoveEvent(QMoveEvent *event)
+@@ -447,6 +450,8 @@ void QWidgetWindow::handleExposeEvent(QExposeEvent *event)
+     }
+ }
+ 
++Qt::WindowState effectiveState(Qt::WindowStates state);
++
+ void QWidgetWindow::handleWindowStateChangedEvent(QWindowStateChangeEvent *event)
+ {
+     // QWindow does currently not know 'active'.
+@@ -465,10 +470,16 @@ void QWidgetWindow::handleWindowStateChangedEvent(QWindowStateChangeEvent *event
+         widgetState |= Qt::WindowMinimized;
+         break;
+     case Qt::WindowMaximized:
++        if (effectiveState(widgetState) == Qt::WindowNoState)
++            if (QTLWExtra *tle = m_widget->d_func()->maybeTopData())
++                tle->normalGeometry = m_widget->geometry();
+         widgetState &= ~Qt::WindowFullScreen;
+         widgetState |= Qt::WindowMaximized;
+         break;
+     case Qt::WindowFullScreen:
++        if (effectiveState(widgetState) == Qt::WindowNoState)
++            if (QTLWExtra *tle = m_widget->d_func()->maybeTopData())
++                tle->normalGeometry = m_widget->geometry();
+         widgetState &= ~Qt::WindowMaximized;
+         widgetState |= Qt::WindowFullScreen;
+         break;
+diff --git a/tests/auto/widgets/dialogs/qdialog/tst_qdialog.cpp b/tests/auto/widgets/dialogs/qdialog/tst_qdialog.cpp
+index 0e19e88..574041c 100644
+--- a/tests/auto/widgets/dialogs/qdialog/tst_qdialog.cpp
++++ b/tests/auto/widgets/dialogs/qdialog/tst_qdialog.cpp
+@@ -388,9 +388,6 @@ void tst_QDialog::toolDialogPosition()
+ #if defined(Q_OS_WINCE)
+     QSKIP("No real support for Qt::Tool on WinCE");
+ #endif
+-#ifdef Q_OS_WIN
+-    QSKIP("QTBUG-25331 - positioning failure");
+-#endif
+     QDialog dialog(0, Qt::Tool);
+     dialog.move(QPoint(100,100));
+     const QPoint beforeShowPosition = dialog.pos();
+diff --git a/tests/auto/widgets/graphicsview/qgraphicsproxywidget/tst_qgraphicsproxywidget.cpp b/tests/auto/widgets/graphicsview/qgraphicsproxywidget/tst_qgraphicsproxywidget.cpp
+index 2b143c5..5ae5e20 100644
+--- a/tests/auto/widgets/graphicsview/qgraphicsproxywidget/tst_qgraphicsproxywidget.cpp
++++ b/tests/auto/widgets/graphicsview/qgraphicsproxywidget/tst_qgraphicsproxywidget.cpp
+@@ -1498,9 +1498,6 @@ void tst_QGraphicsProxyWidget::scrollUpdate()
+     // QRect(0, 0, 200, 12) is the first update, expanded (-2, -2, 2, 2)
+     // QRect(0, 12, 102, 10) is the scroll update, expanded (-2, -2, 2, 2),
+     // intersected with the above update.
+-#ifdef Q_OS_WIN
+-    QEXPECT_FAIL("", "QTBUG-24294", Abort);
+-#endif
+     QCOMPARE(view.paintEventRegion.rects(),
+ 	     QVector<QRect>() << QRect(0, 0, 200, 12) << QRect(0, 12, 102, 10));
+     QCOMPARE(widget->npaints, 2);
+@@ -2475,9 +2472,6 @@ void tst_QGraphicsProxyWidget::popup_basic()
+     QTest::mousePress(view.viewport(), Qt::LeftButton, 0,
+ 		      view.mapFromScene(proxy->mapToScene(proxy->boundingRect().center())));
+ 
+-#ifdef Q_OS_WIN
+-    QEXPECT_FAIL("", "QTBUG-24294", Abort);
+-#endif
+     QTRY_COMPARE(box->pos(), QPoint());
+ 
+     QCOMPARE(proxy->childItems().count(), 1);
+@@ -3363,6 +3357,9 @@ void tst_QGraphicsProxyWidget::comboboxWindowFlags()
+ 
+ void tst_QGraphicsProxyWidget::updateAndDelete()
+ {
++#ifdef Q_OS_MAC
++    QSKIP("Test case unstable on this platform, QTBUG-23700");
++#endif
+     QGraphicsScene scene;
+     QGraphicsProxyWidget *proxy = scene.addWidget(new QPushButton("Hello World"));
+     View view(&scene);
+@@ -3371,6 +3368,8 @@ void tst_QGraphicsProxyWidget::updateAndDelete()
+     qt_x11_wait_for_window_manager(&view);
+ #endif
+     QTRY_VERIFY(view.npaints > 0);
++    // Wait a bit to clear all pending paint events
++    QTest::qWait(10);
+ 
+     const QRect itemDeviceBoundingRect = proxy->deviceTransform(view.viewportTransform())
+                                          .mapRect(proxy->boundingRect()).toRect();
+@@ -3382,13 +3381,7 @@ void tst_QGraphicsProxyWidget::updateAndDelete()
+     // Update and hide.
+     proxy->update();
+     proxy->hide();
+-#ifdef Q_OS_WIN
+-    QEXPECT_FAIL("", "QTBUG-24294", Abort);
+-#endif
+     QTRY_COMPARE(view.npaints, 1);
+-#ifdef Q_OS_MAC
+-    QEXPECT_FAIL("", "QTBUG-23700", Continue);
+-#endif
+     QCOMPARE(view.paintEventRegion, expectedRegion);
+ 
+     proxy->show();
+diff --git a/tests/auto/widgets/kernel/qwidget_window/tst_qwidget_window.cpp b/tests/auto/widgets/kernel/qwidget_window/tst_qwidget_window.cpp
+index be33381..78d9d36 100644
+--- a/tests/auto/widgets/kernel/qwidget_window/tst_qwidget_window.cpp
++++ b/tests/auto/widgets/kernel/qwidget_window/tst_qwidget_window.cpp
+@@ -91,9 +91,6 @@ void tst_QWidget_window::cleanupTestCase()
+ 
+ void tst_QWidget_window::tst_move_show()
+ {
+-#ifdef Q_OS_WIN
+-    QSKIP("QTBUG-25331");
+-#endif
+     QWidget w;
+     w.move(100, 100);
+     w.show();

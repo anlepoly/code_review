@@ -1,0 +1,308 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index fd42ab8..e171635 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -1413,6 +1413,8 @@ void QQmlCompiler::genValueTypeProperty(QQmlScript::Object *obj,QQmlScript::Prop
+     pop.type = prop->type;
+     pop.bindingSkipList = 0;
+     output->addInstruction(pop);
++
++    genPropertyAssignment(prop, obj);
+ }
+ 
+ void QQmlCompiler::genComponent(QQmlScript::Object *obj)
+@@ -2106,10 +2108,15 @@ bool QQmlCompiler::buildGroupedProperty(QQmlScript::Property *prop,
+         if (prop->type >= 0 && enginePrivate->valueTypes[prop->type]) {
+ 
+             if (!prop->values.isEmpty()) {
+-                if (prop->values.first()->location < prop->value->location) {
+-                    COMPILE_EXCEPTION(prop->value, tr( "Property has already been assigned a value"));
+-                } else {
+-                    COMPILE_EXCEPTION(prop->values.first(), tr( "Property has already been assigned a value"));
++                // Only error if we are assigning values, and not e.g. a property interceptor
++                for (Property *dotProp = prop->value->properties.first(); dotProp; dotProp = prop->value->properties.next(dotProp)) {
++                    if (!dotProp->values.isEmpty()) {
++                        if (prop->values.first()->location < prop->value->location) {
++                            COMPILE_EXCEPTION(prop->value, tr( "Property has already been assigned a value"));
++                        } else {
++                            COMPILE_EXCEPTION(prop->values.first(), tr( "Property has already been assigned a value"));
++                        }
++                    }
+                 }
+             }
+ 
+@@ -2117,7 +2124,6 @@ bool QQmlCompiler::buildGroupedProperty(QQmlScript::Property *prop,
+                 COMPILE_EXCEPTION(prop, tr( "Invalid property assignment: \"%1\" is a read-only property").arg(prop->name().toString()));
+             }
+ 
+-
+             if (prop->isAlias) {
+                 for (Property *vtProp = prop->value->properties.first(); vtProp; vtProp = prop->value->properties.next(vtProp)) {
+                     vtProp->isAlias = true;
+@@ -2126,7 +2132,26 @@ bool QQmlCompiler::buildGroupedProperty(QQmlScript::Property *prop,
+ 
+             COMPILE_CHECK(buildValueTypeProperty(enginePrivate->valueTypes[prop->type],
+                                                  prop->value, obj, ctxt.incr()));
++
++            // When building a value type where sub components are declared, this
++            // code path is followed from buildProperty, even if there is a previous
++            // assignment to the value type as a whole. Therefore we need to look
++            // for (and build) assignments to the entire value type before looking
++            // for any onValue assignments.
++            for (Value *v = prop->values.first(); v; v = Property::ValueList::next(v)) {
++                if (v->object) {
++                    COMPILE_EXCEPTION(v->object, tr("Objects cannot be assigned to value types"));
++                }
++                COMPILE_CHECK(buildPropertyLiteralAssignment(prop, obj, v, ctxt));
++            }
++
++            for (Value *v = prop->onValues.first(); v; v = Property::ValueList::next(v)) {
++                Q_ASSERT(v->object);
++                COMPILE_CHECK(buildPropertyOnAssignment(prop, obj, obj, v, ctxt));
++            }
++
+             obj->addValueTypeProperty(prop);
++
+         } else {
+             COMPILE_EXCEPTION(prop, tr("Invalid grouped property access"));
+         }
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index cc2a158..1c07dd6 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -577,9 +577,50 @@ int QQmlVMEMetaObject::metaCall(QMetaObject::Call c, int _id, void **a)
+                     else valueType = QQmlValueTypeFactory::valueType(type);
+                     Q_ASSERT(valueType);
+ 
+-                    valueType->setValue(QVariant(type, a[0]));
++                    //
++                    // Consider the following case:
++                    //  color c = { 0.1, 0.2, 0.3 }
++                    //  interceptor exists on c.r
++                    //  write { 0.2, 0.4, 0.6 }
++                    //
++                    // The interceptor may choose not to update the r component at this
++                    // point (for example, a behavior that creates an animation). But we
++                    // need to ensure that the g and b components are updated correctly.
++                    //
++                    // So we need to perform a full write where the value type is:
++                    //    r = old value, g = new value, b = new value
++                    //
++                    // And then call the interceptor which may or may not write the
++                    // new value to the r component.
++                    //
++                    // This will ensure that the other components don't contain stale data
++                    // and any relevant signals are emitted.
++                    //
++                    // To achieve this:
++                    //   (1) Store the new value type as a whole (needed due to
++                    //       aliasing between a[0] and static storage in value type).
++                    //   (2) Read the entire existing value type from object -> valueType temp.
++                    //   (3) Read the previous value of the component being changed
++                    //       from the valueType temp.
++                    //   (4) Write the entire new value type into the temp.
++                    //   (5) Overwrite the component being changed with the old value.
++                    //   (6) Perform a full write to the value type (which may emit signals etc).
++                    //   (7) Issue the interceptor call with the new component value.
++                    //
++
+                     QMetaProperty valueProp = valueType->metaObject()->property(valueIndex);
+-                    vi->write(valueProp.read(valueType));
++                    QVariant newValue(type, a[0]);
++
++                    valueType->read(object, id);
++                    QVariant prevComponentValue = valueProp.read(valueType);
++
++                    valueType->setValue(newValue);
++                    QVariant newComponentValue = valueProp.read(valueType);
++
++                    valueProp.write(valueType, prevComponentValue);
++                    valueType->write(object, id, QQmlPropertyPrivate::DontRemoveBinding | QQmlPropertyPrivate::BypassInterceptor);
++
++                    vi->write(newComponentValue);
+ 
+                     if (!ep) delete valueType;
+                     return -1;
+diff --git a/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_component.qml b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_component.qml
+new file mode 100644
+index 0000000..7b8b587
+--- /dev/null
++++ b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_component.qml
+@@ -0,0 +1,6 @@
++import Test 1.0
++
++MyColorObject {
++    color: "#8000FF"
++    MyFloatSetInterceptor on color.r {}
++}
+diff --git a/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_ignore.qml b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_ignore.qml
+new file mode 100644
+index 0000000..f1a498c
+--- /dev/null
++++ b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_ignore.qml
+@@ -0,0 +1,6 @@
++import Test 1.0
++
++MyColorObject {
++    color: "#8000FF"
++    MyFloatIgnoreInterceptor on color.r {}
++}
+diff --git a/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_value.qml b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_value.qml
+new file mode 100644
+index 0000000..1d6194c
+--- /dev/null
++++ b/tests/auto/qml/qqmlvaluetypes/data/grouped_interceptors_value.qml
+@@ -0,0 +1,10 @@
++import Test 1.0
++
++MyColorObject {
++    color.r: 0.1
++    color.g: 0.2
++    color.b: 0.3
++    color.a: 0.4
++
++    MyColorInterceptor on color {}
++}
+diff --git a/tests/auto/qml/qqmlvaluetypes/testtypes.cpp b/tests/auto/qml/qqmlvaluetypes/testtypes.cpp
+index ef9f268..16f8b3c 100644
+--- a/tests/auto/qml/qqmlvaluetypes/testtypes.cpp
++++ b/tests/auto/qml/qqmlvaluetypes/testtypes.cpp
+@@ -45,4 +45,8 @@ void registerTypes()
+     qmlRegisterType<MyTypeObject>("Test", 1, 0, "MyTypeObject");
+     qmlRegisterType<MyConstantValueSource>("Test", 1, 0, "MyConstantValueSource");
+     qmlRegisterType<MyOffsetValueInterceptor>("Test", 1, 0, "MyOffsetValueInterceptor");
++    qmlRegisterType<MyColorObject>("Test", 1, 0, "MyColorObject");
++    qmlRegisterType<MyColorInterceptor>("Test", 1, 0, "MyColorInterceptor");
++    qmlRegisterType<MyFloatSetInterceptor>("Test", 1, 0, "MyFloatSetInterceptor");
++    qmlRegisterType<MyFloatIgnoreInterceptor>("Test", 1, 0, "MyFloatIgnoreInterceptor");
+ }
+diff --git a/tests/auto/qml/qqmlvaluetypes/testtypes.h b/tests/auto/qml/qqmlvaluetypes/testtypes.h
+index 813c585..f4ad151 100644
+--- a/tests/auto/qml/qqmlvaluetypes/testtypes.h
++++ b/tests/auto/qml/qqmlvaluetypes/testtypes.h
+@@ -214,6 +214,66 @@ private:
+     QQmlProperty prop;
+ };
+ 
++// This test interceptor deliberately swizzles RGBA -> ABGR
++class MyColorInterceptor : public QObject, public QQmlPropertyValueInterceptor
++{
++    Q_OBJECT
++    Q_INTERFACES(QQmlPropertyValueInterceptor)
++public:
++    virtual void setTarget(const QQmlProperty &p) { prop = p; }
++    virtual void write(const QVariant &v)
++    {
++        QColor c = v.value<QColor>();
++
++        int r, g, b, a;
++        c.getRgb(&r, &g, &b, &a);
++        c.setRgb(a, b, g, r);
++
++        QQmlPropertyPrivate::write(prop, c, QQmlPropertyPrivate::BypassInterceptor);
++    }
++
++private:
++    QQmlProperty prop;
++};
++
++class MyFloatSetInterceptor : public QObject, public QQmlPropertyValueInterceptor
++{
++    Q_OBJECT
++    Q_INTERFACES(QQmlPropertyValueInterceptor)
++public:
++    virtual void setTarget(const QQmlProperty &p) { prop = p; }
++    virtual void write(const QVariant &)
++    {
++        QQmlPropertyPrivate::write(prop, 0.0f, QQmlPropertyPrivate::BypassInterceptor);
++    }
++
++private:
++    QQmlProperty prop;
++};
++
++class MyFloatIgnoreInterceptor : public QObject, public QQmlPropertyValueInterceptor
++{
++    Q_OBJECT
++    Q_INTERFACES(QQmlPropertyValueInterceptor)
++public:
++    virtual void setTarget(const QQmlProperty &) {}
++    virtual void write(const QVariant &) {}
++};
++
++class MyColorObject : public QObject
++{
++    Q_OBJECT
++
++    Q_PROPERTY(QColor color READ color WRITE setColor)
++
++public:
++    MyColorObject() {}
++
++    QColor m_color;
++    QColor color() const { return m_color; }
++    void setColor(const QColor &v) { m_color = v; }
++};
++
+ void registerTypes();
+ 
+ #endif // TESTTYPES_H
+diff --git a/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp b/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
+index 0c890de..f038b9d 100644
+--- a/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
++++ b/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
+@@ -95,6 +95,8 @@ private slots:
+     void bindingsSpliceCorrectly();
+     void nonValueTypeComparison();
+     void initializeByWrite();
++    void groupedInterceptors();
++    void groupedInterceptors_data();
+ 
+ private:
+     QQmlEngine engine;
+@@ -1346,6 +1348,45 @@ void tst_qqmlvaluetypes::initializeByWrite()
+     delete object;
+ }
+ 
++void tst_qqmlvaluetypes::groupedInterceptors_data()
++{
++    QTest::addColumn<QString>("qmlfile");
++    QTest::addColumn<QColor>("expectedInitialColor");
++    QTest::addColumn<QColor>("setColor");
++    QTest::addColumn<QColor>("expectedFinalColor");
++
++    QColor c0, c1, c2;
++    c0.setRgbF(0.1f, 0.2f, 0.3f, 0.4f);
++    c1.setRgbF(0.2f, 0.4f, 0.6f, 0.8f);
++    c2.setRgbF(0.8f, 0.6f, 0.4f, 0.2f);
++
++    QTest::newRow("value-interceptor") << QString::fromLatin1("grouped_interceptors_value.qml") << c0 << c1 << c2;
++    QTest::newRow("component-interceptor") << QString::fromLatin1("grouped_interceptors_component.qml") << QColor(128, 0, 255) << QColor(50, 100, 200) << QColor(0, 100, 200);
++    QTest::newRow("ignore-interceptor") << QString::fromLatin1("grouped_interceptors_ignore.qml") << QColor(128, 0, 255) << QColor(50, 100, 200) << QColor(128, 100, 200);
++}
++
++void tst_qqmlvaluetypes::groupedInterceptors()
++{
++    QFETCH(QString, qmlfile);
++    QFETCH(QColor, expectedInitialColor);
++    QFETCH(QColor, setColor);
++    QFETCH(QColor, expectedFinalColor);
++
++    QQmlComponent component(&engine, testFileUrl(qmlfile));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++
++    QColor initialColor = object->property("color").value<QColor>();
++    QCOMPARE(initialColor, expectedInitialColor);
++
++    object->setProperty("color", setColor);
++
++    QColor finalColor = object->property("color").value<QColor>();
++    QCOMPARE(finalColor, expectedFinalColor);
++
++    delete object;
++}
++
+ QTEST_MAIN(tst_qqmlvaluetypes)
+ 
+ #include "tst_qqmlvaluetypes.moc"

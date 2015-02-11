@@ -1,0 +1,268 @@
+diff --git a/src/corelib/kernel/qvariant.h b/src/corelib/kernel/qvariant.h
+index b61b0cc..089d0d6 100644
+--- a/src/corelib/kernel/qvariant.h
++++ b/src/corelib/kernel/qvariant.h
+@@ -49,6 +49,7 @@
+ #include <QtCore/qmap.h>
+ #include <QtCore/qhash.h>
+ #include <QtCore/qstring.h>
++#include <QtCore/qobject.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -88,6 +89,39 @@ inline QVariant qVariantFromValue(const T &);
+ template<typename T>
+ inline T qvariant_cast(const QVariant &);
+ 
++namespace QtPrivate {
++
++    template <typename Derived, typename Argument, typename ReturnType>
++    struct ObjectInvoker
++    {
++        static ReturnType invoke(Argument a)
++        {
++            return Derived::object(a);
++        }
++    };
++
++    template <typename Derived, typename Argument, typename ReturnType>
++    struct MetaTypeInvoker
++    {
++        static ReturnType invoke(Argument a)
++        {
++            return Derived::metaType(a);
++        }
++    };
++
++    template <typename Derived, typename T, typename Argument, typename ReturnType, bool = IsPointerToTypeDerivedFromQObject<T>::Value>
++    struct TreatAsQObjectBeforeMetaType : ObjectInvoker<Derived, Argument, ReturnType>
++    {
++    };
++
++    template <typename Derived, typename T, typename Argument, typename ReturnType>
++    struct TreatAsQObjectBeforeMetaType<Derived, T, Argument, ReturnType, false> : MetaTypeInvoker<Derived, Argument, ReturnType>
++    {
++    };
++
++    template<typename T> struct QVariantValueHelper;
++}
++
+ class Q_CORE_EXPORT QVariant
+ {
+  public:
+@@ -375,14 +409,15 @@ protected:
+ #ifndef QT_NO_DEBUG_STREAM
+     friend Q_CORE_EXPORT QDebug operator<<(QDebug, const QVariant &);
+ #endif
+-    Private d;
+ #ifndef Q_NO_TEMPLATE_FRIENDS
+     template<typename T>
+     friend inline T qvariant_cast(const QVariant &);
++    template<typename T> friend struct QtPrivate::QVariantValueHelper;
+ protected:
+ #else
+ public:
+ #endif
++    Private d;
+     void create(int type, const void *copy);
+     bool cmp(const QVariant &other) const;
+     bool convert(const int t, void *ptr) const;
+@@ -481,18 +516,35 @@ inline bool operator!=(const QVariant &v1, const QVariantComparisonHelper &v2)
+ }
+ #endif
+ 
++namespace QtPrivate {
++    template<typename T>
++    struct QVariantValueHelper : TreatAsQObjectBeforeMetaType<QVariantValueHelper<T>, T, const QVariant &, T>
++    {
++        static T metaType(const QVariant &v)
++        {
++            const int vid = qMetaTypeId<T>(static_cast<T *>(0));
++            if (vid == v.userType())
++                return *reinterpret_cast<const T *>(v.constData());
++            if (vid < int(QMetaType::User)) {
++                T t;
++                if (v.convert(QVariant::Type(vid), &t))
++                    return t;
++            }
++            return T();
++        }
++#ifndef QT_NO_QOBJECT
++        static T object(const QVariant &v)
++        {
++            return qobject_cast<T>(QMetaType::typeFlags(v.userType()) & QMetaType::PointerToQObject ? v.d.data.o : 0);
++        }
++#endif
++    };
++}
++
+ #ifndef QT_MOC
+ template<typename T> inline T qvariant_cast(const QVariant &v)
+ {
+-    const int vid = qMetaTypeId<T>(static_cast<T *>(0));
+-    if (vid == v.userType())
+-        return *reinterpret_cast<const T *>(v.constData());
+-    if (vid < int(QMetaType::User)) {
+-        T t;
+-        if (v.convert(vid, &t))
+-            return t;
+-    }
+-    return T();
++    return QtPrivate::QVariantValueHelper<T>::invoke(v);
+ }
+ 
+ template<> inline QVariant qvariant_cast<QVariant>(const QVariant &v)
+diff --git a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+index f7bdfd8..6991134 100644
+--- a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
++++ b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+@@ -83,11 +83,22 @@ Q_DECLARE_METATYPE(QFont)
+ Q_DECLARE_METATYPE(QColor)
+ Q_DECLARE_METATYPE(QKeySequence)
+ 
++class CustomNonQObject;
++
+ class tst_QVariant : public QObject
+ {
+     Q_OBJECT
+ 
++public:
++    tst_QVariant(QObject *parent = 0)
++      : QObject(parent), customNonQObjectPointer(0)
++    {
++
++    }
++
+ private slots:
++    void cleanupTestCase();
++
+     void constructor();
+     void copy_constructor();
+     void isNull();
+@@ -176,6 +187,7 @@ private slots:
+ 
+     void qvariant_cast_QObject_data();
+     void qvariant_cast_QObject();
++    void qvariant_cast_QObject_derived();
+ 
+     void toLocale();
+ 
+@@ -275,6 +287,9 @@ private:
+     void dataStream_data(QDataStream::Version version);
+     void loadQVariantFromDataStream(QDataStream::Version version);
+     void saveQVariantFromDataStream(QDataStream::Version version);
++
++    CustomNonQObject *customNonQObjectPointer;
++    QVector<QObject*> objectPointerTestData;
+ };
+ 
+ Q_DECLARE_METATYPE(QDate)
+@@ -2452,20 +2467,63 @@ void tst_QVariant::invalidQColor() const
+     QVERIFY(!qvariant_cast<QColor>(va).isValid());
+ }
+ 
+-void tst_QVariant::qvariant_cast_QObject_data() {
++class CustomQObject : public QObject {
++    Q_OBJECT
++public:
++    CustomQObject(QObject *parent = 0) : QObject(parent) {}
++};
++class CustomQWidget : public QWidget {
++    Q_OBJECT
++public:
++    CustomQWidget(QWidget *parent = 0) : QWidget(parent) {}
++};
++Q_DECLARE_METATYPE(CustomQObject*)
++Q_DECLARE_METATYPE(CustomQWidget*)
++
++class CustomNonQObject { };
++Q_DECLARE_METATYPE(CustomNonQObject)
++Q_DECLARE_METATYPE(CustomNonQObject*)
++
++void tst_QVariant::cleanupTestCase()
++{
++    delete customNonQObjectPointer;
++    qDeleteAll(objectPointerTestData);
++}
+ 
++void tst_QVariant::qvariant_cast_QObject_data()
++{
+     QTest::addColumn<QVariant>("data");
+     QTest::addColumn<bool>("success");
+-    QObject *obj = new QObject(this);
++    QObject *obj = new QObject;
+     obj->setObjectName(QString::fromLatin1("Hello"));
+     QTest::newRow("from QObject") << QVariant(QMetaType::QObjectStar, &obj) << true;
+     QTest::newRow("from QObject2") << QVariant::fromValue(obj) << true;
+     QTest::newRow("from String") << QVariant(QLatin1String("1, 2, 3")) << false;
+     QTest::newRow("from int") << QVariant((int) 123) << false;
+-}
+-
+-
+-void tst_QVariant::qvariant_cast_QObject() {
++    QWidget *widget = new QWidget;
++    widget->setObjectName(QString::fromLatin1("Hello"));
++    QTest::newRow("from QWidget") << QVariant::fromValue(widget) << true;
++    CustomQObject *customObject = new CustomQObject(this);
++    customObject->setObjectName(QString::fromLatin1("Hello"));
++    QTest::newRow("from Derived QObject") << QVariant::fromValue(customObject) << true;
++    CustomQWidget *customWidget = new CustomQWidget;
++    customWidget->setObjectName(QString::fromLatin1("Hello"));
++    QTest::newRow("from Derived QWidget") << QVariant::fromValue(customWidget) << true;
++    QTest::newRow("from custom Object") << QVariant::fromValue(CustomNonQObject()) << false;
++
++    // Deleted in cleanupTestCase.
++    customNonQObjectPointer = new CustomNonQObject;
++    QTest::newRow("from custom ObjectStar") << QVariant::fromValue(customNonQObjectPointer) << false;
++
++    // Deleted in cleanupTestCase.
++    objectPointerTestData.push_back(obj);
++    objectPointerTestData.push_back(widget);
++    objectPointerTestData.push_back(customObject);
++    objectPointerTestData.push_back(customWidget);
++}
++
++void tst_QVariant::qvariant_cast_QObject()
++{
+     QFETCH(QVariant, data);
+     QFETCH(bool, success);
+ 
+@@ -2476,6 +2534,38 @@ void tst_QVariant::qvariant_cast_QObject() {
+     }
+ }
+ 
++class CustomQObjectDerived : public CustomQObject {
++    Q_OBJECT
++public:
++    CustomQObjectDerived(QObject *parent = 0) : CustomQObject(parent) {}
++};
++Q_DECLARE_METATYPE(CustomQObjectDerived*)
++
++void tst_QVariant::qvariant_cast_QObject_derived()
++{
++    {
++        CustomQObjectDerived *object = new CustomQObjectDerived(this);
++        QVariant data = QVariant::fromValue(object);
++
++        QVERIFY(data.userType() == qMetaTypeId<CustomQObjectDerived*>());
++
++        QCOMPARE(data.value<QObject *>(), object);
++        QCOMPARE(data.value<CustomQObjectDerived *>(), object);
++        QCOMPARE(data.value<CustomQObject *>(), object);
++        QVERIFY(data.value<CustomQWidget*>() == 0);
++    }
++    {
++        CustomQWidget customWidget;
++        QWidget *widget = &customWidget;
++        QVariant data = QVariant::fromValue(widget);
++        QVERIFY(data.userType() == QMetaType::QWidgetStar);
++
++        QCOMPARE(data.value<QObject*>(), widget);
++        QCOMPARE(data.value<QWidget*>(), widget);
++        QCOMPARE(data.value<CustomQWidget*>(), widget);
++    }
++}
++
+ Q_DECLARE_METATYPE(qint8);
+ 
+ void tst_QVariant::convertToQUint8() const

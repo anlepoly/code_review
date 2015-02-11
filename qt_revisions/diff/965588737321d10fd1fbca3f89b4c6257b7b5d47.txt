@@ -1,0 +1,2589 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 0792912..0a088a8 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -719,7 +719,7 @@ bool QQmlEngineDebugService::setMethodBody(int objectId, const QString &method,
+ 
+     QQmlPropertyData dummy;
+     QQmlPropertyData *prop =
+-            QQmlPropertyCache::property(context->engine(), object, method, dummy);
++            QQmlPropertyCache::property(context->engine(), object, method, contextData, dummy);
+ 
+     if (!prop || !prop->isVMEFunction())
+         return false;
+diff --git a/src/qml/qml/ftw/qflagpointer_p.h b/src/qml/qml/ftw/qflagpointer_p.h
+index a4b20d9..6200b05 100644
+--- a/src/qml/qml/ftw/qflagpointer_p.h
++++ b/src/qml/qml/ftw/qflagpointer_p.h
+@@ -82,6 +82,8 @@ public:
+     inline T *operator->() const;
+     inline T *operator*() const;
+ 
++    inline T *data() const;
++
+ private:
+     quintptr ptr_value;
+ 
+@@ -225,6 +227,12 @@ T *QFlagPointer<T>::operator*() const
+     return (T *)(ptr_value & ~FlagsMask);
+ }
+ 
++template<typename T>
++T *QFlagPointer<T>::data() const
++{
++    return (T *)(ptr_value & ~FlagsMask);
++}
++
+ template<typename T, typename T2>
+ QBiPointer<T, T2>::QBiPointer()
+ : ptr_value(0)
+diff --git a/src/qml/qml/ftw/qhashedstring.cpp b/src/qml/qml/ftw/qhashedstring.cpp
+index 2dc717b..d5098fc 100644
+--- a/src/qml/qml/ftw/qhashedstring.cpp
++++ b/src/qml/qml/ftw/qhashedstring.cpp
+@@ -173,20 +173,16 @@ static inline int primeForNumBits(int numBits)
+     return (1 << numBits) + prime_deltas[numBits];
+ }
+ 
+-void QStringHashData::rehashToSize(int size, IteratorData first,
+-                                   IteratorData (*Iterate)(const IteratorData &),
+-                                   QStringHashNode *skip)
++void QStringHashData::rehashToSize(int size)
+ {
+     short bits = qMax(MinNumBits, (int)numBits);
+     while (primeForNumBits(bits) < size) bits++;
+ 
+     if (bits > numBits)
+-        rehashToBits(bits, first, Iterate, skip);
++        rehashToBits(bits);
+ }
+ 
+-void QStringHashData::rehashToBits(short bits, IteratorData first,
+-                                   IteratorData (*Iterate)(const IteratorData &),
+-                                   QStringHashNode *skip)
++void QStringHashData::rehashToBits(short bits)
+ {
+     numBits = qMax(MinNumBits, (int)bits);
+ 
+@@ -194,27 +190,36 @@ void QStringHashData::rehashToBits(short bits, IteratorData first,
+     if (nb == numBuckets && buckets)
+         return;
+ 
+-    numBuckets = nb;
+-
+ #ifdef QSTRINGHASH_LINK_DEBUG
+     if (linkCount)
+         qFatal("QStringHash: Illegal attempt to rehash a linked hash.");
+ #endif
+ 
+-    delete []  buckets;
+-    buckets = new QStringHashNode *[numBuckets]; 
+-    ::memset(buckets, 0, sizeof(QStringHashNode *) * numBuckets);
++    QStringHashNode **newBuckets = new QStringHashNode *[nb];
++    ::memset(newBuckets, 0, sizeof(QStringHashNode *) * nb);
+ 
+-    IteratorData nodeList = first;
+-    while (nodeList.n) {
+-        if (nodeList.n != skip) {
+-            int bucket = nodeList.n->hash % numBuckets;
+-            nodeList.n->next = buckets[bucket];
+-            buckets[bucket] = nodeList.n;
+-        }
+-
+-        nodeList = Iterate(nodeList);
++    // Preserve the existing order within buckets so that items with the
++    // same key will retain the same find/findNext order
++    for (int i = 0; i < numBuckets; ++i) {
++        QStringHashNode *bucket = buckets[i];
++        if (bucket)
++            rehashNode(newBuckets, nb, bucket);
+     }
++
++    delete [] buckets;
++    buckets = newBuckets;
++    numBuckets = nb;
++}
++
++void QStringHashData::rehashNode(QStringHashNode **newBuckets, int nb, QStringHashNode *node)
++{
++    QStringHashNode *next = node->next.data();
++    if (next)
++        rehashNode(newBuckets, nb, next);
++
++    int bucket = node->hash % nb;
++    node->next = newBuckets[bucket];
++    newBuckets[bucket] = node;
+ }
+ 
+ // Copy of QString's qMemCompare
+diff --git a/src/qml/qml/ftw/qhashedstring_p.h b/src/qml/qml/ftw/qhashedstring_p.h
+index cdc1577..28bb96d 100644
+--- a/src/qml/qml/ftw/qhashedstring_p.h
++++ b/src/qml/qml/ftw/qhashedstring_p.h
+@@ -144,6 +144,7 @@ public:
+ 
+     inline quint32 hash() const;
+ 
++    inline QChar *data();
+     inline const QChar &at(int) const;
+     inline const QChar *constData() const;
+     bool startsWith(const QString &) const;
+@@ -246,36 +247,44 @@ public:
+         QStringData *strData;
+     };
+ 
++    inline QHashedString key() const
++    {
++        if (isQString())
++            return QHashedString(QString((QChar *)strData->data(), length), hash);
++
++        return QHashedString(QString::fromLatin1(ckey, length), hash);
++    }
++
+     bool isQString() const { return next.flag(); }
+     void setQString(bool v) { if (v) next.setFlag(); else next.clearFlag(); }
+ 
+     inline char *cStrData() const { return (char *)ckey; }
+     inline uint16_t *utf16Data() const { return (uint16_t *)strData->data(); }
+ 
+-    inline bool equals(v8::Handle<v8::String> string) {
++    inline bool equals(v8::Handle<v8::String> string) const {
+         return isQString()?string->Equals(utf16Data(), length):
+                            string->Equals(cStrData(), length);
+     }
+ 
+-    inline bool symbolEquals(const QHashedV8String &string) {
++    inline bool symbolEquals(const QHashedV8String &string) const {
+         Q_ASSERT(string.symbolId() != 0);
+         return length == string.length() && hash == string.hash() && 
+                (string.symbolId() == symbolId || equals(string.string()));
+     }
+ 
+-    inline bool equals(const QHashedV8String &string) {
++    inline bool equals(const QHashedV8String &string) const {
+         return length == string.length() && hash == string.hash() && 
+                equals(string.string());
+     }
+ 
+-    inline bool equals(const QHashedStringRef &string) {
++    inline bool equals(const QHashedStringRef &string) const {
+         return length == string.length() && 
+                hash == string.hash() && 
+                (isQString()?QHashedString::compare(string.constData(), (QChar *)utf16Data(), length):
+                             QHashedString::compare(string.constData(), cStrData(), length));
+     }
+ 
+-    inline bool equals(const QHashedCStringRef &string) {
++    inline bool equals(const QHashedCStringRef &string) const {
+         return length == string.length() && 
+                hash == string.hash() && 
+                (isQString()?QHashedString::compare((QChar *)utf16Data(), string.constData(), length):
+@@ -306,20 +315,61 @@ public:
+         QStringHashNode *n;
+         void *p;
+     };
+-    void rehashToBits(short, IteratorData, IteratorData (*Iterate)(const IteratorData &),
+-                      QStringHashNode *skip = 0);
+-    void rehashToSize(int, IteratorData, IteratorData (*Iterate)(const IteratorData &),
+-                      QStringHashNode *skip = 0);
++    void rehashToBits(short);
++    void rehashToSize(int);
++    void rehashNode(QStringHashNode **newBuckets, int nb, QStringHashNode *node);
+ 
+ private:
+     QStringHashData(const QStringHashData &);
+     QStringHashData &operator=(const QStringHashData &);
+ };
+ 
++// For a supplied key type, in what form do we need to keep a hashed version?
++template<typename T>
++struct HashedForm {};
++
++template<> struct HashedForm<QString> { typedef QHashedString Type; };
++template<> struct HashedForm<QStringRef> { typedef QHashedStringRef Type; };
++template<> struct HashedForm<QHashedString> { typedef const QHashedString &Type; };
++template<> struct HashedForm<QHashedV8String> { typedef const QHashedV8String &Type; };
++template<> struct HashedForm<QHashedStringRef> { typedef const QHashedStringRef &Type; };
++template<> struct HashedForm<QLatin1String> { typedef QHashedCStringRef Type; };
++template<> struct HashedForm<QHashedCStringRef> { typedef const QHashedCStringRef &Type; };
++
++class QStringHashBase
++{
++public:
++    static HashedForm<QString>::Type hashedString(const QString &s) { return QHashedString(s);}
++    static HashedForm<QStringRef>::Type hashedString(const QStringRef &s) { return QHashedStringRef(s.constData(), s.size());}
++    static HashedForm<QHashedString>::Type hashedString(const QHashedString &s) { return s; }
++    static HashedForm<QHashedV8String>::Type hashedString(const QHashedV8String &s) { return s; }
++    static HashedForm<QHashedStringRef>::Type hashedString(const QHashedStringRef &s) { return s; }
++
++    static HashedForm<QLatin1String>::Type hashedString(const QLatin1String &s) { return QHashedCStringRef(s.data(), s.size()); }
++    static HashedForm<QHashedCStringRef>::Type hashedString(const QHashedCStringRef &s) { return s; }
++
++    static const QString &toQString(const QString &s) { return s; }
++    static const QString &toQString(const QHashedString &s) { return s; }
++    static QString toQString(const QHashedV8String &s) { return s.toString(); }
++    static QString toQString(const QHashedStringRef &s) { return s.toString(); }
++
++    static QString toQString(const QLatin1String &s) { return QString(s); }
++    static QString toQString(const QHashedCStringRef &s) { return s.toUtf16(); }
++
++    static inline quint32 hashOf(const QHashedStringRef &s) { return s.hash(); }
++    static inline quint32 hashOf(const QHashedV8String &s) { return s.hash(); }
++
++    template<typename K>
++    static inline quint32 hashOf(const K &key) { return hashedString(key).hash(); }
++};
++
+ template<class T>
+-class QStringHash
++class QStringHash : public QStringHashBase
+ {
+ public:
++    typedef QHashedString key_type;
++    typedef T mapped_type;
++
+     struct Node : public QStringHashNode {
+         Node(const QHashedString &key, const T &value) : QStringHashNode(key), value(value) {}
+         Node(const QHashedCStringRef &key, const T &value) : QStringHashNode(key), value(value) {}
+@@ -347,22 +397,30 @@ public:
+     ReservedNodePool *nodePool;
+     const QStringHash<T> *link;
+ 
+-    inline Node *findNode(const QString &) const;
+-    inline Node *findNode(const QHashedString &) const;
+-    inline Node *findNode(const QHashedStringRef &) const;
+-    inline Node *findNode(const QHashedCStringRef &) const;
+-    inline Node *findNode(const QHashedV8String &) const;
++    template<typename K>
++    inline Node *findNode(const K &) const;
++
+     inline Node *findSymbolNode(const QHashedV8String &) const;
++
+     inline Node *createNode(const Node &o);
+-    inline Node *createNode(const QHashedString &, const T &);
+-    inline Node *createNode(const QHashedCStringRef &, const T &);
+ 
+-    inline Node *takeNode(const QHashedString &key, const T &value);
+-    inline Node *takeNode(const QHashedCStringRef &key, const T &value);
++    template<typename K>
++    inline Node *createNode(const K &, const T &);
++
++    inline Node *insertNode(Node *, quint32);
++
++    inline void initializeNode(Node *, const QHashedString &key);
++    inline void initializeNode(Node *, const QHashedCStringRef &key);
++
++    template<typename K>
++    inline Node *takeNode(const K &key, const T &value);
++
+     inline Node *takeNode(const Node &o);
+ 
+     inline void copy(const QStringHash<T> &);
+ 
++    void copyNode(const QStringHashNode *otherNode);
++
+     inline QStringHashData::IteratorData iterateFirst() const;
+     static inline QStringHashData::IteratorData iterateNext(const QStringHashData::IteratorData &);
+ 
+@@ -393,6 +451,9 @@ public:
+         inline bool operator==(const ConstIterator &o) const;
+         inline bool operator!=(const ConstIterator &o) const;
+ 
++        template<typename K>
++        inline bool equals(const K &) const;
++
+         inline QHashedString key() const;
+         inline const T &value() const;
+         inline const T &operator*() const;
+@@ -402,33 +463,31 @@ public:
+         QStringHashData::IteratorData d;
+     };
+ 
+-    inline void insert(const QString &, const T &);
+-    inline void insert(const QHashedString &, const T &);
+-    inline void insert(const QHashedStringRef &, const T &);
+-    inline void insert(const QHashedCStringRef &, const T &);
++    template<typename K>
++    inline void insert(const K &, const T &);
++
+     inline void insert(const ConstIterator  &);
+ 
+-    inline T *value(const QString &) const;
+-    inline T *value(const QHashedString &) const;
+-    inline T *value(const QHashedStringRef &) const;
+-    inline T *value(const QHashedV8String &) const;
+-    inline T *value(const QHashedCStringRef &) const;
++    template<typename K>
++    inline T *value(const K &) const;
++
++    inline T *value(const QHashedV8String &string) const;
+     inline T *value(const ConstIterator &) const;
+ 
+-    inline bool contains(const QString &) const;
+-    inline bool contains(const QHashedString &) const;
+-    inline bool contains(const QHashedStringRef &) const;
+-    inline bool contains(const QHashedCStringRef &) const;
+-    inline bool contains(const ConstIterator &) const;
++    template<typename K>
++    inline bool contains(const K &) const;
+ 
+-    inline T &operator[](const QString &);
+-    inline T &operator[](const QHashedString &);
+-    inline T &operator[](const QHashedStringRef &);
+-    inline T &operator[](const QHashedCStringRef &);
++    template<typename K>
++    inline T &operator[](const K &);
+ 
+     inline ConstIterator begin() const;
+     inline ConstIterator end() const;
+ 
++    inline ConstIterator iterator(Node *n) const;
++
++    template<typename K>
++    inline ConstIterator find(const K &) const;
++
+     inline void reserve(int);
+ };
+ 
+@@ -480,7 +539,7 @@ void QStringHash<T>::linkAndReserve(const QStringHash<T> &other, int additionalR
+ 
+     if (other.count()) {
+         data.size = other.data.size;
+-        data.rehashToSize(other.count() + additionalReserve, iterateFirst(), iterateNext);
++        data.rehashToSize(other.count() + additionalReserve);
+ 
+         if (data.numBuckets == other.data.numBuckets) {
+             nodePool = new ReservedNodePool;
+@@ -493,11 +552,8 @@ void QStringHash<T>::linkAndReserve(const QStringHash<T> &other, int additionalR
+             const_cast<QStringHash<T>&>(other).data.linkCount++;
+ #endif
+ 
+-            for (int ii = 0; ii < data.numBuckets; ++ii) {
+-                data.buckets[ii] = 0;
+-                Node *n = (Node *)other.data.buckets[ii];
+-                data.buckets[ii] = n;
+-            }
++            for (int ii = 0; ii < data.numBuckets; ++ii)
++                data.buckets[ii] = (Node *)other.data.buckets[ii];
+ 
+             link = &other;
+             return;
+@@ -538,7 +594,7 @@ void QStringHash<T>::clear()
+         delete c;
+     }
+     // Delete the pool allocated nodes
+-    if (nodePool) delete nodePool; 
++    if (nodePool) delete nodePool;
+     delete [] data.buckets;
+ 
+     data.buckets = 0;
+@@ -576,37 +632,34 @@ bool QStringHash<T>::isLinked() const
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::takeNode(const QHashedString &key, const T &value)
++void QStringHash<T>::initializeNode(Node *node, const QHashedString &key)
+ {
+-    if (nodePool && nodePool->used != nodePool->count) {
+-        Node *rv = nodePool->nodes + nodePool->used++;
+-        rv->length = key.length();
+-        rv->hash = key.hash();
+-        rv->strData = const_cast<QHashedString &>(key).data_ptr();
+-        rv->strData->ref.ref();
+-        rv->setQString(true);
+-        rv->value = value;
+-        return rv;
+-    } else {
+-        NewedNode *rv = new NewedNode(key, value);
+-        rv->nextNewed = newedNodes;
+-        newedNodes = rv;
+-        return rv;
+-    }
++    node->length = key.length();
++    node->hash = key.hash();
++    node->strData = const_cast<QHashedString &>(key).data_ptr();
++    node->strData->ref.ref();
++    node->setQString(true);
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::takeNode(const QHashedCStringRef &key, const T &value)
++void QStringHash<T>::initializeNode(Node *node, const QHashedCStringRef &key)
++{
++    node->length = key.length();
++    node->hash = key.hash();
++    node->ckey = key.constData();
++}
++
++template<class T>
++template<class K>
++typename QStringHash<T>::Node *QStringHash<T>::takeNode(const K &key, const T &value)
+ {
+     if (nodePool && nodePool->used != nodePool->count) {
+         Node *rv = nodePool->nodes + nodePool->used++;
+-        rv->length = key.length();
+-        rv->hash = key.hash();
+-        rv->ckey = key.constData();
++        initializeNode(rv, hashedString(key));
+         rv->value = value;
+         return rv;
+     } else {
+-        NewedNode *rv = new NewedNode(key, value);
++        NewedNode *rv = new NewedNode(hashedString(key), value);
+         rv->nextNewed = newedNodes;
+         newedNodes = rv;
+         return rv;
+@@ -639,6 +692,20 @@ typename QStringHash<T>::Node *QStringHash<T>::takeNode(const Node &o)
+ }
+ 
+ template<class T>
++void QStringHash<T>::copyNode(const QStringHashNode *otherNode)
++{
++    // Copy the predecessor before the successor
++    QStringHashNode *next = otherNode->next.data();
++    if (next)
++        copyNode(next);
++
++    Node *mynode = takeNode(*(const Node *)otherNode);
++    int bucket = mynode->hash % data.numBuckets;
++    mynode->next = data.buckets[bucket];
++    data.buckets[bucket] = mynode;
++}
++
++template<class T>
+ void QStringHash<T>::copy(const QStringHash<T> &other)
+ {
+     Q_ASSERT(data.size == 0);
+@@ -646,28 +713,13 @@ void QStringHash<T>::copy(const QStringHash<T> &other)
+     data.size = other.data.size;
+ 
+     // Ensure buckets array is created
+-    data.rehashToBits(data.numBits, iterateFirst(), iterateNext);
+-
+-    if (other.link) {
+-        for (ConstIterator iter = other.begin(); iter != other.end(); ++iter) {
+-            Node *o = iter.node();
+-            Node *n = o->isQString()?findNode(QHashedStringRef((QChar *)o->strData->data(), o->length, o->hash)):
+-                                     findNode(QHashedCStringRef(o->ckey, o->length, o->hash));
+-            if (!n) {
+-                Node *mynode = takeNode(*o);
+-                int bucket = mynode->hash % data.numBuckets;
+-                mynode->next = data.buckets[bucket];
+-                data.buckets[bucket] = mynode;
+-            }
+-        }
+-    } else {
+-        for (ConstIterator iter = other.begin(); iter != other.end(); ++iter) {
+-            Node *o = iter.node();
+-            Node *mynode = takeNode(*o);
+-            int bucket = mynode->hash % data.numBuckets;
+-            mynode->next = data.buckets[bucket];
+-            data.buckets[bucket] = mynode;
+-        }
++    data.rehashToBits(data.numBits);
++
++    // Preserve the existing order within buckets
++    for (int i = 0; i < other.data.numBuckets; ++i) {
++        QStringHashNode *bucket = other.data.buckets[i];
++        if (bucket)
++            copyNode(bucket);
+     }
+ }
+ 
+@@ -719,79 +771,72 @@ QStringHashData::IteratorData QStringHash<T>::iterateFirst() const
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::createNode(const Node &o)
++typename QStringHash<T>::ConstIterator QStringHash<T>::iterator(Node *n) const
+ {
+-    Node *n = takeNode(o);
++    if (!n)
++        return ConstIterator();
+ 
+-    if (data.size >= data.numBuckets)
+-        data.rehashToBits(data.numBits + 1, iterateFirst(), iterateNext, n);
+-
+-    int bucket = n->hash % data.numBuckets;
+-    n->next = data.buckets[bucket];
+-    data.buckets[bucket] = n;
++    const QStringHash<T> *container = this;
+ 
+-    data.size++;
++    if (link) {
++        // This node could be in the linked hash
++        if ((n >= nodePool->nodes) && (n < (nodePool->nodes + nodePool->used))) {
++            // The node is in this hash
++        } else if ((n >= link->nodePool->nodes) && (n < (link->nodePool->nodes + link->nodePool->used))) {
++            // The node is in the linked hash
++            container = link;
++        } else {
++            const NewedNode *ln = link->newedNodes;
++            while (ln) {
++                if (ln == n) {
++                    // This node is in the linked hash's newed list
++                    container = link;
++                    break;
++                }
++                ln = ln->nextNewed;
++            }
++        }
++    }
+ 
+-    return n;
++    QStringHashData::IteratorData rv;
++    rv.n = n;
++    rv.p = const_cast<QStringHash<T> *>(container);
++    return ConstIterator(rv);
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::createNode(const QHashedString &key, const T &value)
++typename QStringHash<T>::Node *QStringHash<T>::createNode(const Node &o)
+ {
+-    Node *n = takeNode(key, value);
+-
+-    if (data.size >= data.numBuckets)
+-        data.rehashToBits(data.numBits + 1, iterateFirst(), iterateNext, n);
+-
+-    int bucket = key.hash() % data.numBuckets;
+-    n->next = data.buckets[bucket];
+-    data.buckets[bucket] = n;
+-
+-    data.size++;
+-
+-    return n;
++    Node *n = takeNode(o);
++    return insertNode(n, n->hash);
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::createNode(const QHashedCStringRef &key, const T &value)
++template<class K>
++typename QStringHash<T>::Node *QStringHash<T>::createNode(const K &key, const T &value)
+ {
+     Node *n = takeNode(key, value);
++    return insertNode(n, hashOf(key));
++}
+ 
++template<class T>
++typename QStringHash<T>::Node *QStringHash<T>::insertNode(Node *n, quint32 hash)
++{
+     if (data.size >= data.numBuckets)
+-        data.rehashToBits(data.numBits + 1, iterateFirst(), iterateNext, n);
++        data.rehashToBits(data.numBits + 1);
+ 
+-    int bucket = key.hash() % data.numBuckets;
++    int bucket = hash % data.numBuckets;
+     n->next = data.buckets[bucket];
+     data.buckets[bucket] = n;
+ 
+-    data.size++; 
++    data.size++;
+ 
+     return n;
+ }
+ 
+ template<class T>
+-void QStringHash<T>::insert(const QString &key, const T &value)
+-{
+-    QHashedStringRef ch(key);
+-    // If this is a linked hash, we can't rely on owning the node, so we always
+-    // create a new one.
+-    Node *n = link?0:findNode(key);
+-    if (n) n->value = value;
+-    else createNode(QHashedString(key, ch.hash()), value);
+-}
+-
+-template<class T>
+-void QStringHash<T>::insert(const QHashedString &key, const T &value)
+-{
+-    // If this is a linked hash, we can't rely on owning the node, so we always
+-    // create a new one.
+-    Node *n = link?0:findNode(key);
+-    if (n) n->value = value;
+-    else createNode(key, value);
+-}
+-
+-template<class T>
+-void QStringHash<T>::insert(const QHashedStringRef &key, const T &value)
++template<class K>
++void QStringHash<T>::insert(const K &key, const T &value)
+ {
+     // If this is a linked hash, we can't rely on owning the node, so we always
+     // create a new one.
+@@ -801,73 +846,19 @@ void QStringHash<T>::insert(const QHashedStringRef &key, const T &value)
+ }
+ 
+ template<class T>
+-void QStringHash<T>::insert(const QHashedCStringRef &key, const T &value)
+-{
+-    // If this is a linked hash, we can't rely on owning the node, so we always
+-    // create a new one.
+-    Node *n = link?0:findNode(key);
+-    if (n) n->value = value;
+-    else createNode(key, value);
+-}
+-
+-template<class T>
+-void QStringHash<T>::insert(const ConstIterator &key)
+-{
+-    // If this is a linked hash, we can't rely on owning the node, so we always
+-    // create a new one.
+-    if (key.node()->isQString()) {
+-        QHashedStringRef str((QChar *)key.node()->strData->data(), key.node()->length,
+-                             key.node()->hash);
+-
+-        Node *n = link?0:findNode(str);
+-        if (n) n->value = key.node()->value;
+-        else createNode(*key.node());
+-    } else {
+-        QHashedCStringRef str(key.node()->ckey, key.node()->length, key.node()->hash);
+-
+-        Node *n = link?0:findNode(str);
+-        if (n) n->value = key.node()->value;
+-        else createNode(str, key.node()->value);
+-    }
+-}
+-
+-template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::findNode(const QString &string) const
++void QStringHash<T>::insert(const ConstIterator &iter)
+ {
+-    return findNode(QHashedStringRef(string));
++    insert(iter.key(), iter.value());
+ }
+ 
+ template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::findNode(const QHashedString &string) const
++template<class K>
++typename QStringHash<T>::Node *QStringHash<T>::findNode(const K &key) const
+ {
+-    return findNode(QHashedStringRef(string.constData(), string.length(), string.hash()));
+-}
++    QStringHashNode *node = data.numBuckets?data.buckets[hashOf(key) % data.numBuckets]:0;
+ 
+-template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::findNode(const QHashedStringRef &string) const
+-{
+-    QStringHashNode *node = data.numBuckets?data.buckets[string.hash() % data.numBuckets]:0;
+-    while (node && !node->equals(string))
+-        node = (*node->next);
+-
+-    return (Node *)node;
+-}
+-
+-template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::findNode(const QHashedCStringRef &string) const
+-{
+-    QStringHashNode *node = data.numBuckets?data.buckets[string.hash() % data.numBuckets]:0;
+-    while (node && !node->equals(string))
+-        node = (*node->next);
+-
+-    return (Node *)node;
+-}
+-
+-template<class T>
+-typename QStringHash<T>::Node *QStringHash<T>::findNode(const QHashedV8String &string) const
+-{
+-    QStringHashNode *node = data.numBuckets?data.buckets[string.hash() % data.numBuckets]:0;
+-    while (node && !node->equals(string))
++    typename HashedForm<K>::Type hashedKey(hashedString(key));
++    while (node && !node->equals(hashedKey))
+         node = (*node->next);
+ 
+     return (Node *)node;
+@@ -878,7 +869,7 @@ typename QStringHash<T>::Node *QStringHash<T>::findSymbolNode(const QHashedV8Str
+ {
+     Q_ASSERT(string.symbolId() != 0);
+ 
+-    QStringHashNode *node = data.numBuckets?data.buckets[string.hash() % data.numBuckets]:0;
++    QStringHashNode *node = data.numBuckets?data.buckets[hashOf(string) % data.numBuckets]:0;
+     while (node && !node->symbolEquals(string))
+         node = (*node->next);
+ 
+@@ -889,28 +880,8 @@ typename QStringHash<T>::Node *QStringHash<T>::findSymbolNode(const QHashedV8Str
+ }
+ 
+ template<class T>
+-T *QStringHash<T>::value(const QString &key) const
+-{
+-    Node *n = findNode(key);
+-    return n?&n->value:0;
+-}
+-
+-template<class T>
+-T *QStringHash<T>::value(const QHashedString &key) const
+-{
+-    Node *n = findNode(key);
+-    return n?&n->value:0;
+-}
+-
+-template<class T>
+-T *QStringHash<T>::value(const QHashedStringRef &key) const
+-{
+-    Node *n = findNode(key);
+-    return n?&n->value:0;
+-}
+-
+-template<class T>
+-T *QStringHash<T>::value(const QHashedCStringRef &key) const
++template<class K>
++T *QStringHash<T>::value(const K &key) const
+ {
+     Node *n = findNode(key);
+     return n?&n->value:0;
+@@ -920,10 +891,7 @@ template<class T>
+ T *QStringHash<T>::value(const ConstIterator &iter) const
+ {
+     Node *n = iter.node();
+-    if (n->isQString())
+-        return value(QHashedStringRef((QChar *)n->strData->data(), n->length, n->hash));
+-    else
+-        return value(QHashedCStringRef(n->ckey, n->length, n->hash));
++    return value(n->key());
+ }
+ 
+ template<class T>
+@@ -934,62 +902,15 @@ T *QStringHash<T>::value(const QHashedV8String &string) const
+ }
+ 
+ template<class T>
+-bool QStringHash<T>::contains(const QString &s) const
+-{
+-    return 0 != value(s);
+-}
+-
+-template<class T>
+-bool QStringHash<T>::contains(const QHashedString &s) const
+-{
+-    return 0 != value(s);
+-}
+-
+-template<class T>
+-bool QStringHash<T>::contains(const QHashedStringRef &s) const
+-{
+-    return 0 != value(s);
+-}
+-
+-template<class T>
+-bool QStringHash<T>::contains(const QHashedCStringRef &s) const
+-{
+-    return 0 != value(s);
+-}
+-
+-template<class T>
+-bool QStringHash<T>::contains(const ConstIterator &s) const
+-{
+-    return 0 != value(s);
+-}
+-
+-template<class T>
+-T &QStringHash<T>::operator[](const QString &key)
++template<class K>
++bool QStringHash<T>::contains(const K &key) const
+ {
+-    QHashedStringRef cs(key);
+-    Node *n = findNode(cs);
+-    if (n) return n->value;
+-    else return createNode(QHashedString(key, cs.hash()), T())->value;
++    return 0 != value(key);
+ }
+ 
+ template<class T>
+-T &QStringHash<T>::operator[](const QHashedString &key)
+-{
+-    Node *n = findNode(key);
+-    if (n) return n->value;
+-    else return createNode(key, T())->value;
+-}
+-
+-template<class T>
+-T &QStringHash<T>::operator[](const QHashedStringRef &key)
+-{
+-    Node *n = findNode(key);
+-    if (n) return n->value;
+-    else return createNode(key, T())->value;
+-}
+-
+-template<class T>
+-T &QStringHash<T>::operator[](const QHashedCStringRef &key)
++template<class K>
++T &QStringHash<T>::operator[](const K &key)
+ {
+     Node *n = findNode(key);
+     if (n) return n->value;
+@@ -1007,7 +928,7 @@ void QStringHash<T>::reserve(int n)
+     nodePool->used = 0;
+     nodePool->nodes = new Node[n];
+ 
+-    data.rehashToSize(n, iterateFirst(), iterateNext);
++    data.rehashToSize(n);
+ }
+ 
+ template<class T>
+@@ -1041,14 +962,17 @@ bool QStringHash<T>::ConstIterator::operator!=(const ConstIterator &o) const
+ }
+ 
+ template<class T>
++template<typename K>
++bool QStringHash<T>::ConstIterator::equals(const K &key) const
++{
++    return d.n->equals(key);
++}
++
++template<class T>
+ QHashedString QStringHash<T>::ConstIterator::key() const
+ {
+     Node *n = (Node *)d.n;
+-    if (n->isQString()) {
+-        return QHashedString(QString((QChar *)n->strData->data(), n->length), n->hash);
+-    } else {
+-        return QHashedString(QString::fromLatin1(n->ckey, n->length), n->hash);
+-    }
++    return n->key();
+ }
+ template<class T>
+ const T &QStringHash<T>::ConstIterator::value() const
+@@ -1083,6 +1007,59 @@ typename QStringHash<T>::ConstIterator QStringHash<T>::end() const
+     return ConstIterator();
+ }
+ 
++template<class T>
++template<class K>
++typename QStringHash<T>::ConstIterator QStringHash<T>::find(const K &key) const
++{
++    return iterator(findNode(key));
++}
++
++template<class T>
++class QStringMultiHash : public QStringHash<T>
++{
++public:
++    typedef typename QStringHash<T>::ConstIterator ConstIterator;
++
++    template<typename K>
++    inline void insert(const K &, const T &);
++
++    inline void insert(const ConstIterator &);
++
++    inline ConstIterator findNext(const ConstIterator &) const;
++};
++
++template<class T>
++template<class K>
++void QStringMultiHash<T>::insert(const K &key, const T &value)
++{
++    // Always create a new node
++    QStringHash<T>::createNode(key, value);
++}
++
++template<class T>
++void QStringMultiHash<T>::insert(const ConstIterator &iter)
++{
++    // Always create a new node
++    QStringHash<T>::createNode(iter.key(), iter.value());
++}
++
++template<class T>
++typename QStringHash<T>::ConstIterator QStringMultiHash<T>::findNext(const ConstIterator &iter) const
++{
++    QStringHashNode *node = iter.node();
++    if (node) {
++        QHashedString key(node->key());
++
++        while ((node = *node->next)) {
++            if (node->equals(key)) {
++                return QStringHash<T>::iterator(static_cast<typename QStringHash<T>::Node *>(node));
++            }
++        }
++    }
++
++    return ConstIterator();
++}
++
+ inline uint qHash(const QHashedString &string) 
+ { 
+     return uint(string.hash()); 
+@@ -1311,6 +1288,11 @@ bool QHashedStringRef::operator!=(const QHashedCStringRef &string) const
+            QHashedString::compare(m_data, string.m_data, m_length);
+ }
+ 
++QChar *QHashedStringRef::data()
++{
++    return const_cast<QChar *>(m_data);
++}
++
+ const QChar &QHashedStringRef::at(int index) const
+ {
+     Q_ASSERT(index < m_length);
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index ee8b30a..c9f66a4 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -2965,7 +2965,7 @@ bool QQmlCompiler::buildDynamicMeta(QQmlScript::Object *obj, DynamicMetaMode mod
+                 // XXX TODO: find a better way to get signal name from the property data :-/
+                 for (QQmlPropertyCache::StringCache::ConstIterator iter = parentCache->stringCache.begin();
+                         iter != parentCache->stringCache.end(); ++iter) {
+-                    if (currPSig == iter.value()) {
++                    if (currPSig == (*iter).second) {
+                         seenSignals.insert(iter.key());
+                         break;
+                     }
+@@ -3922,7 +3922,7 @@ QQmlCompiler::property(QQmlScript::Object *object, const QHashedStringRef &name,
+ 
+     QQmlPropertyCache *cache = propertyCacheForObject(object);
+ 
+-    QQmlPropertyData *d = cache->property(name);
++    QQmlPropertyData *d = cache->property(name, 0, 0);
+ 
+     // Find the first property
+     while (d && d->isFunction())
+@@ -3945,7 +3945,7 @@ QQmlCompiler::signal(QQmlScript::Object *object, const QHashedStringRef &name, b
+     QQmlPropertyCache *cache = propertyCacheForObject(object);
+ 
+ 
+-    QQmlPropertyData *d = cache->property(name);
++    QQmlPropertyData *d = cache->property(name, 0, 0);
+     if (notInRevision) *notInRevision = false;
+ 
+     while (d && !(d->isFunction()))
+diff --git a/src/qml/qml/qqmlcontext.cpp b/src/qml/qml/qqmlcontext.cpp
+index 6c83433..8445625 100644
+--- a/src/qml/qml/qqmlcontext.cpp
++++ b/src/qml/qml/qqmlcontext.cpp
+@@ -385,7 +385,7 @@ QVariant QQmlContext::contextProperty(const QString &name) const
+             QObject *obj = data->contextObject;
+             QQmlPropertyData local;
+             QQmlPropertyData *property =
+-                QQmlPropertyCache::property(data->engine, obj, name, local);
++                QQmlPropertyCache::property(data->engine, obj, name, data, local);
+ 
+             if (property) value = obj->metaObject()->property(property->coreIndex).read(obj);
+         }
+diff --git a/src/qml/qml/qqmllist.cpp b/src/qml/qml/qqmllist.cpp
+index 8698ce3..2e74f3e 100644
+--- a/src/qml/qml/qqmllist.cpp
++++ b/src/qml/qml/qqmllist.cpp
+@@ -139,7 +139,7 @@ QQmlListReference::QQmlListReference(QObject *object, const char *property, QQml
+ 
+     QQmlPropertyData local;
+     QQmlPropertyData *data =
+-        QQmlPropertyCache::property(engine, object, QLatin1String(property), local);
++        QQmlPropertyCache::property(engine, object, QLatin1String(property), 0, local);
+ 
+     if (!data || !data->isQList()) return;
+ 
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index a239b45..ded891a 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -284,7 +284,7 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+ 
+         QQmlPropertyData local;
+         QQmlPropertyData *property =
+-            QQmlPropertyCache::property(engine, obj, pathName, local);
++            QQmlPropertyCache::property(engine, obj, pathName, context, local);
+ 
+         if (!property) return; // Not a property
+         if (property->isFunction())
+@@ -340,7 +340,7 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+         if (ddata && ddata->propertyCache) {
+ 
+             // Try method
+-            QQmlPropertyData *d = ddata->propertyCache->property(signalName);
++            QQmlPropertyData *d = ddata->propertyCache->property(signalName, currentObject, context);
+             while (d && !d->isFunction())
+                 d = ddata->propertyCache->overrideData(d);
+ 
+@@ -353,7 +353,7 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+             // Try property
+             if (signalName.endsWith(QLatin1String("Changed"))) {
+                 QString propName = signalName.mid(0, signalName.length() - 7);
+-                QQmlPropertyData *d = ddata->propertyCache->property(propName);
++                QQmlPropertyData *d = ddata->propertyCache->property(propName, currentObject, context);
+                 while (d && d->isFunction())
+                     d = ddata->propertyCache->overrideData(d);
+ 
+@@ -378,7 +378,7 @@ void QQmlPropertyPrivate::initProperty(QObject *obj, const QString &name)
+     // Property
+     QQmlPropertyData local;
+     QQmlPropertyData *property =
+-        QQmlPropertyCache::property(engine, currentObject, terminal, local);
++        QQmlPropertyCache::property(engine, currentObject, terminal, context, local);
+     if (property && !property->isFunction()) {
+         object = currentObject;
+         core = *property;
+diff --git a/src/qml/qml/qqmlpropertycache.cpp b/src/qml/qml/qqmlpropertycache.cpp
+index 3519d46..9165f89 100644
+--- a/src/qml/qml/qqmlpropertycache.cpp
++++ b/src/qml/qml/qqmlpropertycache.cpp
+@@ -41,8 +41,9 @@
+ 
+ #include "qqmlpropertycache_p.h"
+ 
+-#include "qqmlengine_p.h"
+-#include "qqmlbinding_p.h"
++#include <private/qqmlengine_p.h>
++#include <private/qqmlbinding_p.h>
++#include <private/qqmlvmemetaobject_p.h>
+ #include <private/qv8engine_p.h>
+ 
+ #include <private/qmetaobject_p.h>
+@@ -53,6 +54,7 @@
+ #include <QtCore/qdebug.h>
+ 
+ #include <ctype.h> // for toupper
++#include <limits.h>
+ 
+ #ifdef Q_CC_MSVC
+ // nonstandard extension used : zero-sized array in struct/union.
+@@ -243,7 +245,8 @@ Creates a new empty QQmlPropertyCache.
+ */
+ QQmlPropertyCache::QQmlPropertyCache(QQmlEngine *e)
+ : engine(e), _parent(0), propertyIndexCacheStart(0), methodIndexCacheStart(0),
+-  signalHandlerIndexCacheStart(0), _ownMetaObject(false), _metaObject(0), argumentsCache(0)
++  signalHandlerIndexCacheStart(0), _hasPropertyOverrides(false), _ownMetaObject(false),
++  _metaObject(0), argumentsCache(0)
+ {
+     Q_ASSERT(engine);
+ }
+@@ -253,7 +256,8 @@ Creates a new QQmlPropertyCache of \a metaObject.
+ */
+ QQmlPropertyCache::QQmlPropertyCache(QQmlEngine *e, const QMetaObject *metaObject)
+ : engine(e), _parent(0), propertyIndexCacheStart(0), methodIndexCacheStart(0),
+-  signalHandlerIndexCacheStart(0), _ownMetaObject(false), _metaObject(0), argumentsCache(0)
++  signalHandlerIndexCacheStart(0), _hasPropertyOverrides(false), _ownMetaObject(false),
++  _metaObject(0), argumentsCache(0)
+ {
+     Q_ASSERT(engine);
+     Q_ASSERT(metaObject);
+@@ -351,16 +355,14 @@ void QQmlPropertyCache::appendProperty(const QString &name,
+     data.notifyIndex = notifyIndex;
+     data.flags = flags;
+ 
+-    QHashedString string(name);
+-    if (QQmlPropertyData **old = stringCache.value(string)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int index = propertyIndexCache.count();
+     propertyIndexCache.append(data);
+ 
+-    stringCache.insert(string, propertyIndexCache.data() + propertyIndexCache.count() - 1);
++    setNamedProperty(name, index + propertyOffset(), propertyIndexCache.data() + index, (old != 0));
+ }
+ 
+ void QQmlPropertyCache::appendProperty(const QHashedCStringRef &name,
+@@ -372,15 +374,14 @@ void QQmlPropertyCache::appendProperty(const QHashedCStringRef &name,
+     data.notifyIndex = notifyIndex;
+     data.flags = flags;
+ 
+-    if (QQmlPropertyData **old = stringCache.value(name)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int index = propertyIndexCache.count();
+     propertyIndexCache.append(data);
+ 
+-    stringCache.insert(name, propertyIndexCache.data() + propertyIndexCache.count() - 1);
++    setNamedProperty(name, index + propertyOffset(), propertyIndexCache.data() + index, (old != 0));
+ }
+ 
+ void QQmlPropertyCache::appendSignal(const QString &name, quint32 flags, int coreIndex,
+@@ -410,21 +411,21 @@ void QQmlPropertyCache::appendSignal(const QString &name, quint32 flags, int cor
+         data.arguments = args;
+     }
+ 
+-    QString handlerName = QLatin1String("on") + name;
+-    handlerName[2] = handlerName[2].toUpper();
+-
+-    QHashedString string(name);
+-    if (QQmlPropertyData **old = stringCache.value(string)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int methodIndex = methodIndexCache.count();
+     methodIndexCache.append(data);
++
++    int signalHandlerIndex = signalHandlerIndexCache.count();
+     signalHandlerIndexCache.append(handler);
+ 
+-    stringCache.insert(string, methodIndexCache.data() + methodIndexCache.count() - 1);
+-    stringCache.insert(handlerName, signalHandlerIndexCache.data() + signalHandlerIndexCache.count() - 1);
++    QString handlerName = QLatin1String("on") + name;
++    handlerName[2] = handlerName[2].toUpper();
++
++    setNamedProperty(name, methodIndex + methodOffset(), methodIndexCache.data() + methodIndex, (old != 0));
++    setNamedProperty(handlerName, signalHandlerIndex + signalOffset(), signalHandlerIndexCache.data() + signalHandlerIndex, (old != 0));
+ }
+ 
+ void QQmlPropertyCache::appendSignal(const QHashedCStringRef &name, quint32 flags, int coreIndex,
+@@ -454,20 +455,21 @@ void QQmlPropertyCache::appendSignal(const QHashedCStringRef &name, quint32 flag
+         data.arguments = args;
+     }
+ 
+-    QString handlerName = QLatin1String("on") + name.toUtf16();
+-    handlerName[2] = handlerName[2].toUpper();
+-
+-    if (QQmlPropertyData **old = stringCache.value(name)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int methodIndex = methodIndexCache.count();
+     methodIndexCache.append(data);
++
++    int signalHandlerIndex = signalHandlerIndexCache.count();
+     signalHandlerIndexCache.append(handler);
+ 
+-    stringCache.insert(name, methodIndexCache.data() + methodIndexCache.count() - 1);
+-    stringCache.insert(handlerName, signalHandlerIndexCache.data() + signalHandlerIndexCache.count() - 1);
++    QString handlerName = QLatin1String("on") + name.toUtf16();
++    handlerName[2] = handlerName[2].toUpper();
++
++    setNamedProperty(name, methodIndex + methodOffset(), methodIndexCache.data() + methodIndex, (old != 0));
++    setNamedProperty(handlerName, signalHandlerIndex + signalOffset(), signalHandlerIndexCache.data() + signalHandlerIndex, (old != 0));
+ }
+ 
+ void QQmlPropertyCache::appendMethod(const QString &name, quint32 flags, int coreIndex,
+@@ -497,16 +499,14 @@ void QQmlPropertyCache::appendMethod(const QString &name, quint32 flags, int cor
+ 
+     data.flags = flags;
+ 
+-    QHashedString string(name);
+-    if (QQmlPropertyData **old = stringCache.value(string)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int methodIndex = methodIndexCache.count();
+     methodIndexCache.append(data);
+ 
+-    stringCache.insert(string, methodIndexCache.data() + methodIndexCache.count() - 1);
++    setNamedProperty(name, methodIndex + methodOffset(), methodIndexCache.data() + methodIndex, (old != 0));
+ }
+ 
+ void QQmlPropertyCache::appendMethod(const QHashedCStringRef &name, quint32 flags, int coreIndex,
+@@ -536,15 +536,14 @@ void QQmlPropertyCache::appendMethod(const QHashedCStringRef &name, quint32 flag
+ 
+     data.flags = flags;
+ 
+-    if (QQmlPropertyData **old = stringCache.value(name)) {
+-        data.overrideIndexIsProperty = !(*old)->isFunction();
+-        data.overrideIndex = (*old)->coreIndex;
+-        (*old)->flags |= QQmlPropertyData::IsOverridden;
+-    }
++    QQmlPropertyData *old = findNamedProperty(name);
++    if (old)
++        data.markAsOverrideOf(old);
+ 
++    int methodIndex = methodIndexCache.count();
+     methodIndexCache.append(data);
+ 
+-    stringCache.insert(name, methodIndexCache.data() + methodIndexCache.count() - 1);
++    setNamedProperty(name, methodIndex + methodOffset(), methodIndexCache.data() + methodIndex, (old != 0));
+ }
+ 
+ // Returns this property cache's metaObject.  May be null if it hasn't been created yet.
+@@ -576,7 +575,7 @@ QString QQmlPropertyCache::defaultPropertyName() const
+ 
+ QQmlPropertyData *QQmlPropertyCache::defaultProperty() const
+ {
+-    return property(defaultPropertyName());
++    return property(defaultPropertyName(), 0, 0);
+ }
+ 
+ QQmlPropertyCache *QQmlPropertyCache::parent() const
+@@ -730,20 +729,20 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+ 
+         if (utf8) {
+             QHashedString methodName(QString::fromUtf8(rawName, cptr - rawName));
+-            if (QQmlPropertyData **it = stringCache.value(methodName))
+-                old = *it;
+-            stringCache.insert(methodName, data);
++            if (StringCache::mapped_type *it = stringCache.value(methodName))
++                old = it->second;
++            setNamedProperty(methodName, ii, data, (old != 0));
+ 
+             if (data->isSignal()) {
+                 QHashedString on(QStringLiteral("on") % methodName.at(0).toUpper() % methodName.midRef(1));
+-                stringCache.insert(on, sigdata);
++                setNamedProperty(on, ii, sigdata, (old != 0));
+                 ++signalHandlerIndex;
+             }
+         } else {
+             QHashedCStringRef methodName(rawName, cptr - rawName);
+-            if (QQmlPropertyData **it = stringCache.value(methodName))
+-                old = *it;
+-            stringCache.insert(methodName, data);
++            if (StringCache::mapped_type *it = stringCache.value(methodName))
++                old = it->second;
++            setNamedProperty(methodName, ii, data, (old != 0));
+ 
+             if (data->isSignal()) {
+                 int length = methodName.length();
+@@ -757,7 +756,7 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+                 str[length + 2] = '\0';
+ 
+                 QHashedString on(QString::fromLatin1(str.data()));
+-                stringCache.insert(on, sigdata);
++                setNamedProperty(on, ii, data, (old != 0));
+                 ++signalHandlerIndex;
+             }
+         }
+@@ -766,9 +765,8 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+             // We only overload methods in the same class, exactly like C++
+             if (old->isFunction() && old->coreIndex >= methodOffset)
+                 data->flags |= QQmlPropertyData::IsOverload;
+-            data->overrideIndexIsProperty = !old->isFunction();
+-            data->overrideIndex = old->coreIndex;
+-            old->flags |= QQmlPropertyData::IsOverridden;
++
++            data->markAsOverrideOf(old);
+         }
+     }
+ 
+@@ -806,14 +804,14 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+ 
+         if (utf8) {
+             QHashedString propName(QString::fromUtf8(str, cptr - str));
+-            if (QQmlPropertyData **it = stringCache.value(propName))
+-                old = *it;
+-            stringCache.insert(propName, data);
++            if (StringCache::mapped_type *it = stringCache.value(propName))
++                old = it->second;
++            setNamedProperty(propName, ii, data, (old != 0));
+         } else {
+             QHashedCStringRef propName(str, cptr - str);
+-            if (QQmlPropertyData **it = stringCache.value(propName))
+-                old = *it;
+-            stringCache.insert(propName, data);
++            if (StringCache::mapped_type *it = stringCache.value(propName))
++                old = it->second;
++            setNamedProperty(propName, ii, data, (old != 0));
+         }
+ 
+         QQmlAccessorProperties::Property *accessorProperty = accessorProperties.property(str);
+@@ -826,13 +824,19 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+             data->accessors = accessorProperty->accessors;
+             data->accessorData = accessorProperty->data;
+         } else if (old) {
+-            data->overrideIndexIsProperty = !old->isFunction();
+-            data->overrideIndex = old->coreIndex;
+-            old->flags |= QQmlPropertyData::IsOverridden;
++            data->markAsOverrideOf(old);
+         }
+     }
+ }
+ 
++QQmlPropertyData *QQmlPropertyCache::ensureResolved(QQmlPropertyData *p) const
++{
++    if (p && p->notFullyResolved())
++        resolve(p);
++
++    return p;
++}
++
+ void QQmlPropertyCache::resolve(QQmlPropertyData *data) const
+ {
+     Q_ASSERT(data->notFullyResolved());
+@@ -918,8 +922,7 @@ QQmlPropertyCache::property(int index) const
+         return _parent->property(index);
+ 
+     QQmlPropertyData *rv = const_cast<QQmlPropertyData *>(&propertyIndexCache.at(index - propertyIndexCacheStart));
+-    if (rv->notFullyResolved()) resolve(rv);
+-    return rv;
++    return ensureResolved(rv);
+ }
+ 
+ QQmlPropertyData *
+@@ -932,32 +935,60 @@ QQmlPropertyCache::method(int index) const
+         return _parent->method(index);
+ 
+     QQmlPropertyData *rv = const_cast<QQmlPropertyData *>(&methodIndexCache.at(index - methodIndexCacheStart));
+-    if (rv->notFullyResolved()) resolve(rv);
+-    return rv;
++    return ensureResolved(rv);
+ }
+ 
+-QQmlPropertyData *
+-QQmlPropertyCache::property(const QHashedStringRef &str) const
++QQmlPropertyData *QQmlPropertyCache::findProperty(StringCache::ConstIterator it, QObject *object, QQmlContextData *context) const
+ {
+-    QQmlPropertyData **rv = stringCache.value(str);
+-    if (rv && (*rv)->notFullyResolved()) resolve(*rv);
+-    return rv?*rv:0;
++    QQmlData *data = (object ? QQmlData::get(object) : 0);
++    const QQmlVMEMetaObject *vmemo = (data && data->hasVMEMetaObject ? static_cast<const QQmlVMEMetaObject *>(object->metaObject()) : 0);
++    return findProperty(it, vmemo, context);
+ }
+ 
+-QQmlPropertyData *
+-QQmlPropertyCache::property(const QHashedCStringRef &str) const
++namespace {
++
++inline bool contextHasNoExtensions(QQmlContextData *context)
+ {
+-    QQmlPropertyData **rv = stringCache.value(str);
+-    if (rv && (*rv)->notFullyResolved()) resolve(*rv);
+-    return rv?*rv:0;
++    // This context has no extension if its parent is the engine's rootContext,
++    // which has children but no imports
++    return (!context->parent || !context->parent->imports);
+ }
+ 
+-QQmlPropertyData *
+-QQmlPropertyCache::property(const QString &str) const
++inline int maximumIndexForProperty(QQmlPropertyData *prop, const QQmlVMEMetaObject *vmemo)
+ {
+-    QQmlPropertyData **rv = stringCache.value(str);
+-    if (rv && (*rv)->notFullyResolved()) resolve(*rv);
+-    return rv?*rv:0;
++    return (prop->isFunction() ? vmemo->methodCount()
++                               : prop->isSignalHandler() ? vmemo->signalCount()
++                                                         : vmemo->propertyCount());
++}
++
++}
++
++QQmlPropertyData *QQmlPropertyCache::findProperty(StringCache::ConstIterator it, const QQmlVMEMetaObject *vmemo, QQmlContextData *context) const
++{
++    StringCache::ConstIterator end = stringCache.end();
++
++    if (it != end) {
++        if (vmemo && context && !contextHasNoExtensions(context)) {
++            // Find the highest property offset known to the supplied context
++            do {
++                if (vmemo->ctxt == context)
++                    break;
++
++                vmemo = vmemo->parentVMEMetaObject();
++            } while (vmemo);
++        }
++
++        do {
++            // Is this property available to this context?
++            const StringCache::mapped_type &property(it.value());
++            if (!vmemo || (property.first < maximumIndexForProperty(property.second, vmemo)))
++                return ensureResolved(property.second);
++
++            it = stringCache.findNext(it);
++        } while (it != end);
++    }
++
++    return 0;
+ }
+ 
+ QString QQmlPropertyData::name(QObject *object)
+@@ -983,6 +1014,14 @@ QString QQmlPropertyData::name(const QMetaObject *metaObject)
+     }
+ }
+ 
++void QQmlPropertyData::markAsOverrideOf(QQmlPropertyData *predecessor)
++{
++    overrideIndexIsProperty = !predecessor->isFunction();
++    overrideIndex = predecessor->coreIndex;
++
++    predecessor->flags |= QQmlPropertyData::IsOverridden;
++}
++
+ QStringList QQmlPropertyCache::propertyNames() const
+ {
+     QStringList keys;
+@@ -1311,7 +1350,8 @@ inline QString qQmlPropertyCacheToString(const QHashedV8String &string)
+ 
+ template<typename T>
+ QQmlPropertyData *
+-qQmlPropertyCacheProperty(QQmlEngine *engine, QObject *obj, const T &name, QQmlPropertyData &local)
++qQmlPropertyCacheProperty(QQmlEngine *engine, QObject *obj, const T &name,
++                          QQmlContextData *context, QQmlPropertyData &local)
+ {
+     QQmlPropertyCache *cache = 0;
+ 
+@@ -1332,7 +1372,7 @@ qQmlPropertyCacheProperty(QQmlEngine *engine, QObject *obj, const T &name, QQmlP
+     QQmlPropertyData *rv = 0;
+ 
+     if (cache) {
+-        rv = cache->property(name);
++        rv = cache->property(name, obj, context);
+     } else {
+         local = qQmlPropertyCacheCreate(obj->metaObject(), qQmlPropertyCacheToString(name));
+         if (local.isValid())
+@@ -1343,17 +1383,17 @@ qQmlPropertyCacheProperty(QQmlEngine *engine, QObject *obj, const T &name, QQmlP
+ }
+ 
+ QQmlPropertyData *
+-QQmlPropertyCache::property(QQmlEngine *engine, QObject *obj,
+-                                    const QHashedV8String &name, QQmlPropertyData &local)
++QQmlPropertyCache::property(QQmlEngine *engine, QObject *obj, const QHashedV8String &name,
++                            QQmlContextData *context, QQmlPropertyData &local)
+ {
+-    return qQmlPropertyCacheProperty<QHashedV8String>(engine, obj, name, local);
++    return qQmlPropertyCacheProperty<QHashedV8String>(engine, obj, name, context, local);
+ }
+ 
+ QQmlPropertyData *
+ QQmlPropertyCache::property(QQmlEngine *engine, QObject *obj,
+-                                    const QString &name, QQmlPropertyData &local)
++                                    const QString &name, QQmlContextData *context, QQmlPropertyData &local)
+ {
+-    return qQmlPropertyCacheProperty<QString>(engine, obj, name, local);
++    return qQmlPropertyCacheProperty<QString>(engine, obj, name, context, local);
+ }
+ 
+ static inline const QMetaObjectPrivate *priv(const uint* data)
+@@ -1416,7 +1456,7 @@ void QQmlPropertyCache::toMetaObjectBuilder(QMetaObjectBuilder &builder)
+     QList<QPair<QString, QQmlPropertyData *> > methods;
+ 
+     for (StringCache::ConstIterator iter = stringCache.begin(); iter != stringCache.end(); ++iter)
+-        Insert::in(this, properties, methods, iter, iter.value());
++        Insert::in(this, properties, methods, iter, iter.value().second);
+ 
+     Q_ASSERT(properties.count() == propertyIndexCache.count());
+     Q_ASSERT(methods.count() == methodIndexCache.count());
+@@ -1477,7 +1517,7 @@ void QQmlPropertyCache::toMetaObjectBuilder(QMetaObjectBuilder &builder)
+     }
+ 
+     if (!_defaultPropertyName.isEmpty()) {
+-        QQmlPropertyData *dp = property(_defaultPropertyName);
++        QQmlPropertyData *dp = property(_defaultPropertyName, 0, 0);
+         if (dp && dp->coreIndex >= propertyIndexCacheStart) {
+             Q_ASSERT(!dp->isFunction());
+             builder.addClassInfo("DefaultProperty", _defaultPropertyName.toUtf8());
+diff --git a/src/qml/qml/qqmlpropertycache_p.h b/src/qml/qml/qqmlpropertycache_p.h
+index b14e2f4..e846590 100644
+--- a/src/qml/qml/qqmlpropertycache_p.h
++++ b/src/qml/qml/qqmlpropertycache_p.h
+@@ -72,6 +72,7 @@ class QQmlPropertyData;
+ class QQmlAccessors;
+ class QMetaObjectBuilder;
+ class QQmlPropertyCacheMethodArguments;
++class QQmlVMEMetaObject;
+ 
+ // We have this somewhat awful split between RawData and Data so that RawData can be
+ // used in unions.  In normal code, you should always use Data which initializes RawData
+@@ -228,6 +229,8 @@ public:
+     QString name(QObject *);
+     QString name(const QMetaObject *);
+ 
++    void markAsOverrideOf(QQmlPropertyData *predecessor);
++
+ private:
+     friend class QQmlPropertyCache;
+     void lazyLoad(const QMetaProperty &, QQmlEngine *engine = 0);
+@@ -274,10 +277,12 @@ public:
+     const QMetaObject *createMetaObject();
+     const QMetaObject *firstCppMetaObject() const;
+ 
+-    inline QQmlPropertyData *property(const QHashedV8String &) const;
+-    QQmlPropertyData *property(const QHashedStringRef &) const;
+-    QQmlPropertyData *property(const QHashedCStringRef &) const;
+-    QQmlPropertyData *property(const QString &) const;
++    template<typename K>
++    QQmlPropertyData *property(const K &key, QObject *object, QQmlContextData *context) const
++    {
++        return findProperty(stringCache.find(key), object, context);
++    }
++
+     QQmlPropertyData *property(int) const;
+     QQmlPropertyData *method(int) const;
+     QQmlPropertyData *signal(int) const;
+@@ -293,9 +298,9 @@ public:
+ 
+     inline QQmlEngine *qmlEngine() const;
+     static QQmlPropertyData *property(QQmlEngine *, QObject *, const QString &,
+-                                              QQmlPropertyData &);
++                                              QQmlContextData *, QQmlPropertyData &);
+     static QQmlPropertyData *property(QQmlEngine *, QObject *, const QHashedV8String &,
+-                                              QQmlPropertyData &);
++                                              QQmlContextData *, QQmlPropertyData &);
+     static int *methodParameterTypes(QObject *, int index, QVarLengthArray<int, 9> &dummy,
+                                      QByteArray *unknownTypeError);
+     static int methodReturnType(QObject *, const QQmlPropertyData &data,
+@@ -341,12 +346,31 @@ private:
+     v8::Local<v8::Object> newQObject(QObject *, QV8Engine *);
+ 
+     typedef QVector<QQmlPropertyData> IndexCache;
+-    typedef QStringHash<QQmlPropertyData *> StringCache;
++    typedef QStringMultiHash<QPair<int, QQmlPropertyData *> > StringCache;
+     typedef QVector<int> AllowedRevisionCache;
+ 
++    QQmlPropertyData *findProperty(StringCache::ConstIterator it, QObject *, QQmlContextData *) const;
++    QQmlPropertyData *findProperty(StringCache::ConstIterator it, const QQmlVMEMetaObject *, QQmlContextData *) const;
++
++    QQmlPropertyData *ensureResolved(QQmlPropertyData*) const;
++
+     void resolve(QQmlPropertyData *) const;
+     void updateRecur(QQmlEngine *, const QMetaObject *);
+ 
++    template<typename K>
++    QQmlPropertyData *findNamedProperty(const K &key)
++    {
++        StringCache::mapped_type *it = stringCache.value(key);
++        return it ? it->second : 0;
++    }
++
++    template<typename K>
++    void setNamedProperty(const K &key, int index, QQmlPropertyData *data, bool isOverride)
++    {
++        stringCache.insert(key, qMakePair(index, data));
++        _hasPropertyOverrides |= isOverride;
++    }
++
+     QQmlEngine *engine;
+ 
+     QQmlPropertyCache *_parent;
+@@ -361,7 +385,8 @@ private:
+     AllowedRevisionCache allowedRevisionCache;
+     v8::Persistent<v8::Function> constructor;
+ 
+-    bool _ownMetaObject;
++    bool _hasPropertyOverrides : 1;
++    bool _ownMetaObject : 1;
+     const QMetaObject *_metaObject;
+     QByteArray _dynamicClassName;
+     QByteArray _dynamicStringData;
+@@ -465,13 +490,6 @@ QQmlEngine *QQmlPropertyCache::qmlEngine() const
+     return engine;
+ }
+ 
+-QQmlPropertyData *QQmlPropertyCache::property(const QHashedV8String &str) const
+-{
+-    QQmlPropertyData **rv = stringCache.value(str);
+-    if (rv && (*rv)->notFullyResolved()) resolve(*rv);
+-    return rv?*rv:0;
+-}
+-
+ int QQmlPropertyCache::propertyCount() const
+ {
+     return propertyIndexCacheStart + propertyIndexCache.count();
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 3d70761..8a3e02c 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -187,6 +187,7 @@ protected:
+ public:
+     friend class QQmlVMEMetaObjectEndpoint;
+     friend class QQmlVMEVariantQObjectPtr;
++    friend class QQmlPropertyCache;
+ 
+     QObject *object;
+     QQmlGuardedContextData ctxt;
+@@ -196,6 +197,7 @@ public:
+     inline int propOffset() const;
+     inline int methodOffset() const;
+     inline int signalOffset() const;
++    inline int signalCount() const;
+ 
+     bool hasAssignedMetaObjectData;
+     QQmlVMEVariant *data;
+@@ -224,6 +226,8 @@ public:
+ 
+     QBiPointer<QDynamicMetaObjectData, const QMetaObject> parent;
+ 
++    inline QQmlVMEMetaObject *parentVMEMetaObject() const;
++
+     void listChanged(int);
+     class List : public QList<QObject*>
+     {
+@@ -276,6 +280,19 @@ int QQmlVMEMetaObject::signalOffset() const
+     return cache->signalOffset();
+ }
+ 
++int QQmlVMEMetaObject::signalCount() const
++{
++    return cache->signalCount();
++}
++
++QQmlVMEMetaObject *QQmlVMEMetaObject::parentVMEMetaObject() const
++{
++    if (parent.isT1())
++        return static_cast<QQmlVMEMetaObject *>(parent.asT1());
++
++    return 0;
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLVMEMETAOBJECT_P_H
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index bd67a8d..ddc94d8 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -864,7 +864,7 @@ inline quint32 QV4Bindings::toUint32(double n)
+         } \
+         QQmlPropertyData *prop = (data && data->propertyCache) ? data->propertyCache->property((index)) : 0; \
+         if (prop && prop->isOverridden()) { \
+-            int resolvedIndex = data->propertyCache->property(prop->name(obj))->coreIndex; \
++            int resolvedIndex = data->propertyCache->property(prop->name(obj), obj, context)->coreIndex; \
+             if ((int)index < resolvedIndex) { \
+                 *(inv) = true; \
+                 goto programExit; \
+diff --git a/src/qml/qml/v4/qv4irbuilder.cpp b/src/qml/qml/v4/qv4irbuilder.cpp
+index 37d71f1..45e3a72 100644
+--- a/src/qml/qml/v4/qv4irbuilder.cpp
++++ b/src/qml/qml/v4/qv4irbuilder.cpp
+@@ -466,7 +466,7 @@ bool QV4IRBuilder::visit(AST::IdentifierExpression *ast)
+                 QQmlPropertyCache *cache = m_expression->context->synthCache;
+                 if (!cache) cache = m_expression->context->metatype;
+ 
+-                QQmlPropertyData *data = cache->property(name);
++                QQmlPropertyData *data = cache->property(name, 0, 0);
+ 
+                 if (data && data->hasRevision()) {
+                     if (qmlVerboseCompiler()) 
+@@ -486,7 +486,7 @@ bool QV4IRBuilder::visit(AST::IdentifierExpression *ast)
+                 QQmlPropertyCache *cache = m_expression->component->synthCache;
+                 if (!cache) cache = m_expression->component->metatype;
+ 
+-                QQmlPropertyData *data = cache->property(name);
++                QQmlPropertyData *data = cache->property(name, 0, 0);
+ 
+                 if (data && data->hasRevision()) {
+                     if (qmlVerboseCompiler()) 
+@@ -612,7 +612,7 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                                    << (*baseName->id + QLatin1Char('.') + ast->name.toString());
+                 } else if(const QMetaObject *attachedMeta = baseName->declarativeType->attachedPropertiesType()) {
+                     QQmlPropertyCache *cache = m_engine->cache(attachedMeta);
+-                    QQmlPropertyData *data = cache->property(name);
++                    QQmlPropertyData *data = cache->property(name, 0, 0);
+ 
+                     if (!data || data->isFunction())
+                         return false; // Don't support methods (or non-existing properties ;)
+@@ -647,7 +647,7 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                 } else {
+                     QQmlPropertyCache *cache = baseName->meta.propertyCache(m_engine);
+                     if (!cache) return false;
+-                    QQmlPropertyData *data = cache->property(name);
++                    QQmlPropertyData *data = cache->property(name, 0, 0);
+ 
+                     if (!data || data->isFunction())
+                         return false; // Don't support methods (or non-existing properties ;)
+@@ -666,7 +666,7 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                 QQmlPropertyCache *cache = 
+                     idObject->synthCache?idObject->synthCache:idObject->metatype;
+ 
+-                QQmlPropertyData *data = cache->property(name);
++                QQmlPropertyData *data = cache->property(name, 0, 0);
+ 
+                 if (!data || data->isFunction())
+                     return false; // Don't support methods (or non-existing properties ;)
+@@ -690,7 +690,7 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                     if (!cache)
+                         return false;
+ 
+-                    if (QQmlPropertyData *data = cache->property(name)) {
++                    if (QQmlPropertyData *data = cache->property(name, 0, 0)) {
+                         if (!baseName->property->isFinal() || !data->isFinal())
+                             _invalidatable = true;
+ 
+diff --git a/src/qml/qml/v8/qv8contextwrapper.cpp b/src/qml/qml/v8/qv8contextwrapper.cpp
+index 82ff64f..80d4000 100644
+--- a/src/qml/qml/v8/qv8contextwrapper.cpp
++++ b/src/qml/qml/v8/qv8contextwrapper.cpp
+@@ -323,7 +323,7 @@ v8::Handle<v8::Value> QV8ContextWrapper::Getter(v8::Local<v8::String> property,
+         // Search scope object
+         if (scopeObject) {
+             v8::Handle<v8::Value> result = qobjectWrapper->getProperty(scopeObject, propertystring,
+-                                                                       QV8QObjectWrapper::CheckRevision);
++                                                                       context, QV8QObjectWrapper::CheckRevision);
+             if (!result.IsEmpty()) return result;
+         }
+         scopeObject = 0;
+@@ -332,7 +332,7 @@ v8::Handle<v8::Value> QV8ContextWrapper::Getter(v8::Local<v8::String> property,
+         // Search context object
+         if (context->contextObject) {
+             v8::Handle<v8::Value> result = qobjectWrapper->getProperty(context->contextObject, propertystring,
+-                                                                       QV8QObjectWrapper::CheckRevision);
++                                                                       context, QV8QObjectWrapper::CheckRevision);
+             if (!result.IsEmpty()) return result;
+         }
+ 
+@@ -396,13 +396,13 @@ v8::Handle<v8::Value> QV8ContextWrapper::Setter(v8::Local<v8::String> property,
+ 
+         // Search scope object
+         if (scopeObject && 
+-            qobjectWrapper->setProperty(scopeObject, propertystring, value, QV8QObjectWrapper::CheckRevision))
++            qobjectWrapper->setProperty(scopeObject, propertystring, context, value, QV8QObjectWrapper::CheckRevision))
+             return value;
+         scopeObject = 0;
+ 
+         // Search context object
+         if (context->contextObject &&
+-            qobjectWrapper->setProperty(context->contextObject, propertystring, value, 
++            qobjectWrapper->setProperty(context->contextObject, propertystring, context, value,
+                                         QV8QObjectWrapper::CheckRevision))
+             return value;
+ 
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 627e453..9cb3410 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -479,6 +479,7 @@ static v8::Handle<v8::Value> LoadProperty(QV8Engine *engine, QObject *object,
+ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject *object, 
+                                                      v8::Handle<v8::Value> *objectHandle, 
+                                                      const QHashedV8String &property,
++                                                     QQmlContextData *context,
+                                                      QV8QObjectWrapper::RevisionMode revisionMode)
+ {
+     // XXX More recent versions of V8 introduced "Callable" objects.  It is possible that these
+@@ -525,9 +526,9 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+     {
+         QQmlData *ddata = QQmlData::get(object, false);
+         if (ddata && ddata->propertyCache)
+-            result = ddata->propertyCache->property(property);
++            result = ddata->propertyCache->property(property, object, context);
+         else
+-            result = QQmlPropertyCache::property(engine->engine(), object, property, local);
++            result = QQmlPropertyCache::property(engine->engine(), object, property, context, local);
+     }
+ 
+     if (!result)
+@@ -708,7 +709,7 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+     }
+ }
+ 
+-bool QV8QObjectWrapper::SetProperty(QV8Engine *engine, QObject *object, const QHashedV8String &property,
++bool QV8QObjectWrapper::SetProperty(QV8Engine *engine, QObject *object, const QHashedV8String &property, QQmlContextData *context,
+                                     v8::Handle<v8::Value> value, QV8QObjectWrapper::RevisionMode revisionMode)
+ {
+     if (engine->qobjectWrapper()->m_toStringString == property ||
+@@ -720,7 +721,7 @@ bool QV8QObjectWrapper::SetProperty(QV8Engine *engine, QObject *object, const QH
+ 
+     QQmlPropertyData local;
+     QQmlPropertyData *result = 0;
+-    result = QQmlPropertyCache::property(engine->engine(), object, property, local);
++    result = QQmlPropertyCache::property(engine->engine(), object, property, context, local);
+ 
+     if (!result)
+         return false;
+@@ -756,16 +757,16 @@ v8::Handle<v8::Value> QV8QObjectWrapper::Getter(v8::Local<v8::String> property,
+     QHashedV8String propertystring(property);
+ 
+     QV8Engine *v8engine = resource->engine;
++    QQmlContextData *context = v8engine->callingContext();
++
+     v8::Handle<v8::Value> This = info.This();
+     v8::Handle<v8::Value> result = GetProperty(v8engine, object, &This, propertystring, 
+-                                               QV8QObjectWrapper::IgnoreRevision);
++                                               context, QV8QObjectWrapper::IgnoreRevision);
+     if (!result.IsEmpty())
+         return result;
+ 
+     if (QV8Engine::startsWithUpper(property)) {
+         // Check for attached properties
+-        QQmlContextData *context = v8engine->callingContext();
+-
+         if (context && context->imports) {
+             QQmlTypeNameCache::Result r = context->imports->query(propertystring);
+ 
+@@ -800,7 +801,8 @@ v8::Handle<v8::Value> QV8QObjectWrapper::Setter(v8::Local<v8::String> property,
+     QHashedV8String propertystring(property);
+ 
+     QV8Engine *v8engine = resource->engine;
+-    bool result = SetProperty(v8engine, object, propertystring, value, QV8QObjectWrapper::IgnoreRevision);
++    QQmlContextData *context = v8engine->callingContext();
++    bool result = SetProperty(v8engine, object, propertystring, context, value, QV8QObjectWrapper::IgnoreRevision);
+ 
+     if (!result) {
+         QString error = QLatin1String("Cannot assign to non-existent property \"") +
+@@ -822,12 +824,13 @@ v8::Handle<v8::Integer> QV8QObjectWrapper::Query(v8::Local<v8::String> property,
+ 
+     QV8Engine *engine = resource->engine;
+     QObject *object = resource->object;
++    QQmlContextData *context = engine->callingContext();
+ 
+     QHashedV8String propertystring(property);
+ 
+     QQmlPropertyData local;
+     QQmlPropertyData *result = 0;
+-    result = QQmlPropertyCache::property(engine->engine(), object, propertystring, local);
++    result = QQmlPropertyCache::property(engine->engine(), object, propertystring, context, local);
+ 
+     if (!result)
+         return v8::Handle<v8::Integer>();
+@@ -960,35 +963,37 @@ v8::Local<v8::Object> QQmlPropertyCache::newQObject(QObject *object, QV8Engine *
+     if (constructor.IsEmpty()) {
+         v8::Local<v8::FunctionTemplate> ft;
+ 
+-        QString toString = QLatin1String("toString");
+-        QString destroy = QLatin1String("destroy");
++        const QHashedString toString(QStringLiteral("toString"));
++        const QHashedString destroy(QStringLiteral("destroy"));
++
++        // As we use hash linking, or with property overrides, it is possible that iterating
++        // over the values can yield duplicates.  To combat this, we must unique'ify our properties.
++        const bool checkForDuplicates = stringCache.isLinked() || _hasPropertyOverrides;
+ 
+-        // As we use hash linking, it is possible that iterating over the values can give duplicates.
+-        // To combat this, we must unique'ify our properties.
+         StringCache uniqueHash;
+-        if (stringCache.isLinked())
++        if (checkForDuplicates)
+             uniqueHash.reserve(stringCache.count());
+ 
+         // XXX TODO: Enables fast property accessors.  These more than double the property access 
+         // performance, but the  cost of setting up this structure hasn't been measured so 
+         // its not guarenteed that this is a win overall.  We need to try and measure the cost.
+         for (StringCache::ConstIterator iter = stringCache.begin(); iter != stringCache.end(); ++iter) {
+-            if (stringCache.isLinked()) {
++            if (iter.equals(toString) || iter.equals(destroy))
++                continue;
++
++            if (checkForDuplicates) {
+                 if (uniqueHash.contains(iter))
+                     continue;
+                 uniqueHash.insert(iter);
+             }
+ 
+-            QQmlPropertyData *property = *iter;
++            QQmlPropertyData *property = (*iter).second;
+             if (property->notFullyResolved()) resolve(property);
+ 
+             if (property->isFunction())
+                 continue;
+ 
+             v8::AccessorGetter fastgetter = 0;
+-            v8::AccessorSetter fastsetter = FastValueSetter;
+-            if (!property->isWritable())
+-                fastsetter = FastValueSetterReadOnly;
+ 
+             if (property->isQObject()) 
+                 fastgetter = FAST_GETTER_FUNCTION(property, QObject*);
+@@ -1006,10 +1011,6 @@ v8::Local<v8::Object> QQmlPropertyCache::newQObject(QObject *object, QV8Engine *
+                 fastgetter = FAST_GETTER_FUNCTION(property, double);
+ 
+             if (fastgetter) {
+-                QString name = iter.key();
+-                if (name == toString || name == destroy)
+-                    continue;
+-
+                 if (ft.IsEmpty()) {
+                     ft = v8::FunctionTemplate::New();
+                     ft->InstanceTemplate()->SetFallbackPropertyHandler(QV8QObjectWrapper::Getter, 
+@@ -1020,11 +1021,15 @@ v8::Local<v8::Object> QQmlPropertyCache::newQObject(QObject *object, QV8Engine *
+                     ft->InstanceTemplate()->SetHasExternalResource(true);
+                 }
+ 
++                v8::AccessorSetter fastsetter = FastValueSetter;
++                if (!property->isWritable())
++                    fastsetter = FastValueSetterReadOnly;
++
+                 // We wrap the raw QQmlPropertyData pointer here.  This is safe as the
+                 // pointer will remain valid at least as long as the lifetime of any QObject's of
+                 // this type and the property accessor checks if the object is 0 (deleted) before
+                 // dereferencing the pointer.
+-                ft->InstanceTemplate()->SetAccessor(engine->toString(name), fastgetter, fastsetter,
++                ft->InstanceTemplate()->SetAccessor(engine->toString(iter.key()), fastgetter, fastsetter,
+                                                     v8::External::Wrap(property));
+             }
+         }
+@@ -1371,13 +1376,13 @@ v8::Handle<v8::Value> QV8QObjectWrapper::Connect(const v8::Arguments &args)
+     QObject *signalObject = signalInfo.first;
+     int signalIndex = signalInfo.second;
+ 
+-    if (signalIndex == -1)
++    if (signalIndex < 0)
+         V8THROW_ERROR("Function.prototype.connect: this object is not a signal");
+ 
+     if (!signalObject)
+         V8THROW_ERROR("Function.prototype.connect: cannot connect to deleted QObject");
+ 
+-    if (signalIndex < 0 || signalObject->metaObject()->method(signalIndex).methodType() != QMetaMethod::Signal)
++    if (signalObject->metaObject()->method(signalIndex).methodType() != QMetaMethod::Signal)
+         V8THROW_ERROR("Function.prototype.connect: this object is not a signal");
+ 
+     v8::Local<v8::Value> functionValue;
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper_p.h b/src/qml/qml/v8/qv8qobjectwrapper_p.h
+index de2ec30..88d3634 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper_p.h
++++ b/src/qml/qml/v8/qv8qobjectwrapper_p.h
+@@ -100,8 +100,8 @@ public:
+     static QObject *toQObject(QV8ObjectResource *);
+ 
+     enum RevisionMode { IgnoreRevision, CheckRevision };
+-    inline v8::Handle<v8::Value> getProperty(QObject *, const QHashedV8String &, RevisionMode);
+-    inline bool setProperty(QObject *, const QHashedV8String &, v8::Handle<v8::Value>, RevisionMode);
++    inline v8::Handle<v8::Value> getProperty(QObject *, const QHashedV8String &, QQmlContextData *, RevisionMode);
++    inline bool setProperty(QObject *, const QHashedV8String &, QQmlContextData *, v8::Handle<v8::Value>, RevisionMode);
+ 
+     void registerWeakQObjectReference(QV8QObjectResource *resource)
+     {
+@@ -121,8 +121,8 @@ private:
+     v8::Local<v8::Object> newQObject(QObject *, QQmlData *, QV8Engine *);
+     bool deleteWeakQObject(QV8QObjectResource *resource, bool calledFromEngineDtor = false);
+     static v8::Handle<v8::Value> GetProperty(QV8Engine *, QObject *, v8::Handle<v8::Value> *, 
+-                                             const QHashedV8String &, QV8QObjectWrapper::RevisionMode);
+-    static bool SetProperty(QV8Engine *, QObject *, const QHashedV8String &,
++                                             const QHashedV8String &, QQmlContextData *, QV8QObjectWrapper::RevisionMode);
++    static bool SetProperty(QV8Engine *, QObject *, const QHashedV8String &, QQmlContextData *,
+                             v8::Handle<v8::Value>, QV8QObjectWrapper::RevisionMode);
+     static v8::Handle<v8::Value> Getter(v8::Local<v8::String> property, 
+                                         const v8::AccessorInfo &info);
+@@ -156,24 +156,24 @@ private:
+ };
+ 
+ v8::Handle<v8::Value> QV8QObjectWrapper::getProperty(QObject *object, const QHashedV8String &string,  
+-                                                     RevisionMode mode)
++                                                     QQmlContextData *context, RevisionMode mode)
+ {
+     QQmlData *dd = QQmlData::get(object, false);
+     if (!dd || !dd->propertyCache || m_toStringString == string || m_destroyString == string ||
+-        dd->propertyCache->property(string)) {
+-        return GetProperty(m_engine, object, 0, string, mode);
++        dd->propertyCache->property(string, object, context)) {
++        return GetProperty(m_engine, object, 0, string, context, mode);
+     } else {
+         return v8::Handle<v8::Value>();
+     }
+ }
+ 
+ bool QV8QObjectWrapper::setProperty(QObject *object, const QHashedV8String &string, 
+-                                    v8::Handle<v8::Value> value, RevisionMode mode)
++                                    QQmlContextData *context, v8::Handle<v8::Value> value, RevisionMode mode)
+ {
+     QQmlData *dd = QQmlData::get(object, false);
+     if (!dd || !dd->propertyCache || m_toStringString == string || m_destroyString == string ||
+-        dd->propertyCache->property(string)) {
+-        return SetProperty(m_engine, object, string, value, mode);
++        dd->propertyCache->property(string, object, context)) {
++        return SetProperty(m_engine, object, string, context, value, mode);
+     } else {
+         return false;
+     }
+diff --git a/src/qml/qml/v8/qv8typewrapper.cpp b/src/qml/qml/v8/qv8typewrapper.cpp
+index 4400d30..25695a9 100644
+--- a/src/qml/qml/v8/qv8typewrapper.cpp
++++ b/src/qml/qml/v8/qv8typewrapper.cpp
+@@ -165,6 +165,8 @@ v8::Handle<v8::Value> QV8TypeWrapper::Getter(v8::Local<v8::String> property,
+         return v8::Undefined();
+ 
+     QV8Engine *v8engine = resource->engine;
++    QQmlContextData *context = v8engine->callingContext();
++
+     QObject *object = resource->object;
+ 
+     QHashedV8String propertystring(property);
+@@ -183,7 +185,7 @@ v8::Handle<v8::Value> QV8TypeWrapper::Getter(v8::Local<v8::String> property,
+         } else if (resource->object) {
+             QObject *ao = qmlAttachedPropertiesObjectById(type->attachedPropertiesId(), object);
+             if (ao) 
+-                return v8engine->qobjectWrapper()->getProperty(ao, propertystring, 
++                return v8engine->qobjectWrapper()->getProperty(ao, propertystring, context,
+                                                                QV8QObjectWrapper::IgnoreRevision);
+ 
+             // Fall through to return empty handle
+@@ -241,7 +243,8 @@ v8::Handle<v8::Value> QV8TypeWrapper::Getter(v8::Local<v8::String> property,
+                 }
+ 
+                 // check for property.
+-                v8::Handle<v8::Value> rv = v8engine->qobjectWrapper()->getProperty(singletonType->qobjectApi, propertystring, QV8QObjectWrapper::IgnoreRevision);
++                v8::Handle<v8::Value> rv = v8engine->qobjectWrapper()->getProperty(singletonType->qobjectApi, propertystring,
++                                                                                   context, QV8QObjectWrapper::IgnoreRevision);
+                 return rv;
+             } else if (!singletonType->scriptApi.isUndefined()) {
+                 // NOTE: if used in a binding, changes will not trigger re-evaluation since non-NOTIFYable.
+@@ -272,6 +275,7 @@ v8::Handle<v8::Value> QV8TypeWrapper::Setter(v8::Local<v8::String> property,
+         return value;
+ 
+     QV8Engine *v8engine = resource->engine;
++    QQmlContextData *context = v8engine->callingContext();
+ 
+     QHashedV8String propertystring(property);
+ 
+@@ -280,7 +284,7 @@ v8::Handle<v8::Value> QV8TypeWrapper::Setter(v8::Local<v8::String> property,
+         QObject *object = resource->object;
+         QObject *ao = qmlAttachedPropertiesObjectById(type->attachedPropertiesId(), object);
+         if (ao) 
+-            v8engine->qobjectWrapper()->setProperty(ao, propertystring, value, 
++            v8engine->qobjectWrapper()->setProperty(ao, propertystring, context, value,
+                                                     QV8QObjectWrapper::IgnoreRevision);
+     } else if (resource->typeNamespace) {
+         if (QQmlMetaType::SingletonInstance *singletonType = resource->typeNamespace->singletonType(resource->importNamespace)) {
+@@ -295,7 +299,7 @@ v8::Handle<v8::Value> QV8TypeWrapper::Setter(v8::Local<v8::String> property,
+             }
+ 
+             if (singletonType->qobjectApi) {
+-                v8engine->qobjectWrapper()->setProperty(singletonType->qobjectApi, propertystring, value,
++                v8engine->qobjectWrapper()->setProperty(singletonType->qobjectApi, propertystring, context, value,
+                                                         QV8QObjectWrapper::IgnoreRevision);
+             } else if (!singletonType->scriptApi.isUndefined()) {
+                 QScopedPointer<QJSValuePrivate> setvalp(new QJSValuePrivate(v8engine, value));
+diff --git a/src/qml/qml/v8/qv8valuetypewrapper.cpp b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+index 0408df4..3316632 100644
+--- a/src/qml/qml/v8/qv8valuetypewrapper.cpp
++++ b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+@@ -313,10 +313,10 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Getter(v8::Local<v8::String> property
+     {
+         QQmlData *ddata = QQmlData::get(r->type, false);
+         if (ddata && ddata->propertyCache)
+-            result = ddata->propertyCache->property(propertystring);
++            result = ddata->propertyCache->property(propertystring, 0, 0);
+         else
+             result = QQmlPropertyCache::property(r->engine->engine(), r->type,
+-                                                         propertystring, local);
++                                                         propertystring, 0, local);
+     }
+ 
+     if (!result)
+@@ -324,7 +324,8 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Getter(v8::Local<v8::String> property
+ 
+     if (result->isFunction()) {
+         // calling a Q_INVOKABLE function of a value type
+-        return r->engine->qobjectWrapper()->getProperty(r->type, propertystring, QV8QObjectWrapper::IgnoreRevision);
++        QQmlContextData *context = r->engine->callingContext();
++        return r->engine->qobjectWrapper()->getProperty(r->type, propertystring, context, QV8QObjectWrapper::IgnoreRevision);
+     }
+ 
+ #define VALUE_TYPE_LOAD(metatype, cpptype, constructor) \
+diff --git a/tests/auto/qml/qqmlecmascript/data/BaseComponent2.qml b/tests/auto/qml/qqmlecmascript/data/BaseComponent2.qml
+new file mode 100644
+index 0000000..4f99a3d
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/BaseComponent2.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++
++Item {
++    id: base
++
++    property int directProperty: 333
++    function getDirectFromBase() { return directProperty }
++
++    property alias baseDirectAlias: base.directProperty
++
++    property Item objectProperty: Item { width: 333 }
++
++    property int optimizedBoundProperty: objectProperty.width
++    function getOptimizedBoundFromBase() { return optimizedBoundProperty }
++
++    property alias baseOptimizedBoundAlias: base.optimizedBoundProperty
++
++    property int unoptimizedBoundProperty: if (true) objectProperty.width
++    function getUnoptimizedBoundFromBase() { return unoptimizedBoundProperty }
++
++    property alias baseUnoptimizedBoundAlias: base.unoptimizedBoundProperty
++
++    property int baseDirectPropertyChangedValue: 0
++    onDirectPropertyChanged: baseDirectPropertyChangedValue = directProperty
++
++    property int baseOptimizedBoundPropertyChangedValue: 0
++    onOptimizedBoundPropertyChanged: baseOptimizedBoundPropertyChangedValue = optimizedBoundProperty
++
++    property int baseUnoptimizedBoundPropertyChangedValue: 0
++    onUnoptimizedBoundPropertyChanged: baseUnoptimizedBoundPropertyChangedValue = unoptimizedBoundProperty
++
++    function setDirectFromBase(n) { directProperty = n }
++    function setBoundFromBase(n) { objectProperty.width = n }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml
+index c33c895..7cfc9a3 100644
+--- a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml
+@@ -8,5 +8,8 @@ Item {
+         property Text baz: Text { width: 200 }
+     }
+ 
+-    Component.onCompleted: success = (foo.bar == '200')
++    // With contextual lookup, 'bar' is resolved in the BaseComponent context,
++    // and refers to the 'baz' defined there; in this context, however, 'baz'
++    // resolves to the override defined in 'foo'
++    Component.onCompleted: success = (foo.bar == 100) && (foo.baz.width == 200)
+ }
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.7.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.7.qml
+new file mode 100644
+index 0000000..2fc272d
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.7.qml
+@@ -0,0 +1,11 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsItem 1.0
++
++Item {
++    property bool success: false
++
++    property FallbackBindingsType foo: FallbackBindingsType {}
++    property var test: foo.test
++
++    Component.onCompleted: success = (test == 100)
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.8.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.8.qml
+new file mode 100644
+index 0000000..14aeed9
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.8.qml
+@@ -0,0 +1,11 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsItem 1.0
++
++Item {
++    property bool success: false
++
++    property FallbackBindingsType foo: FallbackBindingsDerivedType {}
++    property var test: foo.test
++
++    Component.onCompleted: success = (test == 'hello')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyOverride.qml b/tests/auto/qml/qqmlecmascript/data/propertyOverride.qml
+new file mode 100644
+index 0000000..bd3fed4
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyOverride.qml
+@@ -0,0 +1,104 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    BaseComponent2 {
++        id: foo
++
++        // Override the properties of the base component
++        property string directProperty: 'hello'
++        function getDirectFromExtension() { return directProperty }
++
++        property alias extensionDirectAlias: foo.directProperty
++
++        property Text objectProperty: Text { width: 666 }
++
++        property int optimizedBoundProperty: objectProperty.width
++        function getOptimizedBoundFromExtension() { return optimizedBoundProperty }
++
++        property alias extensionOptimizedBoundAlias: foo.optimizedBoundProperty
++
++        property int unoptimizedBoundProperty: if (true) objectProperty.width
++        function getUnoptimizedBoundFromExtension() { return unoptimizedBoundProperty }
++
++        property alias extensionUnoptimizedBoundAlias: foo.unoptimizedBoundProperty
++
++        property string extensionDirectPropertyChangedValue: ''
++        onDirectPropertyChanged: extensionDirectPropertyChangedValue = directProperty
++
++        property int extensionOptimizedBoundPropertyChangedValue: 0
++        onOptimizedBoundPropertyChanged: extensionOptimizedBoundPropertyChangedValue = optimizedBoundProperty
++
++        property int extensionUnoptimizedBoundPropertyChangedValue: 0
++        onUnoptimizedBoundPropertyChanged: extensionUnoptimizedBoundPropertyChangedValue = unoptimizedBoundProperty
++
++        function setDirectFromExtension(n) { directProperty = n }
++        function setBoundFromExtension(n) { objectProperty.width = n }
++    }
++
++    Component.onCompleted: {
++        // In the base component, overriding should not affect resolution
++        if (foo.getDirectFromBase() != 333) return
++        if (foo.getOptimizedBoundFromBase() != 333) return
++        if (foo.getUnoptimizedBoundFromBase() != 333) return
++
++        // In the extension component overriding should occur
++        if (foo.getDirectFromExtension() != 'hello') return
++        if (foo.getOptimizedBoundFromExtension() != 666) return
++        if (foo.getUnoptimizedBoundFromExtension() != 666) return
++
++        // External access should yield extension component scoping
++        if (foo.directProperty != 'hello') return
++        if (foo.optimizedBoundProperty != 666) return
++        if (foo.unoptimizedBoundProperty != 666) return
++
++        // Verify alias properties bind to the correct target
++        if (foo.baseDirectAlias != 333) return
++        if (foo.baseOptimizedBoundAlias != 333) return
++        if (foo.baseUnoptimizedBoundAlias != 333) return
++
++        if (foo.extensionDirectAlias != 'hello') return
++        if (foo.extensionOptimizedBoundAlias != 666) return
++        if (foo.extensionUnoptimizedBoundAlias != 666) return
++
++        foo.baseDirectPropertyChangedValue = 0
++        foo.baseOptimizedBoundPropertyChangedValue = 0
++        foo.baseUnoptimizedBoundPropertyChangedValue = 0
++        foo.extensionDirectPropertyChangedValue = ''
++        foo.extensionOptimizedBoundPropertyChangedValue = 0
++        foo.extensionUnoptimizedBoundPropertyChangedValue = 0
++
++        // Verify that the correct onChanged signal is emitted
++        foo.setDirectFromBase(999)
++        if (foo.getDirectFromBase() != 999) return
++        if (foo.baseDirectPropertyChangedValue != 999) return
++        if (foo.extensionDirectPropertyChangedValue != '') return
++
++        foo.setDirectFromExtension('goodbye')
++        if (foo.getDirectFromExtension() != 'goodbye') return
++        if (foo.extensionDirectPropertyChangedValue != 'goodbye') return
++        if (foo.baseDirectPropertyChangedValue != 999) return
++
++        foo.setBoundFromBase(999)
++        if (foo.getOptimizedBoundFromBase() != 999) return
++        if (foo.getUnoptimizedBoundFromBase() != 999) return
++        if (foo.baseOptimizedBoundPropertyChangedValue != 999) return
++        if (foo.baseUnoptimizedBoundPropertyChangedValue != 999) return
++        if (foo.extensionOptimizedBoundPropertyChangedValue != 0) return
++        if (foo.extensionUnoptimizedBoundPropertyChangedValue != 0) return
++
++        foo.baseOptimizedBoundPropertyChangedValue = 0
++        foo.baseUnoptimizedBoundPropertyChangedValue = 0
++
++        foo.setBoundFromExtension(123)
++        if (foo.getOptimizedBoundFromExtension() != 123) return
++        if (foo.getUnoptimizedBoundFromExtension() != 123) return
++        if (foo.extensionOptimizedBoundPropertyChangedValue != 123) return
++        if (foo.extensionUnoptimizedBoundPropertyChangedValue != 123) return
++        if (foo.baseOptimizedBoundPropertyChangedValue != 0) return
++        if (foo.baseUnoptimizedBoundPropertyChangedValue != 0) return
++
++        success = true
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.cpp b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+index a0bdbb6..72c9757 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.cpp
++++ b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+@@ -300,6 +300,9 @@ void registerTypes()
+     qmlRegisterSingletonType<FallbackBindingsObject>("Qt.test.fallbackBindingsObject", 1, 0, "Fallback", fallback_bindings_object);
+     qmlRegisterSingletonType<FallbackBindingsObject>("Qt.test.fallbackBindingsDerived", 1, 0, "Fallback", fallback_bindings_derived);
+ 
++    qmlRegisterType<FallbackBindingsObject>("Qt.test.fallbackBindingsItem", 1, 0, "FallbackBindingsType");
++    qmlRegisterType<FallbackBindingsDerived>("Qt.test.fallbackBindingsItem", 1, 0, "FallbackBindingsDerivedType");
++
+     qmlRegisterType<FallbackBindingsTypeObject>("Qt.test.fallbackBindingsObject", 1, 0, "FallbackBindingsType");
+     qmlRegisterType<FallbackBindingsTypeDerived>("Qt.test.fallbackBindingsDerived", 1, 0, "FallbackBindingsType");
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 81f682f..10425db 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -282,6 +282,7 @@ private slots:
+     void overrideDataAssert();
+     void fallbackBindings_data();
+     void fallbackBindings();
++    void propertyOverride();
+     void concatenatedStringPropertyAccess();
+ 
+ private:
+@@ -7255,6 +7256,8 @@ void tst_qqmlecmascript::fallbackBindings_data()
+     QTest::newRow("SingletonType fallback") << "fallbackBindings.4.qml";
+     QTest::newRow("Attached without fallback") << "fallbackBindings.5.qml";
+     QTest::newRow("Attached fallback") << "fallbackBindings.6.qml";
++    QTest::newRow("Subproperty without fallback") << "fallbackBindings.7.qml";
++    QTest::newRow("Subproperty fallback") << "fallbackBindings.8.qml";
+ }
+ 
+ void tst_qqmlecmascript::fallbackBindings()
+@@ -7268,6 +7271,15 @@ void tst_qqmlecmascript::fallbackBindings()
+     QCOMPARE(object->property("success").toBool(), true);
+ }
+ 
++void tst_qqmlecmascript::propertyOverride()
++{
++    QQmlComponent component(&engine, testFileUrl("propertyOverride.qml"));
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++
++    QCOMPARE(object->property("success").toBool(), true);
++}
++
+ void tst_qqmlecmascript::sequenceSort_data()
+ {
+     QTest::addColumn<QString>("function");
+diff --git a/tests/auto/qml/qqmllanguage/data/MyBaseComponent.qml b/tests/auto/qml/qqmllanguage/data/MyBaseComponent.qml
+new file mode 100644
+index 0000000..dda4c48
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/MyBaseComponent.qml
+@@ -0,0 +1,24 @@
++import QtQuick 2.0
++
++QtObject {
++    id: base
++
++    property bool baseSuccess: false
++
++    property string baseProperty: 'foo'
++    property string boundProperty: baseProperty
++    property alias aliasProperty: base.baseProperty
++
++    function basePropertiesTest(expected) {
++        return (baseProperty == expected &&
++                boundProperty == expected &&
++                aliasProperty == expected);
++    }
++
++    Component.onCompleted: {
++        if (basePropertiesTest('foo')) {
++            baseProperty = 'bar';
++            baseSuccess = basePropertiesTest('bar');
++        }
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/scopedProperties.qml b/tests/auto/qml/qqmllanguage/data/scopedProperties.qml
+new file mode 100644
+index 0000000..6e3a46d
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/scopedProperties.qml
+@@ -0,0 +1,24 @@
++import QtQuick 2.0
++
++MyBaseComponent {
++    id: extended
++
++    property bool success: false
++
++    property int baseProperty: 666
++    property int boundProperty: baseProperty
++    property alias aliasProperty: extended.baseProperty
++
++    function extendedPropertiesTest(expected) {
++        return (baseProperty == expected &&
++                boundProperty == expected &&
++                aliasProperty == expected);
++    }
++
++    Component.onCompleted: {
++        if (basePropertiesTest('bar') && extendedPropertiesTest(666)) {
++            baseProperty = 999;
++            success = extendedPropertiesTest(999) && baseSuccess;
++        }
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 50e93ca..2a09ef2 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -186,6 +186,8 @@ private slots:
+     void objectDeletionNotify_data();
+     void objectDeletionNotify();
+ 
++    void scopedProperties();
++
+ private:
+     QQmlEngine engine;
+     QStringList defaultImportPathList;
+@@ -3111,6 +3113,15 @@ void tst_qqmllanguage::objectDeletionNotify()
+     delete object;
+ }
+ 
++void tst_qqmllanguage::scopedProperties()
++{
++    QQmlComponent component(&engine, testFile("scopedProperties.qml"));
++
++    QScopedPointer<QObject> o(component.create());
++    QVERIFY(o != 0);
++    QVERIFY(o->property("success").toBool());
++}
++
+ QTEST_MAIN(tst_qqmllanguage)
+ 
+ #include "tst_qqmllanguage.moc"
+diff --git a/tests/auto/qml/qqmlpropertycache/tst_qqmlpropertycache.cpp b/tests/auto/qml/qqmlpropertycache/tst_qqmlpropertycache.cpp
+index de3c041..a0b1b99 100644
+--- a/tests/auto/qml/qqmlpropertycache/tst_qqmlpropertycache.cpp
++++ b/tests/auto/qml/qqmlpropertycache/tst_qqmlpropertycache.cpp
+@@ -102,6 +102,11 @@ Q_SIGNALS:
+     void signalB();
+ };
+ 
++QQmlPropertyData *cacheProperty(QQmlPropertyCache *cache, const char *name)
++{
++    return cache->property(QLatin1String(name), 0, 0);
++}
++
+ void tst_qqmlpropertycache::properties()
+ {
+     QQmlEngine engine;
+@@ -111,16 +116,16 @@ void tst_qqmlpropertycache::properties()
+     QQmlRefPointer<QQmlPropertyCache> cache(new QQmlPropertyCache(&engine, metaObject));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyA")));
++    QVERIFY(data = cacheProperty(cache, "propertyA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyA"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyB")));
++    QVERIFY(data = cacheProperty(cache, "propertyB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyB"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyC")));
++    QVERIFY(data = cacheProperty(cache, "propertyC"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyC"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyD")));
++    QVERIFY(data = cacheProperty(cache, "propertyD"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyD"));
+ }
+ 
+@@ -134,16 +139,16 @@ void tst_qqmlpropertycache::propertiesDerived()
+     QQmlRefPointer<QQmlPropertyCache> cache(parentCache->copyAndAppend(&engine, object.metaObject()));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyA")));
++    QVERIFY(data = cacheProperty(cache, "propertyA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyA"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyB")));
++    QVERIFY(data = cacheProperty(cache, "propertyB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyB"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyC")));
++    QVERIFY(data = cacheProperty(cache, "propertyC"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyC"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyD")));
++    QVERIFY(data = cacheProperty(cache, "propertyD"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfProperty("propertyD"));
+ }
+ 
+@@ -156,28 +161,28 @@ void tst_qqmlpropertycache::methods()
+     QQmlRefPointer<QQmlPropertyCache> cache(new QQmlPropertyCache(&engine, metaObject));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("slotA")));
++    QVERIFY(data = cacheProperty(cache, "slotA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("slotA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("slotB")));
++    QVERIFY(data = cacheProperty(cache, "slotB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("slotB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("signalA")));
++    QVERIFY(data = cacheProperty(cache, "signalA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("signalB")));
++    QVERIFY(data = cacheProperty(cache, "signalB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyAChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyAChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyAChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyBChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyBChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyBChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyCChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyCChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyCChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyDChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyDChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyDChanged()"));
+ }
+ 
+@@ -191,28 +196,28 @@ void tst_qqmlpropertycache::methodsDerived()
+     QQmlRefPointer<QQmlPropertyCache> cache(parentCache->copyAndAppend(&engine, object.metaObject()));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("slotA")));
++    QVERIFY(data = cacheProperty(cache, "slotA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("slotA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("slotB")));
++    QVERIFY(data = cacheProperty(cache, "slotB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("slotB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("signalA")));
++    QVERIFY(data = cacheProperty(cache, "signalA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("signalB")));
++    QVERIFY(data = cacheProperty(cache, "signalB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyAChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyAChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyAChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyBChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyBChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyBChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyCChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyCChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyCChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("propertyDChanged")));
++    QVERIFY(data = cacheProperty(cache, "propertyDChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyDChanged()"));
+ }
+ 
+@@ -225,22 +230,22 @@ void tst_qqmlpropertycache::signalHandlers()
+     QQmlRefPointer<QQmlPropertyCache> cache(new QQmlPropertyCache(&engine, metaObject));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onSignalA")));
++    QVERIFY(data = cacheProperty(cache, "onSignalA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onSignalB")));
++    QVERIFY(data = cacheProperty(cache, "onSignalB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyAChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyAChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyAChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyBChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyBChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyBChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyCChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyCChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyCChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyDChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyDChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyDChanged()"));
+ }
+ 
+@@ -254,22 +259,22 @@ void tst_qqmlpropertycache::signalHandlersDerived()
+     QQmlRefPointer<QQmlPropertyCache> cache(parentCache->copyAndAppend(&engine, object.metaObject()));
+     QQmlPropertyData *data;
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onSignalA")));
++    QVERIFY(data = cacheProperty(cache, "onSignalA"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalA()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onSignalB")));
++    QVERIFY(data = cacheProperty(cache, "onSignalB"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("signalB()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyAChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyAChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyAChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyBChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyBChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyBChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyCChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyCChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyCChanged()"));
+ 
+-    QVERIFY(data = cache->property(QLatin1String("onPropertyDChanged")));
++    QVERIFY(data = cacheProperty(cache, "onPropertyDChanged"));
+     QCOMPARE(data->coreIndex, metaObject->indexOfMethod("propertyDChanged()"));
+ }

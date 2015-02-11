@@ -1,0 +1,106 @@
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 832f58b..b122d74 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -472,6 +472,25 @@ void QQmlData::parentChanged(QAbstractDeclarativeData *d, QObject *o, QObject *p
+     static_cast<QQmlData *>(d)->parentChanged(o, p);
+ }
+ 
++class QQmlThreadNotifierProxyObject : public QObject
++{
++public:
++    QPointer<QObject> target;
++
++    virtual int qt_metacall(QMetaObject::Call, int id, void **a) {
++        if (!target)
++            return -1;
++
++        QQmlData *ddata = QQmlData::get(target, false);
++        QQmlNotifierEndpoint *ep = ddata->notify(id);
++        if (ep) QQmlNotifier::emitNotify(ep, a);
++
++        delete this;
++
++        return -1;
++    }
++};
++
+ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int index, void **a)
+ {
+     QQmlData *ddata = QQmlData::get(object, false);
+@@ -486,6 +505,9 @@ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int in
+     if (ddata->notifyList &&
+         QThread::currentThreadId() != QObjectPrivate::get(object)->threadData->threadId) {
+ 
++        if (!QObjectPrivate::get(object)->threadData->thread)
++            return;
++
+         QMetaMethod m = object->metaObject()->method(index);
+         QList<QByteArray> parameterTypes = m.parameterTypes();
+ 
+@@ -516,7 +538,11 @@ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int in
+ 
+         QMetaCallEvent *ev = new QMetaCallEvent(index, 0, 0, object, index,
+                                                 parameterTypes.count() + 1, types, args);
+-        QCoreApplication::postEvent(object, ev);
++
++        QQmlThreadNotifierProxyObject *mpo = new QQmlThreadNotifierProxyObject;
++        mpo->target = object;
++        mpo->moveToThread(QObjectPrivate::get(object)->threadData->thread);
++        QCoreApplication::postEvent(mpo, ev);
+ 
+     } else {
+         QQmlNotifierEndpoint *ep = ddata->notify(index);
+diff --git a/src/qml/qml/qqmlnotifier_p.h b/src/qml/qml/qqmlnotifier_p.h
+index 49bf9ed..2d827aa 100644
+--- a/src/qml/qml/qqmlnotifier_p.h
++++ b/src/qml/qml/qqmlnotifier_p.h
+@@ -58,6 +58,7 @@ public:
+ private:
+     friend class QQmlData;
+     friend class QQmlNotifierEndpoint;
++    friend class QQmlThreadNotifierProxyObject;
+ 
+     static void emitNotify(QQmlNotifierEndpoint *, void **a);
+     QQmlNotifierEndpoint *endpoints;
+diff --git a/tests/auto/qml/qqmlecmascript/data/threadSignal.2.qml b/tests/auto/qml/qqmlecmascript/data/threadSignal.2.qml
+new file mode 100644
+index 0000000..99bdbf6
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/threadSignal.2.qml
+@@ -0,0 +1,7 @@
++import Qt.test 1.0
++import QtQuick 2.0
++
++MyWorkerObject {
++    property bool passed: false
++    onDone: passed = (result == 'good')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index d34a840..2db8967 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -6896,11 +6896,23 @@ void tst_qqmlecmascript::signalEmitted()
+ // QTBUG-25647
+ void tst_qqmlecmascript::threadSignal()
+ {
++    {
+     QQmlComponent c(&engine, testFileUrl("threadSignal.qml"));
+     QObject *object = c.create();
+     QVERIFY(object != 0);
+     QTRY_VERIFY(object->property("passed").toBool());
+     delete object;
++    }
++    {
++    QQmlComponent c(&engine, testFileUrl("threadSignal.2.qml"));
++    QObject *object = c.create();
++    QVERIFY(object != 0);
++    QSignalSpy doneSpy(object, SIGNAL(done(const QString &)));
++    QMetaObject::invokeMethod(object, "doIt");
++    QTRY_VERIFY(object->property("passed").toBool());
++    QCOMPARE(doneSpy.count(), 1);
++    delete object;
++    }
+ }
+ 
+ // ensure that the qqmldata::destroyed() handler doesn't cause problems

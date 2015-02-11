@@ -1,0 +1,391 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 4bd8753..2dbabdb 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -223,7 +223,7 @@ void QQmlEngineDebugService::buildObjectDump(QDataStream &message,
+     
+     int childrenCount = children.count();
+     for (int ii = 0; ii < children.count(); ++ii) {
+-        if (qobject_cast<QQmlContext*>(children[ii]) || qobject_cast<QQmlAbstractBoundSignal*>(children[ii]))
++        if (qobject_cast<QQmlContext*>(children[ii]))
+             --childrenCount;
+     }
+ 
+@@ -235,19 +235,41 @@ void QQmlEngineDebugService::buildObjectDump(QDataStream &message,
+         QObject *child = children.at(ii);
+         if (qobject_cast<QQmlContext*>(child))
+             continue;
+-        QQmlAbstractBoundSignal *signal = qobject_cast<QQmlAbstractBoundSignal*>(child);
+-        if (signal) {
+-            if (!dumpProperties)
++         if (recur)
++             buildObjectDump(message, child, recur, dumpProperties);
++         else
++             message << objectData(child);
++    }
++
++    if (!dumpProperties) {
++        message << 0;
++        return;
++    }
++
++    QList<int> propertyIndexes;
++    for (int ii = 0; ii < object->metaObject()->propertyCount(); ++ii) {
++        if (object->metaObject()->property(ii).isScriptable())
++            propertyIndexes << ii;
++    }
++
++    QQmlData *ddata = QQmlData::get(object);
++    if (ddata && ddata->signalHandlers) {
++        QQmlAbstractBoundSignal *signalHandler = ddata->signalHandlers;
++
++        while (signalHandler) {
++            if (!dumpProperties) {
++                signalHandler = signalHandler->m_nextSignal;
+                 continue;
++            }
+             QQmlObjectProperty prop;
+             prop.type = QQmlObjectProperty::SignalProperty;
+             prop.hasNotifySignal = false;
+-            QQmlExpression *expr = signal->expression();
++            QQmlExpression *expr = signalHandler->expression();
+             if (expr) {
+                 prop.value = expr->expression();
+                 QObject *scope = expr->scopeObject();
+                 if (scope) {
+-                    QString sig = QString::fromLatin1(scope->metaObject()->method(signal->index()).signature());
++                    QString sig = QString::fromLatin1(scope->metaObject()->method(signalHandler->index()).signature());
+                     int lparen = sig.indexOf(QLatin1Char('('));
+                     if (lparen >= 0) {
+                         QString methodName = sig.mid(0, lparen);
+@@ -257,23 +279,9 @@ void QQmlEngineDebugService::buildObjectDump(QDataStream &message,
+                 }
+             }
+             fakeProperties << prop;
+-        } else {
+-            if (recur)
+-                buildObjectDump(message, child, recur, dumpProperties);
+-            else
+-                message << objectData(child);
+-        }
+-    }
+ 
+-    if (!dumpProperties) {
+-        message << 0;
+-        return;
+-    }
+-
+-    QList<int> propertyIndexes;
+-    for (int ii = 0; ii < object->metaObject()->propertyCount(); ++ii) {
+-        if (object->metaObject()->property(ii).isScriptable())
+-            propertyIndexes << ii;
++            signalHandler = signalHandler->m_nextSignal;
++        }
+     }
+ 
+     message << propertyIndexes.size() + fakeProperties.count();
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index f8015a5..d666d9c 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -89,42 +89,45 @@ private:
+ 
+ static int evaluateIdx = -1;
+ 
+-QQmlAbstractBoundSignal::QQmlAbstractBoundSignal(QObject *parent)
+-: QObject(parent)
++QQmlAbstractBoundSignal::QQmlAbstractBoundSignal()
++: m_prevSignal(0), m_nextSignal(0)
+ {
+ }
+ 
+ QQmlAbstractBoundSignal::~QQmlAbstractBoundSignal()
+ {
++    if (m_prevSignal) {
++        *m_prevSignal = m_nextSignal;
++        if (m_nextSignal) m_nextSignal->m_prevSignal = m_prevSignal;
++        m_prevSignal = 0;
++        m_nextSignal = 0;
++    }
+ }
+ 
+-QQmlBoundSignal::QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, 
+-                               QObject *parent)
+-: m_expression(0), m_signal(signal), m_paramsValid(false), m_isEvaluating(false), m_params(0)
++void QQmlAbstractBoundSignal::addToObject()
+ {
+-    // This is thread safe.  Although it may be updated by two threads, they
+-    // will both set it to the same value - so the worst thing that can happen
+-    // is that they both do the work to figure it out.  Boo hoo.
+-    if (evaluateIdx == -1) evaluateIdx = metaObject()->methodCount();
++    Q_ASSERT(!m_prevSignal);
++    QObject *obj = object();
++    Q_ASSERT(obj);
+ 
+-    QQml_setParent_noEvent(this, parent);
+-    QQmlPropertyPrivate::connect(scope, m_signal.methodIndex(), this, evaluateIdx);
++    QQmlData *data = QQmlData::get(obj, true);
++
++    m_nextSignal = data->signalHandlers;
++    if (m_nextSignal) m_nextSignal->m_prevSignal = &m_nextSignal;
++    m_prevSignal = &data->signalHandlers;
++    data->signalHandlers = this;
+ }
+ 
+-QQmlBoundSignal::QQmlBoundSignal(QQmlContext *ctxt, const QString &val, 
+-                               QObject *scope, const QMetaMethod &signal,
+-                               QObject *parent)
+-: m_expression(0), m_signal(signal), m_paramsValid(false), m_isEvaluating(false), m_params(0)
++QQmlBoundSignal::QQmlBoundSignal(QObject *scope, const QMetaMethod &signal,
++                               QObject *owner)
++: m_expression(0), m_signal(signal), m_paramsValid(false), m_isEvaluating(false), m_params(0), m_owner(owner)
+ {
+     // This is thread safe.  Although it may be updated by two threads, they
+     // will both set it to the same value - so the worst thing that can happen
+     // is that they both do the work to figure it out.  Boo hoo.
+     if (evaluateIdx == -1) evaluateIdx = metaObject()->methodCount();
+ 
+-    QQml_setParent_noEvent(this, parent);
+     QQmlPropertyPrivate::connect(scope, m_signal.methodIndex(), this, evaluateIdx);
+-
+-    m_expression = new QQmlExpression(ctxt, scope, val);
+ }
+ 
+ QQmlBoundSignal::~QQmlBoundSignal()
+@@ -244,7 +247,7 @@ QQmlBoundSignalParameters::QQmlBoundSignalParameters(const QMetaMethod &method,
+                 if (scope == "Qt")
+                     meta = &QObject::staticQtMetaObject;
+                 else
+-                    meta = parent->parent()->metaObject();   //### assumes parent->parent()
++                    meta = static_cast<QQmlBoundSignal*>(parent)->object()->metaObject();
+                 for (int i = meta->enumeratorCount() - 1; i >= 0; --i) {
+                     QMetaEnum m = meta->enumerator(i);
+                     if ((m.name() == name) && (scope.isEmpty() || (m.scope() == scope))) {
+diff --git a/src/qml/qml/qqmlboundsignal_p.h b/src/qml/qml/qqmlboundsignal_p.h
+index ab14de0..03b6008 100644
+--- a/src/qml/qml/qqmlboundsignal_p.h
++++ b/src/qml/qml/qqmlboundsignal_p.h
+@@ -61,31 +61,40 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class Q_QML_EXPORT QQmlAbstractBoundSignal : public QObject
++class Q_QML_EXPORT QQmlAbstractBoundSignal
+ {
+-    Q_OBJECT
+ public:
+-    QQmlAbstractBoundSignal(QObject *parent = 0);
+-    virtual ~QQmlAbstractBoundSignal() = 0;
++    QQmlAbstractBoundSignal();
++    virtual ~QQmlAbstractBoundSignal();
+ 
+     virtual int index() const = 0;
+     virtual QQmlExpression *expression() const = 0;
+     virtual QQmlExpression *setExpression(QQmlExpression *) = 0;
++    virtual QObject *object() = 0;
++
++    void addToObject();
++
++private:
++    friend class QQmlData;
++    friend class QQmlPropertyPrivate;
++    friend class QQmlEngineDebugService;
++    QQmlAbstractBoundSignal **m_prevSignal;
++    QQmlAbstractBoundSignal  *m_nextSignal;
+ };
+ 
+ class QQmlBoundSignalParameters;
+-class Q_QML_EXPORT QQmlBoundSignal : public QQmlAbstractBoundSignal
++class Q_QML_EXPORT QQmlBoundSignal : public QObject,
++                                     public QQmlAbstractBoundSignal
+ {
+ public:
+-    QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, QObject *parent);
+-    QQmlBoundSignal(QQmlContext *ctxt, const QString &val, QObject *scope, 
+-                   const QMetaMethod &signal, QObject *parent);
++    QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, QObject *owner);
+     virtual ~QQmlBoundSignal();
+ 
+     int index() const;
+ 
+     QQmlExpression *expression() const;
+     QQmlExpression *setExpression(QQmlExpression *);
++    QObject *object() { return m_owner; }
+ 
+     bool isEvaluating() const { return m_isEvaluating; }
+ 
+@@ -98,6 +107,7 @@ private:
+     bool m_paramsValid : 1;
+     bool m_isEvaluating : 1;
+     QQmlBoundSignalParameters *m_params;
++    QObject *m_owner;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 09d1a23..e7e001c 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -63,6 +63,7 @@ template <class Key, class T> class QHash;
+ class QQmlGuardImpl;
+ class QQmlCompiledData;
+ class QQmlAbstractBinding;
++class QQmlAbstractBoundSignal;
+ class QQmlContext;
+ class QQmlPropertyCache;
+ class QQmlContextData;
+@@ -79,7 +80,7 @@ public:
+     QQmlData()
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+           hasTaintedV8Object(false), isQueuedForDeletion(false), notifyList(0), context(0), outerContext(0),
+-          bindings(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
++          bindings(0), signalHandlers(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+           lineNumber(0), columnNumber(0), deferredComponent(0), deferredIdx(0), v8objectid(0), 
+           propertyCache(0), guards(0), extendedData(0) {
+           init(); 
+@@ -136,6 +137,7 @@ public:
+     QQmlContextData *outerContext;
+ 
+     QQmlAbstractBinding *bindings;
++    QQmlAbstractBoundSignal *signalHandlers;
+ 
+     // Linked list for QQmlContext::contextObjects
+     QQmlData *nextContextObject;
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 3d09ebb..c926a8e 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -71,6 +71,7 @@
+ #include <private/qdebugmessageservice_p.h>
+ #include "qqmlincubator.h"
+ #include <private/qv8profilerservice_p.h>
++#include <private/qqmlboundsignal_p.h>
+ 
+ #include <QtCore/qstandardpaths.h>
+ #include <QtCore/qsettings.h>
+@@ -1164,6 +1165,15 @@ void QQmlData::destroyed(QObject *object)
+         binding = next;
+     }
+ 
++    QQmlAbstractBoundSignal *signalHandler = signalHandlers;
++    while (signalHandler) {
++        QQmlAbstractBoundSignal *next = signalHandler->m_nextSignal;
++        signalHandler->m_prevSignal = 0;
++        signalHandler->m_nextSignal = 0;
++        delete signalHandler;
++        signalHandler = next;
++    }
++
+     if (bindingBits)
+         free(bindingBits);
+ 
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index ebcf903..0848df6 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -923,15 +923,17 @@ QQmlPropertyPrivate::signalExpression(const QQmlProperty &that)
+     if (!(that.type() & QQmlProperty::SignalProperty))
+         return 0;
+ 
+-    const QObjectList &children = that.d->object->children();
+-    
+-    for (int ii = 0; ii < children.count(); ++ii) {
+-        QObject *child = children.at(ii);
++    QQmlData *data = QQmlData::get(that.d->object);
++    if (!data)
++        return 0;
+ 
+-        QQmlAbstractBoundSignal *signal = qobject_cast<QQmlAbstractBoundSignal*>(child);
+-        if (signal && signal->index() == that.index()) 
+-            return signal->expression();
+-    }
++    QQmlAbstractBoundSignal *signalHandler = data->signalHandlers;
++
++    while (signalHandler && signalHandler->index() != that.index())
++        signalHandler = signalHandler->m_nextSignal;
++
++    if (signalHandler)
++        return signalHandler->expression();
+ 
+     return 0;
+ }
+@@ -952,19 +954,23 @@ QQmlPropertyPrivate::setSignalExpression(const QQmlProperty &that,
+         return 0;
+     }
+ 
+-    const QObjectList &children = that.d->object->children();
+-    
+-    for (int ii = 0; ii < children.count(); ++ii) {
+-        QObject *child = children.at(ii);
++    QQmlData *data = QQmlData::get(that.d->object, 0 != expr);
++    if (!data)
++        return 0;
+ 
+-        QQmlAbstractBoundSignal *signal = qobject_cast<QQmlAbstractBoundSignal*>(child);
+-        if (signal && signal->index() == that.index()) 
+-            return signal->setExpression(expr);
+-    }
++    QQmlAbstractBoundSignal *signalHandler = data->signalHandlers;
++
++    while (signalHandler && signalHandler->index() != that.index())
++        signalHandler = signalHandler->m_nextSignal;
++
++    if (signalHandler)
++        return signalHandler->setExpression(expr);
+ 
+     if (expr) {
+         QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object);
+-        return signal->setExpression(expr);
++        QQmlExpression *oldExpr = signal->setExpression(expr);
++        signal->addToObject();
++        return oldExpr;
+     } else {
+         return 0;
+     }
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index ce24540..ba53f8d 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -715,6 +715,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             QQmlExpression *expr = 
+                 new QQmlExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column, *new QQmlExpressionPrivate);
+             bs->setExpression(expr);
++            bs->addToObject();
+         QML_END_INSTR(StoreSignal)
+ 
+         QML_BEGIN_INSTR(StoreImportedScript)
+diff --git a/src/quick/util/qquickconnections.cpp b/src/quick/util/qquickconnections.cpp
+index 533c701..acc9738 100644
+--- a/src/quick/util/qquickconnections.cpp
++++ b/src/quick/util/qquickconnections.cpp
+@@ -283,6 +283,7 @@ void QQuickConnections::connectSignals()
+             QQmlExpression *expression = ctxtdata ?
+                 QQmlExpressionPrivate::create(ctxtdata, 0, script, true, location, line, column) : 0;
+             signal->setExpression(expression);
++            signal->addToObject();
+             d->boundsignals += signal;
+         } else {
+             if (!d->ignoreUnknownSignals)
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+index d082593..b66ba28 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+@@ -204,16 +204,9 @@ void tst_QQmlEngineDebugService::recursiveObjectTest(
+ 
+         // signal properties are fake - they are generated from QQmlAbstractBoundSignal children
+         if (p.name.startsWith("on") && p.name.length() > 2 && p.name[2].isUpper()) {
+-            QList<QQmlAbstractBoundSignal*> signalHandlers =
+-                    o->findChildren<QQmlAbstractBoundSignal*>();
+             QString signal = p.value.toString();
+-            bool found = false;
+-            for (int i = 0; i < signalHandlers.count(); ++i)
+-                if (signalHandlers.at(i)->expression()->expression() == signal) {
+-                    found = true;
+-                    break;
+-                }
+-            QVERIFY(found);
++            QQmlExpression *expr = QQmlPropertyPrivate::signalExpression(QQmlProperty(o, p.name));
++            QVERIFY(expr && expr->expression() == signal);
+             QVERIFY(p.valueTypeName.isEmpty());
+             QVERIFY(p.binding.isEmpty());
+             QVERIFY(!p.hasNotifySignal);

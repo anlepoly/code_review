@@ -1,0 +1,214 @@
+diff --git a/src/corelib/kernel/qeventloop.cpp b/src/corelib/kernel/qeventloop.cpp
+index 8b0ec85..2fb3517 100644
+--- a/src/corelib/kernel/qeventloop.cpp
++++ b/src/corelib/kernel/qeventloop.cpp
+@@ -322,13 +322,19 @@ class QEventLoopLockerPrivate
+ {
+ public:
+     explicit QEventLoopLockerPrivate(QEventLoopPrivate *loop)
+-      : loop(loop), app(0)
++      : loop(loop), thread(0), app(0)
+     {
+         loop->ref();
+     }
+ 
++    explicit QEventLoopLockerPrivate(QThreadPrivate *thread)
++      : loop(0), thread(thread), app(0)
++    {
++        thread->ref();
++    }
++
+     explicit QEventLoopLockerPrivate(QCoreApplicationPrivate *app)
+-      : loop(0), app(app)
++      : loop(0), thread(0), app(app)
+     {
+         app->ref();
+     }
+@@ -337,12 +343,15 @@ public:
+     {
+         if (loop)
+             loop->deref();
++        else if (thread)
++            thread->deref();
+         else
+             app->deref();
+     }
+ 
+ private:
+     QEventLoopPrivate *loop;
++    QThreadPrivate *thread;
+     QCoreApplicationPrivate *app;
+ };
+ 
+@@ -390,6 +399,12 @@ QEventLoopLocker::QEventLoopLocker(QEventLoop *loop)
+ 
+ }
+ 
++QEventLoopLocker::QEventLoopLocker(QThread *thread)
++  : d_ptr(new QEventLoopLockerPrivate(static_cast<QThreadPrivate*>(QObjectPrivate::get(thread))))
++{
++
++}
++
+ /*!
+     Destroys this event loop locker object
+  */
+diff --git a/src/corelib/kernel/qeventloop.h b/src/corelib/kernel/qeventloop.h
+index 0e7195d..ba082d7 100644
+--- a/src/corelib/kernel/qeventloop.h
++++ b/src/corelib/kernel/qeventloop.h
+@@ -96,6 +96,7 @@ class Q_CORE_EXPORT QEventLoopLocker
+ public:
+     QEventLoopLocker();
+     explicit QEventLoopLocker(QEventLoop *loop);
++    explicit QEventLoopLocker(QThread *thread);
+     ~QEventLoopLocker();
+ 
+ private:
+diff --git a/src/corelib/thread/qthread.cpp b/src/corelib/thread/qthread.cpp
+index be0a98d..a071463 100644
+--- a/src/corelib/thread/qthread.cpp
++++ b/src/corelib/thread/qthread.cpp
+@@ -763,5 +763,14 @@ void QThread::setEventDispatcher(QAbstractEventDispatcher *eventDispatcher)
+     }
+ }
+ 
++bool QThread::event(QEvent *event)
++{
++    if (event->type() == QEvent::Quit) {
++        quit();
++        return true;
++    } else {
++        return QObject::event(event);
++    }
++}
+ 
+ QT_END_NAMESPACE
+diff --git a/src/corelib/thread/qthread.h b/src/corelib/thread/qthread.h
+index 719f4af..ba119af 100644
+--- a/src/corelib/thread/qthread.h
++++ b/src/corelib/thread/qthread.h
+@@ -95,6 +95,8 @@ public:
+     QAbstractEventDispatcher *eventDispatcher() const;
+     void setEventDispatcher(QAbstractEventDispatcher *eventDispatcher);
+ 
++    bool event(QEvent *event);
++
+ public Q_SLOTS:
+     void start(Priority = InheritPriority);
+     void terminate();
+diff --git a/src/corelib/thread/qthread_p.h b/src/corelib/thread/qthread_p.h
+index d8374e9..6597b56 100644
+--- a/src/corelib/thread/qthread_p.h
++++ b/src/corelib/thread/qthread_p.h
+@@ -60,6 +60,7 @@
+ #include "QtCore/qstack.h"
+ #include "QtCore/qwaitcondition.h"
+ #include "QtCore/qmap.h"
++#include "QtCore/qcoreapplication.h"
+ #include "private/qobject_p.h"
+ 
+ 
+@@ -144,6 +145,7 @@ public:
+     ~QThreadPrivate();
+ 
+     mutable QMutex mutex;
++    QAtomicInt quitLockRef;
+ 
+     bool running;
+     bool finished;
+@@ -179,6 +181,18 @@ public:
+     QThreadData *data;
+ 
+     static void createEventDispatcher(QThreadData *data);
++
++    void ref()
++    {
++        quitLockRef.ref();
++    }
++
++    void deref()
++    {
++        if (!quitLockRef.deref() && running) {
++            QCoreApplication::instance()->postEvent(q_ptr, new QEvent(QEvent::Quit));
++        }
++    }
+ };
+ 
+ #else // QT_NO_THREAD
+@@ -195,6 +209,9 @@ public:
+     static QThread *threadForId(int) { return QThread::currentThread(); }
+     static void createEventDispatcher(QThreadData *data);
+ 
++    void ref() {}
++    void deref() {}
++
+     Q_DECLARE_PUBLIC(QThread)
+ };
+ 
+diff --git a/tests/auto/corelib/thread/qthread/tst_qthread.cpp b/tests/auto/corelib/thread/qthread/tst_qthread.cpp
+index 25e1a05..8eccd17 100644
+--- a/tests/auto/corelib/thread/qthread/tst_qthread.cpp
++++ b/tests/auto/corelib/thread/qthread/tst_qthread.cpp
+@@ -107,6 +107,8 @@ private slots:
+     void customEventDispatcher();
+ 
+     void stressTest();
++
++    void quitLock();
+ };
+ 
+ enum { one_minute = 60 * 1000, five_minutes = 5 * one_minute };
+@@ -1285,5 +1287,52 @@ void tst_QThread::customEventDispatcher()
+     QVERIFY(weak_ed.isNull());
+ }
+ 
++class Job : public QObject
++{
++    Q_OBJECT
++public:
++    Job(QThread *thread, int deleteDelay, QObject *parent = 0)
++      : QObject(parent), quitLocker(thread), exitThreadCalled(false)
++    {
++        moveToThread(thread);
++        QTimer::singleShot(deleteDelay, this, SLOT(deleteLater()));
++        QTimer::singleShot(1000, this, SLOT(exitThread()));
++    }
++
++private slots:
++    void exitThread()
++    {
++        exitThreadCalled = true;
++        thread()->exit(1);
++    }
++
++private:
++    QEventLoopLocker quitLocker;
++public:
++    bool exitThreadCalled;
++};
++
++void tst_QThread::quitLock()
++{
++    QThread thread;
++
++    QEventLoop loop;
++    connect(&thread, SIGNAL(finished()), &loop, SLOT(quit()));
++
++    Job *job;
++
++    thread.start();
++    job = new Job(&thread, 500);
++    QCOMPARE(job->thread(), &thread);
++    loop.exec();
++    QVERIFY(!job->exitThreadCalled);
++
++    thread.start();
++    job = new Job(&thread, 2500);
++    QCOMPARE(job->thread(), &thread);
++    loop.exec();
++    QVERIFY(job->exitThreadCalled);
++}
++
+ QTEST_MAIN(tst_QThread)
+ #include "tst_qthread.moc"

@@ -1,0 +1,196 @@
+diff --git a/src/testlib/qsignalspy.h b/src/testlib/qsignalspy.h
+index 70944ba..18def8f 100644
+--- a/src/testlib/qsignalspy.h
++++ b/src/testlib/qsignalspy.h
+@@ -47,6 +47,7 @@
+ #include <QtCore/qobject.h>
+ #include <QtCore/qmetaobject.h>
+ #include <QtCore/qvariant.h>
++#include <QtTest/qtesteventloop.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -59,6 +60,7 @@ class QSignalSpy: public QObject, public QList<QList<QVariant> >
+ {
+ public:
+     QSignalSpy(QObject *obj, const char *aSignal)
++        : m_waiting(false)
+     {
+ #ifdef Q_CC_BOR
+         const int memberOffset = QObject::staticMetaObject.methodCount();
+@@ -100,6 +102,15 @@ public:
+     inline bool isValid() const { return !sig.isEmpty(); }
+     inline QByteArray signal() const { return sig; }
+ 
++    bool wait(int timeout = 5000)
++    {
++        Q_ASSERT(!m_waiting);
++        const int origCount = count();
++        m_waiting = true;
++        m_loop.enterLoopMSecs(timeout);
++        m_waiting = false;
++        return count() > origCount;
++    }
+ 
+     int qt_metacall(QMetaObject::Call call, int methodId, void **a)
+     {
+@@ -139,12 +150,18 @@ private:
+             list << QVariant(type, a[i + 1]);
+         }
+         append(list);
++
++        if (m_waiting)
++            m_loop.exitLoop();
+     }
+ 
+     // the full, normalized signal name
+     QByteArray sig;
+     // holds the QMetaType types for the argument list of the signal
+     QList<int> args;
++
++    QTestEventLoop m_loop;
++    bool m_waiting;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/testlib/qsignalspy.qdoc b/src/testlib/qsignalspy.qdoc
+index 7ce0a51..e9e1f4d 100644
+--- a/src/testlib/qsignalspy.qdoc
++++ b/src/testlib/qsignalspy.qdoc
+@@ -86,3 +86,12 @@
+     \internal
+ */
+ 
++/*! \fn QSignalSpy::wait(int timeout) const
++
++    \since 5.0
++
++    Starts an event loop that runs until the given signal is received.
++    Optionally the event loop can return earlier on a \a timeout (in milliseconds).
++
++    Returns true if the signal was emitted at least once in \a timeout milliseconds, otherwise returns false.
++*/
+diff --git a/src/testlib/qtestcase.cpp b/src/testlib/qtestcase.cpp
+index bf40218..296bc96 100644
+--- a/src/testlib/qtestcase.cpp
++++ b/src/testlib/qtestcase.cpp
+@@ -856,7 +856,7 @@ QT_BEGIN_NAMESPACE
+     The code above will wait until the network server is responding for a
+     maximum of about 12.5 seconds.
+ 
+-    \sa QTest::qSleep()
++    \sa QTest::qSleep(), QSignalSpy::wait()
+ */
+ 
+ /*! \fn bool QTest::qWaitForWindowExposed(QWindow *window, int timeout)
+diff --git a/src/testlib/qtesteventloop.h b/src/testlib/qtesteventloop.h
+index 98d6996..3f08a93 100644
+--- a/src/testlib/qtesteventloop.h
++++ b/src/testlib/qtesteventloop.h
+@@ -61,8 +61,9 @@ class Q_TESTLIB_EXPORT QTestEventLoop : public QObject
+ public:
+     inline QTestEventLoop(QObject *aParent = 0)
+         : QObject(aParent), inLoop(false), _timeout(false), timerId(-1), loop(0) {}
+-    inline void enterLoop(int secs);
+ 
++    inline void enterLoopMSecs(int ms);
++    inline void enterLoop(int secs) { enterLoopMSecs(secs * 1000); }
+ 
+     inline void changeInterval(int secs)
+     { killTimer(timerId); timerId = startTimer(secs * 1000); }
+@@ -92,7 +93,7 @@ private:
+     QEventLoop *loop;
+ };
+ 
+-inline void QTestEventLoop::enterLoop(int secs)
++inline void QTestEventLoop::enterLoopMSecs(int ms)
+ {
+     Q_ASSERT(!loop);
+ 
+@@ -101,7 +102,7 @@ inline void QTestEventLoop::enterLoop(int secs)
+     inLoop = true;
+     _timeout = false;
+ 
+-    timerId = startTimer(secs * 1000);
++    timerId = startTimer(ms);
+ 
+     loop = &l;
+     l.exec();
+diff --git a/tests/auto/testlib/qsignalspy/tst_qsignalspy.cpp b/tests/auto/testlib/qsignalspy/tst_qsignalspy.cpp
+index e17fd6a..07b762a 100644
+--- a/tests/auto/testlib/qsignalspy/tst_qsignalspy.cpp
++++ b/tests/auto/testlib/qsignalspy/tst_qsignalspy.cpp
+@@ -49,6 +49,9 @@ class tst_QSignalSpy : public QObject
+ {
+     Q_OBJECT
+ 
++Q_SIGNALS:
++    void sigFoo();
++
+ private slots:
+     void spyWithoutArgs();
+     void spyWithBasicArgs();
+@@ -56,6 +59,12 @@ private slots:
+     void spyWithQtClasses();
+     void spyWithBasicQtClasses();
+     void spyWithQtTypedefs();
++
++    void wait_signalEmitted();
++    void wait_timeout();
++    void wait_signalEmittedLater();
++    void wait_signalEmittedTooLate();
++    void wait_signalEmittedMultipleTimes();
+ };
+ 
+ class QtTestObject: public QObject
+@@ -217,5 +226,49 @@ void tst_QSignalSpy::spyWithQtTypedefs()
+ //    QCOMPARE(spy3.value(0).value(1).toInt(), 45);
+ }
+ 
+-QTEST_APPLESS_MAIN(tst_QSignalSpy)
++void tst_QSignalSpy::wait_signalEmitted()
++{
++    QTimer::singleShot(0, this, SIGNAL(sigFoo()));
++    QSignalSpy spy(this, SIGNAL(sigFoo()));
++    QVERIFY(spy.wait(1));
++}
++
++void tst_QSignalSpy::wait_timeout()
++{
++    QSignalSpy spy(this, SIGNAL(sigFoo()));
++    QVERIFY(!spy.wait(1));
++}
++
++void tst_QSignalSpy::wait_signalEmittedLater()
++{
++    QTimer::singleShot(500, this, SIGNAL(sigFoo()));
++    QSignalSpy spy(this, SIGNAL(sigFoo()));
++    QVERIFY(spy.wait(1000));
++}
++
++void tst_QSignalSpy::wait_signalEmittedTooLate()
++{
++    QTimer::singleShot(500, this, SIGNAL(sigFoo()));
++    QSignalSpy spy(this, SIGNAL(sigFoo()));
++    QVERIFY(!spy.wait(200));
++    QTest::qWait(400);
++    QCOMPARE(spy.count(), 1);
++}
++
++void tst_QSignalSpy::wait_signalEmittedMultipleTimes()
++{
++    QTimer::singleShot(100, this, SIGNAL(sigFoo()));
++    QTimer::singleShot(800, this, SIGNAL(sigFoo()));
++    QSignalSpy spy(this, SIGNAL(sigFoo()));
++    QVERIFY(spy.wait());
++    QCOMPARE(spy.count(), 1); // we don't wait for the second signal...
++    QVERIFY(spy.wait());
++    QCOMPARE(spy.count(), 2);
++    QVERIFY(!spy.wait(1));
++    QTimer::singleShot(10, this, SIGNAL(sigFoo()));
++    QVERIFY(spy.wait());
++    QCOMPARE(spy.count(), 3);
++}
++
++QTEST_MAIN(tst_QSignalSpy)
+ #include "tst_qsignalspy.moc"

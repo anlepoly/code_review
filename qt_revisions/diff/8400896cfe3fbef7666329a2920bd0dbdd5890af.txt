@@ -1,0 +1,285 @@
+diff --git a/qmake/library/proitems.h b/qmake/library/proitems.h
+index b712ca3..23dc86d 100644
+--- a/qmake/library/proitems.h
++++ b/qmake/library/proitems.h
+@@ -306,6 +306,9 @@ enum ProToken {
+     TokTestCall,        // previous literal/expansion is a test function call
+                         // - ((nested expansion + TokArgSeparator)* + nested expansion)?
+                         // - TokFuncTerminator
++    TokReturn,          // previous literal/expansion is a return value
++    TokBreak,           // break loop
++    TokNext,            // shortcut to next loop iteration
+     TokNot,             // '!' operator
+     TokAnd,             // ':' operator
+     TokOr,              // '|' operator
+diff --git a/qmake/library/qmakebuiltins.cpp b/qmake/library/qmakebuiltins.cpp
+index bf1c00f..d03475c 100644
+--- a/qmake/library/qmakebuiltins.cpp
++++ b/qmake/library/qmakebuiltins.cpp
+@@ -96,7 +96,7 @@ enum ExpandFunc {
+ enum TestFunc {
+     T_INVALID = 0, T_REQUIRES, T_GREATERTHAN, T_LESSTHAN, T_EQUALS,
+     T_EXISTS, T_EXPORT, T_CLEAR, T_UNSET, T_EVAL, T_CONFIG, T_SYSTEM,
+-    T_RETURN, T_BREAK, T_NEXT, T_DEFINED, T_CONTAINS, T_INFILE,
++    T_DEFINED, T_CONTAINS, T_INFILE,
+     T_COUNT, T_ISEMPTY, T_INCLUDE, T_LOAD, T_DEBUG, T_LOG, T_MESSAGE, T_WARNING, T_ERROR, T_IF,
+     T_MKPATH, T_WRITE_FILE, T_TOUCH, T_CACHE
+ };
+@@ -168,9 +168,6 @@ void QMakeEvaluator::initFunctionStatics()
+         { "if", T_IF },
+         { "isActiveConfig", T_CONFIG },
+         { "system", T_SYSTEM },
+-        { "return", T_RETURN },
+-        { "break", T_BREAK },
+-        { "next", T_NEXT },
+         { "defined", T_DEFINED },
+         { "contains", T_CONTAINS },
+         { "infile", T_INFILE },
+@@ -1077,17 +1074,6 @@ QMakeEvaluator::VisitReturn QMakeEvaluator::evaluateBuiltinConditional(
+         return returnBool(m_functionDefs.replaceFunctions.contains(var)
+                           || m_functionDefs.testFunctions.contains(var));
+     }
+-    case T_RETURN:
+-        m_returnValue = args;
+-        // It is "safe" to ignore returns - due to qmake brokeness
+-        // they cannot be used to terminate loops anyway.
+-        if (m_cumulative)
+-            return ReturnTrue;
+-        if (m_valuemapStack.size() == 1) {
+-            evalError(fL1S("unexpected return()."));
+-            return ReturnFalse;
+-        }
+-        return ReturnReturn;
+     case T_EXPORT: {
+         if (args.count() != 1) {
+             evalError(fL1S("export(variable) requires one argument."));
+@@ -1158,20 +1144,6 @@ QMakeEvaluator::VisitReturn QMakeEvaluator::evaluateBuiltinConditional(
+             }
+             return ret;
+         }
+-    case T_BREAK:
+-        if (m_skipLevel)
+-            return ReturnFalse;
+-        if (m_loopLevel)
+-            return ReturnBreak;
+-        evalError(fL1S("Unexpected break()."));
+-        return ReturnFalse;
+-    case T_NEXT:
+-        if (m_skipLevel)
+-            return ReturnFalse;
+-        if (m_loopLevel)
+-            return ReturnNext;
+-        evalError(fL1S("Unexpected next()."));
+-        return ReturnFalse;
+     case T_IF: {
+         if (args.count() != 1) {
+             evalError(fL1S("if(condition) requires one argument."));
+diff --git a/qmake/library/qmakeevaluator.cpp b/qmake/library/qmakeevaluator.cpp
+index 4376865..687bb3a 100644
+--- a/qmake/library/qmakeevaluator.cpp
++++ b/qmake/library/qmakeevaluator.cpp
+@@ -195,7 +195,6 @@ QMakeEvaluator::QMakeEvaluator(QMakeGlobals *option,
+ #ifdef PROEVALUATOR_CUMULATIVE
+     m_skipLevel = 0;
+ #endif
+-    m_loopLevel = 0;
+     m_listCount = 0;
+     m_valuemapStack.push(ProValueMap());
+     m_valuemapInited = false;
+@@ -684,6 +683,24 @@ QMakeEvaluator::VisitReturn QMakeEvaluator::visitProBlock(
+             invert = false;
+             curr.clear();
+             continue;
++        case TokReturn:
++            m_returnValue = curr;
++            curr.clear();
++            ret = ReturnReturn;
++            goto ctrlstm;
++        case TokBreak:
++            ret = ReturnBreak;
++            goto ctrlstm;
++        case TokNext:
++            ret = ReturnNext;
++          ctrlstm:
++            if (!m_skipLevel && okey != or_op) {
++                traceMsg("flow control statement '%s', aborting block", dbgReturn(ret));
++                return ret;
++            }
++            traceMsg("skipped flow control statement '%s'", dbgReturn(ret));
++            okey = false, or_op = true; // force next evaluation
++            continue;
+         default: {
+                 const ushort *oTokPtr = --tokPtr;
+                 evaluateExpression(tokPtr, &curr, false);
+@@ -763,7 +780,6 @@ QMakeEvaluator::VisitReturn QMakeEvaluator::visitProLoop(
+     else
+         traceMsg("entering loop for %s over %s", dbgKey(variable), dbgStrList(list));
+ 
+-    m_loopLevel++;
+     forever {
+         if (infinite) {
+             if (!variable.isEmpty())
+@@ -800,7 +816,6 @@ QMakeEvaluator::VisitReturn QMakeEvaluator::visitProLoop(
+         }
+     }
+   do_break:
+-    m_loopLevel--;
+ 
+     traceMsg("done looping");
+ 
+@@ -1576,8 +1591,6 @@ ProStringList QMakeEvaluator::evaluateFunction(
+     } else {
+         m_valuemapStack.push(ProValueMap());
+         m_locationStack.push(m_current);
+-        int loopLevel = m_loopLevel;
+-        m_loopLevel = 0;
+ 
+         ProStringList args;
+         for (int i = 0; i < argumentsList.count(); ++i) {
+@@ -1590,7 +1603,6 @@ ProStringList QMakeEvaluator::evaluateFunction(
+         ret = m_returnValue;
+         m_returnValue.clear();
+ 
+-        m_loopLevel = loopLevel;
+         m_current = m_locationStack.pop();
+         m_valuemapStack.pop();
+     }
+diff --git a/qmake/library/qmakeevaluator.h b/qmake/library/qmakeevaluator.h
+index 7c0da0c..5904c08 100644
+--- a/qmake/library/qmakeevaluator.h
++++ b/qmake/library/qmakeevaluator.h
+@@ -233,7 +233,6 @@ public:
+     static void removeEach(ProStringList *varlist, const ProStringList &value);
+ 
+     QMakeEvaluator *m_caller;
+-    int m_loopLevel; // To report unexpected break() and next()s
+ #ifdef PROEVALUATOR_CUMULATIVE
+     bool m_cumulative;
+     int m_skipLevel;
+diff --git a/qmake/library/qmakeparser.cpp b/qmake/library/qmakeparser.cpp
+index 660f935..04558b8 100644
+--- a/qmake/library/qmakeparser.cpp
++++ b/qmake/library/qmakeparser.cpp
+@@ -108,6 +108,9 @@ static struct {
+     QString strdefineTest;
+     QString strdefineReplace;
+     QString stroption;
++    QString strreturn;
++    QString strnext;
++    QString strbreak;
+     QString strhost_build;
+     QString strLINE;
+     QString strFILE;
+@@ -128,6 +131,9 @@ void QMakeParser::initialize()
+     statics.strdefineTest = QLatin1String("defineTest");
+     statics.strdefineReplace = QLatin1String("defineReplace");
+     statics.stroption = QLatin1String("option");
++    statics.strreturn = QLatin1String("return");
++    statics.strnext = QLatin1String("next");
++    statics.strbreak = QLatin1String("break");
+     statics.strhost_build = QLatin1String("host_build");
+     statics.strLINE = QLatin1String("_LINE_");
+     statics.strFILE = QLatin1String("_FILE_");
+@@ -884,9 +890,11 @@ void QMakeParser::putLineMarker(ushort *&tokPtr)
+ 
+ void QMakeParser::enterScope(ushort *&tokPtr, bool special, ScopeState state)
+ {
++    uchar nest = m_blockstack.top().nest;
+     m_blockstack.resize(m_blockstack.size() + 1);
+     m_blockstack.top().special = special;
+     m_blockstack.top().start = tokPtr;
++    m_blockstack.top().nest = nest;
+     tokPtr += 2;
+     m_state = state;
+     m_canElse = false;
+@@ -1026,6 +1034,7 @@ void QMakeParser::finalizeCall(ushort *&tokPtr, ushort *uc, ushort *ptr, int arg
+             m_tmp.setRawData((QChar *)uc + 4, nlen);
+             const QString *defName;
+             ushort defType;
++            uchar nest;
+             if (m_tmp == statics.strfor) {
+                 if (m_invert || m_operator == OrOperator) {
+                     // '|' could actually work reasonably, but qmake does nonsense here.
+@@ -1048,6 +1057,7 @@ void QMakeParser::finalizeCall(ushort *&tokPtr, ushort *uc, ushort *ptr, int arg
+                       didFor:
+                         putTok(tokPtr, TokValueTerminator);
+                         enterScope(tokPtr, true, StCtrl);
++                        m_blockstack.top().nest |= NestLoop;
+                         return;
+                     } else if (*uc == TokArgSeparator && argc == 2) {
+                         // for(var, something)
+@@ -1094,11 +1104,48 @@ void QMakeParser::finalizeCall(ushort *&tokPtr, ushort *uc, ushort *ptr, int arg
+                         putTok(tokPtr, defType);
+                         putHashStr(tokPtr, uce + 2, nlen);
+                         enterScope(tokPtr, true, StCtrl);
++                        m_blockstack.top().nest = NestFunction;
+                         return;
+                     }
+                 }
+                 parseError(fL1S("%1(function) requires one literal argument.").arg(*defName));
+                 return;
++            } else if (m_tmp == statics.strreturn) {
++                if (argc > 1) {
++                    parseError(fL1S("return() requires zero or one argument."));
++                    bogusTest(tokPtr);
++                    return;
++                }
++                defType = TokReturn;
++                nest = NestFunction;
++                goto ctrlstm2;
++            } else if (m_tmp == statics.strnext) {
++                defType = TokNext;
++                goto ctrlstm;
++            } else if (m_tmp == statics.strbreak) {
++                defType = TokBreak;
++              ctrlstm:
++                if (*uce != TokFuncTerminator) {
++                    parseError(fL1S("%1() requires zero arguments.").arg(m_tmp));
++                    bogusTest(tokPtr);
++                    return;
++                }
++                nest = NestLoop;
++              ctrlstm2:
++                if (m_invert) {
++                    parseError(fL1S("Unexpected NOT operator in front of %1().").arg(m_tmp));
++                    bogusTest(tokPtr);
++                    return;
++                }
++                if (!(m_blockstack.top().nest & nest)) {
++                    parseError(fL1S("Unexpected %1().").arg(m_tmp));
++                    bogusTest(tokPtr);
++                    return;
++                }
++                finalizeTest(tokPtr);
++                putBlock(tokPtr, uce, ptr - uce - 1); // Only for TokReturn
++                putTok(tokPtr, defType);
++                return;
+             } else if (m_tmp == statics.stroption) {
+                 if (m_state != StNew || m_blockstack.top().braceLevel || m_blockstack.size() > 1
+                         || m_invert || m_operator != NoOperator) {
+diff --git a/qmake/library/qmakeparser.h b/qmake/library/qmakeparser.h
+index cbda916..22d83a1 100644
+--- a/qmake/library/qmakeparser.h
++++ b/qmake/library/qmakeparser.h
+@@ -95,13 +95,20 @@ public:
+                             SubGrammar grammar = FullGrammar);
+ 
+ private:
++    enum ScopeNesting {
++        NestNone = 0,
++        NestLoop = 1,
++        NestFunction = 2
++    };
++
+     struct BlockScope {
+-        BlockScope() : start(0), braceLevel(0), special(false), inBranch(false) {}
++        BlockScope() : start(0), braceLevel(0), special(false), inBranch(false), nest(NestNone) {}
+         BlockScope(const BlockScope &other) { *this = other; }
+         ushort *start; // Where this block started; store length here
+         int braceLevel; // Nesting of braces in scope
+         bool special; // Single-line conditionals inside loops, etc. cannot have else branches
+         bool inBranch; // The 'else' branch of the previous TokBranch is still open
++        uchar nest; // Into what control structures we are nested
+     };
+ 
+     enum ScopeState {

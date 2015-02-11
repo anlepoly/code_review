@@ -1,0 +1,233 @@
+diff --git a/src/multimediawidgets/qpaintervideosurface.cpp b/src/multimediawidgets/qpaintervideosurface.cpp
+index 6f86182..324ac33 100644
+--- a/src/multimediawidgets/qpaintervideosurface.cpp
++++ b/src/multimediawidgets/qpaintervideosurface.cpp
+@@ -50,6 +50,7 @@
+ 
+ #if !defined(QT_NO_OPENGL) && !defined(QT_OPENGL_ES_1_CL) && !defined(QT_OPENGL_ES_1)
+ #include <qglshaderprogram.h>
++#include <QtGui/QOpenGLContext>
+ #ifndef GL_CLAMP_TO_EDGE
+ #define GL_CLAMP_TO_EDGE 0x812F
+ #endif
+@@ -1567,6 +1568,9 @@ void QPainterVideoSurface::setGLContext(QGLContext *context)
+     m_shaderTypes = NoShaders;
+ 
+     if (m_glContext) {
++        //Set a dynamic property to access the OpenGL context
++        this->setProperty("GLContext", QVariant::fromValue<QObject*>(m_glContext->contextHandle()));
++
+         m_glContext->makeCurrent();
+ 
+         const QByteArray extensions(reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS)));
+diff --git a/src/multimediawidgets/qpaintervideosurface_mac.mm b/src/multimediawidgets/qpaintervideosurface_mac.mm
+index f056d5f..d63a7b4 100644
+--- a/src/multimediawidgets/qpaintervideosurface_mac.mm
++++ b/src/multimediawidgets/qpaintervideosurface_mac.mm
+@@ -71,6 +71,7 @@ QVideoSurfaceCoreGraphicsPainter::QVideoSurfaceCoreGraphicsPainter(bool glSuppor
+         << QVideoFrame::Format_RGB32
+         << QVideoFrame::Format_ARGB32
+         << QVideoFrame::Format_ARGB32_Premultiplied
++        << QVideoFrame::Format_BGR32
+         << QVideoFrame::Format_RGB24
+         << QVideoFrame::Format_RGB565
+         << QVideoFrame::Format_RGB555
+@@ -112,7 +113,7 @@ QAbstractVideoSurface::Error QVideoSurfaceCoreGraphicsPainter::start(const QVide
+     m_scanLineDirection = format.scanLineDirection();
+ 
+     return m_supportedHandles.contains(format.handleType())
+-            && m_imageFormat != QImage::Format_Invalid
++            && ((m_imageFormat != QImage::Format_Invalid) || (format.handleType() == QAbstractVideoBuffer::GLTextureHandle))
+             && !m_imageSize.isEmpty()
+             ? QAbstractVideoSurface::NoError
+             : QAbstractVideoSurface::UnsupportedFormatError;
+diff --git a/src/plugins/avfoundation/mediaplayer/avfvideoframerenderer.mm b/src/plugins/avfoundation/mediaplayer/avfvideoframerenderer.mm
+index ea787dc..294ea32 100644
+--- a/src/plugins/avfoundation/mediaplayer/avfvideoframerenderer.mm
++++ b/src/plugins/avfoundation/mediaplayer/avfvideoframerenderer.mm
+@@ -131,6 +131,7 @@ GLuint AVFVideoFrameRenderer::renderLayerToTexture(AVPlayerLayer *layer)
+         return 0;
+ 
+     renderLayerToFBO(layer, fbo);
++    m_glContext->doneCurrent();
+ 
+     return fbo->texture();
+ }
+@@ -148,8 +149,10 @@ QImage AVFVideoFrameRenderer::renderLayerToImage(AVPlayerLayer *layer)
+         return QImage();
+ 
+     renderLayerToFBO(layer, fbo);
++    QImage fboImage = fbo->toImage().mirrored();
++    m_glContext->doneCurrent();
+ 
+-    return fbo->toImage();
++    return fboImage;
+ }
+ 
+ QOpenGLFramebufferObject *AVFVideoFrameRenderer::initRenderer(AVPlayerLayer *layer)
+@@ -179,8 +182,8 @@ QOpenGLFramebufferObject *AVFVideoFrameRenderer::initRenderer(AVPlayerLayer *lay
+         } else {
+ #ifdef QT_DEBUG_AVF
+             qWarning("failed to get Render Thread context");
+-            m_isContextShared = false;
+ #endif
++            m_isContextShared = false;
+         }
+         if (!m_glContext->create()) {
+             qWarning("failed to create QOpenGLContext");
+@@ -253,6 +256,4 @@ void AVFVideoFrameRenderer::renderLayerToFBO(AVPlayerLayer *layer, QOpenGLFrameb
+     glFinish(); //Rendering needs to be done before passing texture to video frame
+ 
+     fbo->release();
+-
+-    m_glContext->doneCurrent();
+ }
+diff --git a/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.h b/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.h
+index 19916bd..adee578 100644
+--- a/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.h
++++ b/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.h
+@@ -85,6 +85,7 @@ private:
+     AVFVideoFrameRenderer *m_frameRenderer;
+     AVFDisplayLink *m_displayLink;
+     QSize m_nativeSize;
++    bool m_enableOpenGL;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.mm b/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.mm
+index e7d99cd..289675d 100644
+--- a/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.mm
++++ b/src/plugins/avfoundation/mediaplayer/avfvideorenderercontrol.mm
+@@ -75,11 +75,41 @@ private:
+     GLuint m_textureId;
+ };
+ 
++class QImageVideoBuffer : public QAbstractVideoBuffer
++{
++public:
++    QImageVideoBuffer(const QImage &image)
++        : QAbstractVideoBuffer(NoHandle)
++        , m_image(image)
++        , m_mode(NotMapped)
++    {
++
++    }
++
++    MapMode mapMode() const { return m_mode; }
++    uchar *map(MapMode mode, int *numBytes, int *bytesPerLine)
++    {
++        if (mode != NotMapped && m_mode == NotMapped) {
++            m_mode = mode;
++            return m_image.bits();
++        } else
++            return 0;
++    }
++
++    void unmap() {
++        m_mode = NotMapped;
++    }
++private:
++    QImage m_image;
++    MapMode m_mode;
++};
++
+ AVFVideoRendererControl::AVFVideoRendererControl(QObject *parent)
+     : QVideoRendererControl(parent)
+     , m_surface(0)
+     , m_playerLayer(0)
+     , m_frameRenderer(0)
++    , m_enableOpenGL(false)
+ 
+ {
+     m_displayLink = new AVFDisplayLink(this);
+@@ -132,6 +162,9 @@ void AVFVideoRendererControl::setSurface(QAbstractVideoSurface *surface)
+     //Surface changed, so we need a new frame renderer
+     m_frameRenderer = new AVFVideoFrameRenderer(m_surface, this);
+ 
++    //Check for needed formats to render as OpenGL Texture
++    m_enableOpenGL = m_surface->supportedPixelFormats(QAbstractVideoBuffer::GLTextureHandle).contains(QVideoFrame::Format_BGR32);
++
+     //If we already have a layer, but changed surfaces start rendering again
+     if (m_playerLayer && !m_displayLink->isActive()) {
+         m_displayLink->start();
+@@ -177,31 +210,64 @@ void AVFVideoRendererControl::updateVideoFrame(const CVTimeStamp &ts)
+     if (!playerLayer.readyForDisplay)
+         return;
+ 
+-    GLuint textureId = m_frameRenderer->renderLayerToTexture(playerLayer);
++    if (m_enableOpenGL) {
+ 
+-    //Make sure we got a valid texture
+-    if (textureId == 0) {
+-        qWarning("renderLayerToTexture failed");
+-        return;
+-    }
++        GLuint textureId = m_frameRenderer->renderLayerToTexture(playerLayer);
++
++        //Make sure we got a valid texture
++        if (textureId == 0) {
++            qWarning("renderLayerToTexture failed");
++            return;
++        }
++
++        QAbstractVideoBuffer *buffer = new TextureVideoBuffer(textureId);
++        QVideoFrame frame = QVideoFrame(buffer, m_nativeSize, QVideoFrame::Format_BGR32);
++
++        if (m_surface && frame.isValid()) {
++            if (m_surface->isActive() && m_surface->surfaceFormat().pixelFormat() != frame.pixelFormat())
++                m_surface->stop();
++
++            if (!m_surface->isActive()) {
++                QVideoSurfaceFormat format(frame.size(), frame.pixelFormat(), QAbstractVideoBuffer::GLTextureHandle);
++                format.setScanLineDirection(QVideoSurfaceFormat::BottomToTop);
+ 
+-    QAbstractVideoBuffer *buffer = new TextureVideoBuffer(textureId);
+-    QVideoFrame frame = QVideoFrame(buffer, m_nativeSize, QVideoFrame::Format_BGR32);
++                if (!m_surface->start(format)) {
++                    //Surface doesn't support GLTextureHandle
++                    qWarning("Failed to activate video surface");
++                }
++            }
++
++            if (m_surface->isActive())
++                m_surface->present(frame);
++        }
++    } else {
++        //fallback to rendering frames to QImages
++        QImage frameData = m_frameRenderer->renderLayerToImage(playerLayer);
+ 
+-    if (m_surface && frame.isValid()) {
+-        if (m_surface->isActive() && m_surface->surfaceFormat().pixelFormat() != frame.pixelFormat())
+-            m_surface->stop();
++        if (frameData.isNull()) {
++            qWarning("renterLayerToImage failed");
++            return;
++        }
+ 
+-        if (!m_surface->isActive()) {
+-            QVideoSurfaceFormat format(frame.size(), frame.pixelFormat(), QAbstractVideoBuffer::GLTextureHandle);
++        QAbstractVideoBuffer *buffer = new QImageVideoBuffer(frameData);
++        QVideoFrame frame = QVideoFrame(buffer, m_nativeSize, QVideoFrame::Format_ARGB32_Premultiplied);
+ 
+-            if (!m_surface->start(format)) {
+-                qWarning("Failed to activate video surface");
++        if (m_surface && frame.isValid()) {
++            if (m_surface->isActive() && m_surface->surfaceFormat().pixelFormat() != frame.pixelFormat())
++                m_surface->stop();
++
++            if (!m_surface->isActive()) {
++                QVideoSurfaceFormat format(frame.size(), frame.pixelFormat(), QAbstractVideoBuffer::NoHandle);
++
++                if (!m_surface->start(format)) {
++                    qWarning("Failed to activate video surface");
++                }
+             }
++
++            if (m_surface->isActive())
++                m_surface->present(frame);
+         }
+ 
+-        if (m_surface->isActive())
+-            m_surface->present(frame);
+     }
+ }

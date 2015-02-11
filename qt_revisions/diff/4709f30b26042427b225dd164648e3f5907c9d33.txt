@@ -1,0 +1,2279 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index c3d134f..d568cc4 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -77,6 +77,7 @@ Q_DECLARE_METATYPE(QList<qreal>)
+ Q_DECLARE_METATYPE(QList<bool>)
+ Q_DECLARE_METATYPE(QList<QString>)
+ Q_DECLARE_METATYPE(QList<QUrl>)
++Q_DECLARE_METATYPE(QJSValue)
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -395,6 +396,8 @@ bool QQmlCompiler::testLiteralAssignment(QQmlScript::Property *prop,
+                     COMPILE_EXCEPTION(v, tr("Invalid property assignment: url or array of urls expected"));
+                 }
+                 break;
++            } else if (type == qMetaTypeId<QJSValue>()) {
++                break;
+             }
+ 
+             // otherwise, check for existence of string converter to custom type
+@@ -724,6 +727,32 @@ void QQmlCompiler::genLiteralAssignment(QQmlScript::Property *prop,
+                 instr.value = output->indexForString(v->value.asString());
+                 output->addInstruction(instr);
+                 break;
++            } else if (type == qMetaTypeId<QJSValue>()) {
++                if (v->value.isBoolean()) {
++                    Instruction::StoreJSValueBool instr;
++                    instr.propertyIndex = prop->index;
++                    instr.value = v->value.asBoolean();
++                    output->addInstruction(instr);
++                } else if (v->value.isNumber()) {
++                    double n = v->value.asNumber();
++                    if (double(int(n)) == n) {
++                        Instruction::StoreJSValueInteger instr;
++                        instr.propertyIndex = prop->index;
++                        instr.value = int(n);
++                        output->addInstruction(instr);
++                    } else {
++                        Instruction::StoreJSValueDouble instr;
++                        instr.propertyIndex = prop->index;
++                        instr.value = n;
++                        output->addInstruction(instr);
++                    }
++                } else {
++                    Instruction::StoreJSValueString instr;
++                    instr.propertyIndex = prop->index;
++                    instr.value = output->indexForString(v->value.asString());
++                    output->addInstruction(instr);
++                }
++                break;
+             }
+ 
+             // otherwise, generate custom type literal assignment
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index 533734b..04f419d 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -79,6 +79,10 @@ QT_BEGIN_NAMESPACE
+     F(StoreVarDouble, storeDouble) \
+     F(StoreVarBool, storeBool) \
+     F(StoreString, storeString) \
++    F(StoreJSValueString, storeString) \
++    F(StoreJSValueInteger, storeInteger) \
++    F(StoreJSValueDouble, storeDouble) \
++    F(StoreJSValueBool, storeBool) \
+     F(StoreStringList, storeString) \
+     F(StoreStringQList, storeString) \
+     F(StoreTrString, storeTrString) \
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index 761b75a..087fbaa 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -62,6 +62,7 @@
+ 
+ #include <math.h>
+ 
++Q_DECLARE_METATYPE(QJSValue)
+ Q_DECLARE_METATYPE(QList<int>)
+ Q_DECLARE_METATYPE(QList<qreal>)
+ Q_DECLARE_METATYPE(QList<bool>)
+@@ -1489,7 +1490,7 @@ bool QQmlPropertyPrivate::writeBinding(QObject *object,
+         value = QVariant::fromValue((QObject *)0);
+     } else if (core.propType == qMetaTypeId<QList<QUrl> >()) {
+         value = resolvedUrlSequence(v8engine->toVariant(result, qMetaTypeId<QList<QUrl> >()), context);
+-    } else if (!isVmeProperty) {
++    } else if (!isVmeProperty && type != qMetaTypeId<QJSValue>()) {
+         value = v8engine->toVariant(result, type);
+     }
+ 
+@@ -1511,6 +1512,13 @@ bool QQmlPropertyPrivate::writeBinding(QObject *object,
+         QMetaObject::metacall(object, QMetaObject::ResetProperty, core.coreIndex, args);
+     } else if (isUndefined && type == qMetaTypeId<QVariant>()) {
+         writeValueProperty(object, engine, core, QVariant(), context, flags);
++    } else if (type == qMetaTypeId<QJSValue>()) {
++        if (!result.IsEmpty() && result->IsFunction()
++                && !result->ToObject()->GetHiddenValue(v8engine->bindingFlagKey()).IsEmpty()) {
++            expression->delayedError()->error.setDescription(QLatin1String("Invalid use of Qt.binding() in a binding declaration."));
++            return false;
++        }
++        writeValueProperty(object, engine, core, QVariant::fromValue(v8engine->scriptValueFromInternal(result)), context, flags);
+     } else if (isUndefined) {
+         expression->delayedError()->error.setDescription(QLatin1String("Unable to assign [undefined] to ") + QLatin1String(QMetaType::typeName(type)));
+         return false;
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index b86e3be..1665342 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -426,6 +426,11 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+         QML_STORE_VAR(StoreVarDouble, v8::Number::New(instr.value));
+         QML_STORE_VAR(StoreVarBool, v8::Boolean::New(instr.value));
+ 
++        // Store a literal value in a QJSValue property.
++        QML_STORE_VALUE(StoreJSValueString, QJSValue, QJSValue(PRIMITIVES.at(instr.value)));
++        QML_STORE_VALUE(StoreJSValueInteger, QJSValue, QJSValue(instr.value));
++        QML_STORE_VALUE(StoreJSValueDouble, QJSValue, QJSValue(instr.value));
++        QML_STORE_VALUE(StoreJSValueBool, QJSValue, QJSValue(instr.value));
+ 
+         QML_BEGIN_INSTR(Init)
+             // Ensure that the compiled data has been initialized
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index d4665ac..3c03edb 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -51,6 +51,8 @@
+ #include <private/qv8_p.h>
+ #include <private/qjsconverter_p.h>
+ #include <private/qjsconverter_impl_p.h>
++#include <private/qjsvalue_impl_p.h>
++#include <private/qv8engine_impl_p.h>
+ 
+ #include <private/qqmlaccessors_p.h>
+ #include <private/qqmlprofilerservice_p.h>
+@@ -65,6 +67,8 @@
+ #include <QtCore/qmath.h>
+ #include <math.h> // ::fmod
+ 
++Q_DECLARE_METATYPE(QJSValue)
++
+ QT_BEGIN_NAMESPACE
+ 
+ using namespace QQmlJS;
+@@ -101,11 +105,13 @@ struct Register {
+     inline QString *getstringptr() { return reinterpret_cast<QString *>(typeDataPtr()); }
+     inline QUrl *geturlptr() { return reinterpret_cast<QUrl *>(typeDataPtr()); }
+     inline v8::Handle<v8::Value> *gethandleptr() { return reinterpret_cast<v8::Handle<v8::Value> *>(typeDataPtr()); }
++    inline QJSValue *getjsvalueptr() { return reinterpret_cast<QJSValue *>(typeDataPtr()); }
+ 
+     inline const QVariant *getvariantptr() const { return reinterpret_cast<const QVariant *>(typeDataPtr()); }
+     inline const QString *getstringptr() const { return reinterpret_cast<const QString *>(typeDataPtr()); }
+     inline const QUrl *geturlptr() const { return reinterpret_cast<const QUrl *>(typeDataPtr()); }
+     inline const v8::Handle<v8::Value> *gethandleptr() const { return reinterpret_cast<const v8::Handle<v8::Value> *>(typeDataPtr()); }
++    inline const QJSValue *getjsvalueptr() const { return reinterpret_cast<const QJSValue *>(typeDataPtr()); }
+ 
+     size_t dataSize() { return sizeof(data); }
+     inline void *typeDataPtr() { return (void *)&data; }
+@@ -134,6 +140,7 @@ struct Register {
+     inline void cleanupColor();
+     inline void cleanupVariant();
+     inline void cleanupHandle();
++    inline void cleanupJSValue();
+ 
+     inline void copy(const Register &other);
+     inline void init(Type type);
+@@ -180,6 +187,8 @@ void Register::cleanup()
+             getvariantptr()->~QVariant();
+         } else if (dataType == qMetaTypeId<v8::Handle<v8::Value> >()) {
+             destroyPointee(gethandleptr());
++        } else if (dataType == qMetaTypeId<QJSValue>()) {
++            getjsvalueptr()->~QJSValue();
+         }
+     }
+     setUndefined();
+@@ -215,6 +224,12 @@ void Register::cleanupHandle()
+     setUndefined();
+ }
+ 
++void Register::cleanupJSValue()
++{
++    getjsvalueptr()->~QJSValue();
++    setUndefined();
++}
++
+ void Register::copy(const Register &other)
+ {
+     *this = other;
+@@ -229,6 +244,8 @@ void Register::copy(const Register &other)
+             new (getvariantptr()) QVariant(*other.getvariantptr());
+         else if (other.dataType == qMetaTypeId<v8::Handle<v8::Value> >())
+             copyConstructPointee(gethandleptr(), other.gethandleptr());
++        else if (other.dataType == qMetaTypeId<QJSValue>())
++            new (getjsvalueptr()) QJSValue(*other.getjsvalueptr());
+     } 
+ }
+ 
+@@ -246,6 +263,8 @@ void Register::init(Type type)
+             new (getvariantptr()) QVariant();
+         else if (dataType == qMetaTypeId<v8::Handle<v8::Value> >())
+             defaultConstructPointee(gethandleptr());
++        else if (dataType == qMetaTypeId<QJSValue>())
++            new (getjsvalueptr()) QJSValue();
+     }
+ }
+ 
+@@ -716,6 +735,11 @@ inline quint32 QV4Bindings::toUint32(double n)
+     MARK_REGISTER(reg); \
+ }
+ 
++#define JSVALUE_REGISTER(reg) { \
++    registers[(reg)].settype(QJSValueType); \
++    MARK_REGISTER(reg); \
++}
++
+ #ifdef QML_THREADED_INTERPRETER
+ void **QV4Bindings::getDecodeInstrTable()
+ {
+@@ -935,6 +959,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertBoolToInt, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertBoolToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.getjsvalueptr()) QJSValue(src.getbool());
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertBoolToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertBoolToNumber, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -992,6 +1029,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertIntToBool, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertIntToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.getjsvalueptr()) QJSValue(src.getint());
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertIntToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertIntToNumber, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1040,6 +1090,30 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertIntToVar, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertJSValueToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            QJSValue tmp(*src.getjsvalueptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupJSValue();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            if (tmp.isUndefined()) {
++                output.setUndefined();
++            } else {
++                QV8Engine *v8engine = QQmlEnginePrivate::get(context->engine)->v8engine();
++                new (output.gethandleptr()) v8::Handle<v8::Value>(
++                        QJSValuePrivate::get(tmp)->asV8Value(v8engine));
++                V8HANDLE_REGISTER(instr->unaryop.output);
++            }
++        }
++    }
++    QML_V4_END_INSTR(ConvertJSValueToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertNumberToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1058,6 +1132,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertNumberToInt, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertNumberToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.getjsvalueptr()) QJSValue(src.getnumber());
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertNumberToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertNumberToString, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1138,6 +1225,24 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertStringToInt, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertStringToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            QString tmp(*src.getstringptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupString();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            new (output.getjsvalueptr()) QJSValue(tmp);
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertStringToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertStringToNumber, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1253,6 +1358,24 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertUrlToBool, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertUrlToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            const QUrl tmp(*src.geturlptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupUrl();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            new (output.getjsvalueptr()) QJSValue(tmp.toString());
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertUrlToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertUrlToString, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1324,6 +1447,31 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertColorToBool, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertColorToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            const QVariant tmp(QMetaType::QColor, src.typeDataPtr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupColor();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
++            QV8Engine *v8engine = ep->v8engine();
++            QQmlValueType *vt = ep->valueTypes[QMetaType::QColor];
++            v8::HandleScope handle_scope;
++            v8::Context::Scope scope(v8engine->context());
++            new (output.getjsvalueptr()) QJSValue(v8engine->scriptValueFromInternal(
++                    v8engine->valueTypeWrapper()->newValueType(tmp, vt)));
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertColorToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertColorToString, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1391,6 +1539,22 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertObjectToBool, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertObjectToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
++            v8::HandleScope handle_scope;
++            v8::Context::Scope scope(ep->v8engine()->context());
++            new (output.getjsvalueptr()) QJSValue(context->engine->newQObject(src.getQObject()));
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertObjectToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertObjectToVariant, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1420,6 +1584,33 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertObjectToVar, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertVarToJSValue, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            v8::Handle<v8::Value> tmp(*src.gethandleptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupHandle();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            QV8Engine *v8engine = QQmlEnginePrivate::get(context->engine)->v8engine();
++            new (output.getjsvalueptr()) QJSValue(v8engine->scriptValueFromInternal(tmp));
++            JSVALUE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertVarToJSValue, unaryop)
++
++    QML_V4_BEGIN_INSTR(ConvertNullToJSValue, unaryop)
++    {
++        Register &output = registers[instr->unaryop.output];
++        new (output.getjsvalueptr()) QJSValue(QJSValue::NullValue);
++        JSVALUE_REGISTER(instr->unaryop.output);
++    }
++    QML_V4_END_INSTR(ConvertNullToJSValue, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertNullToObject, unaryop)
+     {
+         Register &output = registers[instr->unaryop.output];
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index 783e147..1c16336 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -50,6 +50,8 @@
+ #include <private/qqmlaccessors_p.h>
+ #include <private/qqmljsengine_p.h>
+ 
++Q_DECLARE_METATYPE(QJSValue)
++
+ QT_BEGIN_NAMESPACE
+ 
+ DEFINE_BOOL_CONFIG_OPTION(bindingsDump, QML_BINDINGS_DUMP)
+@@ -971,6 +973,7 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+             case IR::StringType:
+             case IR::VariantType:
+             case IR::VarType:
++            case IR::JSValueType:
+                 // nothing to do. V4 will generate optimized
+                 // url-to-xxx conversions.
+                 break;
+@@ -1098,9 +1101,25 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+                 case IR::StringType: opcode = V4Instr::ConvertStringToVar; break;
+                 case IR::ObjectType: opcode = V4Instr::ConvertObjectToVar; break;
+                 case IR::NullType: opcode = V4Instr::ConvertNullToVar; break;
++                case IR::JSValueType: opcode = V4Instr::ConvertJSValueToVar; break;
+                 default: break;
+                 } // switch
+             }
++        } else if (targetTy == IR::JSValueType) {
++            if (s->isMoveForReturn) {
++                switch (sourceTy) {
++                case IR::BoolType: opcode = V4Instr::ConvertBoolToJSValue; break;
++                case IR::IntType:  opcode = V4Instr::ConvertIntToJSValue; break;
++                case IR::NumberType: opcode = V4Instr::ConvertNumberToJSValue; break;
++                case IR::UrlType: opcode = V4Instr::ConvertUrlToJSValue; break;
++                case IR::ColorType: opcode = V4Instr::ConvertColorToJSValue; break;
++                case IR::StringType: opcode = V4Instr::ConvertStringToJSValue; break;
++                case IR::ObjectType: opcode = V4Instr::ConvertObjectToJSValue; break;
++                case IR::VarType: opcode = V4Instr::ConvertVarToJSValue; break;
++                case IR::NullType: opcode = V4Instr::ConvertNullToJSValue; break;
++                default: break;
++                }
++            }
+         }
+         if (opcode != V4Instr::Noop) {
+             V4Instr conv;
+@@ -1180,6 +1199,9 @@ void QV4CompilerPrivate::visitRet(IR::Ret *s)
+         case IR::VarType:
+             test.regType = qMetaTypeId<v8::Handle<v8::Value> >();
+             break;
++        case IR::JSValueType:
++            test.regType = qMetaTypeId<QJSValue>();
++            break;
+         case IR::BoolType:
+             test.regType = QMetaType::Bool;
+             break;
+diff --git a/src/qml/qml/v4/qv4instruction.cpp b/src/qml/qml/v4/qv4instruction.cpp
+index fccb0f7..1fbdf3e 100644
+--- a/src/qml/qml/v4/qv4instruction.cpp
++++ b/src/qml/qml/v4/qv4instruction.cpp
+@@ -138,6 +138,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertBoolToInt:
+         INSTR_DUMP << '\t' << "ConvertBoolToInt" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertBoolToJSValue:
++        INSTR_DUMP << '\t' << "ConvertBoolToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertBoolToNumber:
+         INSTR_DUMP << '\t' << "ConvertBoolToNumber" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -153,6 +156,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertIntToBool:
+         INSTR_DUMP << '\t' << "ConvertIntToBool" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertIntToJSValue:
++        INSTR_DUMP << '\t' << "ConvertIntToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertIntToNumber:
+         INSTR_DUMP << '\t' << "ConvertIntToNumber" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -165,12 +171,18 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertIntToVar:
+         INSTR_DUMP << '\t' << "ConvertIntToVar" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertJSValueToVar:
++        INSTR_DUMP << '\t' << "ConvertJSValueToVar" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertNumberToBool:
+         INSTR_DUMP << '\t' << "ConvertNumberToBool" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+     case V4Instr::ConvertNumberToInt:
+         INSTR_DUMP << '\t' << "ConvertNumberToInt" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertNumberToJSValue:
++        INSTR_DUMP << '\t' << "ConvertNumberToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertNumberToString:
+         INSTR_DUMP << '\t' << "ConvertNumberToString" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -186,6 +198,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertStringToInt:
+         INSTR_DUMP << '\t' << "ConvertStringToInt" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertStringToJSValue:
++        INSTR_DUMP << '\t' << "ConvertStringToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertStringToNumber:
+         INSTR_DUMP << '\t' << "ConvertStringToNumber" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -204,6 +219,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertUrlToBool:
+         INSTR_DUMP << '\t' << "ConvertUrlToBool" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertUrlToJSValue:
++        INSTR_DUMP << '\t' << "ConvertUrlToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertUrlToString:
+         INSTR_DUMP << '\t' << "ConvertUrlToString" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -216,6 +234,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertColorToBool:
+         INSTR_DUMP << '\t' << "ConvertColorToBool" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertColorToJSValue:
++        INSTR_DUMP << '\t' << "ConvertColorToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertColorToString:
+         INSTR_DUMP << '\t' << "ConvertColorToString" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+@@ -228,12 +249,21 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertObjectToBool:
+         INSTR_DUMP << '\t' << "ConvertObjectToBool" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertObjectToJSValue:
++        INSTR_DUMP << '\t' << "ConvertObjectToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertObjectToVariant:
+         INSTR_DUMP << '\t' << "ConvertObjectToVariant" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+     case V4Instr::ConvertObjectToVar:
+         INSTR_DUMP << '\t' << "ConvertObjectToVar" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
++    case V4Instr::ConvertVarToJSValue:
++        INSTR_DUMP << '\t' << "ConvertVarToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
++    case V4Instr::ConvertNullToJSValue:
++        INSTR_DUMP << '\t' << "ConvertNullToJSValue" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
++        break;
+     case V4Instr::ConvertNullToObject:
+         INSTR_DUMP << '\t' << "ConvertNullToObject" << '\t' << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ')';
+         break;
+diff --git a/src/qml/qml/v4/qv4instruction_p.h b/src/qml/qml/v4/qv4instruction_p.h
+index c9e244e..2e06bd0 100644
+--- a/src/qml/qml/v4/qv4instruction_p.h
++++ b/src/qml/qml/v4/qv4instruction_p.h
+@@ -81,38 +81,48 @@ QT_BEGIN_NAMESPACE
+     F(UnaryPlusNumber, unaryop) \
+     F(UnaryPlusInt, unaryop) \
+     F(ConvertBoolToInt, unaryop) \
++    F(ConvertBoolToJSValue, unaryop) \
+     F(ConvertBoolToNumber, unaryop) \
+     F(ConvertBoolToString, unaryop) \
+     F(ConvertBoolToVariant, unaryop) \
+     F(ConvertBoolToVar, unaryop) \
+     F(ConvertIntToBool, unaryop) \
++    F(ConvertIntToJSValue, unaryop) \
+     F(ConvertIntToNumber, unaryop) \
+     F(ConvertIntToString, unaryop) \
+     F(ConvertIntToVariant, unaryop) \
+     F(ConvertIntToVar, unaryop) \
++    F(ConvertJSValueToVar, unaryop) \
+     F(ConvertNumberToBool, unaryop) \
+     F(ConvertNumberToInt, unaryop) \
++    F(ConvertNumberToJSValue, unaryop) \
+     F(ConvertNumberToString, unaryop) \
+     F(ConvertNumberToVariant, unaryop) \
+     F(ConvertNumberToVar, unaryop) \
+     F(ConvertStringToBool, unaryop) \
+     F(ConvertStringToInt, unaryop) \
++    F(ConvertStringToJSValue, unaryop) \
+     F(ConvertStringToNumber, unaryop) \
+     F(ConvertStringToUrl, unaryop) \
+     F(ConvertStringToColor, unaryop) \
+     F(ConvertStringToVariant, unaryop) \
+     F(ConvertStringToVar, unaryop) \
+     F(ConvertUrlToBool, unaryop) \
++    F(ConvertUrlToJSValue, unaryop) \
+     F(ConvertUrlToString, unaryop) \
+     F(ConvertUrlToVariant, unaryop) \
+     F(ConvertUrlToVar, unaryop) \
+     F(ConvertColorToBool, unaryop) \
++    F(ConvertColorToJSValue, unaryop) \
+     F(ConvertColorToString, unaryop) \
+     F(ConvertColorToVariant, unaryop) \
+     F(ConvertColorToVar, unaryop) \
+     F(ConvertObjectToBool, unaryop) \
++    F(ConvertObjectToJSValue, unaryop) \
+     F(ConvertObjectToVariant, unaryop) \
+     F(ConvertObjectToVar, unaryop) \
++    F(ConvertVarToJSValue, unaryop) \
++    F(ConvertNullToJSValue, unaryop) \
+     F(ConvertNullToObject, unaryop) \
+     F(ConvertNullToVariant, unaryop) \
+     F(ConvertNullToVar, unaryop) \
+diff --git a/src/qml/qml/v4/qv4ir.cpp b/src/qml/qml/v4/qv4ir.cpp
+index a111bbf..bb4a0d8 100644
+--- a/src/qml/qml/v4/qv4ir.cpp
++++ b/src/qml/qml/v4/qv4ir.cpp
+@@ -65,6 +65,7 @@ const char *typeName(Type t)
+     case ObjectType: return "object";
+     case VariantType: return "variant";
+     case VarType: return "var";
++    case JSValueType: return "QJSValue";
+     case BoolType: return "bool";
+     case IntType: return "int";
+     case FloatType: return "float";
+diff --git a/src/qml/qml/v4/qv4ir_p.h b/src/qml/qml/v4/qv4ir_p.h
+index 485c245..982acc5 100644
+--- a/src/qml/qml/v4/qv4ir_p.h
++++ b/src/qml/qml/v4/qv4ir_p.h
+@@ -148,6 +148,7 @@ enum Type {
+     ObjectType,
+     VariantType,
+     VarType,
++    JSValueType,
+ 
+     FirstNumberType,
+     BoolType = FirstNumberType,
+diff --git a/src/qml/qml/v4/qv4irbuilder.cpp b/src/qml/qml/v4/qv4irbuilder.cpp
+index 52f0696..47acaaf 100644
+--- a/src/qml/qml/v4/qv4irbuilder.cpp
++++ b/src/qml/qml/v4/qv4irbuilder.cpp
+@@ -48,6 +48,8 @@
+ 
+ DEFINE_BOOL_CONFIG_OPTION(qmlVerboseCompiler, QML_VERBOSE_COMPILER)
+ 
++Q_DECLARE_METATYPE(QJSValue)
++
+ QT_BEGIN_NAMESPACE
+ 
+ using namespace QQmlJS;
+@@ -81,6 +83,8 @@ static IR::Type irTypeFromVariantType(int t, QQmlEnginePrivate *engine, const QM
+             return IR::SGAnchorLineType;
+         } else if (engine->metaObjectForType(t)) {
+             return IR::ObjectType;
++        } else if (t == qMetaTypeId<QJSValue>()) {
++            return IR::JSValueType;
+         }
+ 
+         return IR::InvalidType;
+diff --git a/src/qml/qml/v4/qv4program_p.h b/src/qml/qml/v4/qv4program_p.h
+index 3fb1670..d859a83 100644
+--- a/src/qml/qml/v4/qv4program_p.h
++++ b/src/qml/qml/v4/qv4program_p.h
+@@ -103,7 +103,8 @@ enum QQmlRegisterType {
+     QUrlType,
+     QVariantType,
+     QColorType,
+-    V8HandleType
++    V8HandleType,
++    QJSValueType
+ };
+ 
+ const char *QV4Program::data() const 
+diff --git a/src/qml/qml/v8/qv8engine.cpp b/src/qml/qml/v8/qv8engine.cpp
+index 275b648..c075fc9 100644
+--- a/src/qml/qml/v8/qv8engine.cpp
++++ b/src/qml/qml/v8/qv8engine.cpp
+@@ -229,6 +229,9 @@ QVariant QV8Engine::toVariant(v8::Handle<v8::Value> value, int typeHint)
+     if (typeHint == QMetaType::QJsonValue)
+         return QVariant::fromValue(jsonValueFromJS(value));
+ 
++    if (typeHint == qMetaTypeId<QJSValue>())
++        return QVariant::fromValue(scriptValueFromInternal(value));
++
+     if (value->IsObject()) {
+         QV8ObjectResource *r = (QV8ObjectResource *)value->ToObject()->GetExternalResource();
+         if (r) {
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index aab66e3..f540ce1 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -433,6 +433,10 @@ static v8::Handle<v8::Value> LoadProperty(QV8Engine *engine, QObject *object,
+         QQmlV8Handle handle;
+         ReadFunction(object, property, &handle, notifier);
+         return handle.toHandle();
++    } else if (property.propType == qMetaTypeId<QJSValue>()) {
++        QJSValue v;
++        ReadFunction(object, property, &v, notifier);
++        return QJSValuePrivate::get(v)->asV8Value(engine);
+     } else if (property.isQVariant()) {
+         QVariant v;
+         ReadFunction(object, property, &v, notifier);
+@@ -590,8 +594,8 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+     QQmlBinding *newBinding = 0;
+     if (value->IsFunction()) {
+         if (value->ToObject()->GetHiddenValue(engine->bindingFlagKey()).IsEmpty()) {
+-            if (!property->isVMEProperty()) {
+-                // assigning a JS function to a non-var-property is not allowed.
++            if (!property->isVMEProperty() && property->propType != qMetaTypeId<QJSValue>()) {
++                // assigning a JS function to a non var or QJSValue property or is not allowed.
+                 QString error = QLatin1String("Cannot assign JavaScript function to ") +
+                                 QLatin1String(QMetaType::typeName(property->propType));
+                 v8::ThrowException(v8::Exception::Error(engine->toString(error)));
+@@ -647,6 +651,8 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+         PROPERTY_STORE(QVariant, QVariant());
+     } else if (value->IsUndefined() && property->propType == QMetaType::QJsonValue) {
+         PROPERTY_STORE(QJsonValue, QJsonValue(QJsonValue::Undefined));
++    } else if (!newBinding && property->propType == qMetaTypeId<QJSValue>()) {
++        PROPERTY_STORE(QJSValue, engine->scriptValueFromInternal(value));
+     } else if (value->IsUndefined()) {
+         QString error = QLatin1String("Cannot assign [undefined] to ") +
+                         QLatin1String(QMetaType::typeName(property->propType));
+diff --git a/tests/auto/qml/qqmlecmascript/data/PropertyQJSValueBaseItem.qml b/tests/auto/qml/qqmlecmascript/data/PropertyQJSValueBaseItem.qml
+new file mode 100644
+index 0000000..4a695a0
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/PropertyQJSValueBaseItem.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    qjsvalue: null
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/functionAssignment.1.qml b/tests/auto/qml/qqmlecmascript/data/functionAssignment.1.qml
+index 0b1b45b..d97613a 100644
+--- a/tests/auto/qml/qqmlecmascript/data/functionAssignment.1.qml
++++ b/tests/auto/qml/qqmlecmascript/data/functionAssignment.1.qml
+@@ -4,4 +4,5 @@ MyQmlObject {
+     property variant a: function myFunction() { return 2; }
+     property variant b: Qt.binding(function() { return 2; })
+     property var c: Qt.binding(function() { return 2; })
++    qjsvalue: Qt.binding(function() { return 2; })
+ }
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.1.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.1.qml
+new file mode 100644
+index 0000000..4e532cc
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.1.qml
+@@ -0,0 +1,23 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++
++    qjsvalue: new vehicle(4);
++    property int wheelCount: qjsvalue.wheels
++
++    function vehicle(wheels) {
++        this.wheels = wheels;
++    }
++
++    Component.onCompleted: {
++        qjsvalue.wheels = 6;  // not bindable, wheelCount shouldn't update
++
++        if (qjsvalue.wheels != 6) return;
++        if (wheelCount != 4) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.10.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.10.qml
+new file mode 100644
+index 0000000..39036ea
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.10.qml
+@@ -0,0 +1,8 @@
++import QtQuick 2.0
++
++PropertyQJSValueBaseItem {
++    property bool test: false
++    Component.onCompleted: {
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.11.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.11.qml
+new file mode 100644
+index 0000000..2ccab73
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.11.qml
+@@ -0,0 +1,28 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    property bool test: false
++
++    MyQmlObject { id: fnResultObj; qjsvalue: testFunction(5) }
++    MyQmlObject { id: f1Obj; qjsvalue: testFunction }
++    MyQmlObject { id: f2Obj; qjsvalue: testFunction }
++
++
++    property alias fnResult: fnResultObj.qjsvalue;
++    property alias f1: f1Obj.qjsvalue
++    property alias f2: f2Obj.qjsvalue
++
++    function testFunction(x) {
++        return x;
++    }
++
++    Component.onCompleted: {
++        f2 = testFunction;
++        if (fnResult != 5) return;
++        if (f1(6) != 6) return;
++        if (f2(7) != 7) return;
++        if (f1 != f2) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.12.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.12.qml
+new file mode 100644
+index 0000000..78390a0
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.12.qml
+@@ -0,0 +1,26 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    property bool test: false
++
++    MyQmlObject { id: nullOneObj; qjsvalue: null }
++    MyQmlObject { id: nullTwoObj; }
++    MyQmlObject { id: undefOneObj; qjsvalue: undefined }
++    MyQmlObject { id: undefTwoObj }
++
++    property alias nullOne: nullOneObj.qjsvalue
++    property alias nullTwo: nullTwoObj.qjsvalue
++    property alias undefOne: undefOneObj.qjsvalue
++    property alias undefTwo: undefTwoObj.qjsvalue
++
++    Component.onCompleted: {
++        nullTwo = null;
++        undefTwo = undefined;
++        if (nullOne != null) return;
++        if (nullOne != nullTwo) return;
++        if (undefOne != undefined) return;
++        if (undefOne != undefTwo) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.13.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.13.qml
+new file mode 100644
+index 0000000..5ece89b
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.13.qml
+@@ -0,0 +1,20 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    property bool test: false
++    property var f: b + 12
++    property int a: 100
++    property int b: testFunction()
++
++    function testFunction() {
++        return a * 3;
++    }
++
++    Component.onCompleted: {
++        if (f != 312) return;
++        a = 120;
++        if (f != 372) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.14.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.14.qml
+new file mode 100644
+index 0000000..1c1c038
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.14.qml
+@@ -0,0 +1,22 @@
++
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++    property int a: 100
++    property int b
++
++    function testFunction() {
++        return a * 3;
++    }
++
++    Component.onCompleted: {
++        b = Qt.binding(testFunction);
++        qjsvalue = Qt.binding(function() { return b + 12; });
++        if (qjsvalue != 312) return;
++        a = 120;
++        if (qjsvalue != 372) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.15.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.15.qml
+new file mode 100644
+index 0000000..acbfd6e
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.15.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++    qjsvalue: [ Qt.binding(function() { return testFunction() + 12; }) ]
++    property int a: 100
++    property int b
++
++    function testFunction() {
++        return a * 3;
++    }
++
++    Component.onCompleted: {
++        b = qjsvalue[0];
++        if (b != 312) return;
++        a = 120;
++        if (b != 372) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.2.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.2.qml
+new file mode 100644
+index 0000000..21a3e78
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.2.qml
+@@ -0,0 +1,25 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++
++    qjsvalue: new vehicle(8);
++    property int wheelCount: qjsvalue.wheels
++
++    function vehicle(wheels) {
++        this.wheels = wheels;
++    }
++
++    Component.onCompleted: {
++        if (wheelCount != 8) return;
++
++        // not bindable, but wheelCount will update because truck itself changed.
++        qjsvalue = new vehicle(12);
++
++        if (wheelCount != 12) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.3.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.3.qml
+new file mode 100644
+index 0000000..fc0a09a
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.3.qml
+@@ -0,0 +1,20 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++
++    qjsvalue: 4
++    property int bound: qjsvalue + 5
++
++    Component.onCompleted: {
++        if (bound != 9) return;
++
++        qjsvalue = qjsvalue + 1;
++
++        if (bound != 10) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.4.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.4.qml
+new file mode 100644
+index 0000000..18691d1
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.4.qml
+@@ -0,0 +1,19 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++
++    qjsvalue: [1, 2, 3, "four", "five"]
++    property int bound: qjsvalue[0]
++
++    Component.onCompleted: {
++        if (bound != 1) return;
++
++        qjsvalue[0] = 10      // bound should remain 1
++
++        if (bound != 1) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.5.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.5.qml
+new file mode 100644
+index 0000000..485a5fe
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.5.qml
+@@ -0,0 +1,19 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++
++    qjsvalue: { 'color': 'red', 'width': 100 }
++    property int bound: qjsvalue.width
++
++    Component.onCompleted: {
++        if (bound != 100) return;
++
++        qjsvalue.width = 200   // bound should remain 100
++
++        if (bound != 100) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.6.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.6.qml
+new file mode 100644
+index 0000000..255bebf
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.6.qml
+@@ -0,0 +1,31 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    property bool test: false
++
++    MyQmlObject { id: itemsObj; qjsvalue: [1, 2, 3, "four", "five"] }
++    MyQmlObject { id: funcsObj; qjsvalue: [(function() { return 6; })] }
++
++    property alias items: itemsObj.qjsvalue
++    property int bound: itemsObj.qjsvalue[0]
++    property alias funcs: funcsObj.qjsvalue
++    property int bound2: funcsObj.qjsvalue[0]()
++
++    function returnTwenty() {
++        return 20;
++    }
++
++    Component.onCompleted: {
++        if (bound != 1) return false;
++        if (bound2 != 6) return false;
++
++        items = [10, 2, 3, "four", "five"]  // bound should now be 10
++        funcs = [returnTwenty]              // bound2 should now be 20
++
++        if (bound != 10) return false;
++        if (bound2 != 20) return false;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.7.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.7.qml
+new file mode 100644
+index 0000000..09be338
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.7.qml
+@@ -0,0 +1,19 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++
++    qjsvalue: { 'color': 'red', 'width': 100 }
++    property int bound: qjsvalue.width
++
++    Component.onCompleted: {
++        if (bound != 100) return;
++
++        qjsvalue = { 'color': 'blue', 'width': 200 }      // bound should now be 200
++
++        if (bound != 200) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.8.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.8.qml
+new file mode 100644
+index 0000000..73074ca
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.8.qml
+@@ -0,0 +1,13 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++
++    qjsvalue: 6
++
++    Component.onCompleted: {
++        if (qjsvalue != 6) return;
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.9.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.9.qml
+new file mode 100644
+index 0000000..5c776fc
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.9.qml
+@@ -0,0 +1,19 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    property bool test: false
++
++    property MyQmlObject obj: MyQmlObject {
++        id: qmlobject
++        intProperty: 5
++    }
++    qjsvalue: qmlobject
++    property int bound: qjsvalue.intProperty
++
++    Component.onCompleted: {
++        if (bound != 5) return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.bindingreset.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.bindingreset.qml
+new file mode 100644
+index 0000000..598bdd3
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.bindingreset.qml
+@@ -0,0 +1,19 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++
++    property bool doReset: false
++    qjsvalueWithReset: if (doReset) return undefined; else return 9
++
++    Component.onCompleted: {
++        if (qjsvalueWithReset != 9) return;
++        doReset = true
++
++        if (qjsvalueWithReset != "Reset!") return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.reset.qml b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.reset.qml
+new file mode 100644
+index 0000000..7668545
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyQJSValue.reset.qml
+@@ -0,0 +1,17 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++
++    qjsvalueWithReset: 9
++
++    Component.onCompleted: {
++        qjsvalueWithReset = undefined
++
++        if (qjsvalueWithReset != "Reset!") return;
++
++        test = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 4740c47..d02f982 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -104,6 +104,8 @@ class MyQmlObject : public QObject
+     Q_PROPERTY(QRegExp regExp READ regExp WRITE setRegExp)
+     Q_PROPERTY(int nonscriptable READ nonscriptable WRITE setNonscriptable SCRIPTABLE false)
+     Q_PROPERTY(int intProperty READ intProperty WRITE setIntProperty NOTIFY intChanged)
++    Q_PROPERTY(QJSValue qjsvalue READ qjsvalue WRITE setQJSValue NOTIFY qjsvalueChanged)
++    Q_PROPERTY(QJSValue qjsvalueWithReset READ qjsvalue WRITE setQJSValue RESET resetQJSValue NOTIFY qjsvalueChanged)
+ 
+ public:
+     MyQmlObject(): myinvokableObject(0), m_methodCalled(false), m_methodIntCalled(false), m_object(0), m_value(0), m_resetProperty(13), m_intProperty(0), m_buttons(0) {}
+@@ -177,6 +179,9 @@ public:
+     };
+     QVariant variant() const { return m_variant; }
+     QJSValue qjsvalue() const { return m_qjsvalue; }
++    void setQJSValue(const QJSValue &value) { m_qjsvalue = value; emit qjsvalueChanged(); }
++    void resetQJSValue() { m_qjsvalue = QJSValue(QLatin1String("Reset!")); emit qjsvalueChanged(); }
++
+     Qt::MouseButtons buttons() const { return m_buttons; }
+ 
+     int intProperty() const { return m_intProperty; }
+@@ -196,6 +201,7 @@ signals:
+     void signalWithQJSValue(const QJSValue &arg);
+     void signalWithGlobalName(int parseInt);
+     void intChanged();
++    void qjsvalueChanged();
+ 
+ public slots:
+     void deleteMe() { delete this; }
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 9d7d289..30adb33 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -160,6 +160,8 @@ private slots:
+     void propertyChangeSlots();
+     void propertyVar_data();
+     void propertyVar();
++    void propertyQJSValue_data();
++    void propertyQJSValue();
+     void propertyVarCpp();
+     void propertyVarOwnership();
+     void propertyVarImplicitOwnership();
+@@ -4239,6 +4241,44 @@ void tst_qqmlecmascript::propertyVar()
+     delete object;
+ }
+ 
++void tst_qqmlecmascript::propertyQJSValue_data()
++{
++    QTest::addColumn<QUrl>("qmlFile");
++
++    // valid
++    QTest::newRow("non-bindable object subproperty changed") << testFileUrl("propertyQJSValue.1.qml");
++    QTest::newRow("non-bindable object changed") << testFileUrl("propertyQJSValue.2.qml");
++    QTest::newRow("primitive changed") << testFileUrl("propertyQJSValue.3.qml");
++    QTest::newRow("javascript array modification") << testFileUrl("propertyQJSValue.4.qml");
++    QTest::newRow("javascript map modification") << testFileUrl("propertyQJSValue.5.qml");
++    QTest::newRow("javascript array assignment") << testFileUrl("propertyQJSValue.6.qml");
++    QTest::newRow("javascript map assignment") << testFileUrl("propertyQJSValue.7.qml");
++    QTest::newRow("literal property assignment") << testFileUrl("propertyQJSValue.8.qml");
++    QTest::newRow("qobject property assignment") << testFileUrl("propertyQJSValue.9.qml");
++    QTest::newRow("base class var property assignment") << testFileUrl("propertyQJSValue.10.qml");
++    QTest::newRow("javascript function assignment") << testFileUrl("propertyQJSValue.11.qml");
++    QTest::newRow("javascript special assignment") << testFileUrl("propertyQJSValue.12.qml");
++    QTest::newRow("declarative binding assignment") << testFileUrl("propertyQJSValue.13.qml");
++    QTest::newRow("imperative binding assignment") << testFileUrl("propertyQJSValue.14.qml");
++    QTest::newRow("stored binding assignment") << testFileUrl("propertyQJSValue.15.qml");
++
++    QTest::newRow("reset property") << testFileUrl("propertyQJSValue.reset.qml");
++    QTest::newRow("reset property in binding") << testFileUrl("propertyQJSValue.bindingreset.qml");
++}
++
++void tst_qqmlecmascript::propertyQJSValue()
++{
++    QFETCH(QUrl, qmlFile);
++
++    QQmlComponent component(&engine, qmlFile);
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++
++    QCOMPARE(object->property("test").toBool(), true);
++
++    delete object;
++}
++
+ // Tests that we can write QVariant values to var properties from C++
+ void tst_qqmlecmascript::propertyVarCpp()
+ {
+@@ -5491,9 +5531,11 @@ void tst_qqmlecmascript::functionAssignment_fromBinding()
+     QString w1 = url + ":4:25: Unable to assign a function to a property of any type other than var.";
+     QString w2 = url + ":5:25: Invalid use of Qt.binding() in a binding declaration.";
+     QString w3 = url + ":6:21: Invalid use of Qt.binding() in a binding declaration.";
++    QString w4 = url + ":7:15: Invalid use of Qt.binding() in a binding declaration.";
+     QTest::ignoreMessage(QtWarningMsg, w1.toLatin1().constData());
+     QTest::ignoreMessage(QtWarningMsg, w2.toLatin1().constData());
+     QTest::ignoreMessage(QtWarningMsg, w3.toLatin1().constData());
++    QTest::ignoreMessage(QtWarningMsg, w4.toLatin1().constData());
+ 
+     MyQmlObject *o = qobject_cast<MyQmlObject *>(component.create());
+     QVERIFY(o != 0);
+diff --git a/tests/auto/qml/qqmllanguage/data/assignLiteralToJSValue.qml b/tests/auto/qml/qqmllanguage/data/assignLiteralToJSValue.qml
+new file mode 100644
+index 0000000..fce248a
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/assignLiteralToJSValue.qml
+@@ -0,0 +1,109 @@
++// This tests assigning literals to QJSValue properties.
++// These properties store JavaScript object references.
++
++import QtQuick 2.0
++import Test 1.0
++
++QtObject {
++    property list<QtObject> resources: [
++        MyQmlObject { id: testObj1; objectName: "test1"; qjsvalue: 1 },
++        MyQmlObject { id: testObj2; objectName: "test2"; qjsvalue: 1.7 },
++        MyQmlObject { id: testObj3; objectName: "test3"; qjsvalue: "Hello world!" },
++        MyQmlObject { id: testObj4; objectName: "test4"; qjsvalue: "#FF008800" },
++        MyQmlObject { id: testObj5; objectName: "test5"; qjsvalue: "10,10,10x10" },
++        MyQmlObject { id: testObj6; objectName: "test6"; qjsvalue: "10,10" },
++        MyQmlObject { id: testObj7; objectName: "test7"; qjsvalue: "10x10" },
++        MyQmlObject { id: testObj8; objectName: "test8"; qjsvalue: "100,100,100" },
++        MyQmlObject { id: testObj9; objectName: "test9"; qjsvalue: String("#FF008800") },
++        MyQmlObject { id: testObj10; objectName: "test10"; qjsvalue: true },
++        MyQmlObject { id: testObj11; objectName: "test11"; qjsvalue: false },
++        MyQmlObject { id: testObj12; objectName: "test12"; qjsvalue: Qt.rgba(0.2, 0.3, 0.4, 0.5) },
++        MyQmlObject { id: testObj13; objectName: "test13"; qjsvalue: Qt.rect(10, 10, 10, 10) },
++        MyQmlObject { id: testObj14; objectName: "test14"; qjsvalue: Qt.point(10, 10) },
++        MyQmlObject { id: testObj15; objectName: "test15"; qjsvalue: Qt.size(10, 10) },
++        MyQmlObject { id: testObj16; objectName: "test16"; qjsvalue: Qt.vector3d(100, 100, 100); },
++        MyQmlObject { id: testObj17; objectName: "test17"; qjsvalue: "1" },
++        MyQmlObject { id: testObj18; objectName: "test18"; qjsvalue: "1.7" },
++        MyQmlObject { id: testObj19; objectName: "test19"; qjsvalue: "true" },
++        MyQmlObject { id: testObj20; objectName: "test20"; qjsvalue: function(val) { return val * 3; } },
++        MyQmlObject { id: testObj21; objectName: "test21"; qjsvalue: undefined },
++        MyQmlObject { id: testObj22; objectName: "test22"; qjsvalue: null },
++        MyQmlObject { id: testObj1Bound; objectName: "test1Bound"; qjsvalue: testObj1.qjsvalue + 4 },  // 1 + 4 + 4 = 9
++        MyQmlObject { id: testObj20Bound; objectName: "test20Bound"; qjsvalue: testObj20.qjsvalue(testObj1Bound.qjsvalue) }, // 9 * 3 = 27
++        QtObject {
++            id: varProperties
++            objectName: "varProperties"
++            property var test1: testObj1.qjsvalue
++            property var test2: testObj2.qjsvalue
++            property var test3: testObj3.qjsvalue
++            property var test4: testObj4.qjsvalue
++            property var test5: testObj5.qjsvalue
++            property var test6: testObj6.qjsvalue
++            property var test7: testObj7.qjsvalue
++            property var test8: testObj8.qjsvalue
++            property var test9: testObj9.qjsvalue
++            property var test10: testObj10.qjsvalue
++            property var test11: testObj11.qjsvalue
++            property var test12: testObj12.qjsvalue
++            property var test13: testObj13.qjsvalue
++            property var test14: testObj14.qjsvalue
++            property var test15: testObj15.qjsvalue
++            property var test16: testObj16.qjsvalue
++            property var test20: testObj20.qjsvalue
++
++            property var test1Bound: testObj1.qjsvalue + 4 // 1 + 4 + 4 = 9
++            property var test20Bound: testObj20.qjsvalue(test1Bound) // 9 * 3 = 27
++        },
++        QtObject {
++            id: variantProperties
++            objectName: "variantProperties"
++            property variant test1: testObj1.qjsvalue
++            property variant test2: testObj2.qjsvalue
++            property variant test3: testObj3.qjsvalue
++            property variant test4: testObj4.qjsvalue
++            property variant test5: testObj5.qjsvalue
++            property variant test6: testObj6.qjsvalue
++            property variant test7: testObj7.qjsvalue
++            property variant test8: testObj8.qjsvalue
++            property variant test9: testObj9.qjsvalue
++            property variant test10: testObj10.qjsvalue
++            property variant test11: testObj11.qjsvalue
++            property variant test12: testObj12.qjsvalue
++            property variant test13: testObj13.qjsvalue
++            property variant test14: testObj14.qjsvalue
++            property variant test15: testObj15.qjsvalue
++            property variant test16: testObj16.qjsvalue
++
++            property variant test1Bound: testObj1.qjsvalue + 4 // 1 + 4 + 4 = 9
++            property variant test20Bound: testObj20.qjsvalue(test1Bound) // 9 * 3 = 27
++        },
++        MyTypeObject {
++            objectName: "typedProperties"
++            intProperty: testObj1.qjsvalue
++            doubleProperty: testObj2.qjsvalue
++            stringProperty: testObj3.qjsvalue
++            boolProperty: testObj10.qjsvalue
++            colorProperty: testObj12.qjsvalue
++            rectFProperty: testObj13.qjsvalue
++            pointFProperty: testObj14.qjsvalue
++            sizeFProperty: testObj15.qjsvalue
++            vectorProperty: testObj16.qjsvalue
++        },
++        MyTypeObject {
++            objectName: "stringProperties"
++            intProperty: testObj17.qjsvalue
++            doubleProperty: testObj18.qjsvalue
++            stringProperty: testObj3.qjsvalue
++            boolProperty: testObj19.qjsvalue
++            colorProperty: testObj4.qjsvalue
++            rectFProperty: testObj5.qjsvalue
++            pointFProperty: testObj6.qjsvalue
++            sizeFProperty: testObj7.qjsvalue
++            vectorProperty: testObj8.qjsvalue
++        }
++    ]
++
++    Component.onCompleted: {
++        testObj1.qjsvalue = testObj1.qjsvalue + 4
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/bindTypeToJSValue.qml b/tests/auto/qml/qqmllanguage/data/bindTypeToJSValue.qml
+new file mode 100644
+index 0000000..ff724a4
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/bindTypeToJSValue.qml
+@@ -0,0 +1,60 @@
++import Test 1.0
++import QtQuick 2.0
++
++MyTypeObject {
++    flagProperty: "FlagVal1 | FlagVal3"
++    enumProperty: "EnumVal2"
++    stringProperty: "Hello World!"
++    uintProperty: 10
++    intProperty: -19
++    realProperty: 23.2
++    doubleProperty: -19.7
++    floatProperty: 8.5
++    colorProperty: "red"
++    dateProperty: "1982-11-25"
++    timeProperty: "11:11:32"
++    dateTimeProperty: "2009-05-12T13:22:01"
++    pointProperty: "99,13"
++    pointFProperty: "-10.1,12.3"
++    sizeProperty: "99x13"
++    sizeFProperty: "0.1x0.2"
++    rectProperty: "9,7,100x200"
++    rectFProperty: "1000.1,-10.9,400x90.99"
++    boolProperty: true
++    variantProperty: "Hello World!"
++    vectorProperty: "10,1,2.2"
++    vector4Property: "10,1,2.2,2.3"
++    urlProperty: "main.qml?with%3cencoded%3edata"
++
++    objectProperty: MyTypeObject {}
++
++    property var varProperty: "Hello World!"
++
++    property list<MyQmlObject> resources: [
++        MyQmlObject { objectName: "flagProperty"; qjsvalue: flagProperty },
++        MyQmlObject { objectName: "enumProperty"; qjsvalue: enumProperty },
++        MyQmlObject { objectName: "stringProperty"; qjsvalue: stringProperty },
++        MyQmlObject { objectName: "uintProperty"; qjsvalue: uintProperty },
++        MyQmlObject { objectName: "intProperty"; qjsvalue: intProperty },
++        MyQmlObject { objectName: "realProperty"; qjsvalue: realProperty },
++        MyQmlObject { objectName: "doubleProperty"; qjsvalue: doubleProperty },
++        MyQmlObject { objectName: "floatProperty"; qjsvalue: floatProperty },
++        MyQmlObject { objectName: "colorProperty"; qjsvalue: colorProperty },
++        MyQmlObject { objectName: "dateProperty"; qjsvalue: dateProperty },
++        MyQmlObject { objectName: "timeProperty"; qjsvalue: timeProperty },
++        MyQmlObject { objectName: "dateTimeProperty"; qjsvalue: dateTimeProperty },
++        MyQmlObject { objectName: "pointProperty"; qjsvalue: pointProperty },
++        MyQmlObject { objectName: "pointFProperty"; qjsvalue: pointFProperty },
++        MyQmlObject { objectName: "sizeProperty"; qjsvalue: sizeProperty },
++        MyQmlObject { objectName: "sizeFProperty"; qjsvalue: sizeFProperty },
++        MyQmlObject { objectName: "rectProperty"; qjsvalue: rectProperty },
++        MyQmlObject { objectName: "rectFProperty"; qjsvalue: rectFProperty },
++        MyQmlObject { objectName: "boolProperty"; qjsvalue: boolProperty },
++        MyQmlObject { objectName: "variantProperty"; qjsvalue: variantProperty },
++        MyQmlObject { objectName: "vectorProperty"; qjsvalue: vectorProperty },
++        MyQmlObject { objectName: "vector4Property"; qjsvalue: vector4Property },
++        MyQmlObject { objectName: "urlProperty"; qjsvalue: urlProperty },
++        MyQmlObject { objectName: "objectProperty"; qjsvalue: objectProperty },
++        MyQmlObject { objectName: "varProperty"; qjsvalue: varProperty }
++    ]
++}
+diff --git a/tests/auto/qml/qqmllanguage/testtypes.h b/tests/auto/qml/qqmllanguage/testtypes.h
+index a359a34..b601a54 100644
+--- a/tests/auto/qml/qqmllanguage/testtypes.h
++++ b/tests/auto/qml/qqmllanguage/testtypes.h
+@@ -66,6 +66,8 @@ public:
+     int id;
+ };
+ 
++Q_DECLARE_METATYPE(QJSValue)
++
+ QT_BEGIN_NAMESPACE
+ #define MyInterface_iid "org.qt-project.Qt.Test.MyInterface"
+ Q_DECLARE_INTERFACE(MyInterface, MyInterface_iid);
+@@ -115,6 +117,7 @@ class MyQmlObject : public QObject, public MyInterface
+     Q_PROPERTY(MyQmlObject *qmlobjectProperty READ qmlobject WRITE setQmlobject)
+     Q_PROPERTY(int propertyWithNotify READ propertyWithNotify WRITE setPropertyWithNotify NOTIFY oddlyNamedNotifySignal)
+     Q_PROPERTY(int nonScriptable READ nonScriptable WRITE setNonScriptable SCRIPTABLE false)
++    Q_PROPERTY(QJSValue qjsvalue READ qjsvalue WRITE setQJSValue NOTIFY qjsvalueChanged)
+ 
+     Q_INTERFACES(MyInterface)
+ public:
+@@ -156,15 +159,21 @@ public:
+ 
+     int nonScriptable() const { return 0; }
+     void setNonScriptable(int) {}
++
++    QJSValue qjsvalue() const { return m_qjsvalue; }
++    void setQJSValue(const QJSValue &value) { m_qjsvalue = value; emit qjsvalueChanged(); }
++
+ public slots:
+     void basicSlot() { qWarning("MyQmlObject::basicSlot"); }
+     void basicSlotWithArgs(int v) { qWarning("MyQmlObject::basicSlotWithArgs(%d)", v); }
++    void qjsvalueMethod(const QJSValue &v) { m_qjsvalue = v; }
+ 
+ signals:
+     void basicSignal();
+     void basicParameterizedSignal(int parameter);
+     void oddlyNamedNotifySignal();
+     void signalWithDefaultArg(int parameter = 5);
++    void qjsvalueChanged();
+ 
+ private:
+     friend class tst_qqmllanguage;
+@@ -173,6 +182,7 @@ private:
+     MyQmlObject *m_qmlobject;
+     MyCustomVariantType m_custom;
+     int m_propertyWithNotify;
++    QJSValue m_qjsvalue;
+ };
+ QML_DECLARE_TYPE(MyQmlObject)
+ QML_DECLARE_TYPEINFO(MyQmlObject, QML_HAS_ATTACHED_PROPERTIES)
+@@ -202,33 +212,33 @@ class MyTypeObject : public QObject
+     Q_FLAGS(MyFlags)
+ 
+     Q_PROPERTY(QString id READ id WRITE setId)
+-    Q_PROPERTY(QObject *objectProperty READ objectProperty WRITE setObjectProperty)
++    Q_PROPERTY(QObject *objectProperty READ objectProperty WRITE setObjectProperty NOTIFY objectPropertyChanged)
+     Q_PROPERTY(QQmlComponent *componentProperty READ componentProperty WRITE setComponentProperty)
+-    Q_PROPERTY(MyFlags flagProperty READ flagProperty WRITE setFlagProperty)
+-    Q_PROPERTY(MyEnum enumProperty READ enumProperty WRITE setEnumProperty)
++    Q_PROPERTY(MyFlags flagProperty READ flagProperty WRITE setFlagProperty NOTIFY flagPropertyChanged)
++    Q_PROPERTY(MyEnum enumProperty READ enumProperty WRITE setEnumProperty NOTIFY enumPropertyChanged)
+     Q_PROPERTY(MyEnum readOnlyEnumProperty READ readOnlyEnumProperty)
+-    Q_PROPERTY(QString stringProperty READ stringProperty WRITE setStringProperty)
+-    Q_PROPERTY(uint uintProperty READ uintProperty WRITE setUintProperty)
+-    Q_PROPERTY(int intProperty READ intProperty WRITE setIntProperty)
+-    Q_PROPERTY(qreal realProperty READ realProperty WRITE setRealProperty)
+-    Q_PROPERTY(double doubleProperty READ doubleProperty WRITE setDoubleProperty)
+-    Q_PROPERTY(float floatProperty READ floatProperty WRITE setFloatProperty)
+-    Q_PROPERTY(QColor colorProperty READ colorProperty WRITE setColorProperty)
+-    Q_PROPERTY(QDate dateProperty READ dateProperty WRITE setDateProperty)
+-    Q_PROPERTY(QTime timeProperty READ timeProperty WRITE setTimeProperty)
+-    Q_PROPERTY(QDateTime dateTimeProperty READ dateTimeProperty WRITE setDateTimeProperty)
+-    Q_PROPERTY(QPoint pointProperty READ pointProperty WRITE setPointProperty)
+-    Q_PROPERTY(QPointF pointFProperty READ pointFProperty WRITE setPointFProperty)
+-    Q_PROPERTY(QSize sizeProperty READ sizeProperty WRITE setSizeProperty)
+-    Q_PROPERTY(QSizeF sizeFProperty READ sizeFProperty WRITE setSizeFProperty)
++    Q_PROPERTY(QString stringProperty READ stringProperty WRITE setStringProperty NOTIFY stringPropertyChanged)
++    Q_PROPERTY(uint uintProperty READ uintProperty WRITE setUintProperty NOTIFY uintPropertyChanged)
++    Q_PROPERTY(int intProperty READ intProperty WRITE setIntProperty NOTIFY intPropertyChanged)
++    Q_PROPERTY(qreal realProperty READ realProperty WRITE setRealProperty NOTIFY realPropertyChanged)
++    Q_PROPERTY(double doubleProperty READ doubleProperty WRITE setDoubleProperty NOTIFY doublePropertyChanged)
++    Q_PROPERTY(float floatProperty READ floatProperty WRITE setFloatProperty NOTIFY floatPropertyChanged)
++    Q_PROPERTY(QColor colorProperty READ colorProperty WRITE setColorProperty NOTIFY colorPropertyChanged)
++    Q_PROPERTY(QDate dateProperty READ dateProperty WRITE setDateProperty NOTIFY datePropertyChanged)
++    Q_PROPERTY(QTime timeProperty READ timeProperty WRITE setTimeProperty NOTIFY timePropertyChanged)
++    Q_PROPERTY(QDateTime dateTimeProperty READ dateTimeProperty WRITE setDateTimeProperty NOTIFY dateTimePropertyChanged)
++    Q_PROPERTY(QPoint pointProperty READ pointProperty WRITE setPointProperty NOTIFY pointPropertyChanged)
++    Q_PROPERTY(QPointF pointFProperty READ pointFProperty WRITE setPointFProperty NOTIFY pointFPropertyChanged)
++    Q_PROPERTY(QSize sizeProperty READ sizeProperty WRITE setSizeProperty NOTIFY sizePropertyChanged)
++    Q_PROPERTY(QSizeF sizeFProperty READ sizeFProperty WRITE setSizeFProperty NOTIFY sizeFPropertyChanged)
+     Q_PROPERTY(QRect rectProperty READ rectProperty WRITE setRectProperty NOTIFY rectPropertyChanged)
+-    Q_PROPERTY(QRect rectProperty2 READ rectProperty2 WRITE setRectProperty2)
+-    Q_PROPERTY(QRectF rectFProperty READ rectFProperty WRITE setRectFProperty)
+-    Q_PROPERTY(bool boolProperty READ boolProperty WRITE setBoolProperty)
+-    Q_PROPERTY(QVariant variantProperty READ variantProperty WRITE setVariantProperty)
+-    Q_PROPERTY(QVector3D vectorProperty READ vectorProperty WRITE setVectorProperty)
+-    Q_PROPERTY(QVector4D vector4Property READ vector4Property WRITE setVector4Property)
+-    Q_PROPERTY(QUrl urlProperty READ urlProperty WRITE setUrlProperty)
++    Q_PROPERTY(QRect rectProperty2 READ rectProperty2 WRITE setRectProperty2 )
++    Q_PROPERTY(QRectF rectFProperty READ rectFProperty WRITE setRectFProperty NOTIFY rectFPropertyChanged)
++    Q_PROPERTY(bool boolProperty READ boolProperty WRITE setBoolProperty NOTIFY boolPropertyChanged)
++    Q_PROPERTY(QVariant variantProperty READ variantProperty WRITE setVariantProperty NOTIFY variantPropertyChanged)
++    Q_PROPERTY(QVector3D vectorProperty READ vectorProperty WRITE setVectorProperty NOTIFY vectorPropertyChanged)
++    Q_PROPERTY(QVector4D vector4Property READ vector4Property WRITE setVector4Property NOTIFY vector4PropertyChanged)
++    Q_PROPERTY(QUrl urlProperty READ urlProperty WRITE setUrlProperty NOTIFY urlPropertyChanged)
+ 
+     Q_PROPERTY(QQmlScriptString scriptProperty READ scriptProperty WRITE setScriptProperty)
+     Q_PROPERTY(MyGroupedObject *grouped READ grouped CONSTANT)
+@@ -252,6 +262,7 @@ public:
+     }
+     void setObjectProperty(QObject *v) {
+         objectPropertyValue = v;
++        emit objectPropertyChanged();
+     }
+ 
+     QQmlComponent *componentPropertyValue;
+@@ -270,6 +281,7 @@ public:
+     }
+     void setFlagProperty(MyFlags v) {
+         flagPropertyValue = v;
++        emit flagPropertyChanged();
+     }
+ 
+     enum MyEnum { EnumVal1, EnumVal2 };
+@@ -279,6 +291,7 @@ public:
+     }
+     void setEnumProperty(MyEnum v) {
+         enumPropertyValue = v;
++        emit enumPropertyChanged();
+     }
+ 
+     MyEnum readOnlyEnumProperty() const {
+@@ -291,6 +304,7 @@ public:
+     }
+     void setStringProperty(const QString &v) {
+         stringPropertyValue = v;
++        emit stringPropertyChanged();
+     }
+ 
+     uint uintPropertyValue;
+@@ -299,6 +313,7 @@ public:
+     }
+     void setUintProperty(const uint &v) {
+         uintPropertyValue = v;
++        emit uintPropertyChanged();
+     }
+ 
+     int intPropertyValue;
+@@ -307,6 +322,7 @@ public:
+     }
+     void setIntProperty(const int &v) {
+         intPropertyValue = v;
++        emit intPropertyChanged();
+     }
+ 
+     qreal realPropertyValue;
+@@ -315,6 +331,7 @@ public:
+     }
+     void setRealProperty(const qreal &v) {
+         realPropertyValue = v;
++        emit realPropertyChanged();
+     }
+ 
+     double doublePropertyValue;
+@@ -323,6 +340,7 @@ public:
+     }
+     void setDoubleProperty(const double &v) {
+         doublePropertyValue = v;
++        emit doublePropertyChanged();
+     }
+ 
+     float floatPropertyValue;
+@@ -331,6 +349,7 @@ public:
+     }
+     void setFloatProperty(const float &v) {
+         floatPropertyValue = v;
++        emit floatPropertyChanged();
+     }
+ 
+     QColor colorPropertyValue;
+@@ -339,6 +358,7 @@ public:
+     }
+     void setColorProperty(const QColor &v) {
+         colorPropertyValue = v;
++        emit colorPropertyChanged();
+     }
+ 
+     QDate datePropertyValue;
+@@ -347,6 +367,7 @@ public:
+     }
+     void setDateProperty(const QDate &v) {
+         datePropertyValue = v;
++        emit datePropertyChanged();
+     }
+ 
+     QTime timePropertyValue;
+@@ -355,6 +376,7 @@ public:
+     }
+     void setTimeProperty(const QTime &v) {
+         timePropertyValue = v;
++        emit timePropertyChanged();
+     }
+ 
+     QDateTime dateTimePropertyValue;
+@@ -363,6 +385,7 @@ public:
+     }
+     void setDateTimeProperty(const QDateTime &v) {
+         dateTimePropertyValue = v;
++        emit dateTimePropertyChanged();
+     }
+ 
+     QPoint pointPropertyValue;
+@@ -371,6 +394,7 @@ public:
+     }
+     void setPointProperty(const QPoint &v) {
+         pointPropertyValue = v;
++        emit pointPropertyChanged();
+     }
+ 
+     QPointF pointFPropertyValue;
+@@ -379,6 +403,7 @@ public:
+     }
+     void setPointFProperty(const QPointF &v) {
+         pointFPropertyValue = v;
++        emit pointFPropertyChanged();
+     }
+ 
+     QSize sizePropertyValue;
+@@ -387,6 +412,7 @@ public:
+     }
+     void setSizeProperty(const QSize &v) {
+         sizePropertyValue = v;
++        emit sizePropertyChanged();
+     }
+ 
+     QSizeF sizeFPropertyValue;
+@@ -395,6 +421,7 @@ public:
+     }
+     void setSizeFProperty(const QSizeF &v) {
+         sizeFPropertyValue = v;
++        emit sizeFPropertyChanged();
+     }
+ 
+     QRect rectPropertyValue;
+@@ -420,6 +447,7 @@ public:
+     }
+     void setRectFProperty(const QRectF &v) {
+         rectFPropertyValue = v;
++        emit rectFPropertyChanged();
+     }
+ 
+     bool boolPropertyValue;
+@@ -428,6 +456,7 @@ public:
+     }
+     void setBoolProperty(const bool &v) {
+         boolPropertyValue = v;
++        emit boolPropertyChanged();
+     }
+ 
+     QVariant variantPropertyValue;
+@@ -436,6 +465,7 @@ public:
+     }
+     void setVariantProperty(const QVariant &v) {
+         variantPropertyValue = v;
++        emit variantPropertyChanged();
+     }
+ 
+     QVector3D vectorPropertyValue;
+@@ -444,6 +474,7 @@ public:
+     }
+     void setVectorProperty(const QVector3D &v) {
+         vectorPropertyValue = v;
++        emit vectorPropertyChanged();
+     }
+ 
+     QVector4D vector4PropertyValue;
+@@ -452,6 +483,7 @@ public:
+     }
+     void setVector4Property(const QVector4D &v) {
+         vector4PropertyValue = v;
++        emit vector4PropertyChanged();
+     }
+ 
+     QUrl urlPropertyValue;
+@@ -460,6 +492,7 @@ public:
+     }
+     void setUrlProperty(const QUrl &v) {
+         urlPropertyValue = v;
++        emit urlPropertyChanged();
+     }
+ 
+     QQmlScriptString scriptPropertyValue;
+@@ -478,7 +511,32 @@ public:
+     void doAction() { emit action(); }
+ signals:
+     void action();
++
++    void objectPropertyChanged();
++    void flagPropertyChanged();
++    void enumPropertyChanged();
++    void stringPropertyChanged();
++    void uintPropertyChanged();
++    void intPropertyChanged();
++    void realPropertyChanged();
++    void doublePropertyChanged();
++    void floatPropertyChanged();
++    void colorPropertyChanged();
++    void datePropertyChanged();
++    void timePropertyChanged();
++    void dateTimePropertyChanged();
++    void pointPropertyChanged();
++    void pointFPropertyChanged();
++    void sizePropertyChanged();
++    void sizeFPropertyChanged();
+     void rectPropertyChanged();
++    void rectFPropertyChanged();
++    void boolPropertyChanged();
++    void variantPropertyChanged();
++    void vectorPropertyChanged();
++    void vector4PropertyChanged();
++    void urlPropertyChanged();
++
+ };
+ Q_DECLARE_OPERATORS_FOR_FLAGS(MyTypeObject::MyFlags)
+ 
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 05029b9..c6b0dd6 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -109,6 +109,11 @@ private slots:
+     void assignCompositeToType();
+     void assignLiteralToVariant();
+     void assignLiteralToVar();
++    void assignLiteralToJSValue();
++    void bindJSValueToVar();
++    void bindJSValueToVariant();
++    void bindJSValueToType();
++    void bindTypeToJSValue();
+     void customParserTypes();
+     void rootAsQmlComponent();
+     void inlineQmlComponents();
+@@ -711,6 +716,368 @@ void tst_qqmllanguage::assignLiteralToVar()
+     delete object;
+ }
+ 
++void tst_qqmllanguage::assignLiteralToJSValue()
++{
++    QQmlComponent component(&engine, TEST_FILE("assignLiteralToJSValue.qml"));
++    VERIFY_ERRORS(0);
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test1");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(5));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test2");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(1.7));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test3");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("Hello world!")));
++    }{
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test4");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("#FF008800")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test5");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("10,10,10x10")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test6");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("10,10")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test7");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("10x10")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test8");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("100,100,100")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test9");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("#FF008800")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test10");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isBool());
++        QCOMPARE(value.toBool(), true);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test11");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isBool());
++        QCOMPARE(value.toBool(), false);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test20");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isCallable());
++        QCOMPARE(value.call(QList<QJSValue> () << QJSValue(4)).toInt(), 12);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test21");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isUndefined());
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test22");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNull());
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test1Bound");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(9));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("test20Bound");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(27));
++    }
++}
++
++void tst_qqmllanguage::bindJSValueToVar()
++{
++    QQmlComponent component(&engine, TEST_FILE("assignLiteralToJSValue.qml"));
++
++    VERIFY_ERRORS(0);
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    QObject *object = root->findChild<QObject *>("varProperties");
++
++    QCOMPARE(object->property("test1").userType(), (int)QMetaType::Int);
++    QCOMPARE(object->property("test2").userType(), (int)QMetaType::Double);
++    QCOMPARE(object->property("test3").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test4").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test5").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test6").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test7").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test8").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test9").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test10").userType(), (int)QVariant::Bool);
++    QCOMPARE(object->property("test11").userType(), (int)QVariant::Bool);
++    QCOMPARE(object->property("test12").userType(), (int)QVariant::Color);
++    QCOMPARE(object->property("test13").userType(), (int)QVariant::RectF);
++    QCOMPARE(object->property("test14").userType(), (int)QVariant::PointF);
++    QCOMPARE(object->property("test15").userType(), (int)QVariant::SizeF);
++    QCOMPARE(object->property("test16").userType(), (int)QVariant::Vector3D);
++    QCOMPARE(object->property("test1Bound").userType(), (int)QVariant::Int);
++    QCOMPARE(object->property("test20Bound").userType(), (int)QVariant::Int);
++
++    QCOMPARE(object->property("test1"), QVariant(5));
++    QCOMPARE(object->property("test2"), QVariant((double)1.7));
++    QCOMPARE(object->property("test3"), QVariant(QString(QLatin1String("Hello world!"))));
++    QCOMPARE(object->property("test4"), QVariant(QString(QLatin1String("#FF008800"))));
++    QCOMPARE(object->property("test5"), QVariant(QString(QLatin1String("10,10,10x10"))));
++    QCOMPARE(object->property("test6"), QVariant(QString(QLatin1String("10,10"))));
++    QCOMPARE(object->property("test7"), QVariant(QString(QLatin1String("10x10"))));
++    QCOMPARE(object->property("test8"), QVariant(QString(QLatin1String("100,100,100"))));
++    QCOMPARE(object->property("test9"), QVariant(QString(QLatin1String("#FF008800"))));
++    QCOMPARE(object->property("test10"), QVariant(bool(true)));
++    QCOMPARE(object->property("test11"), QVariant(bool(false)));
++    QCOMPARE(object->property("test12"), QVariant(QColor::fromRgbF(0.2, 0.3, 0.4, 0.5)));
++    QCOMPARE(object->property("test13"), QVariant(QRectF(10, 10, 10, 10)));
++    QCOMPARE(object->property("test14"), QVariant(QPointF(10, 10)));
++    QCOMPARE(object->property("test15"), QVariant(QSizeF(10, 10)));
++    QCOMPARE(object->property("test16"), QVariant(QVector3D(100, 100, 100)));
++    QCOMPARE(object->property("test1Bound"), QVariant(9));
++    QCOMPARE(object->property("test20Bound"), QVariant(27));
++}
++
++void tst_qqmllanguage::bindJSValueToVariant()
++{
++    QQmlComponent component(&engine, TEST_FILE("assignLiteralToJSValue.qml"));
++
++    VERIFY_ERRORS(0);
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    QObject *object = root->findChild<QObject *>("variantProperties");
++
++    QCOMPARE(object->property("test1").userType(), (int)QMetaType::Int);
++    QCOMPARE(object->property("test2").userType(), (int)QMetaType::Double);
++    QCOMPARE(object->property("test3").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test4").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test5").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test6").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test7").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test8").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test9").userType(), (int)QVariant::String);
++    QCOMPARE(object->property("test10").userType(), (int)QVariant::Bool);
++    QCOMPARE(object->property("test11").userType(), (int)QVariant::Bool);
++    QCOMPARE(object->property("test12").userType(), (int)QVariant::Color);
++    QCOMPARE(object->property("test13").userType(), (int)QVariant::RectF);
++    QCOMPARE(object->property("test14").userType(), (int)QVariant::PointF);
++    QCOMPARE(object->property("test15").userType(), (int)QVariant::SizeF);
++    QCOMPARE(object->property("test16").userType(), (int)QVariant::Vector3D);
++    QCOMPARE(object->property("test1Bound").userType(), (int)QVariant::Int);
++    QCOMPARE(object->property("test20Bound").userType(), (int)QVariant::Int);
++
++    QCOMPARE(object->property("test1"), QVariant(5));
++    QCOMPARE(object->property("test2"), QVariant((double)1.7));
++    QCOMPARE(object->property("test3"), QVariant(QString(QLatin1String("Hello world!"))));
++    QCOMPARE(object->property("test4"), QVariant(QString(QLatin1String("#FF008800"))));
++    QCOMPARE(object->property("test5"), QVariant(QString(QLatin1String("10,10,10x10"))));
++    QCOMPARE(object->property("test6"), QVariant(QString(QLatin1String("10,10"))));
++    QCOMPARE(object->property("test7"), QVariant(QString(QLatin1String("10x10"))));
++    QCOMPARE(object->property("test8"), QVariant(QString(QLatin1String("100,100,100"))));
++    QCOMPARE(object->property("test9"), QVariant(QString(QLatin1String("#FF008800"))));
++    QCOMPARE(object->property("test10"), QVariant(bool(true)));
++    QCOMPARE(object->property("test11"), QVariant(bool(false)));
++    QCOMPARE(object->property("test12"), QVariant(QColor::fromRgbF(0.2, 0.3, 0.4, 0.5)));
++    QCOMPARE(object->property("test13"), QVariant(QRectF(10, 10, 10, 10)));
++    QCOMPARE(object->property("test14"), QVariant(QPointF(10, 10)));
++    QCOMPARE(object->property("test15"), QVariant(QSizeF(10, 10)));
++    QCOMPARE(object->property("test16"), QVariant(QVector3D(100, 100, 100)));
++    QCOMPARE(object->property("test1Bound"), QVariant(9));
++    QCOMPARE(object->property("test20Bound"), QVariant(27));
++}
++
++void tst_qqmllanguage::bindJSValueToType()
++{
++    QQmlComponent component(&engine, TEST_FILE("assignLiteralToJSValue.qml"));
++
++    VERIFY_ERRORS(0);
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    {
++        MyTypeObject *object = root->findChild<MyTypeObject *>("typedProperties");
++
++        QCOMPARE(object->intProperty(), 5);
++        QCOMPARE(object->doubleProperty(), double(1.7));
++        QCOMPARE(object->stringProperty(), QString(QLatin1String("Hello world!")));
++        QCOMPARE(object->boolProperty(), true);
++        QCOMPARE(object->colorProperty(), QColor::fromRgbF(0.2, 0.3, 0.4, 0.5));
++        QCOMPARE(object->rectFProperty(), QRectF(10, 10, 10, 10));
++        QCOMPARE(object->pointFProperty(), QPointF(10, 10));
++        QCOMPARE(object->sizeFProperty(), QSizeF(10, 10));
++        QCOMPARE(object->vectorProperty(), QVector3D(100, 100, 100));
++    } {
++        MyTypeObject *object = root->findChild<MyTypeObject *>("stringProperties");
++
++        QCOMPARE(object->intProperty(), 1);
++        QCOMPARE(object->doubleProperty(), double(1.7));
++        QCOMPARE(object->stringProperty(), QString(QLatin1String("Hello world!")));
++        QCOMPARE(object->boolProperty(), true);
++        QCOMPARE(object->colorProperty(), QColor::fromRgb(0x00, 0x88, 0x00, 0xFF));
++        QCOMPARE(object->rectFProperty(), QRectF(10, 10, 10, 10));
++        QCOMPARE(object->pointFProperty(), QPointF(10, 10));
++        QCOMPARE(object->sizeFProperty(), QSizeF(10, 10));
++        QCOMPARE(object->vectorProperty(), QVector3D(100, 100, 100));
++    }
++}
++
++void tst_qqmllanguage::bindTypeToJSValue()
++{
++    QQmlComponent component(&engine, TEST_FILE("bindTypeToJSValue.qml"));
++
++    VERIFY_ERRORS(0);
++    QObject *root = component.create();
++    QVERIFY(root != 0);
++
++    {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("flagProperty");
++        QVERIFY(object);
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(MyTypeObject::FlagVal1 | MyTypeObject::FlagVal3));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("enumProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(MyTypeObject::EnumVal2));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("stringProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("Hello World!")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("uintProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(10));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("intProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(-19));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("realProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(23.2));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("doubleProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(-19.7));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("floatProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isNumber());
++        QCOMPARE(value.toNumber(), qreal(8.5));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("colorProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("r")).toNumber(), qreal(1.0));
++        QCOMPARE(value.property(QLatin1String("g")).toNumber(), qreal(0.0));
++        QCOMPARE(value.property(QLatin1String("b")).toNumber(), qreal(0.0));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("dateProperty");
++        QJSValue value = object->qjsvalue();
++        QCOMPARE(value.toDateTime().isValid(), true);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("timeProperty");
++        QJSValue value = object->qjsvalue();
++        QCOMPARE(value.toDateTime().isValid(), true);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("dateTimeProperty");
++        QJSValue value = object->qjsvalue();
++        QCOMPARE(value.toDateTime().isValid(), true);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("pointProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(99));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(13));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("pointFProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(-10.1));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(12.3));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("rectProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(9));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(7));
++        QCOMPARE(value.property(QLatin1String("width")).toNumber(), qreal(100));
++        QCOMPARE(value.property(QLatin1String("height")).toNumber(), qreal(200));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("rectFProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(1000.1));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(-10.9));
++        QCOMPARE(value.property(QLatin1String("width")).toNumber(), qreal(400));
++        QCOMPARE(value.property(QLatin1String("height")).toNumber(), qreal(90.99));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("boolProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isBool());
++        QCOMPARE(value.toBool(), true);
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("variantProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("Hello World!")));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("vectorProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(10.0f));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(1.0f));
++        QCOMPARE(value.property(QLatin1String("z")).toNumber(), qreal(2.2f));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("vector4Property");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isObject());
++        QCOMPARE(value.property(QLatin1String("x")).toNumber(), qreal(10.0f));
++        QCOMPARE(value.property(QLatin1String("y")).toNumber(), qreal(1.0f));
++        QCOMPARE(value.property(QLatin1String("z")).toNumber(), qreal(2.2f));
++        QCOMPARE(value.property(QLatin1String("w")).toNumber(), qreal(2.3f));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("urlProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QUrl encoded;
++        encoded.setEncodedUrl("main.qml?with%3cencoded%3edata", QUrl::TolerantMode);
++        QCOMPARE(value.toString(), component.url().resolved(encoded).toString());
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("objectProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isQObject());
++        QVERIFY(qobject_cast<MyTypeObject *>(value.toQObject()));
++    } {
++        MyQmlObject *object = root->findChild<MyQmlObject *>("varProperty");
++        QJSValue value = object->qjsvalue();
++        QVERIFY(value.isString());
++        QCOMPARE(value.toString(), QString(QLatin1String("Hello World!")));
++    }
++}
++
+ // Tests that custom parser types can be instantiated
+ void tst_qqmllanguage::customParserTypes()
+ {
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index 57dec5a..98df729 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -856,38 +856,48 @@ void tst_v4::debuggingDumpInstructions()
+     expectedPreAddress << "\t\tUnaryPlusNumber\t\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tUnaryPlusInt\t\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToInt\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertBoolToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToBool\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertIntToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToVar\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertJSValueToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToInt\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertNumberToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToInt\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertStringToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToUrl\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToColor\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToBool\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertUrlToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToBool\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertColorToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertObjectToBool\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertObjectToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertObjectToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertObjectToVar\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertVarToJSValue\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertNullToJSValue\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNullToObject\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNullToVariant\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNullToVar\tInput_Reg(0) -> Output_Reg(0)";

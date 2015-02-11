@@ -1,0 +1,234 @@
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index e4ba445..09d1a23 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -78,8 +78,8 @@ class Q_QML_EXPORT QQmlData : public QAbstractDeclarativeData
+ public:
+     QQmlData()
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+-          hasTaintedV8Object(false), notifyList(0), context(0), outerContext(0), bindings(0), 
+-          nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0), 
++          hasTaintedV8Object(false), isQueuedForDeletion(false), notifyList(0), context(0), outerContext(0),
++          bindings(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+           lineNumber(0), columnNumber(0), deferredComponent(0), deferredIdx(0), v8objectid(0), 
+           propertyCache(0), guards(0), extendedData(0) {
+           init(); 
+@@ -110,7 +110,8 @@ public:
+     quint32 indestructible:1;
+     quint32 explicitIndestructibleSet:1;
+     quint32 hasTaintedV8Object:1;
+-    quint32 dummy:27;
++    quint32 isQueuedForDeletion:1;
++    quint32 dummy:26;
+ 
+     struct NotifyList {
+         quint64 connectionMask;
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index ecfde20..cc4ba09 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -832,15 +832,17 @@ v8::Handle<v8::Value> QQmlVMEMetaObject::readVarProperty(int id)
+ {
+     Q_ASSERT(id >= firstVarPropertyIndex);
+ 
+-    ensureVarPropertiesAllocated();
+-    return varProperties->Get(id - firstVarPropertyIndex);
++    if (ensureVarPropertiesAllocated())
++        return varProperties->Get(id - firstVarPropertyIndex);
++    return v8::Handle<v8::Value>();
+ }
+ 
+ QVariant QQmlVMEMetaObject::readPropertyAsVariant(int id)
+ {
+     if (id >= firstVarPropertyIndex) {
+-        ensureVarPropertiesAllocated();
+-        return QQmlEnginePrivate::get(ctxt->engine)->v8engine()->toVariant(varProperties->Get(id - firstVarPropertyIndex), -1);
++        if (ensureVarPropertiesAllocated())
++            return QQmlEnginePrivate::get(ctxt->engine)->v8engine()->toVariant(varProperties->Get(id - firstVarPropertyIndex), -1);
++        return QVariant();
+     } else {
+         if (data[id].dataType() == QMetaType::QObjectStar) {
+             return QVariant::fromValue(data[id].asQObject());
+@@ -853,7 +855,8 @@ QVariant QQmlVMEMetaObject::readPropertyAsVariant(int id)
+ void QQmlVMEMetaObject::writeVarProperty(int id, v8::Handle<v8::Value> value)
+ {
+     Q_ASSERT(id >= firstVarPropertyIndex);
+-    ensureVarPropertiesAllocated();
++    if (!ensureVarPropertiesAllocated())
++        return;
+ 
+     // Importantly, if the current value is a scarce resource, we need to ensure that it
+     // gets automatically released by the engine if no other references to it exist.
+@@ -882,7 +885,8 @@ void QQmlVMEMetaObject::writeVarProperty(int id, v8::Handle<v8::Value> value)
+ void QQmlVMEMetaObject::writeProperty(int id, const QVariant &value)
+ {
+     if (id >= firstVarPropertyIndex) {
+-        ensureVarPropertiesAllocated();
++        if (!ensureVarPropertiesAllocated())
++            return;
+ 
+         // Importantly, if the current value is a scarce resource, we need to ensure that it
+         // gets automatically released by the engine if no other references to it exist.
+@@ -1029,10 +1033,17 @@ void QQmlVMEMetaObject::setVMEProperty(int index, v8::Handle<v8::Value> v)
+     return writeVarProperty(index - propOffset, v);
+ }
+ 
+-void QQmlVMEMetaObject::ensureVarPropertiesAllocated()
++bool QQmlVMEMetaObject::ensureVarPropertiesAllocated()
+ {
+     if (!varPropertiesInitialized)
+         allocateVarPropertiesArray();
++
++    // in some situations, the QObject's v8object (and associated v8 data,
++    // such as the varProperties array) will have been cleaned up, but the
++    // QObject ptr will not yet have been deleted (eg, waiting on deleteLater).
++    // In this situation, the varProperties handle will be (and should remain)
++    // empty.
++    return !varProperties.IsEmpty();
+ }
+ 
+ // see also: QV8GCCallback::garbageCollectorPrologueCallback()
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 84c88fd..1b5ceb8 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -195,7 +195,7 @@ private:
+     static void VarPropertiesWeakReferenceCallback(v8::Persistent<v8::Value> object, void* parameter);
+     static void GcPrologueCallback(QV8GCCallback::Node *node);
+     inline void allocateVarPropertiesArray();
+-    inline void ensureVarPropertiesAllocated();
++    inline bool ensureVarPropertiesAllocated();
+ 
+     void connectAlias(int aliasId);
+     QBitArray aConnected;
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index a483346..3faea2c 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -883,8 +883,10 @@ static void WeakQObjectReferenceCallback(v8::Persistent<v8::Value> handle, void
+         QQmlData *ddata = QQmlData::get(object, false);
+         if (ddata) {
+             ddata->v8object.Clear();
+-            if (!object->parent() && !ddata->indestructible)
++            if (!object->parent() && !ddata->indestructible) {
++                ddata->isQueuedForDeletion = true;
+                 object->deleteLater();
++            }
+         }
+     }
+ 
+@@ -1043,12 +1045,15 @@ v8::Handle<v8::Value> QV8QObjectWrapper::newQObject(QObject *object)
+ 
+     if (QObjectPrivate::get(object)->wasDeleted)
+        return v8::Null();
+-    
++
+     QQmlData *ddata = QQmlData::get(object, true);
+ 
+     if (!ddata) 
+         return v8::Undefined();
+ 
++    if (ddata->isQueuedForDeletion)
++        return v8::Null();
++
+     if (ddata->v8objectid == m_id && !ddata->v8object.IsEmpty()) {
+         // We own the v8object 
+         return v8::Local<v8::Object>::New(ddata->v8object);
+diff --git a/tests/auto/qml/qqmlecmascript/data/ComponentWithVarProp.qml b/tests/auto/qml/qqmlecmascript/data/ComponentWithVarProp.qml
+new file mode 100644
+index 0000000..3105b8c
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/ComponentWithVarProp.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++Item {
++    property var varprop: true
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/propertyVarOwnership.5.qml b/tests/auto/qml/qqmlecmascript/data/propertyVarOwnership.5.qml
+new file mode 100644
+index 0000000..ad5807b
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/propertyVarOwnership.5.qml
+@@ -0,0 +1,28 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModuleApi
++
++Item {
++    id: testOwnership
++    property bool test: false
++
++    function runTest() {
++        var o;
++        var c = Qt.createComponent("ComponentWithVarProp.qml");
++        if (c.status == Component.Ready) {
++            o = c.createObject();
++        } else {
++            return; // failed to create component.
++        }
++        o.varprop = true;                // causes initialization of varProperties.
++        ModuleApi.trackObject(o);        // stores QObject ptr
++        if (ModuleApi.trackedObject() == null) return;        // is still valid, should have a valid v8object.
++        o = new Date();                  // causes object to be gc-able.
++        gc();  // collect object's v8object + varProperties, queues deleteLater.
++        if (ModuleApi.trackedObject() != null) return;        // v8object was previously collected.
++        ModuleApi.setTrackedObjectProperty("varprop");        // deferences varProperties of object.
++        test = !(ModuleApi.trackedObjectProperty("varprop")); // deferences varProperties of object.
++        // if we didn't crash, success.
++    }
++}
++
++
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 65b84d6..54fab26 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -982,7 +982,7 @@ class testQObjectApi : public QObject
+ 
+ public:
+     testQObjectApi(QObject* parent = 0)
+-        : QObject(parent), m_testProperty(0), m_testWritableProperty(0), m_testWritableFinalProperty(0), m_methodCallCount(0)
++        : QObject(parent), m_testProperty(0), m_testWritableProperty(0), m_testWritableFinalProperty(0), m_methodCallCount(0), m_trackedObject(0)
+     {
+     }
+ 
+@@ -992,6 +992,11 @@ public:
+     Q_INVOKABLE int qobjectEnumTestMethod(MyEnum val) { return (static_cast<int>(val) + 5); }
+     Q_INVOKABLE int qobjectTestMethod(int increment = 1) { m_methodCallCount += increment; return m_methodCallCount; }
+ 
++    Q_INVOKABLE void trackObject(QObject *obj) { m_trackedObject = obj; }
++    Q_INVOKABLE QObject *trackedObject() const { return m_trackedObject; }
++    Q_INVOKABLE void setTrackedObjectProperty(const QString &propName) const { m_trackedObject->setProperty(qPrintable(propName), QVariant(5)); }
++    Q_INVOKABLE QVariant trackedObjectProperty(const QString &propName) const { return m_trackedObject->property(qPrintable(propName)); }
++
+     int qobjectTestProperty() const { return m_testProperty; }
+     void setQObjectTestProperty(int tp) { m_testProperty = tp; emit qobjectTestPropertyChanged(tp); }
+ 
+@@ -1011,6 +1016,7 @@ private:
+     int m_testWritableProperty;
+     int m_testWritableFinalProperty;
+     int m_methodCallCount;
++    QObject *m_trackedObject;
+ };
+ 
+ class CircularReferenceObject : public QObject,
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index cca008e..3bbbc2c 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -3906,6 +3906,15 @@ void tst_qqmlecmascript::propertyVarOwnership()
+ 
+     delete object;
+     }
++    // Garbage collection cannot result in attempted dereference of empty handle
++    {
++    QQmlComponent component(&engine, testFileUrl("propertyVarOwnership.5.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QMetaObject::invokeMethod(object, "runTest");
++    QCOMPARE(object->property("test").toBool(), true);
++    delete object;
++    }
+ }
+ 
+ void tst_qqmlecmascript::propertyVarImplicitOwnership()

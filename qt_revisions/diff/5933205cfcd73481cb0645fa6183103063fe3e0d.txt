@@ -1,0 +1,527 @@
+diff --git a/mkspecs/devices/linux-rasp-pi-g++/qeglfshooks_pi.cpp b/mkspecs/devices/linux-rasp-pi-g++/qeglfshooks_pi.cpp
+index 5c5799b..7cb3c7b 100644
+--- a/mkspecs/devices/linux-rasp-pi-g++/qeglfshooks_pi.cpp
++++ b/mkspecs/devices/linux-rasp-pi-g++/qeglfshooks_pi.cpp
+@@ -40,6 +40,12 @@
+ ****************************************************************************/
+ 
+ #include "qeglfshooks.h"
++#include "qeglfscursor.h"
++
++#include <QtDebug>
++
++#include <QtPlatformSupport/private/qeglconvenience_p.h>
++#include <QtPlatformSupport/private/qeglplatformcontext_p.h>
+ 
+ #include <bcm_host.h>
+ 
+@@ -56,6 +62,177 @@ QT_BEGIN_NAMESPACE
+ 
+ static DISPMANX_DISPLAY_HANDLE_T dispman_display = 0;
+ 
++static EGLNativeWindowType createDispmanxLayer(const QPoint &pos, const QSize &size, int z, DISPMANX_FLAGS_ALPHA_T flags)
++{
++    VC_RECT_T dst_rect;
++    dst_rect.x = pos.x();
++    dst_rect.y = pos.y();
++    dst_rect.width = size.width();
++    dst_rect.height = size.height();
++
++    VC_RECT_T src_rect;
++    src_rect.x = 0;
++    src_rect.y = 0;
++    src_rect.width = size.width() << 16;
++    src_rect.height = size.height() << 16;
++
++    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
++
++    VC_DISPMANX_ALPHA_T alpha;
++    alpha.flags = flags;
++    alpha.opacity = 0xFF;
++    alpha.mask = 0;
++
++    DISPMANX_ELEMENT_HANDLE_T dispman_element = vc_dispmanx_element_add(
++            dispman_update, dispman_display, z, &dst_rect, 0, &src_rect,
++            DISPMANX_PROTECTION_NONE, &alpha, (DISPMANX_CLAMP_T *)NULL, (DISPMANX_TRANSFORM_T)0);
++
++    vc_dispmanx_update_submit_sync(dispman_update);
++
++    EGL_DISPMANX_WINDOW_T *eglWindow = new EGL_DISPMANX_WINDOW_T;
++    eglWindow->element = dispman_element;
++    eglWindow->width = size.width();
++    eglWindow->height = size.height();
++
++    return eglWindow;
++}
++
++// this function is not part of debian squeeze headers
++extern "C" int VCHPOST_ vc_dispmanx_element_change_attributes(DISPMANX_UPDATE_HANDLE_T update,
++    DISPMANX_ELEMENT_HANDLE_T element, uint32_t change_flags, int32_t layer,
++    uint8_t opacity, const VC_RECT_T *dest_rect, const VC_RECT_T *src_rect,
++    DISPMANX_RESOURCE_HANDLE_T mask, VC_IMAGE_TRANSFORM_T transform);
++
++// these constants are not in any headers (yet)
++#define ELEMENT_CHANGE_LAYER          (1<<0)
++#define ELEMENT_CHANGE_OPACITY        (1<<1)
++#define ELEMENT_CHANGE_DEST_RECT      (1<<2)
++#define ELEMENT_CHANGE_SRC_RECT       (1<<3)
++#define ELEMENT_CHANGE_MASK_RESOURCE  (1<<4)
++#define ELEMENT_CHANGE_TRANSFORM      (1<<5)
++
++static void moveDispmanxLayer(EGLNativeWindowType window, const QPoint &pos)
++{
++    EGL_DISPMANX_WINDOW_T *eglWindow = static_cast<EGL_DISPMANX_WINDOW_T *>(window);
++    QSize size(eglWindow->width, eglWindow->height);
++
++    VC_RECT_T dst_rect;
++    dst_rect.x = pos.x();
++    dst_rect.y = pos.y();
++    dst_rect.width = size.width();
++    dst_rect.height = size.height();
++
++    VC_RECT_T src_rect;
++    src_rect.x = 0;
++    src_rect.y = 0;
++    src_rect.width = size.width() << 16;
++    src_rect.height = size.height() << 16;
++
++    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
++    vc_dispmanx_element_change_attributes(dispman_update,
++                                          eglWindow->element,
++                                          ELEMENT_CHANGE_DEST_RECT /*change_flags*/,
++                                          0,
++                                          0,
++                                          &dst_rect,
++                                          NULL,
++                                          0,
++                                          (VC_IMAGE_TRANSFORM_T)0);
++
++    vc_dispmanx_update_submit_sync(dispman_update);
++}
++
++static void destroyDispmanxLayer(EGLNativeWindowType window)
++{
++    EGL_DISPMANX_WINDOW_T *eglWindow = static_cast<EGL_DISPMANX_WINDOW_T *>(window);
++    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
++    vc_dispmanx_element_remove(dispman_update, eglWindow->element);
++    vc_dispmanx_update_submit_sync(dispman_update);
++    delete eglWindow;
++}
++
++class QEglFSPiCursor : public QEglFSCursor
++{
++public:
++    QEglFSPiCursor(QEglFSScreen *screen) : QEglFSCursor(screen) {
++        QSurfaceFormat platformFormat;
++        platformFormat.setDepthBufferSize(24);
++        platformFormat.setStencilBufferSize(8);
++        platformFormat.setRedBufferSize(8);
++        platformFormat.setGreenBufferSize(8);
++        platformFormat.setBlueBufferSize(8);
++        platformFormat.setAlphaBufferSize(8);
++        m_config = q_configFromGLFormat(m_screen->display(), platformFormat);
++
++        createSurface();
++        createContext();
++        drawInLayer();
++    }
++
++    ~QEglFSPiCursor() {
++        eglDestroySurface(m_screen->display(), m_surface);
++        destroyDispmanxLayer(m_window);
++        eglDestroyContext(m_screen->display(), m_context);
++    }
++
++    void createSurface() {
++        const QRect cr = cursorRect();
++        m_window = createDispmanxLayer(cr.topLeft(), cr.size(), 50, DISPMANX_FLAGS_ALPHA_FROM_SOURCE);
++        m_surface = eglCreateWindowSurface(m_screen->display(), m_config, m_window, NULL);
++    }
++
++    void createContext() {
++        eglBindAPI(EGL_OPENGL_ES_API);
++        QVector<EGLint> attrs;
++        attrs.append(EGL_CONTEXT_CLIENT_VERSION);
++        attrs.append(2);
++        attrs.append(EGL_NONE);
++        m_context = eglCreateContext(m_screen->display(), m_config, EGL_NO_CONTEXT, attrs.constData());
++    }
++
++    void drawInLayer() {
++        eglMakeCurrent(m_screen->display(), m_surface, m_surface, m_context);
++
++        glClearColor(0, 0, 0, 0);
++        glClear(GL_COLOR_BUFFER_BIT);
++        draw(QRectF(QPointF(-1, 1), QPointF(1, -1)));
++
++        eglSwapBuffers(m_screen->display(), m_surface);
++        eglMakeCurrent(m_screen->display(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    }
++
++    void changeCursor(QCursor *cursor, QWindow *window) {
++        if (!setCurrentCursor(cursor))
++            return;
++
++        EGL_DISPMANX_WINDOW_T *eglWindow = static_cast<EGL_DISPMANX_WINDOW_T *>(m_window);
++        if (QSize(eglWindow->width, eglWindow->height) != m_cursor.size) {
++            eglDestroySurface(m_screen->display(), m_surface);
++            destroyDispmanxLayer(m_window);
++            createSurface();
++        }
++        drawInLayer();
++    }
++
++    void setPos(const QPoint &pos) {
++        m_pos = pos;
++        moveDispmanxLayer(m_window, cursorRect().topLeft());
++    }
++
++    void pointerEvent(const QMouseEvent &event) {
++        if (event.type() != QEvent::MouseMove)
++            return;
++        m_pos = event.pos();
++        moveDispmanxLayer(m_window, cursorRect().topLeft());
++    }
++    void paintOnScreen() { }
++private:
++    EGLConfig m_config;
++    EGLContext m_context;
++    EGLNativeWindowType m_window;
++    EGLSurface m_surface;
++};
++
+ class QEglFSPiHooks : public QEglFSHooks
+ {
+ public:
+@@ -66,6 +243,10 @@ public:
+     virtual EGLNativeWindowType createNativeWindow(const QSize &size);
+     virtual void destroyNativeWindow(EGLNativeWindowType window);
+     virtual bool hasCapability(QPlatformIntegration::Capability cap) const;
++
++    QEglFSCursor *createCursor(QEglFSScreen *screen) const {
++        return new QEglFSPiCursor(screen);
++    }
+ };
+ 
+ void QEglFSPiHooks::platformInit()
+@@ -113,46 +294,12 @@ QSize QEglFSPiHooks::screenSize() const
+ 
+ EGLNativeWindowType QEglFSPiHooks::createNativeWindow(const QSize &size)
+ {
+-    VC_RECT_T dst_rect;
+-    dst_rect.x = 0;
+-    dst_rect.y = 0;
+-    dst_rect.width = size.width();
+-    dst_rect.height = size.height();
+-
+-    VC_RECT_T src_rect;
+-    src_rect.x = 0;
+-    src_rect.y = 0;
+-    src_rect.width = size.width() << 16;
+-    src_rect.height = size.height() << 16;
+-
+-    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
+-
+-    VC_DISPMANX_ALPHA_T alpha;
+-    alpha.flags = DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS;
+-    alpha.opacity = 0xFF;
+-    alpha.mask = 0;
+-
+-    DISPMANX_ELEMENT_HANDLE_T dispman_element = vc_dispmanx_element_add(
+-            dispman_update, dispman_display, 0, &dst_rect, 0, &src_rect,
+-            DISPMANX_PROTECTION_NONE, &alpha, (DISPMANX_CLAMP_T *)NULL, (DISPMANX_TRANSFORM_T)0);
+-
+-    vc_dispmanx_update_submit_sync(dispman_update);
+-
+-    EGL_DISPMANX_WINDOW_T *eglWindow = new EGL_DISPMANX_WINDOW_T;
+-    eglWindow->element = dispman_element;
+-    eglWindow->width = size.width();
+-    eglWindow->height = size.height();
+-
+-    return eglWindow;
++    return createDispmanxLayer(QPoint(0, 0), size, 0, DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS);
+ }
+ 
+ void QEglFSPiHooks::destroyNativeWindow(EGLNativeWindowType window)
+ {
+-    EGL_DISPMANX_WINDOW_T *eglWindow = static_cast<EGL_DISPMANX_WINDOW_T *>(window);
+-    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
+-    vc_dispmanx_element_remove(dispman_update, eglWindow->element);
+-    vc_dispmanx_update_submit_sync(dispman_update);
+-    delete eglWindow;
++    destroyDispmanxLayer(window);
+ }
+ 
+ bool QEglFSPiHooks::hasCapability(QPlatformIntegration::Capability cap) const
+diff --git a/src/plugins/platforms/eglfs/eglfs.pro b/src/plugins/platforms/eglfs/eglfs.pro
+index 84afb9c..0c11a69 100644
+--- a/src/plugins/platforms/eglfs/eglfs.pro
++++ b/src/plugins/platforms/eglfs/eglfs.pro
+@@ -31,6 +31,8 @@ HEADERS =   qeglfsintegration.h \
+ 
+ QMAKE_LFLAGS += $$QMAKE_LFLAGS_NOUNDEF
+ 
++INCLUDEPATH += $$PWD
++
+ !isEmpty(EGLFS_PLATFORM_HOOKS_SOURCES) {
+     HEADERS += $$EGLFS_PLATFORM_HOOKS_HEADERS
+     SOURCES += $$EGLFS_PLATFORM_HOOKS_SOURCES
+diff --git a/src/plugins/platforms/eglfs/qeglfsbackingstore.cpp b/src/plugins/platforms/eglfs/qeglfsbackingstore.cpp
+index 539e4be..d39a08c 100644
+--- a/src/plugins/platforms/eglfs/qeglfsbackingstore.cpp
++++ b/src/plugins/platforms/eglfs/qeglfsbackingstore.cpp
+@@ -182,7 +182,7 @@ void QEglFSBackingStore::flush(QWindow *window, const QRegion &region, const QPo
+ 
+     // draw the cursor
+     if (QEglFSCursor *cursor = static_cast<QEglFSCursor *>(window->screen()->handle()->cursor()))
+-        cursor->render();
++        cursor->paintOnScreen();
+ 
+     m_context->swapBuffers(window);
+ 
+diff --git a/src/plugins/platforms/eglfs/qeglfscursor.cpp b/src/plugins/platforms/eglfs/qeglfscursor.cpp
+index aae5b2a..e72d4f6 100644
+--- a/src/plugins/platforms/eglfs/qeglfscursor.cpp
++++ b/src/plugins/platforms/eglfs/qeglfscursor.cpp
+@@ -54,9 +54,9 @@ QEglFSCursor::QEglFSCursor(QEglFSScreen *screen)
+ {
+     initCursorAtlas();
+ 
+-    // ## this shouldn't be required
++    // initialize the cursor
+     QCursor cursor(Qt::ArrowCursor);
+-    changeCursor(&cursor, 0);
++    setCurrentCursor(&cursor);
+ }
+ 
+ QEglFSCursor::~QEglFSCursor()
+@@ -185,7 +185,16 @@ void QEglFSCursor::initCursorAtlas()
+ 
+ void QEglFSCursor::changeCursor(QCursor *cursor, QWindow *window)
+ {
++    Q_UNUSED(window);
+     const QRect oldCursorRect = cursorRect();
++    if (setCurrentCursor(cursor))
++        update(oldCursorRect | cursorRect());
++}
++
++bool QEglFSCursor::setCurrentCursor(QCursor *cursor)
++{
++    if (m_cursor.shape == cursor->shape() && cursor->shape() != Qt::BitmapCursor)
++        return false;
+ 
+     if (m_cursor.shape == Qt::BitmapCursor) {
+         m_cursor.customCursorImage = QImage(); // in case render() never uploaded it
+@@ -210,8 +219,12 @@ void QEglFSCursor::changeCursor(QCursor *cursor, QWindow *window)
+         m_cursor.customCursorImage = image;
+     }
+ 
+-    QRegion rgn = oldCursorRect | cursorRect();
+-    QWindowSystemInterface::handleSynchronousExposeEvent(window, rgn);
++    return true;
++}
++
++void QEglFSCursor::update(const QRegion &rgn)
++{
++    QWindowSystemInterface::handleSynchronousExposeEvent(m_screen->topLevelAt(m_pos), rgn);
+ }
+ 
+ QRect QEglFSCursor::cursorRect() const
+@@ -228,8 +241,7 @@ void QEglFSCursor::setPos(const QPoint &pos)
+ {
+     const QRect oldCursorRect = cursorRect();
+     m_pos = pos;
+-    QRegion rgn = oldCursorRect | cursorRect();
+-    QWindowSystemInterface::handleSynchronousExposeEvent(m_screen->topLevelAt(m_pos), rgn);
++    update(oldCursorRect | cursorRect());
+ }
+ 
+ void QEglFSCursor::pointerEvent(const QMouseEvent &event)
+@@ -238,11 +250,23 @@ void QEglFSCursor::pointerEvent(const QMouseEvent &event)
+         return;
+     const QRect oldCursorRect = cursorRect();
+     m_pos = event.pos();
+-    QRegion rgn = oldCursorRect | cursorRect();
+-    QWindowSystemInterface::handleSynchronousExposeEvent(m_screen->topLevelAt(m_pos), rgn);
++    update(oldCursorRect | cursorRect());
++}
++
++void QEglFSCursor::paintOnScreen()
++{
++    const QRectF cr = cursorRect();
++    const QRect screenRect(m_screen->geometry());
++    const GLfloat x1 = 2 * (cr.left() / screenRect.width()) - 1;
++    const GLfloat x2 = 2 * (cr.right() / screenRect.width()) - 1;
++    const GLfloat y1 = 1 - (cr.top() / screenRect.height()) * 2;
++    const GLfloat y2 = 1 - (cr.bottom() / screenRect.height()) * 2;
++    QRectF r(QPointF(x1, y1), QPointF(x2, y2));
++
++    draw(r);
+ }
+ 
+-void QEglFSCursor::render()
++void QEglFSCursor::draw(const QRectF &r)
+ {
+     if (!m_program) {
+         // one time initialization
+@@ -268,18 +292,11 @@ void QEglFSCursor::render()
+ 
+     glUseProgram(m_program);
+ 
+-    const QRectF cr = cursorRect();
+-    const QRect screenRect(m_screen->geometry());
+-    const GLfloat x1 = 2 * (cr.left() / screenRect.width()) - 1;
+-    const GLfloat x2 = 2 * (cr.right() / screenRect.width()) - 1;
+-    const GLfloat y1 = 1 - (cr.top() / screenRect.height()) * 2;
+-    const GLfloat y2 = 1 - (cr.bottom() / screenRect.height()) * 2;
+-
+     const GLfloat cursorCoordinates[] = {
+-        x1, y2,
+-        x2, y2,
+-        x1, y1,
+-        x2, y1
++        r.left(), r.bottom(),
++        r.right(), r.bottom(),
++        r.left(), r.top(),
++        r.right(), r.top()
+     };
+ 
+     const GLfloat s1 = m_cursor.textureRect.left();
+diff --git a/src/plugins/platforms/eglfs/qeglfscursor.h b/src/plugins/platforms/eglfs/qeglfscursor.h
+index c8c4a83..464b52e 100644
+--- a/src/plugins/platforms/eglfs/qeglfscursor.h
++++ b/src/plugins/platforms/eglfs/qeglfscursor.h
+@@ -49,6 +49,7 @@
+ QT_BEGIN_NAMESPACE
+ 
+ class QOpenGLShaderProgram;
++class QEglFSScreen;
+ 
+ class QEglFSCursor : public QPlatformCursor
+ {
+@@ -64,15 +65,34 @@ public:
+ 
+     QRect cursorRect() const;
+ 
+-    void render();
++    virtual void paintOnScreen();
++
++protected:
++    bool setCurrentCursor(QCursor *cursor);
++    void draw(const QRectF &rect);
++    void update(const QRegion &region);
++
++    QEglFSScreen *m_screen;
++
++    // current cursor information
++    struct Cursor {
++        Cursor() : texture(0), shape(Qt::BlankCursor), customCursorTexture(0) { }
++        uint texture; // a texture from 'image' or the atlas
++        Qt::CursorShape shape;
++        QRectF textureRect; // normalized rect inside texture
++        QSize size; // size of the cursor
++        QPoint hotSpot;
++        QImage customCursorImage;
++        uint customCursorTexture;
++    } m_cursor;
++
++    QPoint m_pos; // current cursor position
+ 
+ private:
+     void createShaderPrograms();
+     static void createCursorTexture(uint *texture, const QImage &image);
+     void initCursorAtlas();
+ 
+-    QPlatformScreen *m_screen;
+-
+     // cursor atlas information
+     struct CursorAtlas {
+         CursorAtlas() : cursorsPerRow(0), texture(0), cursorWidth(0), cursorHeight(0) { }
+@@ -84,20 +104,6 @@ private:
+         QImage image; // valid until it's uploaded
+     } m_cursorAtlas;
+ 
+-    // current cursor information
+-    struct Cursor {
+-        Cursor() : texture(0), shape(Qt::BlankCursor), customCursorTexture(0) { }
+-        uint texture; // a texture from 'image' or the atlas
+-        Qt::CursorShape shape;
+-        QRectF textureRect; // normalized rect inside texture
+-        QSize size; // size of the cursor
+-        QPoint hotSpot;
+-        QImage customCursorImage;
+-        uint customCursorTexture;
+-    } m_cursor;
+-
+-    QPoint m_pos;
+-
+     GLuint m_program;
+     int m_vertexCoordEntry;
+     int m_textureCoordEntry;
+diff --git a/src/plugins/platforms/eglfs/qeglfshooks.h b/src/plugins/platforms/eglfs/qeglfshooks.h
+index c6ea209..22ba771 100644
+--- a/src/plugins/platforms/eglfs/qeglfshooks.h
++++ b/src/plugins/platforms/eglfs/qeglfshooks.h
+@@ -47,6 +47,9 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class QEglFSCursor;
++class QEglFSScreen;
++
+ class QEglFSHooks
+ {
+ public:
+@@ -57,6 +60,7 @@ public:
+     virtual EGLNativeWindowType createNativeWindow(const QSize &size);
+     virtual void destroyNativeWindow(EGLNativeWindowType window);
+     virtual bool hasCapability(QPlatformIntegration::Capability cap) const;
++    virtual QEglFSCursor *createCursor(QEglFSScreen *screen) const;
+ };
+ 
+ #ifdef EGLFS_PLATFORM_HOOKS
+diff --git a/src/plugins/platforms/eglfs/qeglfshooks_stub.cpp b/src/plugins/platforms/eglfs/qeglfshooks_stub.cpp
+index c0e202f..d0e3e45 100644
+--- a/src/plugins/platforms/eglfs/qeglfshooks_stub.cpp
++++ b/src/plugins/platforms/eglfs/qeglfshooks_stub.cpp
+@@ -78,6 +78,12 @@ bool QEglFSHooks::hasCapability(QPlatformIntegration::Capability cap) const
+     return false;
+ }
+ 
++QEglFSCursor *QEglFSHooks::createCursor(QEglFSScreen *screen) const
++{
++    Q_UNUSED(screen);
++    return 0;
++}
++
+ #ifndef EGLFS_PLATFORM_HOOKS
+ QEglFSHooks stubHooks;
+ #endif
+diff --git a/src/plugins/platforms/eglfs/qeglfsscreen.cpp b/src/plugins/platforms/eglfs/qeglfsscreen.cpp
+index b29981f..007829b 100644
+--- a/src/plugins/platforms/eglfs/qeglfsscreen.cpp
++++ b/src/plugins/platforms/eglfs/qeglfsscreen.cpp
+@@ -72,7 +72,7 @@ public:
+         QEglFSWindow *window = static_cast<QEglFSWindow *>(surface);
+         QEglFSScreen *screen = static_cast<QEglFSScreen *>(window->screen());
+         if (QEglFSCursor *cursor = static_cast<QEglFSCursor *>(screen->cursor()))
+-            cursor->render();
++            cursor->paintOnScreen();
+ 
+         QEGLPlatformContext::swapBuffers(surface);
+     }
+@@ -124,8 +124,12 @@ QEglFSScreen::QEglFSScreen()
+     eglSwapInterval(m_dpy, swapInterval);
+ 
+     static int hideCursor = qgetenv("QT_QPA_EGLFS_HIDECURSOR").toInt();
+-    if (!hideCursor)
+-        m_cursor = new QEglFSCursor(this);
++    if (!hideCursor) {
++        if (QEglFSCursor *customCursor = hooks->createCursor(this))
++            m_cursor = customCursor;
++        else
++            m_cursor = new QEglFSCursor(this);
++    }
+ }
+ 
+ QEglFSScreen::~QEglFSScreen()

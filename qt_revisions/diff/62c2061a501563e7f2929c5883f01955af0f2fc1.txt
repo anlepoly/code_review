@@ -1,0 +1,422 @@
+diff --git a/src/corelib/kernel/qmetaobject.cpp b/src/corelib/kernel/qmetaobject.cpp
+index e76efc3..ac30b0d 100644
+--- a/src/corelib/kernel/qmetaobject.cpp
++++ b/src/corelib/kernel/qmetaobject.cpp
+@@ -2661,7 +2661,14 @@ int QMetaProperty::userType() const
+             return QVariant::Int; // Match behavior of QMetaType::type()
+         return enumMetaTypeId;
+     }
+-    return QMetaType::type(typeName());
++    type = QMetaType::type(typeName());
++    if (type != QMetaType::UnknownType)
++        return type;
++    void *argv[] = { &type };
++    mobj->static_metacall(QMetaObject::RegisterPropertyMetaType, idx, argv);
++    if (type != -1)
++        return type;
++    return QMetaType::UnknownType;
+ }
+ 
+ /*!
+@@ -2768,8 +2775,16 @@ QVariant QMetaProperty::read(const QObject *object) const
+             t = QMetaType::type(typeName);
+         }
+         if (t == QMetaType::UnknownType) {
+-            qWarning("QMetaProperty::read: Unable to handle unregistered datatype '%s' for property '%s::%s'", typeName, mobj->className(), name());
+-            return QVariant();
++            // Try to register the type and try again before reporting an error.
++            int registerResult = -1;
++            void *argv[] = { &registerResult };
++            QMetaObject::metacall(const_cast<QObject*>(object), QMetaObject::RegisterPropertyMetaType,
++                                  idx + mobj->propertyOffset(), argv);
++            if (registerResult == -1) {
++                qWarning("QMetaProperty::read: Unable to handle unregistered datatype '%s' for property '%s::%s'", typeName, mobj->className(), name());
++                return QVariant();
++            }
++            t = registerResult;
+         }
+     }
+ 
+diff --git a/src/corelib/kernel/qobjectdefs.h b/src/corelib/kernel/qobjectdefs.h
+index ba348b5..0ed35a2 100644
+--- a/src/corelib/kernel/qobjectdefs.h
++++ b/src/corelib/kernel/qobjectdefs.h
+@@ -437,7 +437,8 @@ struct Q_CORE_EXPORT QMetaObject
+         QueryPropertyEditable,
+         QueryPropertyUser,
+         CreateInstance,
+-        IndexOfMethod
++        IndexOfMethod,
++        RegisterPropertyMetaType
+     };
+ 
+     int static_metacall(Call, int, void **) const;
+diff --git a/src/tools/moc/generator.cpp b/src/tools/moc/generator.cpp
+index 39bd528..edf2bf8 100644
+--- a/src/tools/moc/generator.cpp
++++ b/src/tools/moc/generator.cpp
+@@ -86,8 +86,8 @@ QT_FOR_EACH_STATIC_TYPE(RETURN_METATYPENAME_STRING)
+     return 0;
+  }
+ 
+-Generator::Generator(ClassDef *classDef, const QList<QByteArray> &metaTypes, FILE *outfile)
+-    : out(outfile), cdef(classDef), metaTypes(metaTypes)
++Generator::Generator(ClassDef *classDef, const QList<QByteArray> &metaTypes, const QSet<QByteArray> &knownQObjectClasses, FILE *outfile)
++    : out(outfile), cdef(classDef), metaTypes(metaTypes), knownQObjectClasses(knownQObjectClasses)
+ {
+     if (cdef->superclassList.size())
+         purestSuperClass = cdef->superclassList.first().first;
+@@ -140,6 +140,49 @@ static int aggregateParameterCount(const QList<FunctionDef> &list)
+     return sum;
+ }
+ 
++bool Generator::registerableMetaType(const QByteArray &propertyType)
++{
++    if (metaTypes.contains(propertyType))
++        return true;
++
++    if (propertyType.endsWith('*')) {
++        QByteArray objectPointerType = propertyType;
++        // The objects container stores class names, such as 'QState', 'QLabel' etc,
++        // not 'QState*', 'QLabel*'. The propertyType does contain the '*', so we need
++        // to chop it to find the class type in the known QObjects list.
++        objectPointerType.chop(1);
++        if (knownQObjectClasses.contains(objectPointerType))
++            return true;
++    }
++
++    static const QVector<QByteArray> smartPointers = QVector<QByteArray>()
++#define STREAM_SMART_POINTER(SMART_POINTER) << #SMART_POINTER
++        QT_FOR_EACH_AUTOMATIC_TEMPLATE_SMART_POINTER(STREAM_SMART_POINTER)
++#undef STREAM_SMART_POINTER
++        ;
++
++    foreach (const QByteArray &smartPointer, smartPointers)
++        if (propertyType.startsWith(smartPointer + "<"))
++            return knownQObjectClasses.contains(propertyType.mid(smartPointer.size() + 1, propertyType.size() - smartPointer.size() - 1 - 1));
++
++    static const QVector<QByteArray> oneArgTemplates = QVector<QByteArray>()
++#define STREAM_1ARG_TEMPLATE(TEMPLATENAME) << #TEMPLATENAME
++      QT_FOR_EACH_AUTOMATIC_TEMPLATE_1ARG(STREAM_1ARG_TEMPLATE)
++#undef STREAM_1ARG_TEMPLATE
++    ;
++    foreach (const QByteArray &oneArgTemplateType, oneArgTemplates)
++        if (propertyType.startsWith(oneArgTemplateType + "<")) {
++            const int argumentSize = propertyType.size() - oneArgTemplateType.size() - 1
++                                     // The closing '>'
++                                     - 1
++                                     // templates inside templates have an extra whitespace char to strip.
++                                     - (propertyType.at(propertyType.size() - 2) == '>' ? 1 : 0 );
++            const QByteArray templateArg = propertyType.mid(oneArgTemplateType.size() + 1, argumentSize);
++            return isBuiltinType(templateArg) || registerableMetaType(templateArg);
++        }
++    return false;
++}
++
+ void Generator::generateCode()
+ {
+     bool isQt = (cdef->classname == "Qt");
+@@ -1034,6 +1077,15 @@ void Generator::generateMetacall()
+                 "        _id -= %d;\n"
+                 "    }", cdef->propertyList.count());
+ 
++        fprintf(out, " else ");
++        fprintf(out, "if (_c == QMetaObject::RegisterPropertyMetaType) {\n");
++        fprintf(out, "        if (_id < %d)\n", cdef->propertyList.size());
++
++        if (automaticPropertyMetaTypesHelper().isEmpty())
++            fprintf(out, "            *reinterpret_cast<int*>(_a[0]) = -1;\n");
++        else
++            fprintf(out, "            qt_static_metacall(this, _c, _id, _a);\n");
++        fprintf(out, "        _id -= %d;\n    }", cdef->propertyList.size());
+ 
+         fprintf(out, "\n#endif // QT_NO_PROPERTIES");
+     }
+@@ -1042,6 +1094,18 @@ void Generator::generateMetacall()
+     fprintf(out,"return _id;\n}\n");
+ }
+ 
++
++QMultiMap<QByteArray, int> Generator::automaticPropertyMetaTypesHelper()
++{
++    QMultiMap<QByteArray, int> automaticPropertyMetaTypes;
++    for (int i = 0; i < cdef->propertyList.size(); ++i) {
++        const QByteArray propertyType = cdef->propertyList.at(i).type;
++        if (registerableMetaType(propertyType) && !isBuiltinType(propertyType))
++            automaticPropertyMetaTypes.insert(propertyType, i);
++    }
++    return automaticPropertyMetaTypes;
++}
++
+ void Generator::generateStaticMetacall()
+ {
+     fprintf(out, "void %s::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, void **_a)\n{\n",
+@@ -1175,12 +1239,33 @@ void Generator::generateStaticMetacall()
+         needElse = true;
+     }
+ 
++    QMultiMap<QByteArray, int> automaticPropertyMetaTypes = automaticPropertyMetaTypesHelper();
++
++    if (!automaticPropertyMetaTypes.isEmpty()) {
++        if (needElse)
++            fprintf(out, " else ");
++        else
++            fprintf(out, "    ");
++        fprintf(out, "if (_c == QMetaObject::RegisterPropertyMetaType) {\n");
++        fprintf(out, "        switch (_id) {\n");
++        fprintf(out, "        default: *reinterpret_cast<int*>(_a[0]) = -1; break;\n");
++        foreach (const QByteArray &key, automaticPropertyMetaTypes.uniqueKeys()) {
++            foreach (int propertyID, automaticPropertyMetaTypes.values(key))
++                fprintf(out, "        case %d:\n", propertyID);
++            fprintf(out, "            *reinterpret_cast<int*>(_a[0]) = qRegisterMetaType< %s >(); break;\n", key.constData());
++        }
++        fprintf(out, "        }\n");
++        fprintf(out, "    }\n");
++        isUsed_a = true;
++        needElse = true;
++    }
++
+     if (needElse)
+         fprintf(out, "\n");
+ 
+     if (methodList.isEmpty()) {
+         fprintf(out, "    Q_UNUSED(_o);\n");
+-        if (cdef->constructorList.isEmpty()) {
++        if (cdef->constructorList.isEmpty() && automaticPropertyMetaTypes.isEmpty()) {
+             fprintf(out, "    Q_UNUSED(_id);\n");
+             fprintf(out, "    Q_UNUSED(_c);\n");
+         }
+diff --git a/src/tools/moc/generator.h b/src/tools/moc/generator.h
+index 8ebc00b..873681a 100644
+--- a/src/tools/moc/generator.h
++++ b/src/tools/moc/generator.h
+@@ -52,9 +52,10 @@ class Generator
+     ClassDef *cdef;
+     QVector<uint> meta_data;
+ public:
+-    Generator(ClassDef *classDef, const QList<QByteArray> &metaTypes, FILE *outfile = 0);
++    Generator(ClassDef *classDef, const QList<QByteArray> &metaTypes, const QSet<QByteArray> &knownQObjectClasses, FILE *outfile = 0);
+     void generateCode();
+ private:
++    bool registerableMetaType(const QByteArray &propertyType);
+     void registerClassInfoStrings();
+     void generateClassInfos();
+     void registerFunctionStrings(const QList<FunctionDef> &list);
+@@ -70,12 +71,14 @@ private:
+     void generateStaticMetacall();
+     void generateSignal(FunctionDef *def, int index);
+     void generatePluginMetaData();
++    QMultiMap<QByteArray, int> automaticPropertyMetaTypesHelper();
+ 
+     void strreg(const QByteArray &); // registers a string
+     int stridx(const QByteArray &); // returns a string's id
+     QList<QByteArray> strings;
+     QByteArray purestSuperClass;
+     QList<QByteArray> metaTypes;
++    QSet<QByteArray> knownQObjectClasses;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/tools/moc/moc.cpp b/src/tools/moc/moc.cpp
+index a176b87..d7c08b4 100644
+--- a/src/tools/moc/moc.cpp
++++ b/src/tools/moc/moc.cpp
+@@ -849,7 +849,7 @@ void Moc::generate(FILE *out)
+     fprintf(out, "QT_BEGIN_MOC_NAMESPACE\n");
+ 
+     for (i = 0; i < classList.size(); ++i) {
+-        Generator generator(&classList[i], metaTypes, out);
++        Generator generator(&classList[i], metaTypes, knownQObjectClasses, out);
+         generator.generateCode();
+     }
+ 
+diff --git a/tests/auto/tools/moc/tst_moc.cpp b/tests/auto/tools/moc/tst_moc.cpp
+index f60ab11..c6178c7 100644
+--- a/tests/auto/tools/moc/tst_moc.cpp
++++ b/tests/auto/tools/moc/tst_moc.cpp
+@@ -549,6 +549,7 @@ private slots:
+     void finalClasses();
+     void explicitOverrideControl_data();
+     void explicitOverrideControl();
++    void autoPropertyMetaTypeRegistration();
+ 
+ signals:
+     void sigWithUnsignedArg(unsigned foo);
+@@ -2293,6 +2294,177 @@ void tst_Moc::explicitOverrideControl()
+ #endif
+ }
+ 
++class CustomQObject : public QObject
++{
++    Q_OBJECT
++    Q_ENUMS(Number)
++public:
++    enum Number {
++      Zero,
++      One,
++      Two
++    };
++    explicit CustomQObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++    }
++};
++
++Q_DECLARE_METATYPE(CustomQObject::Number)
++
++typedef CustomQObject* CustomQObjectStar;
++Q_DECLARE_METATYPE(CustomQObjectStar);
++
++namespace SomeNamespace {
++
++class NamespacedQObject : public QObject
++{
++    Q_OBJECT
++public:
++    explicit NamespacedQObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++
++    }
++};
++
++struct NamespacedNonQObject {};
++}
++Q_DECLARE_METATYPE(SomeNamespace::NamespacedNonQObject)
++
++class AutoRegistrationObject : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QObject* object READ object CONSTANT)
++    Q_PROPERTY(CustomQObject* customObject READ customObject CONSTANT)
++    Q_PROPERTY(QSharedPointer<CustomQObject> customObjectP READ customObjectP CONSTANT)
++    Q_PROPERTY(QWeakPointer<CustomQObject> customObjectWP READ customObjectWP CONSTANT)
++    Q_PROPERTY(QPointer<CustomQObject> customObjectTP READ customObjectTP CONSTANT)
++    Q_PROPERTY(QList<int> listInt READ listInt CONSTANT)
++    Q_PROPERTY(QVector<QVariant> vectorVariant READ vectorVariant CONSTANT)
++    Q_PROPERTY(QList<CustomQObject*> listObject READ listObject CONSTANT)
++    Q_PROPERTY(QVector<QList<int>> vectorListInt READ vectorListInt CONSTANT)
++    Q_PROPERTY(QVector<QList<CustomQObject*>> vectorListObject READ vectorListObject CONSTANT)
++    Q_PROPERTY(CustomQObject::Number enumValue READ enumValue CONSTANT)
++    Q_PROPERTY(CustomQObjectStar customObjectTypedef READ customObjectTypedef CONSTANT)
++    Q_PROPERTY(SomeNamespace::NamespacedQObject* customObjectNamespaced READ customObjectNamespaced CONSTANT)
++    Q_PROPERTY(SomeNamespace::NamespacedNonQObject customNonQObjectNamespaced READ customNonQObjectNamespaced CONSTANT)
++public:
++    AutoRegistrationObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++    }
++
++    QObject* object() const
++    {
++        return 0;
++    }
++
++    QSharedPointer<CustomQObject> customObjectP() const
++    {
++        return QSharedPointer<CustomQObject>();
++    }
++
++    QWeakPointer<CustomQObject> customObjectWP() const
++    {
++        return QWeakPointer<CustomQObject>();
++    }
++
++    QPointer<CustomQObject> customObjectTP() const
++    {
++        return QPointer<CustomQObject>();
++    }
++
++    CustomQObject* customObject() const
++    {
++        return 0;
++    }
++
++    QList<int> listInt() const
++    {
++        return QList<int>();
++    }
++
++    QVector<QVariant> vectorVariant() const
++    {
++        return QVector<QVariant>();
++    }
++
++    QList<CustomQObject*> listObject() const
++    {
++        return QList<CustomQObject*>();
++    }
++
++    QVector<QList<int> > vectorListInt() const
++    {
++        return QVector<QList<int> >();
++    }
++
++    QVector<QList<CustomQObject*> > vectorListObject() const
++    {
++        return QVector<QList<CustomQObject*> >();
++    }
++
++    CustomQObject::Number enumValue() const
++    {
++        return CustomQObject::Zero;
++    }
++
++    CustomQObjectStar customObjectTypedef() const
++    {
++        return 0;
++    }
++
++    SomeNamespace::NamespacedQObject* customObjectNamespaced() const
++    {
++        return 0;
++    }
++
++    SomeNamespace::NamespacedNonQObject customNonQObjectNamespaced() const
++    {
++        return SomeNamespace::NamespacedNonQObject();
++    }
++};
++
++void tst_Moc::autoPropertyMetaTypeRegistration()
++{
++    AutoRegistrationObject aro;
++
++    static const int numPropertiesUnderTest = 15;
++    QVector<int> propertyMetaTypeIds;
++    propertyMetaTypeIds.reserve(numPropertiesUnderTest);
++
++    const QMetaObject *metaObject = aro.metaObject();
++    QCOMPARE(metaObject->propertyCount(), numPropertiesUnderTest);
++    for (int i = 0; i < metaObject->propertyCount(); ++i) {
++        const QMetaProperty prop = metaObject->property(i);
++        propertyMetaTypeIds.append(prop.userType());
++        QVariant var = prop.read(&aro);
++        QVERIFY(var.isValid());
++    }
++
++    // Verify that QMetaProperty::userType gave us what we expected.
++    QVector<int> expectedMetaTypeIds = QVector<int>()
++        << QMetaType::QString            // QObject::userType
++        << QMetaType::QObjectStar        // AutoRegistrationObject::object
++        << qMetaTypeId<CustomQObject*>() // etc.
++        << qMetaTypeId<QSharedPointer<CustomQObject> >()
++        << qMetaTypeId<QWeakPointer<CustomQObject> >()
++        << qMetaTypeId<QPointer<CustomQObject> >()
++        << qMetaTypeId<QList<int> >()
++        << qMetaTypeId<QVector<QVariant> >()
++        << qMetaTypeId<QList<CustomQObject*> >()
++        << qMetaTypeId<QVector<QList<int> > >()
++        << qMetaTypeId<QVector<QList<CustomQObject*> > >()
++        << qMetaTypeId<CustomQObject::Number>()
++        << qMetaTypeId<CustomQObjectStar>()
++        << qMetaTypeId<SomeNamespace::NamespacedQObject*>()
++        << qMetaTypeId<SomeNamespace::NamespacedNonQObject>()
++        ;
++
++    QCOMPARE(propertyMetaTypeIds, expectedMetaTypeIds);
++}
++
+ QTEST_MAIN(tst_Moc)
+ 
+ #include "tst_moc.moc"

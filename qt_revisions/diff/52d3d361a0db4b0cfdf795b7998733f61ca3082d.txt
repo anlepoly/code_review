@@ -1,0 +1,494 @@
+diff --git a/src/quick/items/qquickitemviewtransition.cpp b/src/quick/items/qquickitemviewtransition.cpp
+index d9dce49..823269b 100644
+--- a/src/quick/items/qquickitemviewtransition.cpp
++++ b/src/quick/items/qquickitemviewtransition.cpp
+@@ -333,6 +333,8 @@ QQuickItemViewTransitionableItem::QQuickItemViewTransitionableItem(QQuickItem *i
+     , nextTransitionType(QQuickItemViewTransitioner::NoTransition)
+     , isTransitionTarget(false)
+     , nextTransitionToSet(false)
++    , nextTransitionFromSet(false)
++    , lastMovedToSet(false)
+     , prepared(false)
+ {
+ }
+@@ -367,12 +369,17 @@ qreal QQuickItemViewTransitionableItem::itemY() const
+ 
+ void QQuickItemViewTransitionableItem::moveTo(const QPointF &pos, bool immediate)
+ {
++    if (!nextTransitionFromSet && nextTransitionType != QQuickItemViewTransitioner::NoTransition) {
++        nextTransitionFrom = item->pos();
++        nextTransitionFromSet = true;
++    }
++
++    lastMovedTo = pos;
++    lastMovedToSet = true;
++
+     if (immediate || !transitionScheduledOrRunning()) {
+-        if (immediate) {
+-            if (transition)
+-                transition->cancel();
+-            resetTransitionData();
+-        }
++        if (immediate)
++            stopTransition();
+         item->setPos(pos);
+     } else {
+         nextTransitionTo = pos;
+@@ -402,17 +409,27 @@ bool QQuickItemViewTransitionableItem::isPendingRemoval() const
+ 
+ bool QQuickItemViewTransitionableItem::prepareTransition(QQuickItemViewTransitioner *transitioner, int index, const QRectF &viewBounds)
+ {
+-    bool doTransition = false;
++    if (nextTransitionType == QQuickItemViewTransitioner::NoTransition)
++        return false;
++
++    if (isTransitionTarget) {
++        // If item is not already moving somewhere, set it to not move anywhere.
++        // This ensures that removed targets don't transition to the default (0,0) and that
++        // items set for other transition types only transition if they actually move somewhere.
++        if (!nextTransitionToSet)
++            moveTo(item->pos());
++    } else {
++        // don't start displaced transitions that don't move anywhere
++        if (!nextTransitionToSet || (nextTransitionFromSet && nextTransitionFrom == nextTransitionTo)) {
++            clearCurrentScheduledTransition();
++            return false;
++        }
++    }
+ 
+-    // If item is not already moving somewhere, set it to not move anywhere.
+-    // This ensures that removed targets don't transition to the default (0,0) and that
+-    // items set for other transition types only transition if they actually move somewhere.
+-    if (nextTransitionType != QQuickItemViewTransitioner::NoTransition && !nextTransitionToSet)
+-        moveTo(item->pos());
++    bool doTransition = false;
+ 
+     // For move transitions (both target and displaced) and displaced transitions of other
+     // types, only run the transition if the item is actually moving to another position.
+-
+     switch (nextTransitionType) {
+     case QQuickItemViewTransitioner::NoTransition:
+     {
+@@ -465,10 +482,8 @@ bool QQuickItemViewTransitionableItem::prepareTransition(QQuickItemViewTransitio
+     if (!doTransition) {
+         // if transition type is not valid, the previous transition still has to be
+         // canceled so that the item can move immediately to the right position
+-        if (transition)
+-            transition->cancel();
+         item->setPos(nextTransitionTo);
+-        resetTransitionData();
++        stopTransition();
+     }
+ 
+     prepared = true;
+@@ -490,14 +505,8 @@ void QQuickItemViewTransitionableItem::startTransition(QQuickItemViewTransitione
+         transition = new QQuickItemViewTransitionJob;
+     }
+ 
+-    // if item is not already moving somewhere, set it to not move anywhere
+-    // so that removed items do not move to the default (0,0)
+-    if (!nextTransitionToSet)
+-        moveTo(item->pos());
+-
+     transition->startTransition(this, index, transitioner, nextTransitionType, nextTransitionTo, isTransitionTarget);
+-    nextTransitionType = QQuickItemViewTransitioner::NoTransition;
+-    prepared = false;
++    clearCurrentScheduledTransition();
+ }
+ 
+ void QQuickItemViewTransitionableItem::setNextTransition(QQuickItemViewTransitioner::TransitionType type, bool isTargetItem)
+@@ -507,27 +516,50 @@ void QQuickItemViewTransitionableItem::setNextTransition(QQuickItemViewTransitio
+     // to calculate positions for transitions for other items in the view.
+     nextTransitionType = type;
+     isTransitionTarget = isTargetItem;
++
++    if (!nextTransitionFromSet && lastMovedToSet) {
++        nextTransitionFrom = lastMovedTo;
++        nextTransitionFromSet = true;
++    }
+ }
+ 
+ bool QQuickItemViewTransitionableItem::transitionWillChangePosition() const
+ {
+     if (transitionRunning() && transition->m_toPos != nextTransitionTo)
+         return true;
+-    return nextTransitionTo != item->pos();
++    if (!nextTransitionFromSet)
++        return false;
++    return nextTransitionTo != nextTransitionFrom;
+ }
+ 
+-void QQuickItemViewTransitionableItem::finishedTransition()
++void QQuickItemViewTransitionableItem::resetNextTransitionPos()
+ {
+     nextTransitionToSet = false;
+     nextTransitionTo = QPointF();
+ }
+ 
+-void QQuickItemViewTransitionableItem::resetTransitionData()
++void QQuickItemViewTransitionableItem::finishedTransition()
++{
++    resetNextTransitionPos();
++}
++
++void QQuickItemViewTransitionableItem::clearCurrentScheduledTransition()
+ {
++    // Just clear the current scheduled transition - don't touch the nextTransitionTo
++    // which may have already been set for a previously scheduled transition
++
+     nextTransitionType = QQuickItemViewTransitioner::NoTransition;
+     isTransitionTarget = false;
+-    nextTransitionTo = QPointF();
+-    nextTransitionToSet = false;
++    prepared = false;
++    nextTransitionFromSet = false;
++}
++
++void QQuickItemViewTransitionableItem::stopTransition()
++{
++    if (transition)
++        transition->cancel();
++    clearCurrentScheduledTransition();
++    resetNextTransitionPos();
+ }
+ 
+ 
+diff --git a/src/quick/items/qquickitemviewtransition_p.h b/src/quick/items/qquickitemviewtransition_p.h
+index a4babdc..9e17385 100644
+--- a/src/quick/items/qquickitemviewtransition_p.h
++++ b/src/quick/items/qquickitemviewtransition_p.h
+@@ -142,11 +142,15 @@ public:
+     void startTransition(QQuickItemViewTransitioner *transitioner, int index);
+ 
+     QPointF nextTransitionTo;
++    QPointF lastMovedTo;
++    QPointF nextTransitionFrom;
+     QQuickItem *item;
+     QQuickItemViewTransitionJob *transition;
+     QQuickItemViewTransitioner::TransitionType nextTransitionType;
+     bool isTransitionTarget;
+     bool nextTransitionToSet;
++    bool nextTransitionFromSet;
++    bool lastMovedToSet;
+     bool prepared;
+ 
+ private:
+@@ -155,7 +159,9 @@ private:
+     void setNextTransition(QQuickItemViewTransitioner::TransitionType, bool isTargetItem);
+     bool transitionWillChangePosition() const;
+     void finishedTransition();
+-    void resetTransitionData();
++    void resetNextTransitionPos();
++    void clearCurrentScheduledTransition();
++    void stopTransition();
+ };
+ 
+ 
+diff --git a/tests/auto/quick/qquickgridview/data/multipleDisplaced.qml b/tests/auto/quick/qquickgridview/data/multipleDisplaced.qml
+new file mode 100644
+index 0000000..7c48bf3
+--- /dev/null
++++ b/tests/auto/quick/qquickgridview/data/multipleDisplaced.qml
+@@ -0,0 +1,81 @@
++import QtQuick 2.0
++
++Rectangle {
++    id: root
++    width: 500
++    height: 600
++
++    property int duration: 10
++    property int count: grid.count
++
++    Component {
++        id: myDelegate
++        Rectangle {
++            id: wrapper
++
++            property string nameData: name
++
++            objectName: "wrapper"
++            width: 80
++            height: 60
++            border.width: 1
++            Column {
++                Text { text: index }
++                Text {
++                    text: wrapper.x + ", " + wrapper.y
++                }
++                Text {
++                    id: textName
++                    objectName: "textName"
++                    text: name
++                }
++            }
++            color: GridView.isCurrentItem ? "lightsteelblue" : "white"
++        }
++    }
++
++    GridView {
++        id: grid
++
++        property var displaceTransitionsStarted: new Object()
++        property bool displaceTransitionsDone: false
++
++        objectName: "grid"
++        focus: true
++        anchors.centerIn: parent
++        width: 240
++        height: 320
++        cellWidth: 80
++        cellHeight: 60
++        model: testModel
++        delegate: myDelegate
++
++        displaced: Transition {
++            id: transition
++            SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        var name = transition.ViewTransition.item.nameData
++                        if (grid.displaceTransitionsStarted[name] == undefined)
++                            grid.displaceTransitionsStarted[name] = 0
++                        grid.displaceTransitionsStarted[name] += 1
++                    }
++                }
++                NumberAnimation {
++                    properties: "x,y"
++                    duration: root.duration
++                    easing.type: Easing.OutBounce
++                    easing.amplitude: 10.0      // longer-lasting bounce to trigger bug
++                }
++                PropertyAction { target: grid; property: "displaceTransitionsDone"; value: true }
++            }
++        }
++    }
++
++    Rectangle {
++        anchors.fill: grid
++        color: "lightsteelblue"
++        opacity: 0.2
++    }
++}
++
+diff --git a/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp b/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
+index 04bdfc8..f33883c 100644
+--- a/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
++++ b/tests/auto/quick/qquickgridview/tst_qquickgridview.cpp
+@@ -142,6 +142,7 @@ private slots:
+     void displacedTransitions_data();
+     void multipleTransitions();
+     void multipleTransitions_data();
++    void multipleDisplaced();
+ 
+ private:
+     QList<int> toIntList(const QVariantList &list);
+@@ -4975,6 +4976,55 @@ void tst_QQuickGridView::multipleTransitions_data()
+             << true << true << false << false;
+ }
+ 
++void tst_QQuickGridView::multipleDisplaced()
++{
++    // multiple move() operations should only restart displace transitions for items that
++    // moved from previously set positions, and not those that have moved from their current
++    // item positions (which may e.g. still be changing from easing bounces in the last transition)
++
++    QmlListModel model;
++    for (int i = 0; i < 30; i++)
++        model.addItem("Original item" + QString::number(i), "");
++
++    QQuickView *canvas = createView();
++    QQmlContext *ctxt = canvas->rootContext();
++    ctxt->setContextProperty("testModel", &model);
++    canvas->setSource(testFileUrl("multipleDisplaced.qml"));
++    canvas->show();
++    QTest::qWaitForWindowShown(canvas);
++
++    QQuickGridView *gridview = findItem<QQuickGridView>(canvas->rootObject(), "grid");
++    QTRY_VERIFY(gridview != 0);
++    QQuickItem *contentItem = gridview->contentItem();
++    QVERIFY(contentItem != 0);
++    QTRY_COMPARE(QQuickItemPrivate::get(gridview)->polishScheduled, false);
++
++    model.moveItems(12, 8, 1);
++    QTest::qWait(canvas->rootObject()->property("duration").toInt() / 2);
++    model.moveItems(8, 3, 1);
++    QTRY_VERIFY(gridview->property("displaceTransitionsDone").toBool());
++
++    QVariantMap transitionsStarted = gridview->property("displaceTransitionsStarted").toMap();
++    foreach (const QString &name, transitionsStarted.keys()) {
++        QVERIFY2(transitionsStarted[name] == 1,
++                 QTest::toString(QString("%1 was displaced %2 times").arg(name).arg(transitionsStarted[name].toInt())));
++    }
++
++    // verify all items moved to the correct final positions
++    QList<QQuickItem*> items = findItems<QQuickItem>(contentItem, "wrapper");
++    for (int i=0; i < model.count() && i < items.count(); ++i) {
++        QQuickItem *item = findItem<QQuickItem>(contentItem, "wrapper", i);
++        QVERIFY2(item, QTest::toString(QString("Item %1 not found").arg(i)));
++        QTRY_COMPARE(item->x(), (i%3)*80.0);
++        QTRY_COMPARE(item->y(), (i/3)*60.0);
++        QQuickText *name = findItem<QQuickText>(contentItem, "textName", i);
++        QVERIFY(name != 0);
++        QTRY_COMPARE(name->text(), model.name(i));
++    }
++
++    delete canvas;
++}
++
+ void tst_QQuickGridView::cacheBuffer()
+ {
+     QQuickView *canvas = createView();
+diff --git a/tests/auto/quick/qquicklistview/data/multipleDisplaced.qml b/tests/auto/quick/qquicklistview/data/multipleDisplaced.qml
+new file mode 100644
+index 0000000..e315270
+--- /dev/null
++++ b/tests/auto/quick/qquicklistview/data/multipleDisplaced.qml
+@@ -0,0 +1,78 @@
++import QtQuick 2.0
++
++Rectangle {
++    id: root
++    width: 500
++    height: 600
++
++    property int duration: 10
++    property int count: list.count
++
++    Component {
++        id: myDelegate
++        Rectangle {
++            id: wrapper
++
++            property string nameData: name
++
++            objectName: "wrapper"
++            height: 20
++            width: 240
++            Text { text: index }
++            Text {
++                x: 30
++                id: textName
++                objectName: "textName"
++                text: name
++            }
++            Text {
++                x: 200
++                text: wrapper.y
++            }
++            color: ListView.isCurrentItem ? "lightsteelblue" : "white"
++        }
++    }
++
++    ListView {
++        id: list
++
++        property var displaceTransitionsStarted: new Object()
++        property bool displaceTransitionsDone: false
++
++        objectName: "list"
++        focus: true
++        anchors.centerIn: parent
++        width: 240
++        height: 320
++        model: testModel
++        delegate: myDelegate
++
++        displaced: Transition {
++            id: transition
++            SequentialAnimation {
++                ScriptAction {
++                    script: {
++                        var name = transition.ViewTransition.item.nameData
++                        if (list.displaceTransitionsStarted[name] == undefined)
++                            list.displaceTransitionsStarted[name] = 0
++                        list.displaceTransitionsStarted[name] += 1
++                    }
++                }
++                NumberAnimation {
++                    properties: "x,y"
++                    duration: root.duration
++                    easing.type: Easing.OutBounce
++                    easing.amplitude: 10.0      // longer-lasting bounce to trigger bug
++                }
++                PropertyAction { target: list; property: "displaceTransitionsDone"; value: true }
++            }
++        }
++    }
++
++    Rectangle {
++        anchors.fill: list
++        color: "lightsteelblue"
++        opacity: 0.2
++    }
++}
++
+diff --git a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+index c038faa..037d9e9 100644
+--- a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
++++ b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+@@ -183,6 +183,7 @@ private slots:
+     void displacedTransitions_data();
+     void multipleTransitions();
+     void multipleTransitions_data();
++    void multipleDisplaced();
+ 
+     void flickBeyondBounds();
+ 
+@@ -5977,6 +5978,56 @@ void tst_QQuickListView::multipleTransitions_data()
+             << true << true << false << false;
+ }
+ 
++void tst_QQuickListView::multipleDisplaced()
++{
++    // multiple move() operations should only restart displace transitions for items that
++    // moved from previously set positions, and not those that have moved from their current
++    // item positions (which may e.g. still be changing from easing bounces in the last transition)
++
++    QmlListModel model;
++    for (int i = 0; i < 30; i++)
++        model.addItem("Original item" + QString::number(i), "");
++
++    QQuickView *canvas = createView();
++    QQmlContext *ctxt = canvas->rootContext();
++    ctxt->setContextProperty("testModel", &model);
++    ctxt->setContextProperty("testObject", new TestObject(canvas));
++    canvas->setSource(testFileUrl("multipleDisplaced.qml"));
++    canvas->show();
++    QTest::qWaitForWindowShown(canvas);
++
++    QQuickListView *listview = findItem<QQuickListView>(canvas->rootObject(), "list");
++    QTRY_VERIFY(listview != 0);
++    QQuickItem *contentItem = listview->contentItem();
++    QVERIFY(contentItem != 0);
++    QTRY_COMPARE(QQuickItemPrivate::get(listview)->polishScheduled, false);
++
++    model.moveItems(12, 8, 1);
++    QTest::qWait(canvas->rootObject()->property("duration").toInt() / 2);
++    model.moveItems(8, 3, 1);
++    QTRY_VERIFY(listview->property("displaceTransitionsDone").toBool());
++
++    QVariantMap transitionsStarted = listview->property("displaceTransitionsStarted").toMap();
++    foreach (const QString &name, transitionsStarted.keys()) {
++        QVERIFY2(transitionsStarted[name] == 1,
++                 QTest::toString(QString("%1 was displaced %2 times").arg(name).arg(transitionsStarted[name].toInt())));
++    }
++
++    // verify all items moved to the correct final positions
++    QList<QQuickItem*> items = findItems<QQuickItem>(contentItem, "wrapper");
++    for (int i=0; i < model.count() && i < items.count(); ++i) {
++        QQuickItem *item = findItem<QQuickItem>(contentItem, "wrapper", i);
++        QVERIFY2(item, QTest::toString(QString("Item %1 not found").arg(i)));
++        QTRY_COMPARE(item->x(), 0.0);
++        QTRY_COMPARE(item->y(), i*20.0);
++        QQuickText *name = findItem<QQuickText>(contentItem, "textName", i);
++        QVERIFY(name != 0);
++        QTRY_COMPARE(name->text(), model.name(i));
++    }
++
++    delete canvas;
++}
++
+ QList<int> tst_QQuickListView::toIntList(const QVariantList &list)
+ {
+     QList<int> ret;

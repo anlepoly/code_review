@@ -1,0 +1,259 @@
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace.cpp b/src/declarative/debugger/qdeclarativedebugtrace.cpp
+index d6bb5f8..366c8c5 100644
+--- a/src/declarative/debugger/qdeclarativedebugtrace.cpp
++++ b/src/declarative/debugger/qdeclarativedebugtrace.cpp
+@@ -44,8 +44,68 @@
+ #include <QtCore/qdatastream.h>
+ #include <QtCore/qurl.h>
+ #include <QtCore/qtimer.h>
++#include <QDebug>
++
++#ifdef CUSTOM_DECLARATIVE_DEBUG_TRACE_INSTANCE
++
++namespace {
++
++    class GlobalInstanceDeleter
++    {
++    private:
++        QBasicAtomicPointer<QDeclarativeDebugTrace> &m_pointer;
++    public:
++        GlobalInstanceDeleter(QBasicAtomicPointer<QDeclarativeDebugTrace> &p)
++        : m_pointer(p)
++        {}
++        ~GlobalInstanceDeleter()
++        {
++            delete m_pointer.load();
++            m_pointer.store(0);
++        }
++    };
++
++    QBasicAtomicPointer<QDeclarativeDebugTrace> s_globalInstance = Q_BASIC_ATOMIC_INITIALIZER(0);
++}
++
++
++static QDeclarativeDebugTrace *traceInstance()
++{
++    return QDeclarativeDebugTrace::globalInstance();
++}
++
++QDeclarativeDebugTrace *QDeclarativeDebugTrace::globalInstance()
++{
++    if (!s_globalInstance.load()) {
++        // create default QDeclarativeDebugTrace instance if it is not explicitly set by setGlobalInstance(QDeclarativeDebugTrace *instance)
++        // thread safe implementation
++        QDeclarativeDebugTrace *x = new QDeclarativeDebugTrace();
++        if (!s_globalInstance.testAndSetOrdered(0, x))
++            delete x;
++        else
++            static GlobalInstanceDeleter cleanup(s_globalInstance);
++    }
++    return s_globalInstance.load();
++}
++
++/*!
++ *  Set custom QDeclarativeDebugTrace instance \a custom_instance.
++ *  Function fails if QDeclarativeDebugTrace::globalInstance() was called before.
++ *  QDeclarativeDebugTrace framework takes ownership of the custom instance.
++ */
++void QDeclarativeDebugTrace::setGlobalInstance(QDeclarativeDebugTrace *custom_instance)
++{
++    if (!s_globalInstance.testAndSetOrdered(0, custom_instance)) {
++        qWarning() << "QDeclarativeDebugTrace::setGlobalInstance() - instance already set.";
++        delete custom_instance;
++    } else {
++        static GlobalInstanceDeleter cleanup(s_globalInstance);
++    }
++}
+ 
++#else // CUSTOM_DECLARATIVE_DEBUG_TRACE_INSTANCE
+ Q_GLOBAL_STATIC(QDeclarativeDebugTrace, traceInstance);
++#endif
+ 
+ // convert to a QByteArray that can be sent to the debug client
+ // use of QDataStream can skew results if m_deferredSend == false
+diff --git a/src/declarative/debugger/qdeclarativedebugtrace_p.h b/src/declarative/debugger/qdeclarativedebugtrace_p.h
+index f4d6c18..dfd478b 100644
+--- a/src/declarative/debugger/qdeclarativedebugtrace_p.h
++++ b/src/declarative/debugger/qdeclarativedebugtrace_p.h
+@@ -42,6 +42,8 @@
+ #ifndef QDECLARATIVEDEBUGTRACE_P_H
+ #define QDECLARATIVEDEBUGTRACE_P_H
+ 
++#include "qtquick1global.h"
++
+ #include <private/qdeclarativedebugservice_p.h>
+ #include <private/qperformancetimer_p.h>
+ 
+@@ -63,7 +65,7 @@ struct QDeclarativeDebugData
+ };
+ 
+ class QUrl;
+-class Q_AUTOTEST_EXPORT QDeclarativeDebugTrace : public QDeclarativeDebugService
++class Q_QUICK1_EXPORT QDeclarativeDebugTrace : public QDeclarativeDebugService
+ {
+ public:
+     enum Message {
+@@ -105,6 +107,21 @@ public:
+     static void endRange(RangeType);
+ 
+     QDeclarativeDebugTrace();
++#ifdef CUSTOM_DECLARATIVE_DEBUG_TRACE_INSTANCE
++public:
++    static QDeclarativeDebugTrace* globalInstance();
++    static void setGlobalInstance(QDeclarativeDebugTrace *custom_instance);
++protected:
++    virtual void messageReceived(const QByteArray &);
++protected:
++    virtual void addEventImpl(EventType);
++    virtual void startRangeImpl(RangeType);
++    virtual void rangeDataImpl(RangeType, const QString &);
++    virtual void rangeDataImpl(RangeType, const QUrl &);
++    virtual void rangeLocationImpl(RangeType, const QString &, int);
++    virtual void rangeLocationImpl(RangeType, const QUrl &, int);
++    virtual void endRangeImpl(RangeType);
++#else
+ protected:
+     virtual void messageReceived(const QByteArray &);
+ private:
+@@ -115,6 +132,7 @@ private:
+     void rangeLocationImpl(RangeType, const QString &, int);
+     void rangeLocationImpl(RangeType, const QUrl &, int);
+     void endRangeImpl(RangeType);
++#endif
+     void processMessage(const QDeclarativeDebugData &);
+     void sendMessages();
+     QPerformanceTimer m_timer;
+diff --git a/src/declarative/declarative.pro b/src/declarative/declarative.pro
+index 896aec0..7c3d38f 100644
+--- a/src/declarative/declarative.pro
++++ b/src/declarative/declarative.pro
+@@ -31,3 +31,6 @@ linux-g++-maemo:DEFINES += QDECLARATIVEVIEW_NOBACKGROUND
+ DEFINES += QT_NO_OPENTYPE
+ INCLUDEPATH += ../3rdparty/harfbuzz/src
+ 
++blackberry: {
++    DEFINES   += CUSTOM_DECLARATIVE_DEBUG_TRACE_INSTANCE
++}
+diff --git a/src/declarative/qml/qperformancetimer.cpp b/src/declarative/qml/qperformancetimer.cpp
+index b7c2f47..9e2e073 100644
+--- a/src/declarative/qml/qperformancetimer.cpp
++++ b/src/declarative/qml/qperformancetimer.cpp
+@@ -80,6 +80,13 @@ qint64 QPerformanceTimer::elapsed() const
+     return absoluteToNSecs(cpu_time - t1);
+ }
+ 
++// return number of nsecs elapsed from timer start time till absoluteMonotonicTimeNs
++qint64 QPerformanceTimer::elapsedToAbsoluteTime(qint64 absoluteMonotonicTimeNs) const
++{
++    uint64_t cpu_time = absoluteMonotonicTimeNs;
++    return absoluteToNSecs(cpu_time - t1);
++}
++
+ ////////////////////////////// Unix //////////////////////////////
+ #elif defined(Q_OS_UNIX)
+ 
+@@ -154,6 +161,16 @@ qint64 QPerformanceTimer::elapsed() const
+     return sec * Q_INT64_C(1000000000) + frac;
+ }
+ 
++qint64 QPerformanceTimer::elapsedToAbsoluteTime(qint64 absoluteMonotonicTimeNs) const
++{
++    qint64 sec = absoluteMonotonicTimeNs / Q_INT64_C(1000000000);
++    qint64 frac = absoluteMonotonicTimeNs % Q_INT64_C(1000000000);
++    sec = sec - t1;
++    frac = frac - t2;
++
++    return sec * Q_INT64_C(1000000000) + frac;
++}
++
+ ////////////////////////////// Windows //////////////////////////////
+ #elif defined(Q_OS_WIN)
+ 
+@@ -179,6 +196,11 @@ qint64 QPerformanceTimer::elapsed() const
+     return getTimeFromTick(li.QuadPart - t1);
+ }
+ 
++qint64 QPerformanceTimer::elapsedToAbsoluteTime(qint64 absoluteMonotonicTimeNs) const
++{
++    return absoluteMonotonicTimeNs - t1;
++}
++
+ ////////////////////////////// Default //////////////////////////////
+ #else
+ 
+@@ -192,6 +214,12 @@ qint64 QPerformanceTimer::elapsed() const
+     return 0;
+ }
+ 
++qint64 QPerformanceTimer::elapsedToAbsoluteTime(qint64 absoluteMonotonicTimeNs) const
++{
++    Q_UNUSED(absoluteMonotonicTimeNs);
++    return 0;
++}
++
+ #endif
+ 
+ QT_END_NAMESPACE
+diff --git a/src/declarative/qml/qperformancetimer_p.h b/src/declarative/qml/qperformancetimer_p.h
+index 7880fa8..98cf9c2 100644
+--- a/src/declarative/qml/qperformancetimer_p.h
++++ b/src/declarative/qml/qperformancetimer_p.h
+@@ -53,7 +53,7 @@
+ // We mean it.
+ //
+ 
+-#include <QtCore/qglobal.h>
++#include "qtquick1global.h"
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -61,12 +61,12 @@ QT_BEGIN_NAMESPACE
+ 
+ QT_MODULE(Declarative)
+ 
+-class Q_AUTOTEST_EXPORT QPerformanceTimer
++class Q_QUICK1_EXPORT QPerformanceTimer
+ {
+ public:
+     void start();
+     qint64 elapsed() const;
+-
++    qint64 elapsedToAbsoluteTime(qint64 absoluteMonotonicTimeNs) const;
+ private:
+     qint64 t1;
+     qint64 t2;
+diff --git a/tests/auto/declarative/qperformancetimer/tst_qperformancetimer.cpp b/tests/auto/declarative/qperformancetimer/tst_qperformancetimer.cpp
+index 28dd95b..958fb1a 100644
+--- a/tests/auto/declarative/qperformancetimer/tst_qperformancetimer.cpp
++++ b/tests/auto/declarative/qperformancetimer/tst_qperformancetimer.cpp
+@@ -58,9 +58,27 @@ void tst_qperformancetimer::units()
+ {
+     QPerformanceTimer timer;
+     timer.start();
+-    QTest::qWait(300);
+-    qint64 elapsed = timer.elapsed();
+-    QVERIFY(elapsed > 300000000 && elapsed < 310000000);
++    {
++        QTest::qWait(300);
++        qint64 elapsed = timer.elapsed();
++        QVERIFY(elapsed > 300000000 && elapsed < 310000000);
++    }
++    {
++        qint64 monotonic_time_in_far_future = 1000000000 * 60 * 60 * 24 * 365 * 10; /// 10 years uptime
++        qint64 elapsed = timer.elapsedToAbsoluteTime(time_in_far_future);
++        elapsed = elapsed - timer.elapsedToAbsoluteTime(time_in_far_future - 2000000);
++        QVERIFY(elapsed == 2000000);
++    }
++    {
++        qint64 elapsed = timer.elapsed();
++        qint64 elapsed2 = timer.elapsedToAbsoluteTime(elapsed);
++        qint64 monotonic_now = 2 * elapsed - elapsed2;
++        QTest::qWait(300);
++        elapsed = timer.elapsed();
++        elapsed2 = timer.elapsedToAbsoluteTime(monotonic_now + 300 * 1000000);
++        qint64 diff = elapsed - elapsed2;
++        QVERIFY(diff > -10000000 && diff < 10000000);
++    }
+ }
+ 
+ QTEST_MAIN(tst_qperformancetimer)

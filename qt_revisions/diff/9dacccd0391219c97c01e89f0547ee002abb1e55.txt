@@ -1,0 +1,242 @@
+diff --git a/src/corelib/kernel/qeventdispatcher_blackberry.cpp b/src/corelib/kernel/qeventdispatcher_blackberry.cpp
+index b2ec574..4be1d73 100644
+--- a/src/corelib/kernel/qeventdispatcher_blackberry.cpp
++++ b/src/corelib/kernel/qeventdispatcher_blackberry.cpp
+@@ -67,7 +67,7 @@ struct bpsIOHandlerData {
+     fd_set *exceptfds;
+ };
+ 
+-static int bpsIOReadyDomain = -1;
++static int bpsUnblockDomain = -1;
+ 
+ static int bpsIOHandler(int fd, int io_events, void *data)
+ {
+@@ -103,13 +103,13 @@ static int bpsIOHandler(int fd, int io_events, void *data)
+         qEventDispatcherDebug << "Sending bpsIOReadyDomain event";
+         // create IO ready event
+         bps_event_t *event;
+-        int result = bps_event_create(&event, bpsIOReadyDomain, 0, NULL, NULL);
++        int result = bps_event_create(&event, bpsUnblockDomain, 0, NULL, NULL);
+         if (result != BPS_SUCCESS) {
+             qWarning("QEventDispatcherBlackberryPrivate::QEventDispatcherBlackberry: bps_event_create() failed");
+             return BPS_FAILURE;
+         }
+ 
+-        // post IO ready event to our thread
++        // post unblock event to our thread
+         result = bps_push_event(event);
+         if (result != BPS_SUCCESS) {
+             qWarning("QEventDispatcherBlackberryPrivate::QEventDispatcherBlackberry: bps_push_event() failed");
+@@ -129,31 +129,33 @@ QEventDispatcherBlackberryPrivate::QEventDispatcherBlackberryPrivate()
+     if (result != BPS_SUCCESS)
+         qFatal("QEventDispatcherBlackberryPrivate::QEventDispatcherBlackberry: bps_initialize() failed");
+ 
+-    // get domain for IO ready events - ignoring race condition here for now
+-    if (bpsIOReadyDomain == -1) {
+-        bpsIOReadyDomain = bps_register_domain();
+-        if (bpsIOReadyDomain == -1)
++    bps_channel = bps_channel_get_active();
++
++    // get domain for IO ready and wake up events - ignoring race condition here for now
++    if (bpsUnblockDomain == -1) {
++        bpsUnblockDomain = bps_register_domain();
++        if (bpsUnblockDomain == -1)
+             qWarning("QEventDispatcherBlackberryPrivate::QEventDispatcherBlackberry: bps_register_domain() failed");
+     }
+-
+-    // Register thread_pipe[0] with bps
+-    int io_events = BPS_IO_INPUT;
+-    result = bps_add_fd(thread_pipe[0], io_events, &bpsIOHandler, ioData.data());
+-    if (result != BPS_SUCCESS)
+-        qWarning() << Q_FUNC_INFO << "bps_add_fd() failed";
+ }
+ 
+ QEventDispatcherBlackberryPrivate::~QEventDispatcherBlackberryPrivate()
+ {
+-    // Unregister thread_pipe[0] from bps
+-    const int result = bps_remove_fd(thread_pipe[0]);
+-    if (result != BPS_SUCCESS)
+-        qWarning() << Q_FUNC_INFO << "bps_remove_fd() failed";
+-
+     // we're done using BPS
+     bps_shutdown();
+ }
+ 
++int QEventDispatcherBlackberryPrivate::initThreadWakeUp()
++{
++    return -1;  // no fd's used
++}
++
++int QEventDispatcherBlackberryPrivate::processThreadWakeUp(int nsel)
++{
++    Q_UNUSED(nsel);
++    return wakeUps.fetchAndStoreRelaxed(0);
++}
++
+ /////////////////////////////////////////////////////////////////////////////
+ 
+ QEventDispatcherBlackberry::QEventDispatcherBlackberry(QObject *parent)
+@@ -317,7 +319,7 @@ int QEventDispatcherBlackberry::select(int nfds, fd_set *readfds, fd_set *writef
+         if (!event)    // In case of !event, we break out of the loop to let Qt process the timers
+             break;     // (since timeout has expired) and socket notifiers that are now ready.
+ 
+-        if (bps_event_get_domain(event) == bpsIOReadyDomain) {
++        if (bps_event_get_domain(event) == bpsUnblockDomain) {
+             timeoutTotal = 0;   // in order to immediately drain the event queue of native events
+             event = 0;          // (especially touch move events) we don't break out here
+         }
+@@ -339,6 +341,21 @@ int QEventDispatcherBlackberry::select(int nfds, fd_set *readfds, fd_set *writef
+     return d->ioData->count;
+ }
+ 
++void QEventDispatcherBlackberry::wakeUp()
++{
++    Q_D(QEventDispatcherBlackberry);
++    if (d->wakeUps.testAndSetAcquire(0, 1)) {
++        bps_event_t *event;
++        if (bps_event_create(&event, bpsUnblockDomain, 0, 0, 0) == BPS_SUCCESS) {
++            if (bps_channel_push_event(d->bps_channel, event) == BPS_SUCCESS)
++                return;
++            else
++                bps_event_destroy(event);
++        }
++        qWarning("QEventDispatcherBlackberryPrivate::wakeUp failed");
++    }
++}
++
+ int QEventDispatcherBlackberry::ioEvents(int fd)
+ {
+     int io_events = 0;
+diff --git a/src/corelib/kernel/qeventdispatcher_blackberry_p.h b/src/corelib/kernel/qeventdispatcher_blackberry_p.h
+index 84cdf9e..79ed21d 100644
+--- a/src/corelib/kernel/qeventdispatcher_blackberry_p.h
++++ b/src/corelib/kernel/qeventdispatcher_blackberry_p.h
+@@ -71,6 +71,8 @@ public:
+     void registerSocketNotifier(QSocketNotifier *notifier);
+     void unregisterSocketNotifier(QSocketNotifier *notifier);
+ 
++    void wakeUp();
++
+ protected:
+     QEventDispatcherBlackberry(QEventDispatcherBlackberryPrivate &dd, QObject *parent = 0);
+ 
+@@ -89,6 +91,10 @@ public:
+     QEventDispatcherBlackberryPrivate();
+     ~QEventDispatcherBlackberryPrivate();
+ 
++    int initThreadWakeUp();
++    int processThreadWakeUp(int nsel);
++
++    int bps_channel;
+     QScopedPointer<bpsIOHandlerData> ioData;
+ };
+ 
+diff --git a/src/corelib/kernel/qeventdispatcher_unix.cpp b/src/corelib/kernel/qeventdispatcher_unix.cpp
+index 44715b0..6c2a610 100644
+--- a/src/corelib/kernel/qeventdispatcher_unix.cpp
++++ b/src/corelib/kernel/qeventdispatcher_unix.cpp
+@@ -110,7 +110,7 @@ QEventDispatcherUNIXPrivate::QEventDispatcherUNIXPrivate()
+     bool pipefail = false;
+ 
+     // initialize the common parts of the event loop
+-#if defined(Q_OS_NACL)
++#if defined(Q_OS_NACL) || defined (Q_OS_BLACKBERRY)
+    // do nothing.
+ #elif defined(Q_OS_INTEGRITY)
+     // INTEGRITY doesn't like a "select" on pipes, so use socketpair instead
+@@ -157,7 +157,7 @@ QEventDispatcherUNIXPrivate::QEventDispatcherUNIXPrivate()
+ 
+ QEventDispatcherUNIXPrivate::~QEventDispatcherUNIXPrivate()
+ {
+-#if defined(Q_OS_NACL)
++#if defined(Q_OS_NACL) || defined (Q_OS_BLACKBERRY)
+    // do nothing.
+ #elif defined(Q_OS_VXWORKS)
+     close(thread_pipe[0]);
+@@ -211,8 +211,8 @@ int QEventDispatcherUNIXPrivate::doSelect(QEventLoop::ProcessEventsFlags flags,
+             FD_ZERO(&sn_vec[2].select_fds);
+         }
+ 
+-        FD_SET(thread_pipe[0], &sn_vec[0].select_fds);
+-        highest = qMax(highest, thread_pipe[0]);
++        int wakeUpFd = initThreadWakeUp();
++        highest = qMax(highest, wakeUpFd);
+ 
+         nsel = q->select(highest + 1,
+                          &sn_vec[0].select_fds,
+@@ -271,25 +271,7 @@ int QEventDispatcherUNIXPrivate::doSelect(QEventLoop::ProcessEventsFlags flags,
+         }
+     }
+ 
+-    // some other thread woke us up... consume the data on the thread pipe so that
+-    // select doesn't immediately return next time
+-    int nevents = 0;
+-    if (nsel > 0 && FD_ISSET(thread_pipe[0], &sn_vec[0].select_fds)) {
+-#if defined(Q_OS_VXWORKS)
+-        char c[16];
+-        ::read(thread_pipe[0], c, sizeof(c));
+-        ::ioctl(thread_pipe[0], FIOFLUSH, 0);
+-#else
+-        char c[16];
+-        while (::read(thread_pipe[0], c, sizeof(c)) > 0)
+-            ;
+-#endif
+-        if (!wakeUps.testAndSetRelease(1, 0)) {
+-            // hopefully, this is dead code
+-            qWarning("QEventDispatcherUNIX: internal error, wakeUps.testAndSetRelease(1, 0) failed!");
+-        }
+-        ++nevents;
+-    }
++    int nevents = processThreadWakeUp(nsel);
+ 
+     // activate socket notifiers
+     if (! (flags & QEventLoop::ExcludeSocketNotifiers) && nsel > 0 && sn_highest >= 0) {
+@@ -307,6 +289,35 @@ int QEventDispatcherUNIXPrivate::doSelect(QEventLoop::ProcessEventsFlags flags,
+     return (nevents + q->activateSocketNotifiers());
+ }
+ 
++int QEventDispatcherUNIXPrivate::initThreadWakeUp()
++{
++    FD_SET(thread_pipe[0], &sn_vec[0].select_fds);
++    return thread_pipe[0];
++}
++
++int QEventDispatcherUNIXPrivate::processThreadWakeUp(int nsel)
++{
++    if (nsel > 0 && FD_ISSET(thread_pipe[0], &sn_vec[0].select_fds)) {
++        // some other thread woke us up... consume the data on the thread pipe so that
++        // select doesn't immediately return next time
++#if defined(Q_OS_VXWORKS)
++        char c[16];
++        ::read(thread_pipe[0], c, sizeof(c));
++        ::ioctl(thread_pipe[0], FIOFLUSH, 0);
++#else
++        char c[16];
++        while (::read(thread_pipe[0], c, sizeof(c)) > 0)
++            ;
++#endif
++        if (!wakeUps.testAndSetRelease(1, 0)) {
++            // hopefully, this is dead code
++            qWarning("QEventDispatcherUNIX: internal error, wakeUps.testAndSetRelease(1, 0) failed!");
++        }
++        return 1;
++    }
++    return 0;
++}
++
+ QEventDispatcherUNIX::QEventDispatcherUNIX(QObject *parent)
+     : QAbstractEventDispatcher(*new QEventDispatcherUNIXPrivate, parent)
+ { }
+diff --git a/src/corelib/kernel/qeventdispatcher_unix_p.h b/src/corelib/kernel/qeventdispatcher_unix_p.h
+index 0c5d06d..98ea19c 100644
+--- a/src/corelib/kernel/qeventdispatcher_unix_p.h
++++ b/src/corelib/kernel/qeventdispatcher_unix_p.h
+@@ -144,6 +144,8 @@ public:
+     ~QEventDispatcherUNIXPrivate();
+ 
+     int doSelect(QEventLoop::ProcessEventsFlags flags, timeval *timeout);
++    virtual int initThreadWakeUp();
++    virtual int processThreadWakeUp(int nsel);
+ 
+     bool mainThread;
+     int thread_pipe[2];

@@ -1,0 +1,154 @@
+diff --git a/src/corelib/io/qprocess_unix.cpp b/src/corelib/io/qprocess_unix.cpp
+index 973812a..1ef7af5 100644
+--- a/src/corelib/io/qprocess_unix.cpp
++++ b/src/corelib/io/qprocess_unix.cpp
+@@ -949,27 +949,9 @@ qint64 QProcessPrivate::readFromStderr(char *data, qint64 maxlen)
+     return bytesRead;
+ }
+ 
+-static void qt_ignore_sigpipe()
+-{
+-    // Set to ignore SIGPIPE once only.
+-    static QBasicAtomicInt atom = Q_BASIC_ATOMIC_INITIALIZER(0);
+-    if (!atom.load()) {
+-        // More than one thread could turn off SIGPIPE at the same time
+-        // But that's acceptable because they all would be doing the same
+-        // action
+-        struct sigaction noaction;
+-        memset(&noaction, 0, sizeof(noaction));
+-        noaction.sa_handler = SIG_IGN;
+-        ::sigaction(SIGPIPE, &noaction, 0);
+-        atom.store(1);
+-    }
+-}
+-
+ qint64 QProcessPrivate::writeToStdin(const char *data, qint64 maxlen)
+ {
+-    qt_ignore_sigpipe();
+-
+-    qint64 written = qt_safe_write(stdinChannel.pipe[1], data, maxlen);
++    qint64 written = qt_safe_write_nosignal(stdinChannel.pipe[1], data, maxlen);
+ #if defined QPROCESS_DEBUG
+     qDebug("QProcessPrivate::writeToStdin(%p \"%s\", %lld) == %lld",
+            data, qt_prettyDebug(data, maxlen, 16).constData(), maxlen, written);
+diff --git a/src/corelib/kernel/qcore_unix_p.h b/src/corelib/kernel/qcore_unix_p.h
+index dc946a8..fa84710 100644
+--- a/src/corelib/kernel/qcore_unix_p.h
++++ b/src/corelib/kernel/qcore_unix_p.h
+@@ -54,11 +54,13 @@
+ //
+ 
+ #include "qplatformdefs.h"
++#include "qatomic.h"
+ 
+ #ifndef Q_OS_UNIX
+ # error "qcore_unix_p.h included on a non-Unix system"
+ #endif
+ 
++#include <string.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -143,6 +145,22 @@ inline timeval operator*(const timeval &t1, int mul)
+     return normalizedTimeval(tmp);
+ }
+ 
++inline void qt_ignore_sigpipe()
++{
++    // Set to ignore SIGPIPE once only.
++    static QBasicAtomicInt atom = Q_BASIC_ATOMIC_INITIALIZER(0);
++    if (!atom.load()) {
++        // More than one thread could turn off SIGPIPE at the same time
++        // But that's acceptable because they all would be doing the same
++        // action
++        struct sigaction noaction;
++        memset(&noaction, 0, sizeof(noaction));
++        noaction.sa_handler = SIG_IGN;
++        ::sigaction(SIGPIPE, &noaction, 0);
++        atom.store(1);
++    }
++}
++
+ // don't call QT_OPEN or ::open
+ // call qt_safe_open
+ static inline int qt_safe_open(const char *pathname, int flags, mode_t mode = 0777)
+@@ -265,6 +283,12 @@ static inline qint64 qt_safe_write(int fd, const void *data, qint64 len)
+ #undef QT_WRITE
+ #define QT_WRITE qt_safe_write
+ 
++static inline qint64 qt_safe_write_nosignal(int fd, const void *data, qint64 len)
++{
++    qt_ignore_sigpipe();
++    return qt_safe_write(fd, data, len);
++}
++
+ static inline int qt_safe_close(int fd)
+ {
+     register int ret;
+diff --git a/src/network/socket/qnativesocketengine_unix.cpp b/src/network/socket/qnativesocketengine_unix.cpp
+index 476bc69..3f6b6b5 100644
+--- a/src/network/socket/qnativesocketengine_unix.cpp
++++ b/src/network/socket/qnativesocketengine_unix.cpp
+@@ -98,27 +98,6 @@ static QByteArray qt_prettyDebug(const char *data, int len, int maxSize)
+ }
+ #endif
+ 
+-static void qt_ignore_sigpipe()
+-{
+-#ifndef Q_NO_POSIX_SIGNALS
+-    // Set to ignore SIGPIPE once only.
+-    static QBasicAtomicInt atom = Q_BASIC_ATOMIC_INITIALIZER(0);
+-    if (!atom.load()) {
+-        // More than one thread could turn off SIGPIPE at the same time
+-        // But that's acceptable because they all would be doing the same
+-        // action
+-        struct sigaction noaction;
+-        memset(&noaction, 0, sizeof(noaction));
+-        noaction.sa_handler = SIG_IGN;
+-        ::sigaction(SIGPIPE, &noaction, 0);
+-        atom.store(1);
+-    }
+-#else
+-    // Posix signals are not supported by the underlying platform
+-    // so we don't need to ignore sigpipe signal explicitly
+-#endif
+-}
+-
+ /*
+     Extracts the port and address from a sockaddr, and stores them in
+     \a port and \a addr if they are non-null.
+@@ -900,8 +879,6 @@ qint64 QNativeSocketEnginePrivate::nativeSendDatagram(const char *data, qint64 l
+         sockAddrPtr = (struct sockaddr *)&sockAddrIPv4;
+     }
+ 
+-    // ignore the SIGPIPE signal
+-    qt_ignore_sigpipe();
+     ssize_t sentBytes = qt_safe_sendto(socketDescriptor, data, len,
+                                        0, sockAddrPtr, sockAddrSize);
+ 
+@@ -1025,11 +1002,8 @@ qint64 QNativeSocketEnginePrivate::nativeWrite(const char *data, qint64 len)
+ {
+     Q_Q(QNativeSocketEngine);
+ 
+-    // ignore the SIGPIPE signal
+-    qt_ignore_sigpipe();
+-
+     ssize_t writtenBytes;
+-    writtenBytes = qt_safe_write(socketDescriptor, data, len);
++    writtenBytes = qt_safe_write_nosignal(socketDescriptor, data, len);
+ 
+     if (writtenBytes < 0) {
+         switch (errno) {
+diff --git a/src/network/socket/qnet_unix_p.h b/src/network/socket/qnet_unix_p.h
+index dd13e3e..4b212c9 100644
+--- a/src/network/socket/qnet_unix_p.h
++++ b/src/network/socket/qnet_unix_p.h
+@@ -188,6 +188,8 @@ static inline int qt_safe_sendto(int sockfd, const void *buf, size_t len, int fl
+ {
+ #ifdef MSG_NOSIGNAL
+     flags |= MSG_NOSIGNAL;
++#else
++    qt_ignore_sigpipe();
+ #endif
+ 
+     register int ret;

@@ -1,0 +1,472 @@
+diff --git a/src/gui/image/qimage.cpp b/src/gui/image/qimage.cpp
+index 3e53b04..61a3895 100644
+--- a/src/gui/image/qimage.cpp
++++ b/src/gui/image/qimage.cpp
+@@ -50,6 +50,7 @@
+ #include "qstringlist.h"
+ #include "qvariant.h"
+ #include "qimagepixmapcleanuphooks_p.h"
++#include "qplatformintegration_qpa.h"
+ #include <ctype.h>
+ #include <stdlib.h>
+ #include <limits.h>
+@@ -62,6 +63,7 @@
+ 
+ #include <qhash.h>
+ 
++#include <private/qguiapplication_p.h>
+ #include <private/qpaintengine_raster_p.h>
+ 
+ #include <private/qimage_p.h>
+@@ -4900,7 +4902,9 @@ QPaintEngine *QImage::paintEngine() const
+         return 0;
+ 
+     if (!d->paintEngine) {
+-        d->paintEngine = new QRasterPaintEngine(const_cast<QImage *>(this));
++        QPaintDevice *paintDevice = const_cast<QImage *>(this);
++        QPaintEngine *paintEngine = QGuiApplicationPrivate::platformIntegration()->createImagePaintEngine(paintDevice);
++        d->paintEngine = paintEngine ? paintEngine : new QRasterPaintEngine(paintDevice);
+     }
+ 
+     return d->paintEngine;
+diff --git a/src/gui/kernel/qplatformintegration_qpa.cpp b/src/gui/kernel/qplatformintegration_qpa.cpp
+index 7a3fe05..fd3714d 100644
+--- a/src/gui/kernel/qplatformintegration_qpa.cpp
++++ b/src/gui/kernel/qplatformintegration_qpa.cpp
+@@ -241,6 +241,15 @@ QPlatformSharedGraphicsCache *QPlatformIntegration::createPlatformSharedGraphics
+ }
+ 
+ /*!
++   Factory function for QPaintEngine. This function will return 0 if the platform
++   integration does not support creating any paint engine the given \a paintDevice.
++*/
++QPaintEngine *QPlatformIntegration::createImagePaintEngine(QPaintDevice *paintDevice) const
++{
++    return 0;
++}
++
++/*!
+   Returns the platforms input context.
+ 
+   The default implementation returns 0, implying no input method support.
+diff --git a/src/gui/kernel/qplatformintegration_qpa.h b/src/gui/kernel/qplatformintegration_qpa.h
+index 483964b..a05c0f6 100644
+--- a/src/gui/kernel/qplatformintegration_qpa.h
++++ b/src/gui/kernel/qplatformintegration_qpa.h
+@@ -91,6 +91,7 @@ public:
+     virtual QPlatformOpenGLContext *createPlatformOpenGLContext(QOpenGLContext *context) const;
+ #endif
+     virtual QPlatformSharedGraphicsCache *createPlatformSharedGraphicsCache(const char *cacheId) const;
++    virtual QPaintEngine *createImagePaintEngine(QPaintDevice *paintDevice) const;
+ 
+ // Event dispatcher:
+     virtual QAbstractEventDispatcher *guiThreadEventDispatcher() const = 0;
+diff --git a/src/gui/opengl/qopenglpaintengine.cpp b/src/gui/opengl/qopenglpaintengine.cpp
+index eb32ac1..73be87b 100644
+--- a/src/gui/opengl/qopenglpaintengine.cpp
++++ b/src/gui/opengl/qopenglpaintengine.cpp
+@@ -1405,8 +1405,7 @@ void QOpenGL2PaintEngineEx::drawStaticTextItem(QStaticTextItem *textItem)
+ 
+     // don't try to cache huge fonts or vastly transformed fonts
+     QFontEngine *fontEngine = textItem->fontEngine();
+-    const qreal pixelSize = fontEngine->fontDef.pixelSize;
+-    if (shouldDrawCachedGlyphs(pixelSize, s->matrix) || det < 0.25f || det > 4.f) {
++    if (shouldDrawCachedGlyphs(fontEngine, s->matrix) || det < 0.25f || det > 4.f) {
+         QFontEngineGlyphCache::Type glyphType = fontEngine->glyphFormat >= 0
+                                                 ? QFontEngineGlyphCache::Type(textItem->fontEngine()->glyphFormat)
+                                                 : d->glyphCacheType;
+@@ -1460,8 +1459,7 @@ void QOpenGL2PaintEngineEx::drawTextItem(const QPointF &p, const QTextItem &text
+     bool drawCached = txtype < QTransform::TxProject;
+ 
+     // don't try to cache huge fonts or vastly transformed fonts
+-    const qreal pixelSize = ti.fontEngine->fontDef.pixelSize;
+-    if (shouldDrawCachedGlyphs(pixelSize, s->matrix) || det < 0.25f || det > 4.f)
++    if (shouldDrawCachedGlyphs(ti.fontEngine, s->matrix) || det < 0.25f || det > 4.f)
+         drawCached = false;
+ 
+     QFontEngineGlyphCache::Type glyphType = ti.fontEngine->glyphFormat >= 0
+diff --git a/src/gui/opengl/qopenglpaintengine_p.h b/src/gui/opengl/qopenglpaintengine_p.h
+index 0a6ef2a..1b3dfba 100644
+--- a/src/gui/opengl/qopenglpaintengine_p.h
++++ b/src/gui/opengl/qopenglpaintengine_p.h
+@@ -157,7 +157,7 @@ public:
+     void setRenderTextActive(bool);
+ 
+     bool isNativePaintingActive() const;
+-    bool supportsTransformations(qreal, const QTransform &) const { return true; }
++    bool supportsTransformations(QFontEngine *, const QTransform &) const { return true; }
+ 
+ private:
+     Q_DISABLE_COPY(QOpenGL2PaintEngineEx)
+diff --git a/src/gui/painting/qpaintengine_raster.cpp b/src/gui/painting/qpaintengine_raster.cpp
+index f2aac44..b5e8bca 100644
+--- a/src/gui/painting/qpaintengine_raster.cpp
++++ b/src/gui/painting/qpaintengine_raster.cpp
+@@ -2467,6 +2467,15 @@ static inline bool monoVal(const uchar* s, int x)
+ 
+ /*!
+     \internal
++ */
++QRasterBuffer *QRasterPaintEngine::rasterBuffer()
++{
++    Q_D(QRasterPaintEngine);
++    return d->rasterBuffer.data();
++}
++
++/*!
++    \internal
+ */
+ void QRasterPaintEngine::alphaPenBlt(const void* src, int bpl, int depth, int rx,int ry,int w,int h)
+ {
+@@ -2923,7 +2932,7 @@ void QRasterPaintEngine::drawStaticTextItem(QStaticTextItem *textItem)
+     ensureRasterState();
+ 
+     QFontEngine *fontEngine = textItem->fontEngine();
+-    if (shouldDrawCachedGlyphs(fontEngine->fontDef.pixelSize, state()->matrix)) {
++    if (shouldDrawCachedGlyphs(fontEngine, state()->matrix)) {
+         drawCachedGlyphs(textItem->numGlyphs, textItem->glyphs, textItem->glyphPositions,
+                          fontEngine);
+     } else if (state()->matrix.type() < QTransform::TxProject) {
+@@ -3207,18 +3216,18 @@ void QRasterPaintEngine::releaseDC(HDC) const
+ 
+ #endif
+ 
+-bool QRasterPaintEngine::supportsTransformations(const QFontEngine *fontEngine) const
++bool QRasterPaintEngine::supportsTransformations(QFontEngine *fontEngine) const
+ {
+     const QTransform &m = state()->matrix;
+-    return supportsTransformations(fontEngine->fontDef.pixelSize, m);
++    return supportsTransformations(fontEngine, m);
+ }
+ 
+-bool QRasterPaintEngine::supportsTransformations(qreal pixelSize, const QTransform &m) const
++bool QRasterPaintEngine::supportsTransformations(QFontEngine *fontEngine, const QTransform &m) const
+ {
+     if (m.type() >= QTransform::TxProject)
+         return true;
+ 
+-    return !shouldDrawCachedGlyphs(pixelSize, m);
++    return !shouldDrawCachedGlyphs(fontEngine, m);
+ }
+ 
+ /*!
+diff --git a/src/gui/painting/qpaintengine_raster_p.h b/src/gui/painting/qpaintengine_raster_p.h
+index 7b35318..79ed03e 100644
+--- a/src/gui/painting/qpaintengine_raster_p.h
++++ b/src/gui/painting/qpaintengine_raster_p.h
+@@ -194,8 +194,11 @@ public:
+     void clip(const QVectorPath &path, Qt::ClipOperation op);
+     void clip(const QRect &rect, Qt::ClipOperation op);
+     void clip(const QRegion &region, Qt::ClipOperation op);
++    inline const QClipData *clip() const;
+ 
+     void drawStaticTextItem(QStaticTextItem *textItem);
++    virtual bool drawCachedGlyphs(int numGlyphs, const glyph_t *glyphs, const QFixedPoint *positions,
++                                  QFontEngine *fontEngine);
+ 
+     enum ClipType {
+         RectClip,
+@@ -227,14 +230,15 @@ public:
+     static bool clearTypeFontsEnabled();
+ #endif
+ 
++    QRasterBuffer *rasterBuffer();
+     void alphaPenBlt(const void* src, int bpl, int depth, int rx,int ry,int w,int h);
+ 
+     Type type() const { return Raster; }
+ 
+     QPoint coordinateOffset() const;
+ 
+-    bool supportsTransformations(const QFontEngine *fontEngine) const;
+-    bool supportsTransformations(qreal pixelSize, const QTransform &m) const;
++    bool supportsTransformations(QFontEngine *fontEngine) const;
++    bool supportsTransformations(QFontEngine *fontEngine, const QTransform &m) const;
+ 
+ protected:
+     QRasterPaintEngine(QRasterPaintEnginePrivate &d, QPaintDevice *);
+@@ -247,10 +251,6 @@ private:
+     void fillRect(const QRectF &rect, QSpanData *data);
+     void drawBitmap(const QPointF &pos, const QImage &image, QSpanData *fill);
+ 
+-    bool drawCachedGlyphs(int numGlyphs, const glyph_t *glyphs, const QFixedPoint *positions,
+-                          QFontEngine *fontEngine);
+-
+-
+     bool setClipRectInDeviceCoords(const QRect &r, Qt::ClipOperation op);
+ 
+     inline void ensureBrush(const QBrush &brush) {
+@@ -492,6 +492,12 @@ inline const QClipData *QRasterPaintEnginePrivate::clip() const {
+     return baseClip.data();
+ }
+ 
++inline const QClipData *QRasterPaintEngine::clip() const {
++    Q_D(const QRasterPaintEngine);
++    if (state() && state()->clip && state()->clip->enabled)
++        return state()->clip;
++    return d->baseClip.data();
++}
+ 
+ QT_END_NAMESPACE
+ #endif // QPAINTENGINE_RASTER_P_H
+diff --git a/src/gui/painting/qpaintengineex.cpp b/src/gui/painting/qpaintengineex.cpp
+index 93f36ba..36414f4 100644
+--- a/src/gui/painting/qpaintengineex.cpp
++++ b/src/gui/painting/qpaintengineex.cpp
+@@ -1081,9 +1081,9 @@ void QPaintEngineEx::drawStaticTextItem(QStaticTextItem *staticTextItem)
+     }
+ }
+ 
+-bool QPaintEngineEx::supportsTransformations(qreal pixelSize, const QTransform &m) const
++bool QPaintEngineEx::supportsTransformations(QFontEngine *fontEngine, const QTransform &m) const
+ {
+-    Q_UNUSED(pixelSize);
++    Q_UNUSED(fontEngine);
+ 
+     if (!m.isAffine())
+         return true;
+@@ -1091,8 +1091,9 @@ bool QPaintEngineEx::supportsTransformations(qreal pixelSize, const QTransform &
+     return false;
+ }
+ 
+-bool QPaintEngineEx::shouldDrawCachedGlyphs(qreal pixelSize, const QTransform &m) const
++bool QPaintEngineEx::shouldDrawCachedGlyphs(QFontEngine *fontEngine, const QTransform &m) const
+ {
++    qreal pixelSize = fontEngine->fontDef.pixelSize;
+     return (pixelSize * pixelSize * qAbs(m.determinant())) <
+             QT_MAX_CACHED_GLYPH_SIZE * QT_MAX_CACHED_GLYPH_SIZE;
+ }
+diff --git a/src/gui/painting/qpaintengineex_p.h b/src/gui/painting/qpaintengineex_p.h
+index 62c5d97..bc944b2 100644
+--- a/src/gui/painting/qpaintengineex_p.h
++++ b/src/gui/painting/qpaintengineex_p.h
+@@ -226,8 +226,8 @@ public:
+         IsEmulationEngine = 0x02    // If set, this object is a QEmulationEngine.
+     };
+     virtual uint flags() const {return 0;}
+-    virtual bool supportsTransformations(qreal pixelSize, const QTransform &m) const;
+-    virtual bool shouldDrawCachedGlyphs(qreal pixelSize, const QTransform &m) const;
++    virtual bool supportsTransformations(QFontEngine *fontEngine, const QTransform &m) const;
++    virtual bool shouldDrawCachedGlyphs(QFontEngine *fontEngine, const QTransform &m) const;
+ 
+ protected:
+     QPaintEngineEx(QPaintEngineExPrivate &data);
+diff --git a/src/gui/painting/qpainter.cpp b/src/gui/painting/qpainter.cpp
+index 0f5468d..973dabc 100644
+--- a/src/gui/painting/qpainter.cpp
++++ b/src/gui/painting/qpainter.cpp
+@@ -5551,14 +5551,9 @@ void QPainter::drawGlyphRun(const QPointF &position, const QGlyphRun &glyphRun)
+     QVarLengthArray<QFixedPoint, 128> fixedPointPositions(count);
+ 
+     QRawFontPrivate *fontD = QRawFontPrivate::get(font);
+-    bool supportsTransformations;
+-    if (d->extended != 0) {
+-        supportsTransformations = d->extended->supportsTransformations(fontD->fontEngine->fontDef.pixelSize,
+-                                                                       d->state->matrix);
+-    } else {
+-        supportsTransformations = d->engine->type() == QPaintEngine::CoreGraphics
+-                                  || d->state->matrix.isAffine();
+-    }
++    bool supportsTransformations = d->extended
++        ? d->extended->supportsTransformations(fontD->fontEngine, d->state->matrix)
++        : d->engine->type() == QPaintEngine::CoreGraphics || d->state->matrix.isAffine();
+ 
+     for (int i=0; i<count; ++i) {
+         QPointF processedPosition = position + glyphPositions[i];
+@@ -5739,7 +5734,7 @@ void QPainter::drawStaticText(const QPointF &topLeftPosition, const QStaticText
+         return;
+     }
+ 
+-    bool supportsTransformations = d->extended->supportsTransformations(staticText_d->font.pixelSize(),
++    bool supportsTransformations = d->extended->supportsTransformations(staticText_d->font.d->engineForScript(QUnicodeTables::Common),
+                                                                         d->state->matrix);
+     if (supportsTransformations && !staticText_d->untransformedCoordinates) {
+         staticText_d->untransformedCoordinates = true;
+diff --git a/src/gui/text/qdistancefield.cpp b/src/gui/text/qdistancefield.cpp
+index fb06a26..a1deb47 100644
+--- a/src/gui/text/qdistancefield.cpp
++++ b/src/gui/text/qdistancefield.cpp
+@@ -692,17 +692,8 @@ static QImage makeDistanceField(int imgSize, const QPainterPath &path, int dfSca
+     return image;
+ }
+ 
+-bool qt_fontHasNarrowOutlines(const QRawFont &f)
++static bool imageHasNarrowOutlines(const QImage &im)
+ {
+-    QRawFont font = f;
+-    font.setPixelSize(QT_DISTANCEFIELD_DEFAULT_BASEFONTSIZE);
+-    Q_ASSERT(font.isValid());
+-
+-    QVector<quint32> glyphIndices = font.glyphIndexesForString(QLatin1String("O"));
+-    if (glyphIndices.size() < 1)
+-        return false;
+-
+-    QImage im = font.alphaMapForGlyph(glyphIndices.at(0), QRawFont::PixelAntialiasing);
+     if (im.isNull())
+         return false;
+ 
+@@ -742,6 +733,56 @@ bool qt_fontHasNarrowOutlines(const QRawFont &f)
+     return minHThick == 1 || minVThick == 1;
+ }
+ 
++bool qt_fontHasNarrowOutlines(QFontEngine *fontEngine)
++{
++    QFontEngine *fe = fontEngine->cloneWithSize(QT_DISTANCEFIELD_DEFAULT_BASEFONTSIZE);
++
++    QGlyphLayout glyphs;
++    glyph_t glyph;
++    glyphs.glyphs = &glyph;
++    int numGlyphs;
++    QChar *chars = QString(QLatin1String("O")).data();
++    fe->stringToCMap(chars, 1, &glyphs, &numGlyphs, QTextEngine::GlyphIndicesOnly);
++    QImage im = fe->alphaMapForGlyph(glyph, QFixed(), QTransform());
++    delete fe;
++
++    return imageHasNarrowOutlines(im);
++}
++
++bool qt_fontHasNarrowOutlines(const QRawFont &f)
++{
++    QRawFont font = f;
++    font.setPixelSize(QT_DISTANCEFIELD_DEFAULT_BASEFONTSIZE);
++    Q_ASSERT(font.isValid());
++
++    QVector<quint32> glyphIndices = font.glyphIndexesForString(QLatin1String("O"));
++    if (glyphIndices.size() < 1)
++        return false;
++
++    return imageHasNarrowOutlines(font.alphaMapForGlyph(glyphIndices.at(0),
++                                                        QRawFont::PixelAntialiasing));
++}
++
++static QImage renderDistanceFieldPath(const QPainterPath &path, bool doubleResolution)
++{
++    QImage im = makeDistanceField(QT_DISTANCEFIELD_TILESIZE(doubleResolution),
++                                  path,
++                                  QT_DISTANCEFIELD_SCALE(doubleResolution),
++                                  QT_DISTANCEFIELD_RADIUS(doubleResolution) / QT_DISTANCEFIELD_SCALE(doubleResolution));
++    return im;
++}
++
++QImage qt_renderDistanceFieldGlyph(QFontEngine *fe, glyph_t glyph, bool doubleResolution)
++{
++    QFixedPoint position;
++    QPainterPath path;
++    fe->addGlyphsToPath(&glyph, &position, 1, &path, 0);
++    path.translate(-path.boundingRect().topLeft());
++    path.setFillRule(Qt::WindingFill);
++
++    return renderDistanceFieldPath(path, doubleResolution);
++}
++
+ QImage qt_renderDistanceFieldGlyph(const QRawFont &font, glyph_t glyph, bool doubleResolution)
+ {
+     QRawFont renderFont = font;
+@@ -751,11 +792,7 @@ QImage qt_renderDistanceFieldGlyph(const QRawFont &font, glyph_t glyph, bool dou
+     path.translate(-path.boundingRect().topLeft());
+     path.setFillRule(Qt::WindingFill);
+ 
+-    QImage im = makeDistanceField(QT_DISTANCEFIELD_TILESIZE(doubleResolution),
+-                                  path,
+-                                  QT_DISTANCEFIELD_SCALE(doubleResolution),
+-                                  QT_DISTANCEFIELD_RADIUS(doubleResolution) / QT_DISTANCEFIELD_SCALE(doubleResolution));
+-    return im;
++    return renderDistanceFieldPath(path, doubleResolution);
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/text/qdistancefield_p.h b/src/gui/text/qdistancefield_p.h
+index 486d291..bf87e7d 100644
+--- a/src/gui/text/qdistancefield_p.h
++++ b/src/gui/text/qdistancefield_p.h
+@@ -79,6 +79,8 @@ QT_BEGIN_NAMESPACE
+ 
+ bool Q_GUI_EXPORT qt_fontHasNarrowOutlines(const QRawFont &f);
+ QImage Q_GUI_EXPORT qt_renderDistanceFieldGlyph(const QRawFont &font, glyph_t glyph, bool doubleResolution);
++bool Q_GUI_EXPORT qt_fontHasNarrowOutlines(QFontEngine *fontEngine);
++QImage Q_GUI_EXPORT qt_renderDistanceFieldGlyph(QFontEngine *fontEngine, glyph_t glyph, bool doubleResolution);
+ 
+ QT_END_NAMESPACE
+ 
+diff --git a/src/gui/text/qfontengine.cpp b/src/gui/text/qfontengine.cpp
+index 53c5f9f..364a356 100644
+--- a/src/gui/text/qfontengine.cpp
++++ b/src/gui/text/qfontengine.cpp
+@@ -775,7 +775,7 @@ QByteArray QFontEngine::getSfntTable(uint tag) const
+     return table;
+ }
+ 
+-void QFontEngine::setGlyphCache(void *key, QFontEngineGlyphCache *data)
++void QFontEngine::setGlyphCache(const void *key, QFontEngineGlyphCache *data)
+ {
+     Q_ASSERT(data);
+ 
+@@ -794,7 +794,7 @@ void QFontEngine::setGlyphCache(void *key, QFontEngineGlyphCache *data)
+ 
+ }
+ 
+-QFontEngineGlyphCache *QFontEngine::glyphCache(void *key, QFontEngineGlyphCache::Type type, const QTransform &transform) const
++QFontEngineGlyphCache *QFontEngine::glyphCache(const void *key, QFontEngineGlyphCache::Type type, const QTransform &transform) const
+ {
+     for (QLinkedList<GlyphCacheEntry>::const_iterator it = m_glyphCaches.constBegin(), end = m_glyphCaches.constEnd(); it != end; ++it) {
+         QFontEngineGlyphCache *c = it->cache.data();
+diff --git a/src/gui/text/qfontengine_p.h b/src/gui/text/qfontengine_p.h
+index b443642..1114cdf 100644
+--- a/src/gui/text/qfontengine_p.h
++++ b/src/gui/text/qfontengine_p.h
+@@ -239,8 +239,8 @@ public:
+ 
+     virtual HB_Error getPointInOutline(HB_Glyph glyph, int flags, hb_uint32 point, HB_Fixed *xpos, HB_Fixed *ypos, hb_uint32 *nPoints);
+ 
+-    void setGlyphCache(void *key, QFontEngineGlyphCache *data);
+-    QFontEngineGlyphCache *glyphCache(void *key, QFontEngineGlyphCache::Type type, const QTransform &transform) const;
++    void setGlyphCache(const void *key, QFontEngineGlyphCache *data);
++    QFontEngineGlyphCache *glyphCache(const void *key, QFontEngineGlyphCache::Type type, const QTransform &transform) const;
+ 
+     static const uchar *getCMap(const uchar *table, uint tableSize, bool *isSymbolFont, int *cmapSize);
+     static quint32 getTrueTypeGlyphIndex(const uchar *cmap, uint unicode);
+@@ -284,7 +284,7 @@ protected:
+ 
+ private:
+     struct GlyphCacheEntry {
+-        void *context;
++        const void *context;
+         QExplicitlySharedDataPointer<QFontEngineGlyphCache> cache;
+         bool operator==(const GlyphCacheEntry &other) const { return context == other.context && cache == other.cache; }
+     };
+diff --git a/src/opengl/gl2paintengineex/qpaintengineex_opengl2.cpp b/src/opengl/gl2paintengineex/qpaintengineex_opengl2.cpp
+index 29dab0e..ca32adc 100644
+--- a/src/opengl/gl2paintengineex/qpaintengineex_opengl2.cpp
++++ b/src/opengl/gl2paintengineex/qpaintengineex_opengl2.cpp
+@@ -1432,8 +1432,7 @@ void QGL2PaintEngineEx::drawStaticTextItem(QStaticTextItem *textItem)
+ 
+     // don't try to cache huge fonts or vastly transformed fonts
+     QFontEngine *fontEngine = textItem->fontEngine();
+-    const qreal pixelSize = fontEngine->fontDef.pixelSize;
+-    if (shouldDrawCachedGlyphs(pixelSize, s->matrix) || det < 0.25f || det > 4.f) {
++    if (shouldDrawCachedGlyphs(fontEngine, s->matrix) || det < 0.25f || det > 4.f) {
+         QFontEngineGlyphCache::Type glyphType = fontEngine->glyphFormat >= 0
+                                                 ? QFontEngineGlyphCache::Type(textItem->fontEngine()->glyphFormat)
+                                                 : d->glyphCacheType;
+@@ -1491,8 +1490,7 @@ void QGL2PaintEngineEx::drawTextItem(const QPointF &p, const QTextItem &textItem
+     bool drawCached = txtype < QTransform::TxProject;
+ 
+     // don't try to cache huge fonts or vastly transformed fonts
+-    const qreal pixelSize = ti.fontEngine->fontDef.pixelSize;
+-    if (shouldDrawCachedGlyphs(pixelSize, s->matrix) || det < 0.25f || det > 4.f)
++    if (shouldDrawCachedGlyphs(ti.fontEngine, s->matrix) || det < 0.25f || det > 4.f)
+         drawCached = false;
+ 
+     QFontEngineGlyphCache::Type glyphType = ti.fontEngine->glyphFormat >= 0
+diff --git a/src/opengl/gl2paintengineex/qpaintengineex_opengl2_p.h b/src/opengl/gl2paintengineex/qpaintengineex_opengl2_p.h
+index c5d3417..8eeee33 100644
+--- a/src/opengl/gl2paintengineex/qpaintengineex_opengl2_p.h
++++ b/src/opengl/gl2paintengineex/qpaintengineex_opengl2_p.h
+@@ -155,7 +155,7 @@ public:
+     void setRenderTextActive(bool);
+ 
+     bool isNativePaintingActive() const;
+-    bool supportsTransformations(qreal, const QTransform &) const { return true; }
++    bool supportsTransformations(QFontEngine *, const QTransform &) const { return true; }
+ private:
+     Q_DISABLE_COPY(QGL2PaintEngineEx)
+ };

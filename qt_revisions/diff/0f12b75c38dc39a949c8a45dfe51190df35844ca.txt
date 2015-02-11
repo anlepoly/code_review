@@ -1,0 +1,1821 @@
+diff --git a/scripts/generic/t/40-testplanner.t b/scripts/generic/t/40-testplanner.t
+new file mode 100644
+index 0000000..070226a
+--- /dev/null
++++ b/scripts/generic/t/40-testplanner.t
+@@ -0,0 +1,110 @@
++#!/usr/bin/env perl
++use 5.010;
++use strict;
++use warnings;
++
++=head1 NAME
++
++40-testplanner.t - basic test for testplanner.pl
++
++=cut
++
++use English qw(-no_match_vars);
++use File::Spec::Functions;
++use File::Temp;
++use File::chdir;
++use FindBin;
++use Readonly;
++use ReleaseAction qw(on_release);
++use Test::More;
++use Text::Diff;
++
++use lib "$FindBin::Bin/../../lib/perl5";
++use QtQA::Test::More qw(find_qmake);
++
++Readonly my $TESTPLANNER => catfile( $FindBin::Bin, qw(.. testplanner.pl) );
++
++Readonly my $TESTDATA_DIR => catfile( $FindBin::Bin, qw(data test-projects) );
++
++Readonly my $QMAKE => find_qmake( );
++
++sub test_testplanner_on_testdata
++{
++    my $testplan = File::Temp->new(
++        TEMPLATE => 'qtqa-testplan-XXXXXX',
++        TMPDIR => 1,
++    );
++    $testplan = "$testplan";
++    my $cleanup = on_release { unlink $testplan };
++
++    # Put some garbage in environment variables relating to "make check", to ensure
++    # that this does _not_ affect the behavior
++    local $ENV{ TESTRUNNER } = 'some testrunner';
++    local $ENV{ TESTARGS } = 'some testargs';
++
++    my @cmd = (
++        $EXECUTABLE_NAME,
++        $TESTPLANNER,
++        '--input',
++        $TESTDATA_DIR,
++        '--output',
++        "$testplan",
++    );
++
++    my $status = system( @cmd );
++    is( $status, 0, 'testplanner exit code OK' );
++
++    # Note we must open a new fh to the testplan file, since the testplanner
++    # script overwrote it.
++    my @lines;
++    my $fh = IO::File->new( "$testplan", '<' ) || die "open $testplan for read: $!";
++
++    # We need to replace the testdata dir with a %TESTDATA_DIR% macro, to avoid having
++    # untestable full paths in the testdata.
++    # We allow both unix style and platform native style paths.
++    my $canon_testdata_dir = canonpath $TESTDATA_DIR;
++    # Paths will be quoted with qq in the testplan, so \ becomes \\
++    $canon_testdata_dir =~ s{\\}{\\\\}g;
++    while (my $line = <$fh>) {
++        $line =~ s{\Q$TESTDATA_DIR\E}{%TESTDATA_DIR%}g;
++        $line =~ s{\Q$canon_testdata_dir\E}{%TESTDATA_DIR%}g;
++        push @lines, $line;
++    }
++
++    # The order of output from testplanner is undefined.
++    # We sort the lines for a stable comparison.
++    @lines = sort @lines;
++
++    my $expected = "$TESTDATA_DIR/expected_testplan";
++    if ($OSNAME =~ m{win32}i) {
++        $expected .= '_win32';
++    }
++    $expected .= '.txt';
++
++    my $diff = diff( \@lines, $expected );
++    ok( !$diff, 'testplanner output as expected' )
++        || diag( "diff between actual and expected:\n$diff" );
++
++    return;
++}
++
++sub run
++{
++    # qmake the testdata before doing anything else.
++    ok( $QMAKE, 'found some qmake' );
++
++    {
++        local $CWD = $TESTDATA_DIR;
++        my $status = system( $QMAKE );
++        is( $status, 0, 'qmake ran OK' );
++    }
++
++    test_testplanner_on_testdata;
++    done_testing;
++
++    return;
++}
++
++run if (!caller);
++1;
++
+diff --git a/scripts/generic/t/50-testscheduler.t b/scripts/generic/t/50-testscheduler.t
+new file mode 100644
+index 0000000..49eff7b
+--- /dev/null
++++ b/scripts/generic/t/50-testscheduler.t
+@@ -0,0 +1,220 @@
++#!/usr/bin/env perl
++use 5.010;
++use strict;
++use warnings;
++
++=head1 NAME
++
++50-testplanner.t - basic test for testscheduler.pl
++
++=cut
++
++use English qw(-no_match_vars);
++use File::Spec::Functions;
++use File::Temp;
++use File::chdir;
++use FindBin;
++use Readonly;
++use ReleaseAction qw(on_release);
++use Test::More;
++use Text::Diff;
++use Capture::Tiny qw(capture_merged);
++
++use lib "$FindBin::Bin/../../lib/perl5";
++use QtQA::Test::More qw(find_qmake);
++
++Readonly my $TESTPLANNER => catfile( $FindBin::Bin, qw(.. testplanner.pl) );
++
++Readonly my $TESTSCHEDULER => catfile( $FindBin::Bin, qw(.. testscheduler.pl) );
++
++Readonly my $TESTDATA_DIR => catfile( $FindBin::Bin, qw(data test-projects) );
++
++Readonly my $QMAKE => find_qmake( );
++
++# Given a $directory, returns a filename pointing to a created testplan,
++# and a handle for unlinking that filename.
++# Any additional @args are passed to testplanner.
++sub make_testplan_from_directory
++{
++    my ($directory, @args) = @_;
++
++    my $testplan = File::Temp->new(
++        TEMPLATE => 'qtqa-testplan-XXXXXX',
++        TMPDIR => 1,
++    );
++    $testplan = "$testplan";
++
++    my @cmd = (
++        $EXECUTABLE_NAME,
++        $TESTPLANNER,
++        '--input',
++        $directory,
++        '--output',
++        "$testplan",
++        @args,
++    );
++
++    my $status = system( @cmd );
++    is( $status, 0, 'testplanner exit code OK' );
++
++    my $on_release = on_release { unlink $testplan };
++
++    return ($testplan, $on_release);
++}
++
++sub test_mixed
++{
++    my ($testplan, $unlink) = make_testplan_from_directory $TESTDATA_DIR;
++
++    my $status;
++    my $output = capture_merged {
++        $status = system(
++            $EXECUTABLE_NAME,
++            $TESTSCHEDULER,
++            '--plan',
++            "$testplan",
++            '-j4',
++            '--sync-output',
++        );
++    };
++    isnt( $status, 0, 'testscheduler fails if some tests fail' );
++    is( $output, <<'EOF', 'testscheduler output looks OK' );
++failing. 1 arg(s)
++QtQA::App::TestScheduler: failing_significant_test failed
++passing. 1 arg(s)
++QtQA::App::TestScheduler: ran 2 parallel tests.  Starting 4 serial tests.
++Custom failing
++QtQA::App::TestScheduler: failing_custom_check_target failed
++failing. 1 arg(s)
++QtQA::App::TestScheduler: failing_insignificant_test failed, but it is marked with insignificant_test
++Custom passing
++passing. 1 arg(s)
++Totals: 6 tests, 3 passes, 2 fails, 1 insignificant fail
++EOF
++
++    return;
++}
++
++# Test what happens with a directory containing no tests
++sub test_none
++{
++    my ($testplan, $unlink) = make_testplan_from_directory "$TESTDATA_DIR/not_tests";
++
++    my $status;
++    my $output = capture_merged {
++        $status = system(
++            $EXECUTABLE_NAME,
++            $TESTSCHEDULER,
++            '--plan',
++            "$testplan",
++        );
++    };
++    is( $status, 0, 'testscheduler with no tests is a pass' );
++    is( $output, <<'EOF', 'testscheduler output as expected' );
++Totals: no tests, no passes
++EOF
++
++    return;
++}
++
++sub test_single_fail
++{
++    my ($testplan, $unlink) = make_testplan_from_directory "$TESTDATA_DIR/tests/failing_significant_test";
++
++    my $status;
++    my $output = capture_merged {
++        $status = system(
++            $EXECUTABLE_NAME,
++            $TESTSCHEDULER,
++            '--plan',
++            "$testplan",
++            '--',   # test trailing -- is harmless
++        );
++    };
++    isnt( $status, 0, 'testscheduler with single fail is a fail' );
++    is( $output, <<'EOF', 'testscheduler output as expected' );
++failing. 1 arg(s)
++QtQA::App::TestScheduler: failing_significant_test failed
++Totals: 1 test, no passes, 1 fail
++EOF
++
++    return;
++}
++
++sub test_single_insignificant_fail
++{
++    # Testing with some additional args
++    my ($testplan, $unlink) = make_testplan_from_directory(
++        "$TESTDATA_DIR/tests/failing_insignificant_test",
++        '--',
++        'arg1',
++        'arg2',
++    );
++
++    my $status;
++    my $output = capture_merged {
++        $status = system(
++            $EXECUTABLE_NAME,
++            $TESTSCHEDULER,
++            '--plan',
++            "$testplan",
++        );
++    };
++    is( $status, 0, 'testscheduler with single insignificant fail is a pass' );
++    is( $output, <<'EOF', 'testscheduler output as expected' );
++failing. 3 arg(s)
++QtQA::App::TestScheduler: failing_insignificant_test failed, but it is marked with insignificant_test
++Totals: 1 test, no passes, 1 insignificant fail
++EOF
++
++    return;
++}
++
++sub test_single_pass
++{
++    my ($testplan, $unlink) = make_testplan_from_directory "$TESTDATA_DIR/tests/passing_significant_test";
++
++    my $status;
++    my $output = capture_merged {
++        $status = system(
++            $EXECUTABLE_NAME,
++            $TESTSCHEDULER,
++            '--plan',
++            "$testplan",
++        );
++    };
++    is( $status, 0, 'testscheduler with single pass is a pass' );
++    is( $output, <<'EOF', 'testscheduler output as expected' );
++passing. 1 arg(s)
++Totals: 1 test, 1 pass
++EOF
++
++    return;
++}
++
++sub run
++{
++    # qmake the testdata before doing anything else.
++    ok( $QMAKE, 'found some qmake' );
++
++    {
++        local $CWD = $TESTDATA_DIR;
++        # we use qmake -r so we can access the makefiles at any level,
++        # and we disable debug and release for predictable results
++        my $status = system( $QMAKE, '-r' );
++        is( $status, 0, 'qmake ran OK' );
++    }
++
++    test_none;
++    test_single_fail;
++    test_single_insignificant_fail;
++    test_single_pass;
++    test_mixed;
++    done_testing;
++
++    return;
++}
++
++run if (!caller);
++1;
++
+diff --git a/scripts/generic/t/data/test-projects/expected_testplan.txt b/scripts/generic/t/data/test-projects/expected_testplan.txt
+new file mode 100644
+index 0000000..bc31fb2
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/expected_testplan.txt
+@@ -0,0 +1,6 @@
++{"TARGET" => "failing_custom_check_target","args" => ["perl","-E","say q{Custom failing}; exit 2"],"cwd" => "%TESTDATA_DIR%/tests/failing_custom_check_target","insignificant_test" => 0,"parallel_test" => 0}
++{"TARGET" => "failing_insignificant_test","args" => ["./failing_insignificant_test"],"cwd" => "%TESTDATA_DIR%/tests/failing_insignificant_test","insignificant_test" => 1,"parallel_test" => 0}
++{"TARGET" => "failing_significant_test","args" => ["./failing_significant_test"],"cwd" => "%TESTDATA_DIR%/tests/failing_significant_test","insignificant_test" => 0,"parallel_test" => 1}
++{"TARGET" => "passing_custom_check_target","args" => ["perl","-E","say q{Custom passing}; exit 0"],"cwd" => "%TESTDATA_DIR%/tests/passing_custom_check_target","insignificant_test" => 0,"parallel_test" => 0}
++{"TARGET" => "passing_insignificant_test","args" => ["./passing_insignificant_test"],"cwd" => "%TESTDATA_DIR%/tests/passing_insignificant_test","insignificant_test" => 1,"parallel_test" => 1}
++{"TARGET" => "passing_significant_test","args" => ["./passing_significant_test"],"cwd" => "%TESTDATA_DIR%/tests/passing_significant_test","insignificant_test" => 0,"parallel_test" => 0}
+diff --git a/scripts/generic/t/data/test-projects/expected_testplan_win32.txt b/scripts/generic/t/data/test-projects/expected_testplan_win32.txt
+new file mode 100644
+index 0000000..94320e6
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/expected_testplan_win32.txt
+@@ -0,0 +1,6 @@
++{"TARGET" => "failing_custom_check_target","args" => ["perl","-E","say q{Custom failing}; exit 2"],"cwd" => "%TESTDATA_DIR%\\tests\\failing_custom_check_target","insignificant_test" => 0,"parallel_test" => 0}
++{"TARGET" => "failing_insignificant_test","args" => ["release\\failing_insignificant_test.exe"],"cwd" => "%TESTDATA_DIR%\\tests\\failing_insignificant_test","insignificant_test" => 1,"parallel_test" => 0}
++{"TARGET" => "failing_significant_test","args" => ["release\\failing_significant_test.exe"],"cwd" => "%TESTDATA_DIR%\\tests\\failing_significant_test","insignificant_test" => 0,"parallel_test" => 1}
++{"TARGET" => "passing_custom_check_target","args" => ["perl","-E","say q{Custom passing}; exit 0"],"cwd" => "%TESTDATA_DIR%\\tests\\passing_custom_check_target","insignificant_test" => 0,"parallel_test" => 0}
++{"TARGET" => "passing_insignificant_test","args" => ["release\\passing_insignificant_test.exe"],"cwd" => "%TESTDATA_DIR%\\tests\\passing_insignificant_test","insignificant_test" => 1,"parallel_test" => 1}
++{"TARGET" => "passing_significant_test","args" => ["release\\passing_significant_test.exe"],"cwd" => "%TESTDATA_DIR%\\tests\\passing_significant_test","insignificant_test" => 0,"parallel_test" => 0}
+diff --git a/scripts/generic/t/data/test-projects/not_tests/app1/app1.pro b/scripts/generic/t/data/test-projects/not_tests/app1/app1.pro
+new file mode 100644
+index 0000000..c623a1a
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/not_tests/app1/app1.pro
+@@ -0,0 +1,4 @@
++TEMPLATE=app
++CONFIG-=qt
++win32:CONFIG+=console
++SOURCES=../../src/pass.cpp
+diff --git a/scripts/generic/t/data/test-projects/not_tests/app2/app2.pro b/scripts/generic/t/data/test-projects/not_tests/app2/app2.pro
+new file mode 100644
+index 0000000..c623a1a
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/not_tests/app2/app2.pro
+@@ -0,0 +1,4 @@
++TEMPLATE=app
++CONFIG-=qt
++win32:CONFIG+=console
++SOURCES=../../src/pass.cpp
+diff --git a/scripts/generic/t/data/test-projects/not_tests/not_tests.pro b/scripts/generic/t/data/test-projects/not_tests/not_tests.pro
+new file mode 100644
+index 0000000..ac029fb
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/not_tests/not_tests.pro
+@@ -0,0 +1,4 @@
++TEMPLATE=subdirs
++SUBDIRS=\
++    app1\
++    app2\
+diff --git a/scripts/generic/t/data/test-projects/src/fail.cpp b/scripts/generic/t/data/test-projects/src/fail.cpp
+new file mode 100644
+index 0000000..c355057
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/src/fail.cpp
+@@ -0,0 +1,49 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <stdio.h>
++
++int main(int argc, char**)
++{
++    printf( "failing. %d arg(s)\n", argc );
++
++    return 1;
++}
+diff --git a/scripts/generic/t/data/test-projects/src/pass.cpp b/scripts/generic/t/data/test-projects/src/pass.cpp
+new file mode 100644
+index 0000000..7d1dd35
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/src/pass.cpp
+@@ -0,0 +1,62 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <stdio.h>
++
++#ifdef _MSC_VER
++# include <windows.h>
++# define sleep(x) Sleep(x*1000)
++#else
++# include <unistd.h>
++#endif
++
++
++int main(int argc, char**)
++{
++    /*
++        This sleep gives predictable timing for a "fail" test vs a "pass" test,
++        for testing of parallel_test
++    */
++    sleep( 2 );
++    printf( "passing. %d arg(s)\n", argc );
++
++    return 0;
++}
+diff --git a/scripts/generic/t/data/test-projects/test-projects.pro b/scripts/generic/t/data/test-projects/test-projects.pro
+new file mode 100644
+index 0000000..00bd899
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/test-projects.pro
+@@ -0,0 +1,7 @@
++# Under this directory are various test projects, used for testing
++# testplanner / testscheduler.
++
++TEMPLATE=subdirs
++SUBDIRS=\
++    tests \
++    not_tests \
+diff --git a/scripts/generic/t/data/test-projects/tests/failing_custom_check_target/failing_custom_check_target.pro b/scripts/generic/t/data/test-projects/tests/failing_custom_check_target/failing_custom_check_target.pro
+new file mode 100644
+index 0000000..7c522ea
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/failing_custom_check_target/failing_custom_check_target.pro
+@@ -0,0 +1,3 @@
++TEMPLATE=subdirs
++check.commands = $(TESTRUNNER) perl -E \"say q{Custom failing}; exit 2\" $(TESTARGS)
++QMAKE_EXTRA_TARGETS += check
+diff --git a/scripts/generic/t/data/test-projects/tests/failing_disabled_test/failing_disabled_test.pro b/scripts/generic/t/data/test-projects/tests/failing_disabled_test/failing_disabled_test.pro
+new file mode 100644
+index 0000000..8a7a86f
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/failing_disabled_test/failing_disabled_test.pro
+@@ -0,0 +1,5 @@
++TEMPLATE=app
++CONFIG-=qt build_all debug app_bundle
++CONFIG+=testcase release
++win32:CONFIG+=console
++SOURCES=../../src/fail.cpp
+diff --git a/scripts/generic/t/data/test-projects/tests/failing_insignificant_test/failing_insignificant_test.pro b/scripts/generic/t/data/test-projects/tests/failing_insignificant_test/failing_insignificant_test.pro
+new file mode 100644
+index 0000000..eb45927
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/failing_insignificant_test/failing_insignificant_test.pro
+@@ -0,0 +1,6 @@
++TEMPLATE=app
++CONFIG-=qt build_all debug app_bundle
++CONFIG+=testcase release
++CONFIG+=insignificant_test
++win32:CONFIG+=console
++SOURCES=../../src/fail.cpp
+diff --git a/scripts/generic/t/data/test-projects/tests/failing_significant_test/failing_significant_test.pro b/scripts/generic/t/data/test-projects/tests/failing_significant_test/failing_significant_test.pro
+new file mode 100644
+index 0000000..24d1119
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/failing_significant_test/failing_significant_test.pro
+@@ -0,0 +1,6 @@
++TEMPLATE=app
++CONFIG-=qt build_all debug app_bundle
++CONFIG+=testcase release
++CONFIG+=parallel_test
++win32:CONFIG+=console
++SOURCES=../../src/fail.cpp
+diff --git a/scripts/generic/t/data/test-projects/tests/passing_custom_check_target/passing_custom_check_target.pro b/scripts/generic/t/data/test-projects/tests/passing_custom_check_target/passing_custom_check_target.pro
+new file mode 100644
+index 0000000..20c1965
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/passing_custom_check_target/passing_custom_check_target.pro
+@@ -0,0 +1,3 @@
++TEMPLATE=subdirs
++check.commands = $(TESTRUNNER) perl -E \"say q{Custom passing}; exit 0\" $(TESTARGS)
++QMAKE_EXTRA_TARGETS += check
+diff --git a/scripts/generic/t/data/test-projects/tests/passing_insignificant_test/passing_insignificant_test.pro b/scripts/generic/t/data/test-projects/tests/passing_insignificant_test/passing_insignificant_test.pro
+new file mode 100644
+index 0000000..58e6a2a
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/passing_insignificant_test/passing_insignificant_test.pro
+@@ -0,0 +1,7 @@
++TEMPLATE=app
++CONFIG-=qt build_all debug app_bundle
++CONFIG+=testcase release
++CONFIG+=insignificant_test
++CONFIG+=parallel_test
++win32:CONFIG+=console
++SOURCES=../../src/pass.cpp
+diff --git a/scripts/generic/t/data/test-projects/tests/passing_significant_test/passing_significant_test.pro b/scripts/generic/t/data/test-projects/tests/passing_significant_test/passing_significant_test.pro
+new file mode 100644
+index 0000000..f29281b
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/passing_significant_test/passing_significant_test.pro
+@@ -0,0 +1,5 @@
++TEMPLATE=app
++CONFIG-=qt build_all debug app_bundle
++CONFIG+=testcase release
++win32:CONFIG+=console
++SOURCES=../../src/pass.cpp
+diff --git a/scripts/generic/t/data/test-projects/tests/tests.pro b/scripts/generic/t/data/test-projects/tests/tests.pro
+new file mode 100644
+index 0000000..569165f
+--- /dev/null
++++ b/scripts/generic/t/data/test-projects/tests/tests.pro
+@@ -0,0 +1,11 @@
++TEMPLATE=subdirs
++SUBDIRS=\
++    passing_significant_test\
++    passing_insignificant_test\
++    failing_significant_test\
++    failing_insignificant_test\
++    failing_disabled_test\
++    passing_custom_check_target\
++    failing_custom_check_target\
++
++failing_disabled_test.CONFIG += no_check_target
+diff --git a/scripts/generic/testplanner.pl b/scripts/generic/testplanner.pl
+new file mode 100755
+index 0000000..9adb2ef
+--- /dev/null
++++ b/scripts/generic/testplanner.pl
+@@ -0,0 +1,377 @@
++#!/usr/bin/env perl
++#############################################################################
++##
++## Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++## Contact: http://www.qt-project.org/
++##
++## This file is part of the Quality Assurance module of the Qt Toolkit.
++##
++## $QT_BEGIN_LICENSE:LGPL$
++## GNU Lesser General Public License Usage
++## This file may be used under the terms of the GNU Lesser General Public
++## License version 2.1 as published by the Free Software Foundation and
++## appearing in the file LICENSE.LGPL included in the packaging of this
++## file. Please review the following information to ensure the GNU Lesser
++## General Public License version 2.1 requirements will be met:
++## http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++##
++## In addition, as a special exception, Nokia gives you certain additional
++## rights. These rights are described in the Nokia Qt LGPL Exception
++## version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++##
++## GNU General Public License Usage
++## Alternatively, this file may be used under the terms of the GNU General
++## Public License version 3.0 as published by the Free Software Foundation
++## and appearing in the file LICENSE.GPL included in the packaging of this
++## file. Please review the following information to ensure the GNU General
++## Public License version 3.0 requirements will be met:
++## http://www.gnu.org/copyleft/gpl.html.
++##
++## Other Usage
++## Alternatively, this file may be used in accordance with the terms and
++## conditions contained in a signed written agreement between you and Nokia.
++##
++##
++##
++##
++##
++##
++## $QT_END_LICENSE$
++##
++#############################################################################
++
++use 5.010;
++use strict;
++use warnings;
++
++package QtQA::App::TestPlanner;
++
++=head1 NAME
++
++testplanner - construct a test plan for a set of testcases
++
++=head1 SYNOPSIS
++
++  # Make a plan to run all available tests under this directory ...
++  $ testplanner --input path/to/tests --output testplan.txt
++
++  # Then run them all
++  $ testscheduler --timeout 120 -j4 --sync-output --plan testplan.txt
++
++testplanner will iterate through a build tree, collecting information
++about autotests and preparing a test plan to be used by testrunner.
++
++=head2 OPTIONS
++
++=over
++
++=item B<--input> PATH (mandatory)
++
++Specifies the build tree from which a testplan should be created.
++
++=item B<--output> PATH (mandatory)
++
++Specifies the output test plan filename.
++
++=item B<--make> MAKE
++
++Customize the make command to be used for `make check'.
++Defaults to `nmake' on Windows and `make' everywhere else.
++
++=back
++
++Further options may be passed to the testcases themselves.
++These should be separated from testplanner options with a '--'.
++For example:
++
++  testplanner --input . --output plan.txt -- -silent -no-crash-handler
++
++... to create a testplan which will run the tests with
++"-silent -no-crash-handler" arguments.
++
++=head1 DESCRIPTION
++
++testplanner creates a testplan according to the contents of a given
++build tree.
++
++testplanner is primarily designed to work with qmake.
++
++Any test which would be run by the `make check' command under the
++build tree will be included in the test plan.  This is normally
++achieved by using CONFIG+=testcase in a testcase .pro file.
++Custom `check' targets may also be used, but these B<must> support
++the $(TESTRUNNER) parameter to `make check' as CONFIG+=testcase does.
++
++The precise output format of testplanner is undefined, but it
++is plaintext and may be influenced by values from the buildsystem
++such as:
++
++=over
++
++=item CONFIG+=insignificant_test
++
++Indicates the result of the test can be ignored.
++
++=item CONFIG+=parallel_test
++
++Indicates the test is safe to run in parallel with other tests.
++
++=back
++
++
++
++=cut
++
++use Data::Dumper;
++use English qw(-no_match_vars);
++use Fcntl qw(LOCK_EX LOCK_UN SEEK_END);
++use File::Basename;
++use File::Spec::Functions qw(:ALL);
++use File::chdir;
++use Getopt::Long;
++use IO::File;
++use Lingua::EN::Inflect qw(inflect);
++use List::MoreUtils qw(any apply);
++use Pod::Usage;
++use Readonly;
++
++use FindBin;
++use lib "$FindBin::Bin/../lib/perl5";
++
++use autodie;
++
++use QtQA::QMake::Project;
++
++Readonly my $WINDOWS => ($OSNAME =~ m{win32}i);
++
++sub new
++{
++    my ($class) = @_;
++    return bless {
++        this_script => rel2abs( $0 ),
++    }, $class;
++}
++
++sub run
++{
++    my ($self, @args) = @_;
++
++    my $testcase;
++
++    local @ARGV = @args;
++    GetOptions(
++        'help|?' => sub { pod2usage(0) },
++        'input=s' => \$self->{ input },
++        'output=s' => \$self->{ output },
++        'make=s' => \$self->{ make },
++        'testcase' => \$testcase,
++    ) || pod2usage(2);
++
++    # Testcase mode; we're calling ourselves for one specific testcase.
++    # The remaining args are the testcase command and arguments.
++    if ($testcase) {
++        return $self->plan_testcase( @ARGV );
++    }
++
++    foreach my $arg (qw(input output)) {
++        $self->{ $arg } || die "Missing mandatory --$arg argument";
++    }
++
++    # We can't safely handle arguments with spaces.
++    # The processing of TESTARGS within the makefile depends on the exact
++    # shell being used, which is generally quite difficult to determine
++    # (e.g. mingw32-make uses sh.exe if it is in PATH, cmd.exe otherwise).
++    # It's not impossible to support this, but we won't bother until
++    # it becomes necessary.
++    if (any { m{ } } @ARGV) {
++        die 'sorry, it is currently not supported to pass arguments with '
++           ."spaces while generating a test plan.\nYour arguments were:\n"
++           .(join(' ', map { "[$_]" } @ARGV));
++    }
++
++    # We're going to pass output to subprocesses with a different
++    # working directory, we'd better make it absolute
++    $self->{ output } = rel2abs( $self->{ output } );
++
++    # And also delete it if it currently exists
++    if (-e $self->{ output }) {
++        unlink( $self->{ output } );
++    }
++
++    if (!$self->{ make }) {
++        $self->{ make } = $self->default_make( );
++    }
++
++    $self->run_make_check( @ARGV );
++    $self->finalize_test_plan( $self->{ output } );
++
++    return;
++}
++
++# finalize the test plan;
++# currently does not actually modify the test plan in any way,
++# just does a basic sanity check that it exists, can be parsed,
++# and summarizes it.
++sub finalize_test_plan
++{
++    my ($self, $filename) = @_;
++
++    if (! -e $filename) {
++        warn "No tests found under $self->{ input }\n";
++
++        # No tests? make an empty testplan.
++        open( my $fh, '>', $filename ) || die "open $filename for create: $!";
++        close( $fh ) || die "close $filename after create: $!";
++
++        return;
++    }
++
++    my $count = 0;
++    my $fh = IO::File->new( $filename, '<' ) || die "open $filename: $!";
++    while (my $line = <$fh>) {
++        ++$count;
++        eval $line;  ## no critic (ProhibitStringyEval) - no way around it
++        if (my $error = $@) {
++            die "$filename:$count: error: $error";
++        }
++    }
++
++    print inflect "Test plan generated for NO(test,$count) at $filename\n";
++
++    return;
++}
++
++sub default_make
++{
++    my ($self) = @_;
++
++    if ($WINDOWS) {
++        return 'nmake';
++    }
++
++    return 'make';
++}
++
++sub plan_testcase
++{
++    my ($self, $testcase, @args) = @_;
++
++    my $make = $self->{ make };
++    my $output = $self->{ output };
++
++    # FIXME: how to accurately figure out the calling Makefile on all
++    # platforms?
++    #
++    # For GNU make, this could be done by using the $(MAKEFILE_LIST) variable.
++    # For nmake, there doesn't seem a clear, generic solution.
++    # The GNU make solution is deliberately unimplemented so that, if this
++    # should ever start to cause problems, the problems will be reproducible
++    # on all platforms.
++    #
++    # In practice this is not thought to be a problem - even qmake assumes
++    # the makefile is always called "Makefile" in various places.
++
++    my $prj = QtQA::QMake::Project->new( 'Makefile' );
++    $prj->set_make( $make );
++
++    # Collect all interesting info about the tests.
++    my @qmake_tests = qw(
++        parallel_test
++        insignificant_test
++    );
++    my @qmake_scalar_values = qw(
++        TARGET
++    );
++    my @qmake_keys = (@qmake_tests, @qmake_scalar_values);
++
++    my %info = (
++        args => [ $testcase, @args ],
++        cwd => $CWD,
++        map( { my $v = $prj->test( $_ ); $_ => $v } @qmake_tests),
++        map( { my $v = $prj->values( $_ ); $_ => $v } @qmake_scalar_values),
++    );
++
++    # flatten info before passing to Data::Dumper
++    @info{ @qmake_keys } = apply { $_ = "$_" } @info{ @qmake_keys };
++
++    my $dumper = Data::Dumper->new( [ \%info ] );
++    $dumper->Indent( 0 );   # all output on one line
++    $dumper->Terse( 1 );    # omit leading $VAR1
++    $dumper->Sortkeys( 1 ); # get a predictable order
++    $dumper->Useqq( 1 );    # handle special characters safely (although none are expected)
++
++    my $info_string = $dumper->Dump( );
++
++    # trivial sanity check: should be just one line
++    if ($info_string =~ m{\n}) {
++        die "internal error: multiple lines in testcase info string:\n$info_string";
++    }
++
++    # Now write the info to the testplan (single line).
++    open( my $fh, '>>', $output );
++    flock( $fh, LOCK_EX );
++    seek( $fh, 0, SEEK_END );
++    print $fh "$info_string\n";
++    flock( $fh, LOCK_UN );
++    close( $fh );
++
++    print "  testplan: $info{ TARGET }\n";
++
++    return;
++}
++
++sub run_make_check
++{
++    my ($self, @args) = @_;
++
++    local $CWD = $self->{ input };
++
++    # We are going to pass TESTRUNNER and TESTARGS to `make check'.
++    # If these are already set in the environment, they may interfere with
++    # our own values, so remove them.
++    # In practice, this occurs when `nmake check' is used to run the selftests in
++    # the qtqa repository.
++    my %clean_env = %ENV;
++    delete @clean_env{qw(TESTARGS TESTRUNNER)};
++    local %ENV = %clean_env;
++
++    my $make = $self->{ make };
++    my $output = $self->{ output };
++    my $this_script = $self->{ this_script };
++
++    my @command = ( $make );
++
++    my %gnulike = map { $_ => 1 } qw(make gmake mingw32-make);
++    my %mslike = map { $_ => 1 } qw(nmake jom);
++
++    if ($gnulike{ $make }) {
++        push @command, '-s', '-j4';
++    } elsif ($mslike{ $make }) {
++        push @command, '/NOLOGO', '/S';
++        if ($make eq 'jom') {
++            push @command, '/J4';
++        }
++    } else {
++        warn "Unknown make command $make.  May be slow and noisy.\n";
++    }
++
++    my $subcmd = "$EXECUTABLE_NAME $this_script --make $make --output $output --testcase";
++
++    push @command, (
++        'check',
++        "TESTRUNNER=$subcmd --",
++        "TESTARGS=".join(' ', @args),   # note: we know there are no spaces in any of @args
++    );
++
++    if (my $status = system( @command )) {
++        die "testplan generation failed; @command exited with status $status (exit code ".($status >> 8).')';
++    }
++
++    return;
++}
++
++#==================================================================================================
++
++QtQA::App::TestPlanner->new( )->run( @ARGV ) if (!caller);
++1;
++
+diff --git a/scripts/generic/testscheduler.pl b/scripts/generic/testscheduler.pl
+new file mode 100755
+index 0000000..4fe7a91
+--- /dev/null
++++ b/scripts/generic/testscheduler.pl
+@@ -0,0 +1,436 @@
++#!/usr/bin/env perl
++#############################################################################
++##
++## Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++## Contact: http://www.qt-project.org/
++##
++## This file is part of the Quality Assurance module of the Qt Toolkit.
++##
++## $QT_BEGIN_LICENSE:LGPL$
++## GNU Lesser General Public License Usage
++## This file may be used under the terms of the GNU Lesser General Public
++## License version 2.1 as published by the Free Software Foundation and
++## appearing in the file LICENSE.LGPL included in the packaging of this
++## file. Please review the following information to ensure the GNU Lesser
++## General Public License version 2.1 requirements will be met:
++## http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++##
++## In addition, as a special exception, Nokia gives you certain additional
++## rights. These rights are described in the Nokia Qt LGPL Exception
++## version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++##
++## GNU General Public License Usage
++## Alternatively, this file may be used under the terms of the GNU General
++## Public License version 3.0 as published by the Free Software Foundation
++## and appearing in the file LICENSE.GPL included in the packaging of this
++## file. Please review the following information to ensure the GNU General
++## Public License version 3.0 requirements will be met:
++## http://www.gnu.org/copyleft/gpl.html.
++##
++## Other Usage
++## Alternatively, this file may be used in accordance with the terms and
++## conditions contained in a signed written agreement between you and Nokia.
++##
++##
++##
++##
++##
++##
++## $QT_END_LICENSE$
++##
++#############################################################################
++
++use 5.010;
++use strict;
++use warnings;
++
++package QtQA::App::TestScheduler;
++
++=head1 NAME
++
++testscheduler - run a set of autotests
++
++=head1 SYNOPSIS
++
++  # Run all tests mentioned in testplan.txt, up to 4 at a time
++  $ ./testscheduler --plan testplan.txt -j4 --timeout 120
++
++Run a set of testcases and output a summary of the results.
++
++=head2 OPTIONS
++
++=over
++
++=item --plan FILENAME (Mandatory)
++
++Execute the test plan from this file.
++The test plan should be generated by the "testplanner" command.
++
++=item -j N
++
++=item --jobs N
++
++Execute tests in parallel, up to N concurrently.
++
++Note that only tests marked with parallel_test in the testplan
++are permitted to run in parallel.
++
++=back
++
++All other arguments are passed to the "testrunner" script,
++which is invoked once for each test.
++
++=head1 DESCRIPTION
++
++testscheduler runs a set of autotests from a testplan.
++
++testscheduler implements appropriate handling of insignificant
++tests and parallel tests according to the metadata in the
++testplan (which generally comes from the build system):
++
++=over
++
++=item *
++
++Tests may be run in parallel if they are marked with
++parallel_test and testscheduler is invoked with a -j option
++higher than 1.
++
++=item *
++
++Test failures may be ignored if a test is marked with insignificant_test.
++
++=back
++
++=cut
++
++use English qw(-no_match_vars);
++use File::Spec::Functions;
++use FindBin;
++use IO::File;
++use Lingua::EN::Inflect qw(inflect);
++use Pod::Usage;
++use Readonly;
++
++use Getopt::Long qw(
++    GetOptionsFromArray
++    :config pass_through bundling
++);
++
++# testrunner script
++Readonly my $TESTRUNNER => catfile( $FindBin::Bin, 'testrunner.pl' );
++
++sub new
++{
++    my ($class) = @_;
++
++    return bless {
++        jobs => 1,
++    }, $class;
++}
++
++sub run
++{
++    my ($self, @args) = @_;
++
++    GetOptionsFromArray( \@args,
++        'help|?'    =>  sub { pod2usage(0) },
++        'plan=s'    =>  \$self->{ testplan },
++        'j|jobs=i'  =>  \$self->{ jobs },
++    ) || pod2usage(2);
++
++    # Strip trailing --, if that's what ended our argument processing
++    if (@args && $args[0] eq '--') {
++        shift @args;
++    }
++
++    # All remaining args are for testrunner
++    $self->{ testrunner_args } = [ @args ];
++
++    if (!$self->{ testplan }) {
++        die "Missing mandatory --plan argument";
++    }
++
++    my @results = $self->do_testplan( $self->{ testplan } );
++    $self->exit_appropriately( @results );
++
++    return;
++}
++
++sub do_testplan
++{
++    my ($self, $testplan) = @_;
++
++    my @tests = $self->read_tests_from_testplan( $testplan );
++    @tests = sort { $a->{ TARGET } cmp $b->{ TARGET } } @tests;
++
++    return $self->execute_tests_from_testplan( @tests );
++}
++
++sub read_tests_from_testplan
++{
++    my ($self, $testplan) = @_;
++
++    my @tests;
++
++    my $fh = IO::File->new( $testplan, '<' ) || die "open $testplan for read: $!";
++    my $line_no = 0;
++    while (my $line = <$fh>) {
++        ++$line_no;
++        my $test = eval $line;  ## no critic (ProhibitStringyEval)
++        if (my $error = $@) {
++            die "$testplan:$line_no: error: $error";
++        }
++        push @tests, $test;
++    }
++
++    return @tests;
++}
++
++sub execute_tests_from_testplan
++{
++    my ($self, @tests) = @_;
++
++    my $jobs = $self->{ jobs };
++
++    $self->{ test_results } = [];
++
++    # Do all the parallel tests first, then serial.
++    # However, if jobs are 1, all tests are serial.
++    my @parallel_tests;
++    my @serial_tests;
++    foreach my $test (@tests) {
++        if ($test->{ parallel_test } && $jobs > 1) {
++            push @parallel_tests, $test;
++        }
++        else {
++            push @serial_tests, $test;
++        }
++    }
++
++    # If there is only one parallel test, downgrade it to a serial test
++    if (@parallel_tests == 1) {
++        @serial_tests = (@parallel_tests, @serial_tests);
++        @parallel_tests = ();
++    }
++
++    local $SIG{ INT } = sub {
++        die 'aborting due to SIGINT';
++    };
++
++    $self->execute_parallel_tests( @parallel_tests );
++
++    if (@parallel_tests && @serial_tests) {
++        my $p = scalar( @parallel_tests );
++        my $s = scalar( @serial_tests );
++        # NO -> Number Of
++        $self->print_info( inflect "ran NO(parallel test,$p).  Starting NO(serial test,$s).\n" );
++    }
++
++    $self->execute_serial_tests( @serial_tests );
++
++    my @test_results = @{ $self->{ test_results } };
++
++    # Sanity check
++    if (scalar(@test_results) != scalar(@tests)) {
++        die 'internal error: I expected to run '.scalar(@tests).' tests, but only '
++           .scalar(@test_results).' tests reported results';
++    }
++
++    return @test_results;
++}
++
++sub execute_parallel_tests
++{
++    my ($self, @tests) = @_;
++    return unless @tests;
++
++    while (my $test = shift @tests) {
++        while ($self->running_tests_count() >= $self->{ jobs }) {
++            $self->wait_for_test_to_complete( );
++        }
++        $self->spawn_subtest(
++            test => $test,
++            testrunner_args => [ '--sync-output' ],
++        );
++    }
++
++    while ($self->running_tests_count()) {
++        $self->wait_for_test_to_complete( );
++    }
++
++    return;
++}
++
++sub execute_serial_tests
++{
++    my ($self, @tests) = @_;
++
++    return unless @tests;
++
++    while (my $test = shift @tests) {
++        while ($self->running_tests_count()) {
++            $self->wait_for_test_to_complete( );
++        }
++        $self->spawn_subtest( test => $test );
++    }
++
++    while ($self->running_tests_count()) {
++        $self->wait_for_test_to_complete( );
++    }
++
++    return;
++}
++
++sub print_info
++{
++    my ($self, $info) = @_;
++
++    local $| = 1;
++    print __PACKAGE__.': '.$info;
++
++    return;
++}
++
++sub spawn_subtest
++{
++    my ($self, %args) = @_;
++
++    my $test = $args{ test };
++
++    my @testrunner_args = (
++        '--chdir',
++        $test->{ cwd },
++        @{ $args{ testrunner_args } || []},
++        @{ $self->{ testrunner_args } || []},
++    );
++
++    my @cmd_and_args = @{ $test->{ args } };
++
++    my @testrunner_cmd = (
++        $EXECUTABLE_NAME,
++        $TESTRUNNER,
++        @testrunner_args,
++    );
++
++    my @cmd = (@testrunner_cmd, '--', @cmd_and_args );
++    my $pid = $self->spawn( @cmd );
++    $self->{ test_by_pid }{ $pid } = $test;
++
++    return;
++}
++
++sub running_tests_count
++{
++    my ($self) = @_;
++
++    return scalar keys %{ $self->{ test_by_pid } || {} };
++}
++
++# Waits for one test to complete and writes the 'status' key for that test.
++sub wait_for_test_to_complete
++{
++    my ($self) = @_;
++
++    return if (!$self->running_tests_count( ));
++
++    my $pid = waitpid( -1, 0 );
++    my $status = $?;
++    if ($pid <= 0) {
++        # should never happen
++        die "internal error: waitpid returned $pid (status $status)";
++    }
++
++    my $test = delete $self->{ test_by_pid }{ $pid };
++    if (!$test) {
++        warn "waitpid returned $pid; this pid could not be associated with any running test";
++        return;
++    }
++
++    $test->{ status } = $status;
++
++    $self->print_test_fail_info( $test );
++
++    push @{ $self->{ test_results } }, $test;
++
++    return;
++}
++
++sub print_test_fail_info
++{
++    my ($self, $test) = @_;
++
++    if ($test->{ status } == 0) {
++        return;
++    }
++
++    my $msg = "$test->{ TARGET } failed";
++    if ($test->{ insignificant_test }) {
++        $msg .= ', but it is marked with insignificant_test';
++    }
++
++    $self->print_info( "$msg\n" );
++
++    return;
++}
++
++sub spawn
++{
++    my ($self, @cmd) = @_;
++
++    my $pid;
++
++    if ($OSNAME =~ m{win32}i) {
++        # see `perldoc perlport'
++        $pid = system( 1, @cmd );
++    } else {
++        $pid = fork();
++        if ($pid == -1) {
++            die "fork: $!";
++        }
++        if ($pid == 0) {
++            exec( @cmd );
++            die "exec: $!";
++        }
++    }
++
++    return $pid;
++}
++
++sub exit_appropriately
++{
++    my ($self, @tests) = @_;
++
++    my $total = 0;
++    my $pass = 0;
++    my $fail = 0;
++    my $insignificant_fail = 0;
++
++    foreach my $test (@tests) {
++        ++$total;
++        if ($test->{ status } == 0) {
++            ++$pass;
++        } elsif ($test->{ insignificant_test }) {
++            ++$insignificant_fail;
++        } else {
++            ++$fail;
++        }
++    }
++
++    my $message = inflect "Totals: NO(test,$total), NO(pass,$pass)";
++    if ($fail) {
++        $message .= inflect ", NO(fail,$fail)";
++    }
++    if ($insignificant_fail) {
++        $message .= inflect ", NO(insignificant fail,$insignificant_fail)";
++    }
++
++    print "$message\n";
++
++    exit( $fail ? 1 : 0 );
++}
++
++#==================================================================================================
++
++QtQA::App::TestScheduler->new( )->run( @ARGV ) if (!caller);
++1;
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t b/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t
+index df001fd..9a34a8b 100644
+--- a/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t
++++ b/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t
+@@ -12,6 +12,7 @@ use FindBin;
+ use lib "$FindBin::Bin/../../..";
+ 
+ use QtQA::QMake::Project;
++use QtQA::Test::More qw(find_qmake);
+ 
+ use English qw(-no_match_vars);
+ use File::Spec::Functions;
+@@ -22,7 +23,6 @@ use Test::More;
+ use Test::Warn;
+ 
+ Readonly my $TESTDATA => catfile( $FindBin::Bin, 'test_projects' );
+-Readonly my $QT_VERSION => 5;
+ Readonly my $QMAKE => find_qmake( );
+ Readonly my $ERROR_RE => qr/^QtQA::QMake::Project:/;
+ 
+@@ -374,30 +374,6 @@ sub run_test
+     return;
+ }
+ 
+-sub find_qmake
+-{
+-    # Try to find the "right" qmake - not particularly easy.
+-    my $repo_base = catfile( $FindBin::Bin, qw(.. .. .. .. .. ..) );
+-    my $qmake = canonpath catfile( $repo_base, qw(.. qtbase bin qmake) );
+-    if ($OSNAME =~ m{win32}i) {
+-        $qmake .= '.exe';
+-    }
+-
+-    if (-f $qmake) {
+-        diag "Using qmake from sibling qtbase: $qmake";
+-        return $qmake;
+-    }
+-
+-    # OK, then just try to use qmake from PATH
+-    my $output = qx(qmake -v 2>&1);
+-    if ($? == 0 && $output =~ m{Using Qt version $QT_VERSION}) {
+-        diag "Using qmake from PATH";
+-        return 'qmake';
+-    }
+-
+-    return;
+-}
+-
+ if (!caller) {
+     run_test;
+     done_testing;
+diff --git a/scripts/lib/perl5/QtQA/Test/More.pm b/scripts/lib/perl5/QtQA/Test/More.pm
+index 6a7a3a7..b0b118f 100644
+--- a/scripts/lib/perl5/QtQA/Test/More.pm
++++ b/scripts/lib/perl5/QtQA/Test/More.pm
+@@ -44,9 +44,12 @@ use strict;
+ use warnings;
+ 
+ use Carp;
++use Cwd qw(abs_path);
+ use Data::Dumper;
+ use IO::File;
+ use File::Basename;
++use File::Spec::Functions;
++use File::Which;
+ use List::MoreUtils qw( any );
+ use Params::Validate qw( :all );
+ use Readonly;
+@@ -57,9 +60,12 @@ use base 'Exporter';
+ Readonly our @EXPORT_OK => qw(
+     is_or_like
+     create_mock_command
++    find_qmake
+ );
+ Readonly our %EXPORT_TAGS => ( all => \@EXPORT_OK );
+ 
++Readonly my $QT_VERSION => 5;
++
+ ## no critic (Subroutines::RequireArgUnpacking)
+ #  This policy does not work nicely with Params::Validate
+ 
+@@ -264,6 +270,42 @@ die "no more test steps!\n"
+     return;
+ }
+ 
++sub find_qmake
++{
++    # Try to find the "right" qmake - not particularly easy.
++    my $this_dir = $INC{ 'QtQA/Test/More.pm' };
++    if (!$this_dir) {
++        diag "Warning: can't find QtQA/Test/More.pm in %INC.  Included unusually?\n"
++            ."find_qmake() will probably fail.";
++        $this_dir = '.';
++    }
++    $this_dir = dirname( $this_dir );
++
++    my $repo_base = catfile( $this_dir, qw(.. .. .. .. ..) );
++    my $qmake = catfile( $repo_base, qw(.. qtbase bin qmake) );
++    if ($OSNAME =~ m{win32}i) {
++        $qmake .= '.exe';
++    }
++
++    if (-f $qmake) {
++        $qmake = abs_path $qmake;
++        diag "Using qmake from sibling qtbase: $qmake";
++        return $qmake;
++    }
++
++    # OK, then just try to use qmake from PATH
++    $qmake = which 'qmake';
++    my $output = qx("$qmake" -v 2>&1);
++    if ($? == 0 && $output =~ m{Using Qt version $QT_VERSION}) {
++        diag "Using qmake from PATH: $qmake\n$output";
++        return $qmake;
++    }
++
++    diag 'Warning: no qmake found';
++
++    return;
++}
++
+ 
+ 
+ =head1 NAME
+@@ -436,6 +478,28 @@ will die, noisily).
+ 
+ =back
+ 
++=item B<find_qmake>
++
++Attempts to find and return a qmake command string suitable for running from
++within a test:
++
++=over
++
++=item *
++
++If the "qtqa" directory has a sibling "qtbase" directory, the qmake from that
++qtbase will be used, if available.  The full path to qmake is returned.
++
++=item *
++
++Otherwise, if a qmake from Qt 5 is in PATH, it will be used.
++The string "qmake" is returned.
++
++=item *
++
++Otherwise, an undefined value is returned.
++
++=back
+ 
+ =back
+ 
+diff --git a/scripts/qt/qtmod_test.pl b/scripts/qt/qtmod_test.pl
+index 61dccef..1cda690 100755
+--- a/scripts/qt/qtmod_test.pl
++++ b/scripts/qt/qtmod_test.pl
+@@ -160,6 +160,14 @@ my @PROPERTIES = (
+                                 . q{uses gdb on Linux, CrashReporter on Mac, and does not work }
+                                 . q{on Windows},
+ 
++    q{qt.tests.testscheduler}  => q{if 1, run the autotests via the testscheduler script, rather }
++                                . q{than directly by `make check'; this is intended to eventually }
++                                . q{become the default},
++
++    q{qt.tests.testscheduler.args}
++                               => q{arguments to pass to testscheduler, if any; for example, -j4 }
++                                . q{to run autotests in parallel},
++
+     q{qt.tests.flaky_mode}     => q{how to handle flaky autotests ("best", "worst" or "ignore")},
+ 
+     q{qt.qtqa-tests.enabled}   => q{if 1, run the shared autotests in qtqa (over this module }
+@@ -379,6 +387,8 @@ sub read_and_store_configuration
+         'qt.minimal_deps'         => \&default_qt_minimal_deps                   ,
+         'qt.install.dir'          => \&default_qt_install_dir                    ,
+         'qt.tests.enabled'        => \&default_qt_tests_enabled                  ,
++        'qt.tests.testscheduler'  => 0                                           ,
++        'qt.tests.testscheduler.args' => q{}                                     ,
+         'qt.tests.insignificant'  => 0                                           ,
+         'qt.tests.timeout'        => 60*15                                       ,
+         'qt.tests.capture_logs'   => q{}                                         ,
+@@ -838,6 +848,25 @@ sub get_testrunner_command
+ {
+     my ($self) = @_;
+ 
++    my $testrunner = catfile( $FindBin::Bin, '..', '..', 'bin', 'testrunner' );
++    $testrunner    = canonpath abs_path( $testrunner );
++
++    # sanity check
++    confess( "internal error: $testrunner does not exist" ) if (! -e $testrunner);
++
++    my @testrunner_with_args = (
++        $testrunner,
++        $self->get_testrunner_args( ),
++    );
++
++    return join(' ', @testrunner_with_args);
++}
++
++# Returns appropriate testrunner arguments
++sub get_testrunner_args
++{
++    my ($self) = @_;
++
+     my $qt_tests_timeout         = $self->{ 'qt.tests.timeout' };
+     my $qt_tests_capture_logs    = $self->{ 'qt.tests.capture_logs' };
+     my $qt_coverage_tool         = $self->{ 'qt.coverage.tool' };
+@@ -848,52 +877,45 @@ sub get_testrunner_command
+     my $qt_tests_backtraces      = $self->{ 'qt.tests.backtraces' };
+     my $qt_tests_flaky_mode      = $self->{ 'qt.tests.flaky_mode' };
+ 
+-    my $testrunner = catfile( $FindBin::Bin, '..', '..', 'bin', 'testrunner' );
+-    $testrunner    = canonpath abs_path( $testrunner );
+-
+-    # sanity check
+-    confess( "internal error: $testrunner does not exist" ) if (! -e $testrunner);
+-
+-    my @testrunner_with_args = (
+-        $testrunner,        # run the tests through our testrunner script ...
++    my @testrunner_args = (
+         '--timeout',
+         $qt_tests_timeout,  # kill any test which takes longer than this ...
+     );
+ 
+     # capture or tee logs to a given directory
+     if ($qt_tests_capture_logs) {
+-        push @testrunner_with_args, '--capture-logs', canonpath $qt_tests_capture_logs;
++        push @testrunner_args, '--capture-logs', canonpath $qt_tests_capture_logs;
+     }
+     elsif ($qt_tests_tee_logs) {
+-        push @testrunner_with_args, '--tee-logs', canonpath $qt_tests_tee_logs;
++        push @testrunner_args, '--tee-logs', canonpath $qt_tests_tee_logs;
+     }
+ 
+     if ($qt_tests_backtraces) {
+         if ($OSNAME =~ m{linux}i) {
+-            push @testrunner_with_args, '--plugin', 'core';
++            push @testrunner_args, '--plugin', 'core';
+         }
+         elsif ($OSNAME =~ m{darwin}i) {
+-            push @testrunner_with_args, '--plugin', 'crashreporter';
++            push @testrunner_args, '--plugin', 'crashreporter';
+         }
+     }
+ 
+     # give more info about unstable / flaky tests
+-    push @testrunner_with_args, '--plugin', 'flaky';
++    push @testrunner_args, '--plugin', 'flaky';
+     if ($qt_tests_flaky_mode) {
+-        push @testrunner_with_args, '--flaky-mode', $qt_tests_flaky_mode;
++        push @testrunner_args, '--flaky-mode', $qt_tests_flaky_mode;
+     }
+ 
+     if ($qt_coverage_tool) {
+-        push @testrunner_with_args, '--plugin', $qt_coverage_tool;
+-        push @testrunner_with_args, "--${qt_coverage_tool}-qt-gitmodule-dir", canonpath $qt_gitmodule_dir;
+-        push @testrunner_with_args, "--${qt_coverage_tool}-qt-gitmodule", $qt_gitmodule;
++        push @testrunner_args, '--plugin', $qt_coverage_tool;
++        push @testrunner_args, "--${qt_coverage_tool}-qt-gitmodule-dir", canonpath $qt_gitmodule_dir;
++        push @testrunner_args, "--${qt_coverage_tool}-qt-gitmodule", $qt_gitmodule;
+     }
+ 
+     if ($qt_coverage_tests_output) {
+-        push @testrunner_with_args, "--${qt_coverage_tool}-tests-output", $qt_coverage_tests_output;
++        push @testrunner_args, "--${qt_coverage_tool}-tests-output", $qt_coverage_tests_output;
+     }
+ 
+-    push @testrunner_with_args, '--'; # no more args
++    push @testrunner_args, '--'; # no more args
+ 
+     # We cannot handle passing arguments with spaces into `make TESTRUNNER...',
+     # so detect and abort right now if that's the case.
+@@ -903,13 +925,13 @@ sub get_testrunner_command
+     # be affected by the value of the PATH environment variable when make is run, etc...),
+     # so we will not do it unless it becomes necessary.
+     #
+-    if (any { /\s/ } @testrunner_with_args) {
++    if (any { /\s/ } @testrunner_args) {
+         confess( "Some arguments to testrunner contain spaces, which is currently not supported.\n"
+                 ."Try removing spaces from build / log paths, if there are any.\n"
+-                .'testrunner and arguments: '.Dumper(\@testrunner_with_args)."\n" );
++                .'testrunner arguments: '.Dumper(\@testrunner_args)."\n" );
+     }
+ 
+-    return join(' ', @testrunner_with_args);
++    return @testrunner_args;
+ }
+ 
+ sub run_autotests
+@@ -1030,6 +1052,8 @@ sub _run_autotests_impl
+     my $make_check_bin = $self->{ 'make-check.bin' };
+     my $make_check_args = $self->{ 'make-check.args' };
+     my $qt_tests_args  = $self->{ 'qt.tests.args' };
++    my $qt_tests_testscheduler = $self->{ 'qt.tests.testscheduler' };
++    my $qt_tests_testscheduler_args = $self->{ 'qt.tests.testscheduler.args' };
+ 
+     # settings for this autotest run
+     my $tests_dir            = $args{ tests_dir };
+@@ -1037,8 +1061,6 @@ sub _run_autotests_impl
+     my $do_compile           = $args{ do_compile };
+     my $insignificant        = $self->{ $insignificant_option };
+ 
+-    my $testrunner_command = $self->get_testrunner_command( );
+-
+     # Add tools from all the modules to PATH.
+     # If shadow-build with install enabled, then we need to add install path
+     # rather than build path into the PATH.
+@@ -1072,14 +1094,43 @@ sub _run_autotests_impl
+             $self->exe( $make_bin, '-k', @make_args );
+         }
+ 
+-        my @make_check_args = split(/ /, $make_check_args);
++        if ($qt_tests_testscheduler) {
++            my @testrunner_args = $self->get_testrunner_args( );
++
++            $self->exe(
++                $EXECUTABLE_NAME,
++                catfile( "$FindBin::Bin/../generic/testplanner.pl" ),
++                '--input',
++                '.',
++                '--output',
++                'testplan.txt',
++                '--make',
++                $make_bin,
++                '--',
++                split(/ /, $qt_tests_args),
++            );
+ 
+-        $self->exe( $make_check_bin,
+-            @make_check_args,                   # include args requested by user
+-            "TESTRUNNER=$testrunner_command",   # use our testrunner script
+-            "TESTARGS=$qt_tests_args",          # and our test args (may be empty)
+-            'check',                            # run the autotests :)
+-        );
++            $self->exe(
++                $EXECUTABLE_NAME,
++                catfile( "$FindBin::Bin/../generic/testscheduler.pl" ),
++                '--plan',
++                'testplan.txt',
++                split( m{ }, $qt_tests_testscheduler_args ),
++                @testrunner_args,
++            );
++
++        } else {
++            my $testrunner_command = $self->get_testrunner_command( );
++
++            my @make_check_args = split(/ /, $make_check_args);
++
++            $self->exe( $make_check_bin,
++                @make_check_args,                   # include args requested by user
++                "TESTRUNNER=$testrunner_command",   # use our testrunner script
++                "TESTARGS=$qt_tests_args",          # and our test args (may be empty)
++                'check',                            # run the autotests :)
++            );
++        }
+     };
+ 
+     if ($insignificant) {
+diff --git a/scripts/setup.pl b/scripts/setup.pl
+index e5fb7df..8fb5719 100755
+--- a/scripts/setup.pl
++++ b/scripts/setup.pl
+@@ -162,6 +162,7 @@ sub all_required_cpan_modules
+         File::Find::Rule
+         File::HomeDir
+         File::Slurp
++        File::Which
+         IO::CaptureOutput
+         IO::Uncompress::AnyInflate
+         Inline::C

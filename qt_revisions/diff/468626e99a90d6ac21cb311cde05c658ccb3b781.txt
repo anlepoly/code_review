@@ -1,0 +1,3409 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index 7c59a9d..37c238f 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -72,8 +72,6 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-DEFINE_BOOL_CONFIG_OPTION(qmlTranslateTouchToMouse, QML_TRANSLATE_TOUCH_TO_MOUSE)
+-
+ void QQuickCanvasPrivate::updateFocusItemTransform()
+ {
+     Q_Q(QQuickCanvas);
+@@ -395,25 +393,39 @@ void QQuickCanvasPrivate::initRootItem()
+     rootItem->setHeight(q->height());
+ }
+ 
+-static QQuickMouseEventEx touchToMouseEvent(QEvent::Type type, const QTouchEvent::TouchPoint &p)
++static QMouseEvent *touchToMouseEvent(QEvent::Type type, const QTouchEvent::TouchPoint &p, QTouchEvent *event, QQuickItem *item, bool transformNeeded = true)
+ {
+-    QQuickMouseEventEx me(type, p.pos(), p.scenePos(), p.screenPos(),
+-            Qt::LeftButton, Qt::LeftButton, 0);
+-    me.setVelocity(p.velocity());
++    // The touch point local position and velocity are not yet transformed.
++    QMouseEvent *me = new QMouseEvent(type, transformNeeded ? item->mapFromScene(p.scenePos()) : p.pos(), p.scenePos(), p.screenPos(),
++                                      Qt::LeftButton, Qt::LeftButton, event->modifiers());
++    me->setAccepted(true);
++    me->setTimestamp(event->timestamp());
++    QVector2D transformedVelocity = p.velocity();
++    if (transformNeeded) {
++        QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
++        QMatrix4x4 transformMatrix(itemPrivate->canvasToItemTransform());
++        transformedVelocity = transformMatrix.mapVector(p.velocity()).toVector2D();
++    }
++    QGuiApplicationPrivate::setMouseEventCapsAndVelocity(me, event->device()->capabilities(), transformedVelocity);
+     return me;
+ }
+ 
+-void QQuickCanvasPrivate::translateTouchToMouse(QTouchEvent *event)
++bool QQuickCanvasPrivate::translateTouchToMouse(QQuickItem *item, QTouchEvent *event)
+ {
+-    if (event->type() == QEvent::TouchCancel) {
+-        touchMouseId = -1;
+-        if (mouseGrabberItem)
+-            mouseGrabberItem->ungrabMouse();
+-        return;
+-    }
++    Q_Q(QQuickCanvas);
++    // For each point, check if it is accepted, if not, try the next point.
++    // Any of the fingers can become the mouse one.
++    // This can happen because a mouse area might not accept an event at some point but another.
+     for (int i = 0; i < event->touchPoints().count(); ++i) {
+-        QTouchEvent::TouchPoint p = event->touchPoints().at(i);
++        const QTouchEvent::TouchPoint &p = event->touchPoints().at(i);
++        // A new touch point
+         if (touchMouseId == -1 && p.state() & Qt::TouchPointPressed) {
++            QPointF pos = item->mapFromScene(p.scenePos());
++
++            // probably redundant, we check bounds in the calling function (matchingNewPoints)
++            if (!item->contains(pos))
++                break;
++
+             bool doubleClick = event->timestamp() - touchMousePressTimestamp
+                             < static_cast<ulong>(qApp->styleHints()->mouseDoubleClickInterval());
+             touchMousePressTimestamp = event->timestamp();
+@@ -421,72 +433,89 @@ void QQuickCanvasPrivate::translateTouchToMouse(QTouchEvent *event)
+             // accepted. Cannot defer setting the new value because otherwise if the event
+             // handler spins the event loop all subsequent moves and releases get lost.
+             touchMouseId = p.id();
+-            QQuickMouseEventEx me = touchToMouseEvent(QEvent::MouseButtonPress, p);
+-            me.setTimestamp(event->timestamp());
+-            me.setAccepted(false);
+-            me.setCapabilities(event->device()->capabilities());
+-            deliverMouseEvent(&me);
+-            if (me.isAccepted())
+-                event->setAccepted(true);
+-            else
++            itemForTouchPointId[touchMouseId] = item;
++            QScopedPointer<QMouseEvent> mousePress(touchToMouseEvent(QEvent::MouseButtonPress, p, event, item));
++
++            // Send a single press and see if that's accepted
++            if (!mouseGrabberItem)
++                item->grabMouse();
++            item->grabTouchPoints(QVector<int>() << touchMouseId);
++
++            q->sendEvent(item, mousePress.data());
++            event->setAccepted(mousePress->isAccepted());
++            if (!mousePress->isAccepted()) {
+                 touchMouseId = -1;
+-            if (doubleClick && me.isAccepted()) {
++                if (itemForTouchPointId.value(p.id()) == item)
++                    itemForTouchPointId.remove(p.id());
++
++                if (mouseGrabberItem == item)
++                    item->ungrabMouse();
++            }
++
++            if (doubleClick && mousePress->isAccepted()) {
+                 touchMousePressTimestamp = 0;
+-                QQuickMouseEventEx me = touchToMouseEvent(QEvent::MouseButtonDblClick, p);
+-                me.setTimestamp(event->timestamp());
+-                me.setAccepted(false);
+-                me.setCapabilities(event->device()->capabilities());
+-                if (!mouseGrabberItem) {
+-                    if (deliverInitialMousePressEvent(rootItem, &me))
+-                        event->setAccepted(true);
+-                    else
+-                        touchMouseId = -1;
++                QScopedPointer<QMouseEvent> mouseDoubleClick(touchToMouseEvent(QEvent::MouseButtonDblClick, p, event, item));
++                q->sendEvent(item, mouseDoubleClick.data());
++                event->setAccepted(mouseDoubleClick->isAccepted());
++                if (mouseDoubleClick->isAccepted()) {
++                    return true;
+                 } else {
+-                    deliverMouseEvent(&me);
+-                    if (me.isAccepted())
+-                        event->setAccepted(true);
+-                    else
+-                        touchMouseId = -1;
++                    touchMouseId = -1;
+                 }
+             }
++            // The event was accepted, we are done.
++            if (mousePress->isAccepted())
++                return true;
++            // The event was not accepted but touchMouseId was set.
+             if (touchMouseId != -1)
+-                break;
++                return false;
++            // try the next point
++
++        // Touch point was there before and moved
+         } else if (p.id() == touchMouseId) {
+             if (p.state() & Qt::TouchPointMoved) {
+-                QQuickMouseEventEx me = touchToMouseEvent(QEvent::MouseMove, p);
+-                me.setTimestamp(event->timestamp());
+-                me.setCapabilities(event->device()->capabilities());
+-                if (!mouseGrabberItem) {
++                if (mouseGrabberItem) {
++                    QScopedPointer<QMouseEvent> me(touchToMouseEvent(QEvent::MouseMove, p, event, mouseGrabberItem));
++                    q->sendEvent(mouseGrabberItem, me.data());
++                    event->setAccepted(me->isAccepted());
++                    if (me->isAccepted()) {
++                        itemForTouchPointId[p.id()] = mouseGrabberItem; // N.B. the mouseGrabberItem may be different after returning from sendEvent()
++                        return true;
++                    }
++                } else {
++                    // no grabber, check if we care about mouse hover
++                    // FIXME: this should only happen once, not recursively... I'll ignore it just ignore hover now.
++                    // hover for touch???
++                    QScopedPointer<QMouseEvent> me(touchToMouseEvent(QEvent::MouseMove, p, event, item));
+                     if (lastMousePosition.isNull())
+-                        lastMousePosition = me.windowPos();
++                        lastMousePosition = me->windowPos();
+                     QPointF last = lastMousePosition;
+-                    lastMousePosition = me.windowPos();
++                    lastMousePosition = me->windowPos();
+ 
+-                    bool accepted = me.isAccepted();
+-                    bool delivered = deliverHoverEvent(rootItem, me.windowPos(), last, me.modifiers(), accepted);
++                    bool accepted = me->isAccepted();
++                    bool delivered = deliverHoverEvent(rootItem, me->windowPos(), last, me->modifiers(), accepted);
+                     if (!delivered) {
+                         //take care of any exits
+                         accepted = clearHover();
+                     }
+-                    me.setAccepted(accepted);
++                    me->setAccepted(accepted);
+                     break;
+                 }
+-
+-                deliverMouseEvent(&me);
+             } else if (p.state() & Qt::TouchPointReleased) {
++                // currently handled point was released
+                 touchMouseId = -1;
+-                if (!mouseGrabberItem)
+-                    return;
+-                QQuickMouseEventEx me = touchToMouseEvent(QEvent::MouseButtonRelease, p);
+-                me.setTimestamp(event->timestamp());
+-                me.setCapabilities(event->device()->capabilities());
+-                deliverMouseEvent(&me);
+-                if (mouseGrabberItem)
+-                    mouseGrabberItem->ungrabMouse();
++                if (mouseGrabberItem) {
++                    QScopedPointer<QMouseEvent> me(touchToMouseEvent(QEvent::MouseButtonRelease, p, event, mouseGrabberItem));
++                    q->sendEvent(mouseGrabberItem, me.data());
++                    if (mouseGrabberItem) // might have ungrabbed due to event
++                        mouseGrabberItem->ungrabMouse();
++                    return me->isAccepted();
++                }
+             }
+             break;
+         }
+     }
++    return false;
+ }
+ 
+ void QQuickCanvasPrivate::transformTouchPoints(QList<QTouchEvent::TouchPoint> &touchPoints, const QTransform &transform)
+@@ -1047,17 +1076,17 @@ bool QQuickCanvas::event(QEvent *e)
+ 
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+-    case QEvent::TouchEnd:
+-    case QEvent::TouchCancel:
+-    {
+-        QTouchEvent *touch = static_cast<QTouchEvent *>(e);
++    case QEvent::TouchEnd: {
++        QTouchEvent *touch = static_cast<QTouchEvent*>(e);
+         d->translateTouchEvent(touch);
+-        d->deliverTouchEvent(touch);
+-        if (qmlTranslateTouchToMouse())
+-            d->translateTouchToMouse(touch);
+-
+-        return touch->isAccepted();
++        // return in order to avoid the QWindow::event below
++        return d->deliverTouchEvent(touch);
+     }
++        break;
++    case QEvent::TouchCancel:
++        // return in order to avoid the QWindow::event below
++        return d->deliverTouchCancelEvent(static_cast<QTouchEvent*>(e));
++        break;
+     case QEvent::Leave:
+         d->clearHover();
+         d->lastMousePosition = QPoint();
+@@ -1102,6 +1131,19 @@ void QQuickCanvas::keyReleaseEvent(QKeyEvent *e)
+         sendEvent(d->activeFocusItem, e);
+ }
+ 
++QMouseEvent *QQuickCanvasPrivate::cloneMouseEvent(QMouseEvent *event, QPointF *transformedLocalPos)
++{
++    int caps = QGuiApplicationPrivate::mouseEventCaps(event);
++    QVector2D velocity = QGuiApplicationPrivate::mouseEventVelocity(event);
++    QMouseEvent *me = new QMouseEvent(event->type(),
++                                      transformedLocalPos ? *transformedLocalPos : event->localPos(),
++                                      event->windowPos(), event->screenPos(),
++                                      event->button(), event->buttons(), event->modifiers());
++    QGuiApplicationPrivate::setMouseEventCapsAndVelocity(me, caps, velocity);
++    me->setTimestamp(event->timestamp());
++    return me;
++}
++
+ bool QQuickCanvasPrivate::deliverInitialMousePressEvent(QQuickItem *item, QMouseEvent *event)
+ {
+     Q_Q(QQuickCanvas);
+@@ -1126,16 +1168,14 @@ bool QQuickCanvasPrivate::deliverInitialMousePressEvent(QQuickItem *item, QMouse
+     }
+ 
+     if (itemPrivate->acceptedMouseButtons() & event->button()) {
+-        QPointF p = item->mapFromScene(event->windowPos());
+-        if (item->contains(p)) {
+-            QMouseEvent me(event->type(), p, event->windowPos(), event->screenPos(),
+-                           event->button(), event->buttons(), event->modifiers());
+-            me.setTimestamp(event->timestamp());
+-            me.accept();
++        QPointF localPos = item->mapFromScene(event->windowPos());
++        if (item->contains(localPos)) {
++            QScopedPointer<QMouseEvent> me(cloneMouseEvent(event, &localPos));
++            me->accept();
+             item->grabMouse();
+-            q->sendEvent(item, &me);
+-            event->setAccepted(me.isAccepted());
+-            if (me.isAccepted())
++            q->sendEvent(item, me.data());
++            event->setAccepted(me->isAccepted());
++            if (me->isAccepted())
+                 return true;
+             if (mouseGrabberItem)
+                 mouseGrabberItem->ungrabMouse();
+@@ -1162,21 +1202,12 @@ bool QQuickCanvasPrivate::deliverMouseEvent(QMouseEvent *event)
+     }
+ 
+     if (mouseGrabberItem) {
+-        QQuickItemPrivate *mgPrivate = QQuickItemPrivate::get(mouseGrabberItem);
+-        const QTransform &transform = mgPrivate->canvasToItemTransform();
+-        QQuickMouseEventEx me(event->type(), transform.map(event->windowPos()),
+-                                event->windowPos(), event->screenPos(),
+-                                event->button(), event->buttons(), event->modifiers());
+-        QQuickMouseEventEx *eventEx = QQuickMouseEventEx::extended(event);
+-        if (eventEx) {
+-            me.setVelocity(QMatrix4x4(transform).mapVector(eventEx->velocity()).toVector2D());
+-            me.setCapabilities(eventEx->capabilities());
+-        }
+-        me.setTimestamp(event->timestamp());
+-        me.accept();
+-        q->sendEvent(mouseGrabberItem, &me);
+-        event->setAccepted(me.isAccepted());
+-        if (me.isAccepted())
++        QPointF localPos = mouseGrabberItem->mapFromScene(event->windowPos());
++        QScopedPointer<QMouseEvent> me(cloneMouseEvent(event, &localPos));
++        me->accept();
++        q->sendEvent(mouseGrabberItem, me.data());
++        event->setAccepted(me->isAccepted());
++        if (me->isAccepted())
+             return true;
+     }
+ 
+@@ -1187,8 +1218,6 @@ bool QQuickCanvasPrivate::deliverMouseEvent(QMouseEvent *event)
+ void QQuickCanvas::mousePressEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickCanvas);
+-    if (qmlTranslateTouchToMouse())
+-        return; // We are using touch events
+ #ifdef MOUSE_DEBUG
+     qWarning() << "QQuickCanvas::mousePressEvent()" << event->pos() << event->button() << event->buttons();
+ #endif
+@@ -1200,8 +1229,6 @@ void QQuickCanvas::mousePressEvent(QMouseEvent *event)
+ void QQuickCanvas::mouseReleaseEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickCanvas);
+-    if (qmlTranslateTouchToMouse())
+-        return; // We are using touch events
+ #ifdef MOUSE_DEBUG
+     qWarning() << "QQuickCanvas::mouseReleaseEvent()" << event->pos() << event->button() << event->buttons();
+ #endif
+@@ -1220,9 +1247,6 @@ void QQuickCanvas::mouseReleaseEvent(QMouseEvent *event)
+ void QQuickCanvas::mouseDoubleClickEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickCanvas);
+-    if (qmlTranslateTouchToMouse())
+-        return; // We are using touch events
+-
+ #ifdef MOUSE_DEBUG
+     qWarning() << "QQuickCanvas::mouseDoubleClickEvent()" << event->pos() << event->button() << event->buttons();
+ #endif
+@@ -1258,8 +1282,6 @@ bool QQuickCanvasPrivate::sendHoverEvent(QEvent::Type type, QQuickItem *item,
+ void QQuickCanvas::mouseMoveEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickCanvas);
+-    if (qmlTranslateTouchToMouse())
+-        return; // We are using touch events
+ #ifdef MOUSE_DEBUG
+     qWarning() << "QQuickCanvas::mouseMoveEvent()" << event->pos() << event->button() << event->buttons();
+ #endif
+@@ -1402,98 +1424,100 @@ void QQuickCanvas::wheelEvent(QWheelEvent *event)
+ }
+ #endif // QT_NO_WHEELEVENT
+ 
++
++bool QQuickCanvasPrivate::deliverTouchCancelEvent(QTouchEvent *event)
++{
++#ifdef TOUCH_DEBUG
++    qWarning("touchCancelEvent");
++#endif
++    Q_Q(QQuickCanvas);
++    // A TouchCancel event will typically not contain any points.
++    // Deliver it to all items that have active touches.
++    QSet<QQuickItem *> cancelDelivered;
++    foreach (QQuickItem *item, itemForTouchPointId) {
++        if (cancelDelivered.contains(item))
++            continue;
++        cancelDelivered.insert(item);
++        q->sendEvent(item, event);
++    }
++    touchMouseId = -1;
++    if (mouseGrabberItem)
++        mouseGrabberItem->ungrabMouse();
++    // The next touch event can only be a TouchBegin so clean up.
++    itemForTouchPointId.clear();
++    return true;
++}
++
++// check what kind of touch we have (begin/update) and
++// call deliverTouchPoints to actually dispatch the points
+ bool QQuickCanvasPrivate::deliverTouchEvent(QTouchEvent *event)
+ {
+ #ifdef TOUCH_DEBUG
+     if (event->type() == QEvent::TouchBegin)
+-        qWarning("touchBeginEvent");
++        qWarning() << "touchBeginEvent";
+     else if (event->type() == QEvent::TouchUpdate)
+-        qWarning("touchUpdateEvent");
++        qWarning() << "touchUpdateEvent points";
+     else if (event->type() == QEvent::TouchEnd)
+         qWarning("touchEndEvent");
+-    else if (event->type() == QEvent::TouchCancel)
+-        qWarning("touchCancelEvent");
+ #endif
+ 
+-    Q_Q(QQuickCanvas);
+-
++    // List of all items that received an event before
++    // When we have TouchBegin this is and will stay empty
+     QHash<QQuickItem *, QList<QTouchEvent::TouchPoint> > updatedPoints;
+ 
+-    if (event->type() == QTouchEvent::TouchBegin) {     // all points are new touch points
+-        QSet<int> acceptedNewPoints;
+-        deliverTouchPoints(rootItem, event, event->touchPoints(), &acceptedNewPoints, &updatedPoints);
+-        if (acceptedNewPoints.count() > 0)
+-            event->accept();
+-        else
+-            event->ignore();
+-        return event->isAccepted();
+-    }
+-
+-    if (event->type() == QTouchEvent::TouchCancel) {
+-        // A TouchCancel event will typically not contain any points.
+-        // Deliver it to all items that have active touches.
+-        QSet<QQuickItem *> cancelDelivered;
+-        foreach (QQuickItem *item, itemForTouchPointId) {
+-            if (cancelDelivered.contains(item))
+-                continue;
+-            cancelDelivered.insert(item);
+-            q->sendEvent(item, event);
+-        }
+-        // The next touch event can only be a TouchBegin so clean up.
+-        itemForTouchPointId.clear();
+-        return true;
+-    }
+-
++    // Figure out who accepted a touch point last and put it in updatedPoints
++    // Add additional item to newPoints
+     const QList<QTouchEvent::TouchPoint> &touchPoints = event->touchPoints();
+     QList<QTouchEvent::TouchPoint> newPoints;
+-    QQuickItem *item = 0;
+     for (int i=0; i<touchPoints.count(); i++) {
+-        const QTouchEvent::TouchPoint &touchPoint = touchPoints[i];
+-        switch (touchPoint.state()) {
+-            case Qt::TouchPointPressed:
+-                newPoints << touchPoint;
+-                break;
+-            case Qt::TouchPointMoved:
+-            case Qt::TouchPointStationary:
+-            case Qt::TouchPointReleased:
+-                if (itemForTouchPointId.contains(touchPoint.id())) {
+-                    item = itemForTouchPointId[touchPoint.id()];
+-                    if (item)
+-                        updatedPoints[item].append(touchPoint);
+-                }
+-                break;
+-            default:
+-                break;
++        const QTouchEvent::TouchPoint &touchPoint = touchPoints.at(i);
++        if (touchPoint.state() == Qt::TouchPointPressed) {
++            newPoints << touchPoint;
++        } else {
++            // TouchPointStationary is relevant only to items which
++            // are also receiving touch points with some other state.
++            // But we have not yet decided which points go to which item,
++            // so for now we must include all non-new points in updatedPoints.
++            if (itemForTouchPointId.contains(touchPoint.id())) {
++                QQuickItem *item = itemForTouchPointId.value(touchPoint.id());
++                if (item)
++                    updatedPoints[item].append(touchPoint);
++            }
+         }
+     }
+ 
++    // Deliver the event, but only if there is at least one new point
++    // or some item accepted a point and should receive an update
+     if (newPoints.count() > 0 || updatedPoints.count() > 0) {
+         QSet<int> acceptedNewPoints;
+-        int prevCount = updatedPoints.count();
+-        deliverTouchPoints(rootItem, event, newPoints, &acceptedNewPoints, &updatedPoints);
+-        if (acceptedNewPoints.count() > 0 || updatedPoints.count() != prevCount)
+-            event->accept();
+-        else
+-            event->ignore();
++        event->setAccepted(deliverTouchPoints(rootItem, event, newPoints, &acceptedNewPoints, &updatedPoints));
+     } else
+         event->ignore();
+ 
++    // Remove released points from itemForTouchPointId
+     if (event->touchPointStates() & Qt::TouchPointReleased) {
+         for (int i=0; i<touchPoints.count(); i++) {
+-            if (touchPoints[i].state() == Qt::TouchPointReleased)
++            if (touchPoints[i].state() == Qt::TouchPointReleased) {
+                 itemForTouchPointId.remove(touchPoints[i].id());
++                if (touchPoints[i].id() == touchMouseId)
++                    touchMouseId = -1;
++            }
+         }
+     }
+ 
++    if (event->type() == QEvent::TouchEnd) {
++        Q_ASSERT(itemForTouchPointId.isEmpty());
++    }
++
+     return event->isAccepted();
+ }
+ 
++// This function recurses and sends the events to the individual items
+ bool QQuickCanvasPrivate::deliverTouchPoints(QQuickItem *item, QTouchEvent *event, const QList<QTouchEvent::TouchPoint> &newPoints, QSet<int> *acceptedNewPoints, QHash<QQuickItem *, QList<QTouchEvent::TouchPoint> > *updatedPoints)
+ {
+-    Q_Q(QQuickCanvas);
+     QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
+ 
+-    if (itemPrivate->opacity() == 0.0)
++    if (qFuzzyIsNull(itemPrivate->opacity()))
+         return false;
+ 
+     if (itemPrivate->flags & QQuickItem::ItemClipsChildrenToShape) {
+@@ -1504,6 +1528,8 @@ bool QQuickCanvasPrivate::deliverTouchPoints(QQuickItem *item, QTouchEvent *even
+         }
+     }
+ 
++    // Check if our children want the event (or parts of it)
++    // This is the only point where touch event delivery recurses!
+     QList<QQuickItem *> children = itemPrivate->paintOrderChildItems();
+     for (int ii = children.count() - 1; ii >= 0; --ii) {
+         QQuickItem *child = children.at(ii);
+@@ -1513,71 +1539,161 @@ bool QQuickCanvasPrivate::deliverTouchPoints(QQuickItem *item, QTouchEvent *even
+             return true;
+     }
+ 
+-    QList<QTouchEvent::TouchPoint> matchingPoints;
++    // None of the children accepted the event, so check the given item itself.
++    // First, construct matchingPoints as a list of TouchPoints which the
++    // given item might be interested in.  Any newly-pressed point which is
++    // inside the item's bounds will be interesting, and also any updated point
++    // which was already accepted by that item when it was first pressed.
++    // (A point which was already accepted is effectively "grabbed" by the item.)
++
++    // set of IDs of "interesting" new points
++    QSet<int> matchingNewPoints;
++    // set of points which this item has previously accepted, for starters
++    QList<QTouchEvent::TouchPoint> matchingPoints = (*updatedPoints)[item];
++    // now add the new points which are inside this item's bounds
+     if (newPoints.count() > 0 && acceptedNewPoints->count() < newPoints.count()) {
+-        for (int i=0; i<newPoints.count(); i++) {
++        for (int i = 0; i < newPoints.count(); i++) {
+             if (acceptedNewPoints->contains(newPoints[i].id()))
+                 continue;
+             QPointF p = item->mapFromScene(newPoints[i].scenePos());
+-            if (item->contains(p))
++            if (item->contains(p)) {
++                matchingNewPoints.insert(newPoints[i].id());
+                 matchingPoints << newPoints[i];
++            }
+         }
+     }
++    // If there are no matching new points, and the existing points are all stationary,
++    // there's no need to send an event to this item.  This is required by a test in
++    // tst_qquickcanvas::touchEvent_basic:
++    // a single stationary press on an item shouldn't cause an event
++    if (matchingNewPoints.isEmpty()) {
++        bool stationaryOnly = true;
++        Q_FOREACH (QTouchEvent::TouchPoint tp, matchingPoints)
++            if (tp.state() != Qt::TouchPointStationary)
++                stationaryOnly = false;
++        if (stationaryOnly)
++            matchingPoints.clear();
++    }
++
++    if (!matchingPoints.isEmpty()) {
++        // Now we know this item might be interested in the event. Copy and send it, but
++        // with only the subset of TouchPoints which are relevant to that item: that's matchingPoints.
++        QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
++        transformTouchPoints(matchingPoints, itemPrivate->canvasToItemTransform());
++        deliverMatchingPointsToItem(item, event, acceptedNewPoints, matchingNewPoints, matchingPoints);
++    }
+ 
+-    if (matchingPoints.count() > 0 || (*updatedPoints)[item].count() > 0) {
+-        QList<QTouchEvent::TouchPoint> &eventPoints = (*updatedPoints)[item];
+-        eventPoints.append(matchingPoints);
+-        transformTouchPoints(eventPoints, itemPrivate->canvasToItemTransform());
++    // record the fact that this item has been visited already
++    updatedPoints->remove(item);
+ 
+-        Qt::TouchPointStates eventStates;
+-        for (int i=0; i<eventPoints.count(); i++)
+-            eventStates |= eventPoints[i].state();
+-        // if all points have the same state, set the event type accordingly
+-        QEvent::Type eventType;
+-        switch (eventStates) {
+-            case Qt::TouchPointPressed:
+-                eventType = QEvent::TouchBegin;
+-                break;
+-            case Qt::TouchPointReleased:
+-                eventType = QEvent::TouchEnd;
+-                break;
+-            default:
+-                eventType = QEvent::TouchUpdate;
+-                break;
++    // recursion is done only if ALL touch points have been delivered
++    return (acceptedNewPoints->count() == newPoints.count() && updatedPoints->isEmpty());
++}
++
++// touchEventForItemBounds has no means to generate a touch event that contains
++// only the points that are relevant for this item.  Thus the need for
++// matchingPoints to already be that set of interesting points.
++// They are all pre-transformed, too.
++bool QQuickCanvasPrivate::deliverMatchingPointsToItem(QQuickItem *item, QTouchEvent *event, QSet<int> *acceptedNewPoints, const QSet<int> &matchingNewPoints, const QList<QTouchEvent::TouchPoint> &matchingPoints)
++{
++    QScopedPointer<QTouchEvent> touchEvent(touchEventWithPoints(*event, matchingPoints));
++    touchEvent.data()->setTarget(item);
++    bool touchEventAccepted = false;
++
++    // First check whether the parent wants to be a filter,
++    // and if the parent accepts the event we are done.
++    if (sendFilteredTouchEvent(item->parentItem(), item, event)) {
++        event->accept();
++        return true;
++    }
++
++    // Since it can change in sendEvent, update itemForTouchPointId now
++    foreach (int id, matchingNewPoints)
++        itemForTouchPointId[id] = item;
++
++    // Deliver the touch event to the given item
++    QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
++    itemPrivate->deliverTouchEvent(touchEvent.data());
++    touchEventAccepted = touchEvent->isAccepted();
++
++    // If the touch event wasn't accepted, synthesize a mouse event and see if the item wants it.
++    if (!touchEventAccepted && (itemPrivate->acceptedMouseButtons() & Qt::LeftButton)) {
++        //  send mouse event
++        event->setAccepted(translateTouchToMouse(item, event));
++        if (event->isAccepted()) {
++            touchEventAccepted = true;
+         }
++    }
+ 
+-        if (eventStates != Qt::TouchPointStationary) {
+-            QTouchEvent touchEvent(eventType);
+-            touchEvent.setWindow(event->window());
+-            touchEvent.setTarget(item);
+-            touchEvent.setDevice(event->device());
+-            touchEvent.setModifiers(event->modifiers());
+-            touchEvent.setTouchPointStates(eventStates);
+-            touchEvent.setTouchPoints(eventPoints);
+-            touchEvent.setTimestamp(event->timestamp());
+-
+-            for (int i = 0; i < matchingPoints.count(); ++i)
+-                itemForTouchPointId[matchingPoints[i].id()] = item;
+-
+-            touchEvent.accept();
+-            q->sendEvent(item, &touchEvent);
+-
+-            if (touchEvent.isAccepted()) {
+-                for (int i = 0; i < matchingPoints.count(); ++i)
+-                    acceptedNewPoints->insert(matchingPoints[i].id());
++    if (touchEventAccepted) {
++        // If the touch was accepted (regardless by whom or in what form),
++        // update acceptedNewPoints.
++        foreach (int id, matchingNewPoints)
++            acceptedNewPoints->insert(id);
++    } else {
++        // But if the event was not accepted then we know this item
++        // will not be interested in further updates for those touchpoint IDs either.
++        foreach (int id, matchingNewPoints)
++            if (itemForTouchPointId[id] == item)
++                itemForTouchPointId.remove(id);
++    }
++
++    return touchEventAccepted;
++}
++
++QTouchEvent *QQuickCanvasPrivate::touchEventForItemBounds(QQuickItem *target, const QTouchEvent &originalEvent)
++{
++    const QList<QTouchEvent::TouchPoint> &touchPoints = originalEvent.touchPoints();
++    QList<QTouchEvent::TouchPoint> pointsInBounds;
++    // if all points are stationary, the list of points should be empty to signal a no-op
++    if (originalEvent.touchPointStates() != Qt::TouchPointStationary) {
++        for (int i = 0; i < touchPoints.count(); ++i) {
++            const QTouchEvent::TouchPoint &tp = touchPoints.at(i);
++            if (tp.state() == Qt::TouchPointPressed) {
++                QPointF p = target->mapFromScene(tp.scenePos());
++                if (target->contains(p))
++                    pointsInBounds.append(tp);
+             } else {
+-                for (int i = 0; i < matchingPoints.count(); ++i)
+-                    if (itemForTouchPointId.value(matchingPoints[i].id()) == item)
+-                        itemForTouchPointId.remove(matchingPoints[i].id());
++                pointsInBounds.append(tp);
+             }
+         }
++        transformTouchPoints(pointsInBounds, QQuickItemPrivate::get(target)->canvasToItemTransform());
+     }
+ 
+-    updatedPoints->remove(item);
+-    if (acceptedNewPoints->count() == newPoints.count() && updatedPoints->isEmpty())
+-        return true;
++    QTouchEvent* touchEvent = touchEventWithPoints(originalEvent, pointsInBounds);
++    touchEvent->setTarget(target);
++    return touchEvent;
++}
+ 
+-    return false;
++QTouchEvent *QQuickCanvasPrivate::touchEventWithPoints(const QTouchEvent &event, const QList<QTouchEvent::TouchPoint> &newPoints)
++{
++    Qt::TouchPointStates eventStates;
++    for (int i=0; i<newPoints.count(); i++)
++        eventStates |= newPoints[i].state();
++    // if all points have the same state, set the event type accordingly
++    QEvent::Type eventType = event.type();
++    switch (eventStates) {
++        case Qt::TouchPointPressed:
++            eventType = QEvent::TouchBegin;
++            break;
++        case Qt::TouchPointReleased:
++            eventType = QEvent::TouchEnd;
++            break;
++        default:
++            eventType = QEvent::TouchUpdate;
++            break;
++    }
++
++    QTouchEvent *touchEvent = new QTouchEvent(eventType);
++    touchEvent->setWindow(event.window());
++    touchEvent->setTarget(event.target());
++    touchEvent->setDevice(event.device());
++    touchEvent->setModifiers(event.modifiers());
++    touchEvent->setTouchPoints(newPoints);
++    touchEvent->setTouchPointStates(eventStates);
++    touchEvent->setTimestamp(event.timestamp());
++    touchEvent->accept();
++    return touchEvent;
+ }
+ 
+ #ifndef QT_NO_DRAGANDDROP
+@@ -1702,6 +1818,59 @@ bool QQuickCanvasPrivate::deliverDragEvent(QQuickDragGrabber *grabber, QQuickIte
+ }
+ #endif // QT_NO_DRAGANDDROP
+ 
++bool QQuickCanvasPrivate::sendFilteredTouchEvent(QQuickItem *target, QQuickItem *item, QTouchEvent *event)
++{
++    if (!target)
++        return false;
++
++    QQuickItemPrivate *targetPrivate = QQuickItemPrivate::get(target);
++    if (targetPrivate->filtersChildMouseEvents) {
++        QScopedPointer<QTouchEvent> targetEvent(touchEventForItemBounds(target, *event));
++        if (!targetEvent->touchPoints().isEmpty()) {
++            QVector<int> touchIds;
++            for (int i = 0; i < event->touchPoints().size(); ++i)
++                touchIds.append(event->touchPoints().at(i).id());
++            if (target->childMouseEventFilter(item, targetEvent.data())) {
++                target->grabTouchPoints(touchIds);
++                if (mouseGrabberItem) {
++                    mouseGrabberItem->ungrabMouse();
++                    touchMouseId = -1;
++                }
++                return true;
++            }
++
++            // Only offer a mouse event to the filter if we have one point
++            if (targetEvent->touchPoints().count() == 1) {
++                QEvent::Type t;
++                const QTouchEvent::TouchPoint &tp = targetEvent->touchPoints().first();
++                switch (tp.state()) {
++                case Qt::TouchPointPressed:
++                    t = QEvent::MouseButtonPress;
++                    break;
++                case Qt::TouchPointReleased:
++                    t = QEvent::MouseButtonRelease;
++                    break;
++                default:
++                    // move or stationary
++                    t = QEvent::MouseMove;
++                    break;
++                }
++
++                // targetEvent is already transformed wrt local position, velocity, etc.
++                QScopedPointer<QMouseEvent> mouseEvent(touchToMouseEvent(t, targetEvent->touchPoints().first(), event, item, false));
++                if (target->childMouseEventFilter(item, mouseEvent.data())) {
++                    itemForTouchPointId[tp.id()] = target;
++                    touchMouseId = tp.id();
++                    target->grabMouse();
++                    return true;
++                }
++            }
++        }
++    }
++
++    return sendFilteredTouchEvent(target->parentItem(), item, event);
++}
++
+ bool QQuickCanvasPrivate::sendFilteredMouseEvent(QQuickItem *target, QQuickItem *item, QEvent *event)
+ {
+     if (!target)
+@@ -1721,14 +1890,13 @@ bool QQuickCanvasPrivate::sendFilteredMouseEvent(QQuickItem *target, QQuickItem
+ bool QQuickCanvasPrivate::dragOverThreshold(qreal d, Qt::Axis axis, QMouseEvent *event)
+ {
+     QStyleHints *styleHints = qApp->styleHints();
+-    QQuickMouseEventEx *extended = QQuickMouseEventEx::extended(event);
+-    bool dragVelocityLimitAvailable = extended
+-        && extended->capabilities().testFlag(QTouchDevice::Velocity)
++    int caps = QGuiApplicationPrivate::mouseEventCaps(event);
++    bool dragVelocityLimitAvailable = (caps & QTouchDevice::Velocity)
+         && styleHints->startDragVelocity();
+     bool overThreshold = qAbs(d) > styleHints->startDragDistance();
+     if (dragVelocityLimitAvailable) {
+-        qreal velocity = axis == Qt::XAxis ? extended->velocity().x()
+-                                           : extended->velocity().y();
++        QVector2D velocityVec = QGuiApplicationPrivate::mouseEventVelocity(event);
++        qreal velocity = axis == Qt::XAxis ? velocityVec.x() : velocityVec.y();
+         overThreshold |= qAbs(velocity) > styleHints->startDragVelocity();
+     }
+     return overThreshold;
+@@ -1768,6 +1936,7 @@ bool QQuickCanvas::sendEvent(QQuickItem *item, QEvent *e)
+     case QEvent::MouseMove:
+         // XXX todo - should sendEvent be doing this?  how does it relate to forwarded events?
+         if (!d->sendFilteredMouseEvent(item->parentItem(), item, e)) {
++            // accept because qml items by default accept and have to explicitly opt out of accepting
+             e->accept();
+             QQuickItemPrivate::get(item)->deliverMouseEvent(static_cast<QMouseEvent *>(e));
+         }
+@@ -1789,12 +1958,10 @@ bool QQuickCanvas::sendEvent(QQuickItem *item, QEvent *e)
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+     case QEvent::TouchEnd:
++        d->sendFilteredTouchEvent(item->parentItem(), item, static_cast<QTouchEvent *>(e));
++        break;
+     case QEvent::TouchCancel:
+-        // XXX todo - should sendEvent be doing this?  how does it relate to forwarded events?
+-        if (!d->sendFilteredMouseEvent(item->parentItem(), item, e)) {
+-            e->accept();
+-            QQuickItemPrivate::get(item)->deliverTouchEvent(static_cast<QTouchEvent *>(e));
+-        }
++        QQuickItemPrivate::get(item)->deliverTouchEvent(static_cast<QTouchEvent *>(e));
+         break;
+ #ifndef QT_NO_DRAGANDDROP
+     case QEvent::DragEnter:
+diff --git a/src/quick/items/qquickcanvas_p.h b/src/quick/items/qquickcanvas_p.h
+index e08c342..1bbf36f 100644
+--- a/src/quick/items/qquickcanvas_p.h
++++ b/src/quick/items/qquickcanvas_p.h
+@@ -110,6 +110,8 @@ public:
+     QQmlListProperty<QObject> data();
+ 
+     QQuickItem *activeFocusItem;
++
++    // Keeps track of the item currently receiving mouse events
+     QQuickItem *mouseGrabberItem;
+ #ifndef QT_NO_DRAGANDDROP
+     QQuickDragGrabber dragGrabber;
+@@ -119,9 +121,10 @@ public:
+ 
+     // Mouse positions are saved in widget coordinates
+     QPointF lastMousePosition;
+-    void translateTouchToMouse(QTouchEvent *event);
++    bool translateTouchToMouse(QQuickItem *item, QTouchEvent *event);
+     void translateTouchEvent(QTouchEvent *touchEvent);
+     static void transformTouchPoints(QList<QTouchEvent::TouchPoint> &touchPoints, const QTransform &transform);
++    static QMouseEvent *cloneMouseEvent(QMouseEvent *event, QPointF *transformedLocalPos = 0);
+     bool deliverInitialMousePressEvent(QQuickItem *, QMouseEvent *);
+     bool deliverMouseEvent(QMouseEvent *);
+     bool sendFilteredMouseEvent(QQuickItem *, QQuickItem *, QEvent *);
+@@ -129,7 +132,12 @@ public:
+     bool deliverTouchPoints(QQuickItem *, QTouchEvent *, const QList<QTouchEvent::TouchPoint> &, QSet<int> *,
+             QHash<QQuickItem *, QList<QTouchEvent::TouchPoint> > *);
+     bool deliverTouchEvent(QTouchEvent *);
++    bool deliverTouchCancelEvent(QTouchEvent *);
+     bool deliverHoverEvent(QQuickItem *, const QPointF &scenePos, const QPointF &lastScenePos, Qt::KeyboardModifiers modifiers, bool &accepted);
++    bool deliverMatchingPointsToItem(QQuickItem *item, QTouchEvent *event, QSet<int> *acceptedNewPoints, const QSet<int> &matchingNewPoints, const QList<QTouchEvent::TouchPoint> &matchingPoints);
++    QTouchEvent *touchEventForItemBounds(QQuickItem *target, const QTouchEvent &originalEvent);
++    QTouchEvent *touchEventWithPoints(const QTouchEvent &event, const QList<QTouchEvent::TouchPoint> &newPoints);
++    bool sendFilteredTouchEvent(QQuickItem *target, QQuickItem *item, QTouchEvent *event);
+     bool sendHoverEvent(QEvent::Type, QQuickItem *, const QPointF &scenePos, const QPointF &lastScenePos,
+                         Qt::KeyboardModifiers modifiers, bool accepted);
+     bool clearHover();
+@@ -195,6 +203,7 @@ public:
+     uint renderTargetId;
+     QSize renderTargetSize;
+ 
++    // Keeps track of which touch point (int) was last accepted by which item
+     QHash<int, QQuickItem *> itemForTouchPointId;
+ 
+     mutable QQuickCanvasIncubationController *incubationController;
+diff --git a/src/quick/items/qquickevents_p_p.h b/src/quick/items/qquickevents_p_p.h
+index 1809394..0cf53f6 100644
+--- a/src/quick/items/qquickevents_p_p.h
++++ b/src/quick/items/qquickevents_p_p.h
+@@ -137,75 +137,6 @@ private:
+     bool _accepted;
+ };
+ 
+-class QQuickMouseEventEx : public QMouseEvent
+-{
+-public:
+-    QQuickMouseEventEx(Type type, const QPointF &pos, Qt::MouseButton button,
+-                Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
+-        : QMouseEvent(type,pos,button,buttons,modifiers)
+-    {
+-    }
+-
+-    QQuickMouseEventEx(Type type, const QPointF &pos, const QPointF &globalPos,
+-                Qt::MouseButton button, Qt::MouseButtons buttons,
+-                Qt::KeyboardModifiers modifiers)
+-        : QMouseEvent(type,pos,globalPos,button,buttons,modifiers)
+-    {
+-    }
+-
+-    QQuickMouseEventEx(Type type, const QPointF &pos, const QPointF &windowPos, const QPointF &globalPos,
+-                Qt::MouseButton button, Qt::MouseButtons buttons,
+-                Qt::KeyboardModifiers modifiers)
+-        : QMouseEvent(type,pos,windowPos,globalPos,button,buttons,modifiers)
+-    {
+-    }
+-
+-    QQuickMouseEventEx(const QMouseEvent &event)
+-        : QMouseEvent(event)
+-    {
+-        const QQuickMouseEventEx *eventEx = extended(&event);
+-        if (eventEx) {
+-            setVelocity(eventEx->velocity());
+-            setCapabilities(eventEx->capabilities());
+-        }
+-    }
+-
+-    ~QQuickMouseEventEx()
+-    {
+-        d = 0;
+-    }
+-
+-    static const QQuickMouseEventEx *extended(const QMouseEvent *e) {
+-        const QQuickMouseEventEx *ex = static_cast<const QQuickMouseEventEx*>(e);
+-        return reinterpret_cast<const QMouseEvent*>(ex->d) == e ? ex : 0;
+-    }
+-    static QQuickMouseEventEx *extended(QMouseEvent *e) {
+-        QQuickMouseEventEx *ex = static_cast<QQuickMouseEventEx*>(e);
+-        return reinterpret_cast<QMouseEvent*>(ex->d) == e ? ex : 0;
+-    }
+-
+-    void setExtended() {
+-        d = reinterpret_cast<QEventPrivate*>(this);
+-    }
+-
+-    void setVelocity(const QVector2D &v) {
+-        setExtended();
+-        _velocity = v;
+-    }
+-    QVector2D velocity() const { return _velocity; }
+-
+-    void setCapabilities(QTouchDevice::Capabilities caps) {
+-        setExtended();
+-        _capabilities = caps;
+-    }
+-    QTouchDevice::Capabilities capabilities() const { return _capabilities; }
+-
+-private:
+-    QVector2D _velocity;
+-    QTouchDevice::Capabilities _capabilities;
+-};
+-
+-
+ class QQuickWheelEvent : public QObject
+ {
+     Q_OBJECT
+diff --git a/src/quick/items/qquickflickable.cpp b/src/quick/items/qquickflickable.cpp
+index 9d69034..3a56dd1 100644
+--- a/src/quick/items/qquickflickable.cpp
++++ b/src/quick/items/qquickflickable.cpp
+@@ -51,6 +51,7 @@
+ #include <QtQml/qqmlinfo.h>
+ #include <QtGui/qevent.h>
+ #include <QtGui/qguiapplication.h>
++#include <QtGui/private/qguiapplication_p.h>
+ #include <QtGui/qstylehints.h>
+ #include "qplatformdefs.h"
+ 
+@@ -970,7 +971,7 @@ void QQuickFlickablePrivate::handleMousePressEvent(QMouseEvent *event)
+     vData.dragMaxBound = q->maxYExtent();
+     fixupMode = Normal;
+     lastPos = QPointF();
+-    pressPos = event->localPos();
++    pressPos = event->windowPos();
+     hData.pressPos = hData.move.value();
+     vData.pressPos = vData.move.value();
+     bool wasFlicking = hData.flicking || vData.flicking;
+@@ -1005,7 +1006,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+ 
+     qint64 elapsedSincePress = computeCurrentTime(event) - lastPressTime;
+     if (q->yflick()) {
+-        qreal dy = event->localPos().y() - pressPos.y();
++        qreal dy = event->windowPos().y() - pressPos.y();
+         bool overThreshold = QQuickCanvasPrivate::dragOverThreshold(dy, Qt::YAxis, event);
+         if (overThreshold || elapsedSincePress > 200) {
+             if (!vMoved)
+@@ -1039,7 +1040,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+     }
+ 
+     if (q->xflick()) {
+-        qreal dx = event->localPos().x() - pressPos.x();
++        qreal dx = event->windowPos().x() - pressPos.x();
+         bool overThreshold = QQuickCanvasPrivate::dragOverThreshold(dx, Qt::XAxis, event);
+         if (overThreshold || elapsedSincePress > 200) {
+             if (!hMoved)
+@@ -1096,25 +1097,24 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+     if (elapsed <= 0)
+         return;
+     lastPosTime = currentTimestamp;
+-    QQuickMouseEventEx *extended = QQuickMouseEventEx::extended(event);
+     if (q->yflick() && !rejectY) {
+-        if (extended && extended->capabilities().testFlag(QTouchDevice::Velocity)) {
+-            vData.addVelocitySample(extended->velocity().y(), maxVelocity);
++        if (QGuiApplicationPrivate::mouseEventCaps(event) & QTouchDevice::Velocity) {
++            vData.addVelocitySample(QGuiApplicationPrivate::mouseEventVelocity(event).y(), maxVelocity);
+         } else {
+-            qreal dy = event->localPos().y() - (lastPos.isNull() ? pressPos.y() : lastPos.y());
++            qreal dy = event->windowPos().y() - (lastPos.isNull() ? pressPos.y() : lastPos.y());
+             vData.addVelocitySample(dy/elapsed, maxVelocity);
+         }
+     }
+     if (q->xflick() && !rejectX) {
+-        if (extended && extended->capabilities().testFlag(QTouchDevice::Velocity)) {
+-            hData.addVelocitySample(extended->velocity().x(), maxVelocity);
++        if (QGuiApplicationPrivate::mouseEventCaps(event) & QTouchDevice::Velocity) {
++            hData.addVelocitySample(QGuiApplicationPrivate::mouseEventVelocity(event).x(), maxVelocity);
+         } else {
+-            qreal dx = event->localPos().x() - (lastPos.isNull() ? pressPos.x() : lastPos.x());
++            qreal dx = event->windowPos().x() - (lastPos.isNull() ? pressPos.x() : lastPos.x());
+             hData.addVelocitySample(dx/elapsed, maxVelocity);
+         }
+     }
+ 
+-    lastPos = event->localPos();
++    lastPos = event->windowPos();
+ }
+ 
+ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+@@ -1141,9 +1141,8 @@ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+ 
+     qreal vVelocity = 0;
+     if (elapsed < 100 && vData.velocity != 0.) {
+-        QQuickMouseEventEx *extended = QQuickMouseEventEx::extended(event);
+-        vVelocity = (extended && extended->capabilities().testFlag(QTouchDevice::Velocity))
+-                ? extended->velocity().y() : vData.velocity;
++        vVelocity = (QGuiApplicationPrivate::mouseEventCaps(event) & QTouchDevice::Velocity)
++                ? QGuiApplicationPrivate::mouseEventVelocity(event).y() : vData.velocity;
+     }
+     if ((vData.atBeginning && vVelocity > 0.) || (vData.atEnd && vVelocity < 0.)) {
+         vVelocity /= 2;
+@@ -1157,9 +1156,8 @@ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+ 
+     qreal hVelocity = 0;
+     if (elapsed < 100 && hData.velocity != 0.) {
+-        QQuickMouseEventEx *extended = QQuickMouseEventEx::extended(event);
+-        hVelocity = (extended && extended->capabilities().testFlag(QTouchDevice::Velocity))
+-                ? extended->velocity().x() : hData.velocity;
++        hVelocity = (QGuiApplicationPrivate::mouseEventCaps(event) & QTouchDevice::Velocity)
++                ? QGuiApplicationPrivate::mouseEventVelocity(event).x() : hData.velocity;
+     }
+     if ((hData.atBeginning && hVelocity > 0.) || (hData.atEnd && hVelocity < 0.)) {
+         hVelocity /= 2;
+@@ -1175,7 +1173,7 @@ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+ 
+     bool flickedV = false;
+     vVelocity *= flickBoost;
+-    if (q->yflick() && qAbs(vVelocity) > MinimumFlickVelocity && qAbs(event->localPos().y() - pressPos.y()) > FlickThreshold) {
++    if (q->yflick() && qAbs(vVelocity) > MinimumFlickVelocity && qAbs(event->windowPos().y() - pressPos.y()) > FlickThreshold) {
+         velocityTimeline.reset(vData.smoothVelocity);
+         vData.smoothVelocity.setValue(-vVelocity);
+         flickedV = flickY(vVelocity);
+@@ -1185,7 +1183,7 @@ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+ 
+     bool flickedH = false;
+     hVelocity *= flickBoost;
+-    if (q->xflick() && qAbs(hVelocity) > MinimumFlickVelocity && qAbs(event->localPos().x() - pressPos.x()) > FlickThreshold) {
++    if (q->xflick() && qAbs(hVelocity) > MinimumFlickVelocity && qAbs(event->windowPos().x() - pressPos.x()) > FlickThreshold) {
+         velocityTimeline.reset(hData.smoothVelocity);
+         hData.smoothVelocity.setValue(-hVelocity);
+         flickedH = flickX(hVelocity);
+@@ -1305,7 +1303,7 @@ void QQuickFlickablePrivate::captureDelayedPress(QMouseEvent *event)
+     if (!isOutermostPressDelay())
+         return;
+     delayedPressTarget = q->canvas()->mouseGrabberItem();
+-    delayedPressEvent = new QQuickMouseEventEx(*event);
++    delayedPressEvent = QQuickCanvasPrivate::cloneMouseEvent(event);
+     delayedPressEvent->setAccepted(false);
+     delayedPressTimer.start(pressDelay, q);
+ }
+@@ -1974,26 +1972,18 @@ bool QQuickFlickable::sendMouseEvent(QMouseEvent *event)
+     bool grabberDisabled = grabber && !grabber->isEnabled();
+     bool stealThisEvent = d->stealMouse;
+     if ((stealThisEvent || contains(localPos)) && (!grabber || !grabber->keepMouseGrab() || grabberDisabled)) {
+-        QQuickMouseEventEx mouseEvent(event->type(), localPos,
+-                                event->windowPos(), event->screenPos(),
+-                                event->button(), event->buttons(), event->modifiers());
+-        QQuickMouseEventEx *eventEx = QQuickMouseEventEx::extended(event);
+-        if (eventEx) {
+-            mouseEvent.setVelocity(eventEx->velocity());
+-            mouseEvent.setCapabilities(eventEx->capabilities());
+-        }
+-        mouseEvent.setTimestamp(event->timestamp());
+-        mouseEvent.setAccepted(false);
++        QScopedPointer<QMouseEvent> mouseEvent(QQuickCanvasPrivate::cloneMouseEvent(event, &localPos));
++        mouseEvent->setAccepted(false);
+ 
+-        switch (mouseEvent.type()) {
++        switch (mouseEvent->type()) {
+         case QEvent::MouseMove:
+-            d->handleMouseMoveEvent(&mouseEvent);
++            d->handleMouseMoveEvent(mouseEvent.data());
+             break;
+         case QEvent::MouseButtonPress:
+             if (d->pressed) // we are already pressed - this is a delayed replay
+                 return false;
+ 
+-            d->handleMousePressEvent(&mouseEvent);
++            d->handleMousePressEvent(mouseEvent.data());
+             d->captureDelayedPress(event);
+             stealThisEvent = d->stealMouse;   // Update stealThisEvent in case changed by function call above
+             break;
+@@ -2013,7 +2003,7 @@ bool QQuickFlickable::sendMouseEvent(QMouseEvent *event)
+                 d->pressed = false;
+                 return true;
+             }
+-            d->handleMouseReleaseEvent(&mouseEvent);
++            d->handleMouseReleaseEvent(mouseEvent.data());
+             break;
+         default:
+             break;
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 02a0c22..2cf12b6 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -2290,6 +2290,11 @@ void QQuickItemPrivate::derefCanvas()
+     QQuickCanvasPrivate *c = QQuickCanvasPrivate::get(canvas);
+     if (polishScheduled)
+         c->itemsToPolish.remove(q);
++    QMutableHashIterator<int, QQuickItem *> itemTouchMapIt(c->itemForTouchPointId);
++    while (itemTouchMapIt.hasNext()) {
++        if (itemTouchMapIt.next().value() == q)
++            itemTouchMapIt.remove();
++    }
+     if (c->mouseGrabberItem == q)
+         c->mouseGrabberItem = 0;
+     if ( hoverEnabled )
+@@ -5131,7 +5136,7 @@ void QQuickItem::setKeepMouseGrab(bool keep)
+ 
+     \sa ungrabTouchPoints(), setKeepTouchGrab()
+ */
+-void QQuickItem::grabTouchPoints(const QList<int> &ids)
++void QQuickItem::grabTouchPoints(const QVector<int> &ids)
+ {
+     Q_D(QQuickItem);
+     if (!d->canvas)
+diff --git a/src/quick/items/qquickitem.h b/src/quick/items/qquickitem.h
+index c0fd01f..7174edd 100644
+--- a/src/quick/items/qquickitem.h
++++ b/src/quick/items/qquickitem.h
+@@ -284,7 +284,7 @@ public:
+     bool filtersChildMouseEvents() const;
+     void setFiltersChildMouseEvents(bool filter);
+ 
+-    void grabTouchPoints(const QList<int> &ids);
++    void grabTouchPoints(const QVector<int> &ids);
+     void ungrabTouchPoints();
+     bool keepTouchGrab() const;
+     void setKeepTouchGrab(bool);
+diff --git a/src/quick/items/qquickmultipointtoucharea.cpp b/src/quick/items/qquickmultipointtoucharea.cpp
+index f980fdc..f4e49bd 100644
+--- a/src/quick/items/qquickmultipointtoucharea.cpp
++++ b/src/quick/items/qquickmultipointtoucharea.cpp
+@@ -418,7 +418,7 @@ void QQuickMultiPointTouchArea::grabGesture()
+     grabMouse();
+     setKeepMouseGrab(true);
+ 
+-    grabTouchPoints(_touchPoints.keys());
++    grabTouchPoints(_touchPoints.keys().toVector());
+     setKeepTouchGrab(true);
+ }
+ 
+diff --git a/src/quick/items/qquickpincharea.cpp b/src/quick/items/qquickpincharea.cpp
+index 8c1c7bd..f589904 100644
+--- a/src/quick/items/qquickpincharea.cpp
++++ b/src/quick/items/qquickpincharea.cpp
+@@ -247,6 +247,8 @@ QQuickPinchArea::QQuickPinchArea(QQuickItem *parent)
+ {
+     Q_D(QQuickPinchArea);
+     d->init();
++    setAcceptedMouseButtons(Qt::LeftButton);
++    setFiltersChildMouseEvents(true);
+ }
+ 
+ QQuickPinchArea::~QQuickPinchArea()
+@@ -281,6 +283,20 @@ void QQuickPinchArea::touchEvent(QTouchEvent *event)
+         return;
+     }
+ 
++    // A common non-trivial starting scenario is the user puts down one finger,
++    // then that finger remains stationary while putting down a second one.
++    // However QQuickCanvas will not send TouchUpdates for TouchPoints which
++    // were not initially accepted; that would be inefficient and noisy.
++    // So even if there is only one touchpoint so far, it's important to accept it
++    // in order to get updates later on (and it's accepted by default anyway).
++    // If the user puts down one finger, we're waiting for the other finger to drop.
++    // Therefore updatePinch() must do the right thing for any combination of
++    // points and states that may occur, and there is no reason to ignore any event.
++    // One consequence though is that if PinchArea is on top of something else,
++    // it's always going to accept the touches, and that means the item underneath
++    // will not get them (unless the PA's parent is doing parent filtering,
++    // as the Flickable does, for example).
++
+     switch (event->type()) {
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate:
+@@ -329,17 +345,27 @@ void QQuickPinchArea::updatePinch()
+         setKeepMouseGrab(false);
+         return;
+     }
++
++    if (d->touchPoints.count() == 1) {
++        setKeepMouseGrab(false);
++    }
++
+     QTouchEvent::TouchPoint touchPoint1 = d->touchPoints.at(0);
+     QTouchEvent::TouchPoint touchPoint2 = d->touchPoints.at(d->touchPoints. count() >= 2 ? 1 : 0);
++    QRectF bounds = clipRect();
++    // Pinch is not started unless there are exactly two touch points
++    // AND one or more of the points has just now been pressed (wasn't pressed already)
++    // AND both points are inside the bounds.
+     if (d->touchPoints.count() == 2
+-        && (touchPoint1.state() & Qt::TouchPointPressed || touchPoint2.state() & Qt::TouchPointPressed)) {
++            && (touchPoint1.state() & Qt::TouchPointPressed || touchPoint2.state() & Qt::TouchPointPressed) &&
++            bounds.contains(touchPoint1.pos()) && bounds.contains(touchPoint2.pos())) {
+         d->id1 = touchPoint1.id();
+         d->sceneStartPoint1 = touchPoint1.scenePos();
+         d->sceneStartPoint2 = touchPoint2.scenePos();
+         d->pinchActivated = true;
+         d->initPinch = true;
+     }
+-    if (d->pinchActivated && !d->pinchRejected){
++    if (d->pinchActivated && !d->pinchRejected) {
+         const int dragThreshold = qApp->styleHints()->startDragDistance();
+         QPointF p1 = touchPoint1.scenePos();
+         QPointF p2 = touchPoint2.scenePos();
+@@ -361,10 +387,10 @@ void QQuickPinchArea::updatePinch()
+             angle -= 360;
+         if (!d->inPinch || d->initPinch) {
+             if (d->touchPoints.count() >= 2
+-                    && (qAbs(p1.x()-d->sceneStartPoint1.x()) > dragThreshold
+-                    || qAbs(p1.y()-d->sceneStartPoint1.y()) > dragThreshold
+-                    || qAbs(p2.x()-d->sceneStartPoint2.x()) > dragThreshold
+-                    || qAbs(p2.y()-d->sceneStartPoint2.y()) > dragThreshold)) {
++                    && (qAbs(p1.x()-d->sceneStartPoint1.x()) >= dragThreshold
++                    || qAbs(p1.y()-d->sceneStartPoint1.y()) >= dragThreshold
++                    || qAbs(p2.x()-d->sceneStartPoint2.x()) >= dragThreshold
++                    || qAbs(p2.y()-d->sceneStartPoint2.y()) >= dragThreshold)) {
+                 d->initPinch = false;
+                 d->sceneStartCenter = sceneCenter;
+                 d->sceneLastCenter = sceneCenter;
+@@ -461,106 +487,24 @@ void QQuickPinchArea::updatePinch()
+     }
+ }
+ 
+-void QQuickPinchArea::mousePressEvent(QMouseEvent *event)
+-{
+-    Q_D(QQuickPinchArea);
+-    d->stealMouse = false;
+-    if (!d->enabled)
+-        QQuickItem::mousePressEvent(event);
+-    else {
+-        setKeepMouseGrab(false);
+-        event->setAccepted(true);
+-    }
+-}
+-
+-void QQuickPinchArea::mouseMoveEvent(QMouseEvent *event)
+-{
+-    Q_D(QQuickPinchArea);
+-    if (!d->enabled) {
+-        QQuickItem::mouseMoveEvent(event);
+-        return;
+-    }
+-}
+-
+-void QQuickPinchArea::mouseReleaseEvent(QMouseEvent *event)
+-{
+-    Q_D(QQuickPinchArea);
+-    d->stealMouse = false;
+-    if (!d->enabled) {
+-        QQuickItem::mouseReleaseEvent(event);
+-    } else {
+-        QQuickCanvas *c = canvas();
+-        if (c && c->mouseGrabberItem() == this)
+-            ungrabMouse();
+-        setKeepMouseGrab(false);
+-    }
+-}
+-
+-void QQuickPinchArea::mouseUngrabEvent()
+-{
+-    setKeepMouseGrab(false);
+-}
+-
+-bool QQuickPinchArea::sendMouseEvent(QMouseEvent *event)
+-{
+-    Q_D(QQuickPinchArea);
+-    QPointF localPos = mapFromScene(event->windowPos());
+-
+-    QQuickCanvas *c = canvas();
+-    QQuickItem *grabber = c ? c->mouseGrabberItem() : 0;
+-    bool stealThisEvent = d->stealMouse;
+-    if ((stealThisEvent || contains(localPos)) && (!grabber || !grabber->keepMouseGrab())) {
+-        QMouseEvent mouseEvent(event->type(), localPos, event->windowPos(), event->screenPos(),
+-                               event->button(), event->buttons(), event->modifiers());
+-        mouseEvent.setAccepted(false);
+-
+-        switch (mouseEvent.type()) {
+-        case QEvent::MouseMove:
+-            mouseMoveEvent(&mouseEvent);
+-            break;
+-        case QEvent::MouseButtonPress:
+-            mousePressEvent(&mouseEvent);
+-            break;
+-        case QEvent::MouseButtonRelease:
+-            mouseReleaseEvent(&mouseEvent);
+-            break;
+-        default:
+-            break;
+-        }
+-        grabber = c->mouseGrabberItem();
+-        if (grabber && stealThisEvent && !grabber->keepMouseGrab() && grabber != this)
+-            grabMouse();
+-
+-        return stealThisEvent;
+-    }
+-    if (event->type() == QEvent::MouseButtonRelease) {
+-        d->stealMouse = false;
+-        if (c && c->mouseGrabberItem() == this)
+-            ungrabMouse();
+-        setKeepMouseGrab(false);
+-    }
+-    return false;
+-}
+-
+ bool QQuickPinchArea::childMouseEventFilter(QQuickItem *i, QEvent *e)
+ {
+     Q_D(QQuickPinchArea);
+     if (!d->enabled || !isVisible())
+         return QQuickItem::childMouseEventFilter(i, e);
+     switch (e->type()) {
+-    case QEvent::MouseButtonPress:
+-    case QEvent::MouseMove:
+-    case QEvent::MouseButtonRelease:
+-        return sendMouseEvent(static_cast<QMouseEvent *>(e));
+-        break;
+     case QEvent::TouchBegin:
+     case QEvent::TouchUpdate: {
+             QTouchEvent *touch = static_cast<QTouchEvent*>(e);
+-            d->touchPoints.clear();
+-            for (int i = 0; i < touch->touchPoints().count(); ++i)
+-                if (!(touch->touchPoints().at(i).state() & Qt::TouchPointReleased))
+-                    d->touchPoints << touch->touchPoints().at(i);
+-            updatePinch();
++            if (touch->touchPoints().count() > 1) {
++                touchEvent(touch);
++            } else {
++                d->touchPoints.clear();
++                for (int i = 0; i < touch->touchPoints().count(); ++i)
++                    if (!(touch->touchPoints().at(i).state() & Qt::TouchPointReleased))
++                        d->touchPoints << touch->touchPoints().at(i);
++                updatePinch();
++            }
+         }
+         return d->inPinch;
+     case QEvent::TouchEnd:
+diff --git a/src/quick/items/qquickpincharea_p.h b/src/quick/items/qquickpincharea_p.h
+index b7328b3..3abe3bb 100644
+--- a/src/quick/items/qquickpincharea_p.h
++++ b/src/quick/items/qquickpincharea_p.h
+@@ -278,11 +278,6 @@ Q_SIGNALS:
+     void pinchFinished(QQuickPinchEvent *pinch);
+ 
+ protected:
+-    virtual void mousePressEvent(QMouseEvent *event);
+-    virtual void mouseReleaseEvent(QMouseEvent *event);
+-    virtual void mouseMoveEvent(QMouseEvent *event);
+-    virtual void mouseUngrabEvent();
+-    virtual bool sendMouseEvent(QMouseEvent *event);
+     virtual bool childMouseEventFilter(QQuickItem *i, QEvent *e);
+     virtual void touchEvent(QTouchEvent *event);
+ 
+diff --git a/tests/auto/quick/qquickcanvas/tst_qquickcanvas.cpp b/tests/auto/quick/qquickcanvas/tst_qquickcanvas.cpp
+index ed3dceb..82af367 100644
+--- a/tests/auto/quick/qquickcanvas/tst_qquickcanvas.cpp
++++ b/tests/auto/quick/qquickcanvas/tst_qquickcanvas.cpp
+@@ -51,6 +51,7 @@
+ #include "../../shared/util.h"
+ #include <QSignalSpy>
+ #include <private/qquickcanvas_p.h>
++#include <private/qguiapplication_p.h>
+ 
+ struct TouchEventData {
+     QEvent::Type type;
+@@ -144,7 +145,8 @@ class TestTouchItem : public QQuickRectangle
+     Q_OBJECT
+ public:
+     TestTouchItem(QQuickItem *parent = 0)
+-        : QQuickRectangle(parent), acceptEvents(true), mousePressId(0),
++        : QQuickRectangle(parent), acceptTouchEvents(true), acceptMouseEvents(true),
++          mousePressId(0),
+           spinLoopWhenPressed(false), touchEventCount(0)
+     {
+         border()->setWidth(1);
+@@ -153,16 +155,20 @@ public:
+     }
+ 
+     void reset() {
+-        acceptEvents = true;
++        acceptTouchEvents = acceptMouseEvents = true;
+         setEnabled(true);
+         setOpacity(1.0);
+ 
+         lastEvent = makeTouchData(QEvent::None, canvas(), 0, QList<QTouchEvent::TouchPoint>());//CHECK_VALID
++
++        lastVelocity = lastVelocityFromMouseMove = QVector2D();
++        lastMousePos = QPointF();
++        lastMouseCapabilityFlags = 0;
+     }
+ 
+     static void clearMousePressCounter()
+     {
+-        mousePressNum = 0;
++        mousePressNum = mouseMoveNum = mouseReleaseNum = 0;
+     }
+ 
+     void clearTouchEventCounter()
+@@ -170,40 +176,78 @@ public:
+         touchEventCount = 0;
+     }
+ 
+-    bool acceptEvents;
++    bool acceptTouchEvents;
++    bool acceptMouseEvents;
+     TouchEventData lastEvent;
+     int mousePressId;
+     bool spinLoopWhenPressed;
+     int touchEventCount;
++    QVector2D lastVelocity;
++    QVector2D lastVelocityFromMouseMove;
++    QPointF lastMousePos;
++    int lastMouseCapabilityFlags;
+ 
+-protected:
+-    virtual void touchEvent(QTouchEvent *event) {
+-        if (!acceptEvents) {
++    void touchEvent(QTouchEvent *event) {
++        if (!acceptTouchEvents) {
+             event->ignore();
+             return;
+         }
+         ++touchEventCount;
+         lastEvent = makeTouchData(event->type(), event->window(), event->touchPointStates(), event->touchPoints());
+-        event->accept();
++        if (event->device()->capabilities().testFlag(QTouchDevice::Velocity) && !event->touchPoints().isEmpty()) {
++            lastVelocity = event->touchPoints().first().velocity();
++        } else {
++            lastVelocity = QVector2D();
++        }
+         if (spinLoopWhenPressed && event->touchPointStates().testFlag(Qt::TouchPointPressed)) {
+             QCoreApplication::processEvents();
+         }
+     }
+ 
+-    virtual void mousePressEvent(QMouseEvent *) {
++    void mousePressEvent(QMouseEvent *e) {
++        if (!acceptMouseEvents) {
++            e->ignore();
++            return;
++        }
+         mousePressId = ++mousePressNum;
++        lastMousePos = e->pos();
++        lastMouseCapabilityFlags = QGuiApplicationPrivate::mouseEventCaps(e);
++    }
++
++    void mouseMoveEvent(QMouseEvent *e) {
++        if (!acceptMouseEvents) {
++            e->ignore();
++            return;
++        }
++        ++mouseMoveNum;
++        lastVelocityFromMouseMove = QGuiApplicationPrivate::mouseEventVelocity(e);
++        lastMouseCapabilityFlags = QGuiApplicationPrivate::mouseEventCaps(e);
++        lastMousePos = e->pos();
++    }
++
++    void mouseReleaseEvent(QMouseEvent *e) {
++        if (!acceptMouseEvents) {
++            e->ignore();
++            return;
++        }
++        ++mouseReleaseNum;
++        lastMousePos = e->pos();
++        lastMouseCapabilityFlags = QGuiApplicationPrivate::mouseEventCaps(e);
+     }
+ 
+     bool childMouseEventFilter(QQuickItem *, QEvent *event) {
++        // TODO Is it a bug if a QTouchEvent comes here?
+         if (event->type() == QEvent::MouseButtonPress)
+             mousePressId = ++mousePressNum;
+         return false;
+     }
+ 
+-    static int mousePressNum;
++    static int mousePressNum, mouseMoveNum, mouseReleaseNum;
+ };
+ 
+ int TestTouchItem::mousePressNum = 0;
++int TestTouchItem::mouseMoveNum = 0;
++int TestTouchItem::mouseReleaseNum = 0;
+ 
+ class ConstantUpdateItem : public QQuickItem
+ {
+@@ -229,9 +273,13 @@ private slots:
+     void initTestCase()
+     {
+         QQmlDataTest::initTestCase();
+-        touchDevice = new QTouchDevice();
++        touchDevice = new QTouchDevice;
+         touchDevice->setType(QTouchDevice::TouchScreen);
+         QWindowSystemInterface::registerTouchDevice(touchDevice);
++        touchDeviceWithVelocity = new QTouchDevice;
++        touchDeviceWithVelocity->setType(QTouchDevice::TouchScreen);
++        touchDeviceWithVelocity->setCapabilities(QTouchDevice::Position | QTouchDevice::Velocity);
++        QWindowSystemInterface::registerTouchDevice(touchDeviceWithVelocity);
+     }
+ 
+ 
+@@ -244,6 +292,9 @@ private slots:
+     void touchEvent_propagation_data();
+     void touchEvent_cancel();
+     void touchEvent_reentrant();
++    void touchEvent_velocity();
++
++    void mouseFromTouch_basic();
+ 
+     void clearCanvas();
+ 
+@@ -262,6 +313,7 @@ private slots:
+     void ownershipRootItem();
+ private:
+     QTouchDevice *touchDevice;
++    QTouchDevice *touchDeviceWithVelocity;
+ };
+ 
+ //If the item calls update inside updatePaintNode, it should schedule another update
+@@ -282,6 +334,7 @@ void tst_qquickcanvas::touchEvent_basic()
+     canvas->resize(250, 250);
+     canvas->setPos(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     TestTouchItem *bottomItem = new TestTouchItem(canvas->rootItem());
+     bottomItem->setObjectName("Bottom Item");
+@@ -307,7 +360,8 @@ void tst_qquickcanvas::touchEvent_basic()
+ 
+     QVERIFY(middleItem->lastEvent.touchPoints.isEmpty());
+     QVERIFY(bottomItem->lastEvent.touchPoints.isEmpty());
+-    TouchEventData d = makeTouchData(QEvent::TouchBegin, canvas, Qt::TouchPointPressed, makeTouchPoint(topItem,pos));
++    // At one point this was failing with kwin (KDE window manager) because canvas->setPos(100, 100)
++    // would put the decorated window at that position rather than the canvas itself.
+     COMPARE_TOUCH_DATA(topItem->lastEvent, makeTouchData(QEvent::TouchBegin, canvas, Qt::TouchPointPressed, makeTouchPoint(topItem, pos)));
+     topItem->reset();
+ 
+@@ -356,6 +410,10 @@ void tst_qquickcanvas::touchEvent_basic()
+     COMPARE_TOUCH_DATA(bottomItem->lastEvent, makeTouchData(QEvent::TouchBegin, canvas, Qt::TouchPointPressed, makeTouchPoint(bottomItem, pos)));
+     topItem->reset();
+     bottomItem->reset();
++    // cleanup: what is pressed must be released
++    // Otherwise you will get an assertion failure:
++    // ASSERT: "itemForTouchPointId.isEmpty()" in file items/qquickcanvas.cpp
++    QTest::touchEvent(canvas, touchDevice).release(0, pos.toPoint(), canvas).release(1, pos.toPoint(), canvas);
+ 
+     // move touch point from top item to bottom, and release
+     QTest::touchEvent(canvas, touchDevice).press(0, topItem->mapToScene(pos).toPoint(),canvas);
+@@ -395,7 +453,8 @@ void tst_qquickcanvas::touchEvent_propagation()
+ {
+     TestTouchItem::clearMousePressCounter();
+ 
+-    QFETCH(bool, acceptEvents);
++    QFETCH(bool, acceptTouchEvents);
++    QFETCH(bool, acceptMouseEvents);
+     QFETCH(bool, enableItem);
+     QFETCH(qreal, itemOpacity);
+ 
+@@ -403,6 +462,7 @@ void tst_qquickcanvas::touchEvent_propagation()
+     canvas->resize(250, 250);
+     canvas->setPos(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     TestTouchItem *bottomItem = new TestTouchItem(canvas->rootItem());
+     bottomItem->setObjectName("Bottom Item");
+@@ -424,7 +484,8 @@ void tst_qquickcanvas::touchEvent_propagation()
+     QPoint pointInTopItem = topItem->mapToScene(pos).toPoint();  // (110, 110) overlaps with bottom & top items
+ 
+     // disable topItem
+-    topItem->acceptEvents = acceptEvents;
++    topItem->acceptTouchEvents = acceptTouchEvents;
++    topItem->acceptMouseEvents = acceptMouseEvents;
+     topItem->setEnabled(enableItem);
+     topItem->setOpacity(itemOpacity);
+ 
+@@ -450,7 +511,8 @@ void tst_qquickcanvas::touchEvent_propagation()
+     middleItem->reset();
+ 
+     // disable middleItem as well
+-    middleItem->acceptEvents = acceptEvents;
++    middleItem->acceptTouchEvents = acceptTouchEvents;
++    middleItem->acceptMouseEvents = acceptMouseEvents;
+     middleItem->setEnabled(enableItem);
+     middleItem->setOpacity(itemOpacity);
+ 
+@@ -467,7 +529,7 @@ void tst_qquickcanvas::touchEvent_propagation()
+     bottomItem->reset();
+ 
+     // disable bottom item as well
+-    bottomItem->acceptEvents = acceptEvents;
++    bottomItem->acceptTouchEvents = acceptTouchEvents;
+     bottomItem->setEnabled(enableItem);
+     bottomItem->setOpacity(itemOpacity);
+ 
+@@ -485,7 +547,7 @@ void tst_qquickcanvas::touchEvent_propagation()
+     bottomItem->reset();
+ 
+     // disable middle item, touch on top item
+-    middleItem->acceptEvents = acceptEvents;
++    middleItem->acceptTouchEvents = acceptTouchEvents;
+     middleItem->setEnabled(enableItem);
+     middleItem->setOpacity(itemOpacity);
+     QTest::touchEvent(canvas, touchDevice).press(0, pointInTopItem, canvas);
+@@ -514,13 +576,14 @@ void tst_qquickcanvas::touchEvent_propagation()
+ 
+ void tst_qquickcanvas::touchEvent_propagation_data()
+ {
+-    QTest::addColumn<bool>("acceptEvents");
++    QTest::addColumn<bool>("acceptTouchEvents");
++    QTest::addColumn<bool>("acceptMouseEvents");
+     QTest::addColumn<bool>("enableItem");
+     QTest::addColumn<qreal>("itemOpacity");
+ 
+-    QTest::newRow("disable events") << false << true << 1.0;
+-    QTest::newRow("disable item") << true << false << 1.0;
+-    QTest::newRow("opacity of 0") << true << true << 0.0;
++    QTest::newRow("disable events") << false << false << true << 1.0;
++    QTest::newRow("disable item") << true << true << false << 1.0;
++    QTest::newRow("opacity of 0") << true << true << true << 0.0;
+ }
+ 
+ void tst_qquickcanvas::touchEvent_cancel()
+@@ -531,6 +594,7 @@ void tst_qquickcanvas::touchEvent_cancel()
+     canvas->resize(250, 250);
+     canvas->setPos(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     TestTouchItem *item = new TestTouchItem(canvas->rootItem());
+     item->setPos(QPointF(50, 50));
+@@ -562,6 +626,7 @@ void tst_qquickcanvas::touchEvent_reentrant()
+     canvas->resize(250, 250);
+     canvas->setPos(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     TestTouchItem *item = new TestTouchItem(canvas->rootItem());
+ 
+@@ -590,6 +655,126 @@ void tst_qquickcanvas::touchEvent_reentrant()
+     delete canvas;
+ }
+ 
++void tst_qquickcanvas::touchEvent_velocity()
++{
++    TestTouchItem::clearMousePressCounter();
++
++    QQuickCanvas *canvas = new QQuickCanvas;
++    canvas->resize(250, 250);
++    canvas->setPos(100, 100);
++    canvas->show();
++    QTest::qWaitForWindowShown(canvas);
++    QTest::qWait(10);
++
++    TestTouchItem *item = new TestTouchItem(canvas->rootItem());
++    item->setPos(QPointF(50, 50));
++    item->setSize(QSizeF(150, 150));
++
++    QList<QWindowSystemInterface::TouchPoint> points;
++    QWindowSystemInterface::TouchPoint tp;
++    tp.id = 1;
++    tp.state = Qt::TouchPointPressed;
++    QPoint pos = canvas->mapToGlobal(item->mapToScene(QPointF(10, 10)).toPoint());
++    tp.area = QRectF(pos, QSizeF(4, 4));
++    points << tp;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    points[0].state = Qt::TouchPointMoved;
++    points[0].area.adjust(5, 5, 5, 5);
++    QVector2D velocity(1.5, 2.5);
++    points[0].velocity = velocity;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++    QCOMPARE(item->touchEventCount, 2);
++    QCOMPARE(item->lastEvent.touchPoints.count(), 1);
++    QCOMPARE(item->lastVelocity, velocity);
++
++    // Now have a transformation on the item and check if velocity and position are transformed accordingly.
++    item->setRotation(90); // clockwise
++    QMatrix4x4 transformMatrix;
++    transformMatrix.rotate(-90, 0, 0, 1); // counterclockwise
++    QVector2D transformedVelocity = transformMatrix.mapVector(velocity).toVector2D();
++    points[0].area.adjust(5, 5, 5, 5);
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++    QCOMPARE(item->lastVelocity, transformedVelocity);
++    QPoint itemLocalPos = item->mapFromScene(canvas->mapFromGlobal(points[0].area.center().toPoint())).toPoint();
++    QPoint itemLocalPosFromEvent = item->lastEvent.touchPoints[0].pos().toPoint();
++    QCOMPARE(itemLocalPos, itemLocalPosFromEvent);
++
++    points[0].state = Qt::TouchPointReleased;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++    delete item;
++    delete canvas;
++}
++
++void tst_qquickcanvas::mouseFromTouch_basic()
++{
++    // Turn off accepting touch events with acceptTouchEvents. This
++    // should result in sending mouse events generated from the touch
++    // with the new event propagation system.
++
++    TestTouchItem::clearMousePressCounter();
++    QQuickCanvas *canvas = new QQuickCanvas;
++    canvas->resize(250, 250);
++    canvas->setPos(100, 100);
++    canvas->show();
++    QTest::qWaitForWindowShown(canvas);
++    QTest::qWait(10);
++
++    TestTouchItem *item = new TestTouchItem(canvas->rootItem());
++    item->setPos(QPointF(50, 50));
++    item->setSize(QSizeF(150, 150));
++    item->acceptTouchEvents = false;
++
++    QList<QWindowSystemInterface::TouchPoint> points;
++    QWindowSystemInterface::TouchPoint tp;
++    tp.id = 1;
++    tp.state = Qt::TouchPointPressed;
++    QPoint pos = canvas->mapToGlobal(item->mapToScene(QPointF(10, 10)).toPoint());
++    tp.area = QRectF(pos, QSizeF(4, 4));
++    points << tp;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    points[0].state = Qt::TouchPointMoved;
++    points[0].area.adjust(5, 5, 5, 5);
++    QVector2D velocity(1.5, 2.5);
++    points[0].velocity = velocity;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    points[0].state = Qt::TouchPointReleased;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++
++    // The item should have received a mouse press, move, and release.
++    QCOMPARE(item->mousePressNum, 1);
++    QCOMPARE(item->mouseMoveNum, 1);
++    QCOMPARE(item->mouseReleaseNum, 1);
++    QCOMPARE(item->lastMousePos.toPoint(), item->mapFromScene(canvas->mapFromGlobal(points[0].area.center().toPoint())).toPoint());
++    QCOMPARE(item->lastVelocityFromMouseMove, velocity);
++    QVERIFY((item->lastMouseCapabilityFlags & QTouchDevice::Velocity) != 0);
++
++    // Now the same with a transformation.
++    item->setRotation(90); // clockwise
++    QMatrix4x4 transformMatrix;
++    transformMatrix.rotate(-90, 0, 0, 1); // counterclockwise
++    QVector2D transformedVelocity = transformMatrix.mapVector(velocity).toVector2D();
++    points[0].state = Qt::TouchPointPressed;
++    points[0].velocity = velocity;
++    points[0].area = QRectF(pos, QSizeF(4, 4));
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    points[0].state = Qt::TouchPointMoved;
++    points[0].area.adjust(5, 5, 5, 5);
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++    QCOMPARE(item->lastMousePos.toPoint(), item->mapFromScene(canvas->mapFromGlobal(points[0].area.center().toPoint())).toPoint());
++    QCOMPARE(item->lastVelocityFromMouseMove, transformedVelocity);
++
++    points[0].state = Qt::TouchPointReleased;
++    QWindowSystemInterface::handleTouchEvent(canvas, touchDeviceWithVelocity, points);
++    QCoreApplication::processEvents();
++    delete item;
++    delete canvas;
++}
++
+ void tst_qquickcanvas::clearCanvas()
+ {
+     QQuickCanvas *canvas = new QQuickCanvas;
+@@ -613,6 +798,7 @@ void tst_qquickcanvas::mouseFiltering()
+     canvas->resize(250, 250);
+     canvas->setPos(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     TestTouchItem *bottomItem = new TestTouchItem(canvas->rootItem());
+     bottomItem->setObjectName("Bottom Item");
+@@ -820,6 +1006,7 @@ void tst_qquickcanvas::ignoreUnhandledMouseEvents()
+     QQuickCanvas* canvas = new QQuickCanvas;
+     canvas->resize(100, 100);
+     canvas->show();
++    QTest::qWaitForWindowShown(canvas);
+ 
+     QQuickItem* item = new QQuickItem;
+     item->setSize(QSizeF(100, 100));
+diff --git a/tests/auto/quick/qquickmultipointtoucharea/tst_qquickmultipointtoucharea.cpp b/tests/auto/quick/qquickmultipointtoucharea/tst_qquickmultipointtoucharea.cpp
+index c5ede26..9745e20 100644
+--- a/tests/auto/quick/qquickmultipointtoucharea/tst_qquickmultipointtoucharea.cpp
++++ b/tests/auto/quick/qquickmultipointtoucharea/tst_qquickmultipointtoucharea.cpp
+@@ -570,30 +570,24 @@ void tst_QQuickMultiPointTouchArea::inFlickable()
+ 
+     //moving one point vertically
+     QTest::touchEvent(canvas, device).press(0, p1);
+-    QTest::mousePress(canvas, Qt::LeftButton, 0, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     QVERIFY(flickable->contentY() < 0);
+     QCOMPARE(point11->pressed(), false);
+     QCOMPARE(point12->pressed(), false);
+ 
+     QTest::touchEvent(canvas, device).release(0, p1);
+-    QTest::mouseRelease(canvas,Qt::LeftButton, 0, p1);
+     QTest::qWait(50);
+ 
+     QTRY_VERIFY(!flickable->isMoving());
+@@ -736,32 +730,26 @@ void tst_QQuickMultiPointTouchArea::inFlickable2()
+     // Check that we can still move the Flickable
+     p1 = QPoint(50,100);
+     QTest::touchEvent(canvas, device).press(0, p1);
+-    QTest::mousePress(canvas, Qt::LeftButton, 0, p1);
+ 
+     QCOMPARE(point11->pressed(), true);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     p1 += QPoint(0,15);
+     QTest::touchEvent(canvas, device).move(0, p1);
+-    QTest::mouseMove(canvas, p1);
+ 
+     QVERIFY(flickable->contentY() < 0);
+     QVERIFY(flickable->isMoving());
+-    QCOMPARE(point11->pressed(), false);
++    QCOMPARE(point11->pressed(), true);
+ 
+     QTest::touchEvent(canvas, device).release(0, p1);
+-    QTest::mouseRelease(canvas,Qt::LeftButton, 0, p1);
+     QTest::qWait(50);
+ 
+     QTRY_VERIFY(!flickable->isMoving());
+diff --git a/tests/auto/quick/qquickpincharea/data/pinchproperties.qml b/tests/auto/quick/qquickpincharea/data/pinchproperties.qml
+index 44d1161..6665e2f 100644
+--- a/tests/auto/quick/qquickpincharea/data/pinchproperties.qml
++++ b/tests/auto/quick/qquickpincharea/data/pinchproperties.qml
+@@ -4,6 +4,7 @@ Rectangle {
+     property variant center
+     property real scale
+     property int pointCount: 0
++    property bool pinchActive: false
+     width: 240; height: 320
+     color: "white"
+     Rectangle {
+@@ -34,6 +35,7 @@ Rectangle {
+                 whiteRect.center = pinch.center
+                 whiteRect.scale = pinch.scale
+                 whiteRect.pointCount = pinch.pointCount;
++                whiteRect.pinchActive = true;
+             }
+             onPinchUpdated: {
+                 whiteRect.center = pinch.center
+@@ -44,6 +46,7 @@ Rectangle {
+                 whiteRect.center = pinch.center
+                 whiteRect.scale = pinch.scale
+                 whiteRect.pointCount = pinch.pointCount;
++                whiteRect.pinchActive = false;
+             }
+          }
+      }
+diff --git a/tests/auto/quick/qquickpincharea/tst_qquickpincharea.cpp b/tests/auto/quick/qquickpincharea/tst_qquickpincharea.cpp
+index 27efdf7..e0e4b6c 100644
+--- a/tests/auto/quick/qquickpincharea/tst_qquickpincharea.cpp
++++ b/tests/auto/quick/qquickpincharea/tst_qquickpincharea.cpp
+@@ -229,31 +229,41 @@ void tst_QQuickPinchArea::scale()
+ 
+     QPoint p1(80, 80);
+     QPoint p2(100, 100);
+-
+-    QTest::touchEvent(canvas, device).press(0, p1, canvas);
+-    QTest::touchEvent(canvas, device).stationary(0).press(1, p2, canvas);
+-    p1 -= QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1,canvas).move(1, p2,canvas);
+-
+-    QCOMPARE(root->property("scale").toReal(), 1.0);
+-
+-    p1 -= QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1,canvas).move(1, p2,canvas);
+-
+-    QCOMPARE(root->property("scale").toReal(), 1.5);
+-    QCOMPARE(root->property("center").toPointF(), QPointF(40, 40)); // blackrect is at 50,50
+-    QCOMPARE(blackRect->scale(), 1.5);
++    {
++        QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++        pinchSequence.press(0, p1, canvas).commit();
++        // In order for the stationary point to remember its previous position,
++        // we have to reuse the same pinchSequence object.  Otherwise if we let it
++        // be destroyed and then start a new sequence, point 0 will default to being
++        // stationary at 0, 0, and PinchArea will filter out that touchpoint because
++        // it is outside its bounds.
++        pinchSequence.stationary(0).press(1, p2, canvas).commit();
++        p1 -= QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
++
++        QCOMPARE(root->property("scale").toReal(), 1.0);
++        QVERIFY(root->property("pinchActive").toBool());
++
++        p1 -= QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
++
++        QCOMPARE(root->property("scale").toReal(), 1.5);
++        QCOMPARE(root->property("center").toPointF(), QPointF(40, 40)); // blackrect is at 50,50
++        QCOMPARE(blackRect->scale(), 1.5);
++    }
+ 
+     // scale beyond bound
+     p1 -= QPoint(50,50);
+     p2 += QPoint(50,50);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
+-
+-    QCOMPARE(blackRect->scale(), 2.0);
+-
+-    QTest::touchEvent(canvas, device).release(0, p1, canvas).release(1, p2, canvas);
++    {
++        QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++        pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++        QCOMPARE(blackRect->scale(), 2.0);
++        pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
++    }
++    QVERIFY(!root->property("pinchActive").toBool());
+ 
+     delete canvas;
+ }
+@@ -282,21 +292,25 @@ void tst_QQuickPinchArea::pan()
+ 
+     QPoint p1(80, 80);
+     QPoint p2(100, 100);
+-
+-    QTest::touchEvent(canvas, device).press(0, p1, canvas);
+-    QTest::touchEvent(canvas, device).stationary(0).press(1, p2, canvas);
+-    p1 += QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
+-
+-    QCOMPARE(root->property("scale").toReal(), 1.0);
+-
+-    p1 += QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++    {
++        QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++        pinchSequence.press(0, p1, canvas).commit();
++        // In order for the stationary point to remember its previous position,
++        // we have to reuse the same pinchSequence object.
++        pinchSequence.stationary(0).press(1, p2, canvas).commit();
++        p1 += QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
++
++        QCOMPARE(root->property("scale").toReal(), 1.0);
++        QVERIFY(root->property("pinchActive").toBool());
++
++        p1 += QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
++    }
+ 
+     QCOMPARE(root->property("center").toPointF(), QPointF(60, 60)); // blackrect is at 50,50
+-
+     QCOMPARE(blackRect->x(), 60.0);
+     QCOMPARE(blackRect->y(), 60.0);
+ 
+@@ -309,6 +323,7 @@ void tst_QQuickPinchArea::pan()
+     QCOMPARE(blackRect->y(), 160.0);
+ 
+     QTest::touchEvent(canvas, device).release(0, p1, canvas).release(1, p2, canvas);
++    QVERIFY(!root->property("pinchActive").toBool());
+ 
+     delete canvas;
+ }
+@@ -341,57 +356,64 @@ void tst_QQuickPinchArea::retouch()
+ 
+     QPoint p1(80, 80);
+     QPoint p2(100, 100);
++    {
++        QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++        pinchSequence.press(0, p1, canvas).commit();
++        // In order for the stationary point to remember its previous position,
++        // we have to reuse the same pinchSequence object.
++        pinchSequence.stationary(0).press(1, p2, canvas).commit();
++        p1 -= QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
+ 
+-    QTest::touchEvent(canvas, device).press(0, p1, canvas);
+-    QTest::touchEvent(canvas, device).stationary(0).press(1, p2, canvas);
+-    p1 -= QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
+-
+-    QCOMPARE(root->property("scale").toReal(), 1.0);
++        QCOMPARE(root->property("scale").toReal(), 1.0);
++        QVERIFY(root->property("pinchActive").toBool());
+ 
+-    p1 -= QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++        p1 -= QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1,canvas).move(1, p2,canvas).commit();
+ 
+-    QCOMPARE(startedSpy.count(), 1);
++        QCOMPARE(startedSpy.count(), 1);
+ 
+-    QCOMPARE(root->property("scale").toReal(), 1.5);
+-    QCOMPARE(root->property("center").toPointF(), QPointF(40, 40)); // blackrect is at 50,50
+-    QCOMPARE(blackRect->scale(), 1.5);
++        QCOMPARE(root->property("scale").toReal(), 1.5);
++        QCOMPARE(root->property("center").toPointF(), QPointF(40, 40)); // blackrect is at 50,50
++        QCOMPARE(blackRect->scale(), 1.5);
+ 
+-    QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 2);
++        QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 2);
+ 
+-    QCOMPARE(startedSpy.count(), 1);
+-    QCOMPARE(finishedSpy.count(), 0);
++        QCOMPARE(startedSpy.count(), 1);
++        QCOMPARE(finishedSpy.count(), 0);
+ 
+-    QTest::touchEvent(canvas, device).stationary(0).release(1, p2, canvas);
++        // Hold down the first finger but release the second one
++        pinchSequence.stationary(0).release(1, p2, canvas).commit();
+ 
+-    QCOMPARE(startedSpy.count(), 1);
+-    QCOMPARE(finishedSpy.count(), 0);
++        QCOMPARE(startedSpy.count(), 1);
++        QCOMPARE(finishedSpy.count(), 0);
+ 
+-    QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 1);
++        QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 1);
+ 
+-    QTest::touchEvent(canvas, device).stationary(0).press(1, p2, canvas);
+-    p1 -= QPoint(10,10);
+-    p2 += QPoint(10,10);
+-    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++        // Keep holding down the first finger and re-touch the second one, then move them both
++        pinchSequence.stationary(0).press(1, p2, canvas).commit();
++        p1 -= QPoint(10,10);
++        p2 += QPoint(10,10);
++        pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
+ 
+-    // Lifting and retouching results in onPinchStarted being called again
+-    QCOMPARE(startedSpy.count(), 2);
+-    QCOMPARE(finishedSpy.count(), 0);
++        // Lifting and retouching results in onPinchStarted being called again
++        QCOMPARE(startedSpy.count(), 2);
++        QCOMPARE(finishedSpy.count(), 0);
+ 
+-    QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 2);
++        QCOMPARE(canvas->rootObject()->property("pointCount").toInt(), 2);
+ 
+-    QTest::touchEvent(canvas, device).release(0, p1, canvas).release(1, p2, canvas);
++        pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
+ 
+-    QCOMPARE(startedSpy.count(), 2);
+-    QCOMPARE(finishedSpy.count(), 1);
++        QVERIFY(!root->property("pinchActive").toBool());
++        QCOMPARE(startedSpy.count(), 2);
++        QCOMPARE(finishedSpy.count(), 1);
++    }
+ 
+     delete canvas;
+ }
+ 
+-
+ QQuickView *tst_QQuickPinchArea::createView()
+ {
+     QQuickView *canvas = new QQuickView(0);
+diff --git a/tests/auto/quick/quick.pro b/tests/auto/quick/quick.pro
+index 2ef6dc0..fd78da2 100644
+--- a/tests/auto/quick/quick.pro
++++ b/tests/auto/quick/quick.pro
+@@ -70,6 +70,7 @@ QUICKTESTS =  \
+     qquickview \
+     qquickcanvasitem \
+     qquickscreen \
++    touchmouse \
+ 
+ 
+ SUBDIRS += $$PUBLICTESTS
+diff --git a/tests/auto/quick/touchmouse/data/buttononflickable.qml b/tests/auto/quick/touchmouse/data/buttononflickable.qml
+new file mode 100644
+index 0000000..95a993f
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/buttononflickable.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 300
++    height: 500
++    color: "green"
++
++    Flickable {
++        objectName: "flickable"
++        anchors.fill: parent
++        contentHeight: 1000
++
++        Rectangle {
++            objectName: "button"
++            y: 100
++            height: 100
++            width: parent.width
++
++            EventItem {
++                objectName: "eventItem1"
++                height: 100
++                width: 300
++            }
++        }
++
++        Rectangle {
++            objectName: "button2"
++            y: 300
++            height: 100
++            width: parent.width
++
++            EventItem {
++                objectName: "eventItem2"
++                height: 100
++                width: 300
++            }
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/buttonontouch.qml b/tests/auto/quick/touchmouse/data/buttonontouch.qml
+new file mode 100644
+index 0000000..dcd2573
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/buttonontouch.qml
+@@ -0,0 +1,100 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 300
++    height: 800
++    color: "green"
++
++    Rectangle {
++        color: "blue"
++        height: 400
++        width: parent.width
++
++
++        PinchArea {
++            pinch.target: button1
++            objectName: "pincharea"
++            anchors.fill: parent
++
++            pinch.minimumScale: 0.1
++            pinch.maximumScale: 10.0
++        }
++
++        Rectangle {
++
++            id: button1
++            objectName: "button1"
++            y: 100
++            height: 100
++            width: parent.width
++            Text { text: "Button 1" }
++
++            EventItem {
++                objectName: "eventItem1"
++                height: 100
++                width: 300
++            }
++        }
++
++        Rectangle {
++            objectName: "button2"
++            y: 300
++            height: 100
++            width: parent.width
++            Text { text: "Button 2" }
++
++            EventItem {
++                objectName: "eventItem2"
++                height: 100
++                width: 300
++            }
++        }
++    }
++
++    Rectangle {
++        y: 400
++        width: parent.width
++        height: parent.height
++        color: "red"
++
++        MultiPointTouchArea {
++            objectName: "toucharea"
++            anchors.fill: parent
++
++            y: 400
++            height: 400
++
++            Rectangle {
++                objectName: "button3"
++                y: 100
++                height: 100
++                width: parent.width
++                Text { text: "Button 3" }
++
++                EventItem {
++                    objectName: "eventItem3"
++                    height: 100
++                    width: 300
++                }
++            }
++
++            Rectangle {
++                objectName: "button4"
++                y: 300
++                height: 100
++                width: parent.width
++                Text { text: "Button 4" }
++
++                EventItem {
++                    objectName: "eventItem4"
++                    height: 100
++                    width: 300
++                }
++            }
++
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/flickableonpinch.qml b/tests/auto/quick/touchmouse/data/flickableonpinch.qml
+new file mode 100644
+index 0000000..9c9a197
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/flickableonpinch.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 600
++    height: 600
++    color: "green"
++
++    PinchArea {
++        objectName: "pincharea"
++        pinch.target: rect
++        anchors.fill: parent
++
++        pinch.minimumScale: 1.0
++        pinch.maximumScale: 10.0
++
++        Flickable {
++            objectName: "flickable"
++            anchors.fill: parent
++            contentHeight: 1000
++            contentWidth: 1000
++
++            Rectangle {
++                objectName: "rect"
++                id: rect
++                color: "blue"
++                x: 200
++                y: 200
++                width: 400
++                height: 400
++            }
++        }
++    }
++
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/mouseonflickableonpinch.qml b/tests/auto/quick/touchmouse/data/mouseonflickableonpinch.qml
+new file mode 100644
+index 0000000..015391f
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/mouseonflickableonpinch.qml
+@@ -0,0 +1,47 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 600
++    height: 600
++    color: "green"
++
++    PinchArea {
++        objectName: "pincharea"
++        pinch.target: rect
++        anchors.fill: parent
++
++        pinch.minimumScale: 1.0
++        pinch.maximumScale: 10.0
++
++        Flickable {
++            objectName: "flickable"
++            anchors.fill: parent
++            contentHeight: 1000
++            contentWidth: 1000
++
++            MouseArea {
++                anchors.fill: parent
++                onClicked: {
++                    if (rect.color == "#000000")
++                        rect.color = "#00ff00"
++                    else
++                        rect.color = "#000000"
++                }
++            }
++
++            Rectangle {
++                objectName: "rect"
++                id: rect
++                color: "blue"
++                x: 200
++                y: 200
++                width: 400
++                height: 400
++            }
++        }
++    }
++
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/pinchonflickable.qml b/tests/auto/quick/touchmouse/data/pinchonflickable.qml
+new file mode 100644
+index 0000000..2a7a910
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/pinchonflickable.qml
+@@ -0,0 +1,35 @@
++import QtQuick 2.0
++//import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 600
++    height: 600
++    color: "green"
++
++    Flickable {
++        objectName: "flickable"
++        anchors.fill: parent
++        contentHeight: 1000
++        contentWidth: 1000
++
++        Rectangle {
++            objectName: "rect"
++            id: rect
++            color: "blue"
++            x: 200
++            y: 200
++            width: 400
++            height: 400
++        }
++        PinchArea {
++            objectName: "pincharea"
++            pinch.target: rect
++            anchors.fill: parent
++
++            pinch.minimumScale: 1.0
++            pinch.maximumScale: 10.0
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/singleitem.qml b/tests/auto/quick/touchmouse/data/singleitem.qml
+new file mode 100644
+index 0000000..76d3a51
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/singleitem.qml
+@@ -0,0 +1,18 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 320
++    height: 480
++    color: "green"
++
++    EventItem {
++        objectName: "eventItem1"
++        x: 5
++        y: 5
++        height: 30
++        width: 30
++    }
++}
++
+diff --git a/tests/auto/quick/touchmouse/data/twoitems.qml b/tests/auto/quick/touchmouse/data/twoitems.qml
+new file mode 100644
+index 0000000..afbf35f
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/data/twoitems.qml
+@@ -0,0 +1,22 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Rectangle {
++    id: root
++    width: 320
++    height: 480
++    color: "green"
++
++    EventItem {
++        objectName: "eventItem1"
++        height: 200
++        width: 100
++
++        EventItem {
++            objectName: "eventItem2"
++            height: 100
++            width: 100
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/touchmouse/touchmouse.pro b/tests/auto/quick/touchmouse/touchmouse.pro
+new file mode 100644
+index 0000000..d0b0fa7
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/touchmouse.pro
+@@ -0,0 +1,17 @@
++CONFIG += testcase
++
++TARGET = tst_touchmouse
++QT += core-private gui-private qml-private quick-private v8-private testlib
++
++macx:CONFIG -= app_bundle
++
++SOURCES  += tst_touchmouse.cpp
++
++include (../../shared/util.pri)
++
++TESTDATA = data/*
++
++# OTHER_FILES += data/foo.qml
++
++CONFIG += parallel_test
++
+diff --git a/tests/auto/quick/touchmouse/tst_touchmouse.cpp b/tests/auto/quick/touchmouse/tst_touchmouse.cpp
+new file mode 100644
+index 0000000..7ab9387
+--- /dev/null
++++ b/tests/auto/quick/touchmouse/tst_touchmouse.cpp
+@@ -0,0 +1,923 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtQml module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++
++#include <QtTest/QtTest>
++
++#include <QtGui/qstylehints.h>
++
++#include <QtQuick/qquickview.h>
++#include <QtQuick/qquickitem.h>
++#include <QtQuick/private/qquickmousearea_p.h>
++#include <QtQuick/private/qquickmultipointtoucharea_p.h>
++#include <QtQuick/private/qquickpincharea_p.h>
++#include <QtQuick/private/qquickflickable_p.h>
++
++#include <private/qquickcanvas_p.h>
++
++#include <QtQml/qqmlengine.h>
++#include <QtQml/qqmlproperty.h>
++
++#include "../../shared/util.h"
++
++struct Event
++{
++    Event(QEvent::Type t, QPoint mouse, QPoint global)
++        :type(t), mousePos(mouse), mousePosGlobal(global)
++    {}
++
++    Event(QEvent::Type t, QList<QTouchEvent::TouchPoint> touch)
++        :type(t), points(touch)
++    {}
++
++    QEvent::Type type;
++    QPoint mousePos;
++    QPoint mousePosGlobal;
++    QList<QTouchEvent::TouchPoint> points;
++};
++
++class EventItem : public QQuickItem
++{
++    Q_OBJECT
++public:
++    EventItem(QQuickItem *parent = 0)
++        : QQuickItem(parent), acceptMouse(false), acceptTouch(false), filterTouch(false)
++    {}
++
++    void touchEvent(QTouchEvent *event)
++    {
++        eventList.append(Event(event->type(), event->touchPoints()));
++        event->setAccepted(acceptTouch);
++    }
++    void mousePressEvent(QMouseEvent *event)
++    {
++        eventList.append(Event(event->type(), event->pos(), event->globalPos()));
++        event->setAccepted(acceptMouse);
++    }
++    void mouseMoveEvent(QMouseEvent *event)
++    {
++        eventList.append(Event(event->type(), event->pos(), event->globalPos()));
++        event->setAccepted(acceptMouse);
++    }
++    void mouseReleaseEvent(QMouseEvent *event)
++    {
++        eventList.append(Event(event->type(), event->pos(), event->globalPos()));
++        event->setAccepted(acceptMouse);
++    }
++    void mouseDoubleClickEvent(QMouseEvent *event)
++    {
++        eventList.append(Event(event->type(), event->pos(), event->globalPos()));
++        event->setAccepted(acceptMouse);
++    }
++    bool event(QEvent *event) {
++        if (event->type() == QEvent::UngrabMouse) {
++            eventList.append(Event(event->type(), QPoint(0,0), QPoint(0,0)));
++        }
++        return QQuickItem::event(event);
++    }
++
++    QList<Event> eventList;
++    bool acceptMouse;
++    bool acceptTouch;
++    bool filterTouch; // when used as event filter
++
++    bool eventFilter(QObject *, QEvent *event)
++    {
++        if (event->type() == QEvent::TouchBegin ||
++                event->type() == QEvent::TouchUpdate ||
++                event->type() == QEvent::TouchCancel ||
++                event->type() == QEvent::TouchEnd) {
++            QTouchEvent *touch = static_cast<QTouchEvent*>(event);
++            eventList.append(Event(event->type(), touch->touchPoints()));
++            if (filterTouch)
++                event->accept();
++            return true;
++        }
++        return false;
++    }
++};
++
++class tst_TouchMouse : public QQmlDataTest
++{
++    Q_OBJECT
++public:
++    tst_TouchMouse()
++        :device(0)
++    {}
++
++private slots:
++    void initTestCase();
++
++    void simpleTouchEvent();
++    void eventFilter();
++    void mouse();
++    void touchOverMouse();
++    void mouseOverTouch();
++
++    void buttonOnFlickable();
++    void buttonOnTouch();
++
++    void pinchOnFlickable();
++    void flickableOnPinch();
++    void mouseOnFlickableOnPinch();
++
++private:
++    QQuickView *createView();
++    QTouchDevice *device;
++};
++
++QQuickView *tst_TouchMouse::createView()
++{
++    QQuickView *canvas = new QQuickView(0);
++    canvas->setGeometry(0,0,240,320);
++
++    return canvas;
++}
++
++void tst_TouchMouse::initTestCase()
++{
++    // This test assumes that we don't get synthesized mouse events from QGuiApplication
++    qApp->setAttribute(Qt::AA_SynthesizeMouseForUnhandledTouchEvents, false);
++
++    QQmlDataTest::initTestCase();
++    qmlRegisterType<EventItem>("Qt.test", 1, 0, "EventItem");
++    if (!device) {
++        device = new QTouchDevice;
++        device->setType(QTouchDevice::TouchScreen);
++        QWindowSystemInterface::registerTouchDevice(device);
++    }
++}
++
++void tst_TouchMouse::simpleTouchEvent()
++{
++    QQuickView *canvas = createView();
++
++    canvas->setSource(testFileUrl("singleitem.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QTest::qWaitForWindowShown(canvas);
++    QVERIFY(canvas->rootObject() != 0);
++
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++
++    // Do not accept touch or mouse
++    QPoint p1;
++    p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 1);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 1);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 1);
++    eventItem1->eventList.clear();
++
++    // Accept touch
++    eventItem1->acceptTouch = true;
++    p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 1);
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 3);
++    eventItem1->eventList.clear();
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // Accept mouse
++    eventItem1->acceptTouch = false;
++    eventItem1->acceptMouse = true;
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++    QQuickCanvasPrivate *canvasPriv = QQuickCanvasPrivate::get(canvas);
++    QCOMPARE(canvasPriv->mouseGrabberItem, eventItem1);
++
++    QPoint localPos = eventItem1->mapFromScene(p1).toPoint();
++    QPoint globalPos = canvas->mapToGlobal(p1);
++    QPoint scenePos = p1; // item is at 0,0
++    QCOMPARE(eventItem1->eventList.at(0).points.at(0).pos().toPoint(), localPos);
++    QCOMPARE(eventItem1->eventList.at(0).points.at(0).scenePos().toPoint(), scenePos);
++    QCOMPARE(eventItem1->eventList.at(0).points.at(0).screenPos().toPoint(), globalPos);
++    QCOMPARE(eventItem1->eventList.at(1).mousePos, localPos);
++    QCOMPARE(eventItem1->eventList.at(1).mousePosGlobal, globalPos);
++
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 4);
++    QCOMPARE(eventItem1->eventList.at(2).type, QEvent::TouchUpdate);
++    QCOMPARE(eventItem1->eventList.at(3).type, QEvent::MouseMove);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 6);
++    QCOMPARE(eventItem1->eventList.at(4).type, QEvent::TouchEnd);
++    QCOMPARE(eventItem1->eventList.at(5).type, QEvent::MouseButtonRelease);
++    eventItem1->eventList.clear();
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // Accept mouse buttons but not the event
++    eventItem1->acceptTouch = false;
++    eventItem1->acceptMouse = false;
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    eventItem1->eventList.clear();
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // Accept touch and mouse
++    eventItem1->acceptTouch = true;
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 1);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::TouchUpdate);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 3);
++    QCOMPARE(eventItem1->eventList.at(2).type, QEvent::TouchEnd);
++    eventItem1->eventList.clear();
++
++    delete canvas;
++}
++
++void tst_TouchMouse::eventFilter()
++{
++//    // install event filter on item and see that it can grab events
++//    QQuickView *canvas = createView();
++
++//    canvas->setSource(testFileUrl("singleitem.qml"));
++//    canvas->show();
++//    canvas->requestActivateWindow();
++//    QVERIFY(canvas->rootObject() != 0);
++
++//    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++//    QVERIFY(eventItem1);
++//    eventItem1->acceptTouch = true;
++
++//    EventItem *filter = new EventItem;
++//    filter->filterTouch = true;
++//    eventItem1->installEventFilter(filter);
++
++//    QPoint p1 = QPoint(20, 20);
++//    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++//    // QEXPECT_FAIL("", "We do not implement event filters correctly", Abort);
++//    QCOMPARE(eventItem1->eventList.size(), 0);
++//    QCOMPARE(filter->eventList.size(), 1);
++//    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++//    QCOMPARE(eventItem1->eventList.size(), 0);
++//    QCOMPARE(filter->eventList.size(), 2);
++
++//    delete filter;
++//    delete canvas;
++}
++
++void tst_TouchMouse::mouse()
++{
++    // eventItem1
++    //   - eventItem2
++
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++    QQuickView *canvas = createView();
++
++    canvas->setSource(testFileUrl("twoitems.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++    EventItem *eventItem2 = canvas->rootObject()->findChild<EventItem*>("eventItem2");
++    QVERIFY(eventItem2);
++    QTest::qWaitForWindowShown(canvas);
++
++    // bottom item likes mouse, top likes touch
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    eventItem1->acceptMouse = true;
++    // item 2 doesn't accept anything, thus it sees a touch pass by
++    QPoint p1 = QPoint(30, 30);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++
++    delete canvas;
++}
++
++void tst_TouchMouse::touchOverMouse()
++{
++    // eventItem1
++    //   - eventItem2
++
++    QQuickView *canvas = createView();
++
++    canvas->setSource(testFileUrl("twoitems.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++    EventItem *eventItem2 = canvas->rootObject()->findChild<EventItem*>("eventItem2");
++    QVERIFY(eventItem2);
++
++    // bottom item likes mouse, top likes touch
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    eventItem2->acceptTouch = true;
++
++    QTest::qWaitForWindowShown(canvas);
++
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    QPoint p1 = QPoint(20, 20);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    QCOMPARE(eventItem2->eventList.size(), 1);
++    QCOMPARE(eventItem2->eventList.at(0).type, QEvent::TouchBegin);
++    p1 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QCOMPARE(eventItem2->eventList.size(), 2);
++    QCOMPARE(eventItem2->eventList.at(1).type, QEvent::TouchUpdate);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem2->eventList.size(), 3);
++    QCOMPARE(eventItem2->eventList.at(2).type, QEvent::TouchEnd);
++    eventItem2->eventList.clear();
++
++    delete canvas;
++}
++
++void tst_TouchMouse::mouseOverTouch()
++{
++    // eventItem1
++    //   - eventItem2
++
++    QQuickView *canvas = createView();
++
++    canvas->setSource(testFileUrl("twoitems.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++    EventItem *eventItem2 = canvas->rootObject()->findChild<EventItem*>("eventItem2");
++    QVERIFY(eventItem2);
++
++    // bottom item likes mouse, top likes touch
++    eventItem1->acceptTouch = true;
++    eventItem2->setAcceptedMouseButtons(Qt::LeftButton);
++    eventItem2->acceptMouse = true;
++
++    QTest::qWaitForWindowShown(canvas);
++
++    QPoint p1 = QPoint(20, 20);
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    QCOMPARE(eventItem2->eventList.size(), 2);
++    QCOMPARE(eventItem2->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem2->eventList.at(1).type, QEvent::MouseButtonPress);
++
++
++//    p1 += QPoint(10, 0);
++//    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++//    QCOMPARE(eventItem2->eventList.size(), 1);
++//    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++//    QCOMPARE(eventItem2->eventList.size(), 1);
++//    eventItem2->eventList.clear();
++
++    delete canvas;
++}
++
++void tst_TouchMouse::buttonOnFlickable()
++{
++    // flickable - height 500 / 1000
++    //   - eventItem1 y: 100, height 100
++    //   - eventItem2 y: 300, height 100
++
++    QQuickView *canvas = createView();
++
++    canvas->setSource(testFileUrl("buttononflickable.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickFlickable *flickable = canvas->rootObject()->findChild<QQuickFlickable*>("flickable");
++    QVERIFY(flickable);
++
++    // should a mouse area button be clickable on top of flickable? yes :)
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    eventItem1->acceptMouse = true;
++
++    // should a touch button be touchable on top of flickable? yes :)
++    EventItem *eventItem2 = canvas->rootObject()->findChild<EventItem*>("eventItem2");
++    QVERIFY(eventItem2);
++    QCOMPARE(eventItem2->eventList.size(), 0);
++    eventItem2->acceptTouch = true;
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // check that buttons are clickable
++    // mouse button
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    QPoint p1 = QPoint(20, 130);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 4);
++    QCOMPARE(eventItem1->eventList.at(2).type, QEvent::TouchEnd);
++    QCOMPARE(eventItem1->eventList.at(3).type, QEvent::MouseButtonRelease);
++    eventItem1->eventList.clear();
++
++    // touch button
++    p1 = QPoint(10, 310);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem2->eventList.size(), 1);
++    QCOMPARE(eventItem2->eventList.at(0).type, QEvent::TouchBegin);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem2->eventList.size(), 2);
++    QCOMPARE(eventItem2->eventList.at(1).type, QEvent::TouchEnd);
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    eventItem2->eventList.clear();
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // click above button, no events please
++    p1 = QPoint(10, 90);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    eventItem1->eventList.clear();
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // check that flickable moves - mouse button
++    QCOMPARE(eventItem1->eventList.size(), 0);
++    p1 = QPoint(10, 110);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++
++    QQuickCanvasPrivate *canvasPriv = QQuickCanvasPrivate::get(canvas);
++    QCOMPARE(canvasPriv->touchMouseId, 0);
++    QCOMPARE(canvasPriv->itemForTouchPointId[0], eventItem1);
++    QCOMPARE(canvasPriv->mouseGrabberItem, eventItem1);
++
++    p1 += QPoint(0, -10);
++    QPoint p2 = p1 + QPoint(0, -10);
++    QPoint p3 = p2 + QPoint(0, -10);
++    QTest::qWait(10);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas);
++    QTest::qWait(10);
++    QTest::touchEvent(canvas, device).move(0, p2, canvas);
++    QTest::qWait(10);
++    QTest::touchEvent(canvas, device).move(0, p3, canvas);
++
++    // we cannot really know when the events get grabbed away
++    QVERIFY(eventItem1->eventList.size() >= 4);
++    QCOMPARE(eventItem1->eventList.at(2).type, QEvent::TouchUpdate);
++    QCOMPARE(eventItem1->eventList.at(3).type, QEvent::MouseMove);
++
++    QCOMPARE(canvasPriv->mouseGrabberItem, flickable);
++    QVERIFY(flickable->isMovingVertically());
++
++    QTest::touchEvent(canvas, device).release(0, p3, canvas);
++    delete canvas;
++}
++
++void tst_TouchMouse::buttonOnTouch()
++{
++    // 400x800
++    //   PinchArea - height 400
++    //     - eventItem1 y: 100, height 100
++    //     - eventItem2 y: 300, height 100
++    //   MultiPointTouchArea - height 400
++    //     - eventItem1 y: 100, height 100
++    //     - eventItem2 y: 300, height 100
++
++    QQuickView *canvas = createView();
++    canvas->setSource(testFileUrl("buttonontouch.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickPinchArea *pinchArea = canvas->rootObject()->findChild<QQuickPinchArea*>("pincharea");
++    QVERIFY(pinchArea);
++    QQuickItem *button1 = canvas->rootObject()->findChild<QQuickItem*>("button1");
++    QVERIFY(button1);
++    EventItem *eventItem1 = canvas->rootObject()->findChild<EventItem*>("eventItem1");
++    QVERIFY(eventItem1);
++    EventItem *eventItem2 = canvas->rootObject()->findChild<EventItem*>("eventItem2");
++    QVERIFY(eventItem2);
++
++    QQuickMultiPointTouchArea *touchArea = canvas->rootObject()->findChild<QQuickMultiPointTouchArea*>("toucharea");
++    QVERIFY(touchArea);
++    EventItem *eventItem3 = canvas->rootObject()->findChild<EventItem*>("eventItem3");
++    QVERIFY(eventItem3);
++    EventItem *eventItem4 = canvas->rootObject()->findChild<EventItem*>("eventItem4");
++    QVERIFY(eventItem4);
++
++
++    // Test the common case of a mouse area on top of pinch
++    eventItem1->setAcceptedMouseButtons(Qt::LeftButton);
++    eventItem1->acceptMouse = true;
++
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // Normal touch click
++    QPoint p1 = QPoint(10, 110);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QTest::touchEvent(canvas, device).release(0, p1, canvas);
++    QCOMPARE(eventItem1->eventList.size(), 4);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++    QCOMPARE(eventItem1->eventList.at(2).type, QEvent::TouchEnd);
++    QCOMPARE(eventItem1->eventList.at(3).type, QEvent::MouseButtonRelease);
++    eventItem1->eventList.clear();
++
++    // Normal mouse click
++    QTest::mouseClick(canvas, Qt::LeftButton, 0, p1);
++    QCOMPARE(eventItem1->eventList.size(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::MouseButtonPress);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonRelease);
++    eventItem1->eventList.clear();
++
++    // Pinch starting on the PinchArea should work
++    p1 = QPoint(40, 10);
++    QPoint p2 = QPoint(60, 10);
++
++    // Start the events after each other
++    QTest::touchEvent(canvas, device).press(0, p1, canvas);
++    QTest::touchEvent(canvas, device).stationary(0).press(1, p2, canvas);
++
++    QCOMPARE(button1->scale(), 1.0);
++
++    // This event seems to be discarded, let's ignore it for now until someone digs into pincharea
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++//    QCOMPARE(button1->scale(), 1.5);
++    qDebug() << "Button scale: " << button1->scale();
++
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++//    QCOMPARE(button1->scale(), 2.0);
++    qDebug() << "Button scale: " << button1->scale();
++
++    QTest::touchEvent(canvas, device).release(0, p1, canvas).release(1, p2, canvas);
++//    QVERIFY(eventItem1->eventList.isEmpty());
++//    QCOMPARE(button1->scale(), 2.0);
++    qDebug() << "Button scale: " << button1->scale();
++
++
++    // wait to avoid getting a double click event
++    QTest::qWait(qApp->styleHints()->mouseDoubleClickInterval() + 10);
++
++    // Start pinching while on the button
++    button1->setScale(1.0);
++    p1 = QPoint(40, 110);
++    p2 = QPoint(60, 110);
++    QTest::touchEvent(canvas, device).press(0, p1, canvas).press(1, p2, canvas);
++    QCOMPARE(button1->scale(), 1.0);
++    QCOMPARE(eventItem1->eventList.count(), 2);
++    QCOMPARE(eventItem1->eventList.at(0).type, QEvent::TouchBegin);
++    QCOMPARE(eventItem1->eventList.at(1).type, QEvent::MouseButtonPress);
++
++    // This event seems to be discarded, let's ignore it for now until someone digs into pincharea
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++    //QCOMPARE(button1->scale(), 1.5);
++    qDebug() << button1->scale();
++
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p1, canvas).move(1, p2, canvas);
++    qDebug() << button1->scale();
++    //QCOMPARE(button1->scale(), 2.0);
++
++    QTest::touchEvent(canvas, device).release(0, p1, canvas).release(1, p2, canvas);
++//    QCOMPARE(eventItem1->eventList.size(), 99);
++    qDebug() << button1->scale();
++    //QCOMPARE(button1->scale(), 2.0);
++
++    delete canvas;
++}
++
++void tst_TouchMouse::pinchOnFlickable()
++{
++    QQuickView *canvas = createView();
++    canvas->setSource(testFileUrl("pinchonflickable.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickPinchArea *pinchArea = canvas->rootObject()->findChild<QQuickPinchArea*>("pincharea");
++    QVERIFY(pinchArea);
++    QQuickFlickable *flickable = canvas->rootObject()->findChild<QQuickFlickable*>("flickable");
++    QVERIFY(flickable);
++    QQuickItem *rect = canvas->rootObject()->findChild<QQuickItem*>("rect");
++    QVERIFY(rect);
++
++    // flickable - single touch point
++    QVERIFY(flickable->contentX() == 0.0);
++    QPoint p = QPoint(100, 100);
++    QTest::touchEvent(canvas, device).press(0, p, canvas);
++    QCOMPARE(rect->pos(), QPointF(200.0, 200.0));
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    QTest::qWait(10);
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    QTest::qWait(10);
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    QTest::touchEvent(canvas, device).release(0, p, canvas);
++
++    QGuiApplication::processEvents();
++    QTest::qWait(10);
++    QVERIFY(!flickable->isAtXBeginning());
++    // wait until flicking is done
++    QTRY_VERIFY(!flickable->isFlicking());
++
++    // pinch
++    QPoint p1 = QPoint(40, 20);
++    QPoint p2 = QPoint(60, 20);
++
++    QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++    pinchSequence.press(0, p1, canvas).commit();
++    // In order for the stationary point to remember its previous position,
++    // we have to reuse the same pinchSequence object.  Otherwise if we let it
++    // be destroyed and then start a new sequence, point 0 will default to being
++    // stationary at 0, 0, and PinchArea will filter out that touchpoint because
++    // it is outside its bounds.
++    pinchSequence.stationary(0).press(1, p2, canvas).commit();
++    p1 -= QPoint(10,10);
++    p2 += QPoint(10,10);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    QCOMPARE(rect->scale(), 1.0);
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
++    QVERIFY(rect->scale() > 1.0);
++}
++
++void tst_TouchMouse::flickableOnPinch()
++{
++    QQuickView *canvas = createView();
++    canvas->setSource(testFileUrl("flickableonpinch.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickPinchArea *pinchArea = canvas->rootObject()->findChild<QQuickPinchArea*>("pincharea");
++    QVERIFY(pinchArea);
++    QQuickFlickable *flickable = canvas->rootObject()->findChild<QQuickFlickable*>("flickable");
++    QVERIFY(flickable);
++    QQuickItem *rect = canvas->rootObject()->findChild<QQuickItem*>("rect");
++    QVERIFY(rect);
++
++    // flickable - single touch point
++    QVERIFY(flickable->contentX() == 0.0);
++    QPoint p = QPoint(100, 100);
++    QTest::touchEvent(canvas, device).press(0, p, canvas);
++    QCOMPARE(rect->pos(), QPointF(200.0, 200.0));
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++
++    QTest::qWait(1000);
++
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    QTest::touchEvent(canvas, device).release(0, p, canvas);
++
++    QTest::qWait(1000);
++
++    //QVERIFY(flickable->isMovingHorizontally());
++    qDebug() << "Pos: " << rect->pos();
++    // wait until flicking is done
++    QTRY_VERIFY(!flickable->isFlicking());
++
++    // pinch
++    QPoint p1 = QPoint(40, 20);
++    QPoint p2 = QPoint(60, 20);
++    QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++    pinchSequence.press(0, p1, canvas).commit();
++    // In order for the stationary point to remember its previous position,
++    // we have to reuse the same pinchSequence object.  Otherwise if we let it
++    // be destroyed and then start a new sequence, point 0 will default to being
++    // stationary at 0, 0, and PinchArea will filter out that touchpoint because
++    // it is outside its bounds.
++    pinchSequence.stationary(0).press(1, p2, canvas).commit();
++    p1 -= QPoint(10,10);
++    p2 += QPoint(10,10);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    QCOMPARE(rect->scale(), 1.0);
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
++    QVERIFY(rect->scale() > 1.0);
++}
++
++void tst_TouchMouse::mouseOnFlickableOnPinch()
++{
++    QQuickView *canvas = createView();
++    canvas->setSource(testFileUrl("mouseonflickableonpinch.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickPinchArea *pinchArea = canvas->rootObject()->findChild<QQuickPinchArea*>("pincharea");
++    QVERIFY(pinchArea);
++    QQuickFlickable *flickable = canvas->rootObject()->findChild<QQuickFlickable*>("flickable");
++    QVERIFY(flickable);
++    QQuickItem *rect = canvas->rootObject()->findChild<QQuickItem*>("rect");
++    QVERIFY(rect);
++
++    // flickable - single touch point
++    QVERIFY(flickable->contentX() == 0.0);
++    QPoint p = QPoint(100, 100);
++    QTest::touchEvent(canvas, device).press(0, p, canvas);
++    QCOMPARE(rect->pos(), QPointF(200.0, 200.0));
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++
++    QTest::qWait(1000);
++
++    p -= QPoint(10, 0);
++    QTest::touchEvent(canvas, device).move(0, p, canvas);
++    QTest::touchEvent(canvas, device).release(0, p, canvas);
++
++    QTest::qWait(1000);
++
++    //QVERIFY(flickable->isMovingHorizontally());
++    qDebug() << "Pos: " << rect->pos();
++
++    // pinch
++    QPoint p1 = QPoint(40, 20);
++    QPoint p2 = QPoint(60, 20);
++    QTest::QTouchEventSequence pinchSequence = QTest::touchEvent(canvas, device);
++    pinchSequence.press(0, p1, canvas).commit();
++    // In order for the stationary point to remember its previous position,
++    // we have to reuse the same pinchSequence object.  Otherwise if we let it
++    // be destroyed and then start a new sequence, point 0 will default to being
++    // stationary at 0, 0, and PinchArea will filter out that touchpoint because
++    // it is outside its bounds.
++    pinchSequence.stationary(0).press(1, p2, canvas).commit();
++    p1 -= QPoint(10,10);
++    p2 += QPoint(10,10);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    QCOMPARE(rect->scale(), 1.0);
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(10, 0);
++    p2 += QPoint(10, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
++    QVERIFY(rect->scale() > 1.0);
++
++    // PinchArea should steal the event after flicking started
++    rect->setScale(1.0);
++    flickable->setContentX(0.0);
++    p = QPoint(100, 100);
++    pinchSequence.press(0, p, canvas).commit();
++    QCOMPARE(rect->pos(), QPointF(200.0, 200.0));
++    p -= QPoint(10, 0);
++    pinchSequence.move(0, p, canvas).commit();
++    p -= QPoint(10, 0);
++    pinchSequence.move(0, p, canvas).commit();
++    QTest::qWait(1000);
++    p -= QPoint(10, 0);
++    pinchSequence.move(0, p, canvas).commit();
++
++    QQuickCanvasPrivate *canvasPriv = QQuickCanvasPrivate::get(canvas);
++    QCOMPARE(canvasPriv->mouseGrabberItem, flickable);
++    qDebug() << "Mouse Grabber: " << canvasPriv->mouseGrabberItem << " itemForTouchPointId: " << canvasPriv->itemForTouchPointId;
++
++    // Add a second finger, this should lead to stealing
++    p1 = QPoint(40, 100);
++    p2 = QPoint(60, 100);
++    pinchSequence.stationary(0).press(1, p2, canvas).commit();
++    QCOMPARE(rect->scale(), 1.0);
++
++    p1 -= QPoint(5, 0);
++    p2 += QPoint(5, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(5, 0);
++    p2 += QPoint(5, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    p1 -= QPoint(5, 0);
++    p2 += QPoint(5, 0);
++    pinchSequence.move(0, p1, canvas).move(1, p2, canvas).commit();
++    pinchSequence.release(0, p1, canvas).release(1, p2, canvas).commit();
++    QVERIFY(rect->scale() > 1.0);
++    pinchSequence.release(0, p, canvas).commit();
++}
++
++QTEST_MAIN(tst_TouchMouse)
++
++#include "tst_touchmouse.moc"
++

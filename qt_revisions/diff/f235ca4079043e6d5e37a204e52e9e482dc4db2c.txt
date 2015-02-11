@@ -1,0 +1,292 @@
+diff --git a/src/corelib/kernel/qtranslator.cpp b/src/corelib/kernel/qtranslator.cpp
+index c34a3ac..e8c913e 100644
+--- a/src/corelib/kernel/qtranslator.cpp
++++ b/src/corelib/kernel/qtranslator.cpp
+@@ -286,7 +286,7 @@ class QTranslatorPrivate : public QObjectPrivate
+ {
+     Q_DECLARE_PUBLIC(QTranslator)
+ public:
+-    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88 };
++    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88, Dependencies = 0x96 };
+ 
+     QTranslatorPrivate() :
+ #if defined(QT_USE_MMAP)
+@@ -302,6 +302,9 @@ public:
+     char *unmapPointer;     // owned memory (mmap or new)
+     quint32 unmapLength;
+ 
++    // used if the translator has dependencies
++    QList<QTranslator*> subTranslators;
++
+     // Pointers and offsets into unmapPointer[unmapLength] array, or user
+     // provided data array
+     const uchar *messageArray;
+@@ -313,8 +316,8 @@ public:
+     uint contextLength;
+     uint numerusRulesLength;
+ 
+-    bool do_load(const QString &filename);
+-    bool do_load(const uchar *data, int len);
++    bool do_load(const QString &filename, const QString &directory);
++    bool do_load(const uchar *data, int len, const QString &directory);
+     QString do_translate(const char *context, const char *sourceText, const char *comment,
+                          int n) const;
+     void clear();
+@@ -506,10 +509,10 @@ bool QTranslator::load(const QString & filename, const QString & directory,
+     }
+ 
+     // realname is now the fully qualified name of a readable file.
+-    return d->do_load(realname);
++    return d->do_load(realname, directory);
+ }
+ 
+-bool QTranslatorPrivate::do_load(const QString &realname)
++bool QTranslatorPrivate::do_load(const QString &realname, const QString &directory)
+ {
+     QTranslatorPrivate *d = this;
+     bool ok = false;
+@@ -567,7 +570,7 @@ bool QTranslatorPrivate::do_load(const QString &realname)
+         }
+     }
+ 
+-    if (ok && d->do_load(reinterpret_cast<const uchar *>(d->unmapPointer), d->unmapLength))
++    if (ok && d->do_load(reinterpret_cast<const uchar *>(d->unmapPointer), d->unmapLength, directory))
+         return true;
+ 
+ #if defined(QT_USE_MMAP)
+@@ -723,7 +726,7 @@ bool QTranslator::load(const QLocale & locale,
+     Q_D(QTranslator);
+     d->clear();
+     QString fname = find_translation(locale, filename, prefix, directory, suffix);
+-    return !fname.isEmpty() && d->do_load(fname);
++    return !fname.isEmpty() && d->do_load(fname, directory);
+ }
+ 
+ /*!
+@@ -735,8 +738,11 @@ bool QTranslator::load(const QLocale & locale,
+ 
+   The data is not copied. The caller must be able to guarantee that \a data
+   will not be deleted or modified.
++
++  \a directory is only used to specify the base directory when loading the dependencies
++  of a QM file. If the file does not have dependencies, this argument is ignored.
+ */
+-bool QTranslator::load(const uchar *data, int len)
++bool QTranslator::load(const uchar *data, int len, const QString &directory)
+ {
+     Q_D(QTranslator);
+     d->clear();
+@@ -744,7 +750,7 @@ bool QTranslator::load(const uchar *data, int len)
+     if (!data || len < MagicLength || memcmp(data, magic, MagicLength))
+         return false;
+ 
+-    return d->do_load(data, len);
++    return d->do_load(data, len, directory);
+ }
+ 
+ static quint8 read8(const uchar *data)
+@@ -762,13 +768,14 @@ static quint32 read32(const uchar *data)
+     return qFromBigEndian<quint32>(data);
+ }
+ 
+-bool QTranslatorPrivate::do_load(const uchar *data, int len)
++bool QTranslatorPrivate::do_load(const uchar *data, int len, const QString &directory)
+ {
+     bool ok = true;
+     const uchar *end = data + len;
+ 
+     data += MagicLength;
+ 
++    QStringList dependencies;
+     while (data < end - 4) {
+         quint8 tag = read8(data++);
+         quint32 blockLen = read32(data);
+@@ -792,15 +799,39 @@ bool QTranslatorPrivate::do_load(const uchar *data, int len)
+         } else if (tag == QTranslatorPrivate::NumerusRules) {
+             numerusRulesArray = data;
+             numerusRulesLength = blockLen;
++        } else if (tag == QTranslatorPrivate::Dependencies) {
++            QDataStream stream(QByteArray::fromRawData((const char*)data, blockLen));
++            QString dep;
++            while (!stream.atEnd()) {
++                stream >> dep;
++                dependencies.append(dep);
++            }
+         }
+ 
+         data += blockLen;
+     }
+ 
+-    if (!offsetArray || !messageArray)
++    if (dependencies.isEmpty() && (!offsetArray || !messageArray))
+         ok = false;
+-    if (!isValidNumerusRules(numerusRulesArray, numerusRulesLength))
++    if (ok && !isValidNumerusRules(numerusRulesArray, numerusRulesLength))
+         ok = false;
++    if (ok) {
++        const int dependenciesCount = dependencies.count();
++        subTranslators.reserve(dependenciesCount);
++        for (int i = 0 ; i < dependenciesCount; ++i) {
++            QTranslator *translator = new QTranslator;
++            subTranslators.append(translator);
++            ok = translator->load(dependencies.at(i), directory);
++            if (!ok)
++                break;
++        }
++
++        // In case some dependencies fail to load, unload all the other ones too.
++        if (!ok) {
++            qDeleteAll(subTranslators);
++            subTranslators.clear();
++        }
++    }
+ 
+     if (!ok) {
+         messageArray = 0;
+@@ -893,8 +924,11 @@ QString QTranslatorPrivate::do_translate(const char *context, const char *source
+     if (comment == 0)
+         comment = "";
+ 
++    uint numerus = 0;
++    size_t numItems = 0;
++
+     if (!offsetLength)
+-        return QString();
++        goto searchDependencies;
+ 
+     /*
+         Check if the context belongs to this QTranslator. If many
+@@ -920,11 +954,10 @@ QString QTranslatorPrivate::do_translate(const char *context, const char *source
+         }
+     }
+ 
+-    size_t numItems = offsetLength / (2 * sizeof(quint32));
++    numItems = offsetLength / (2 * sizeof(quint32));
+     if (!numItems)
+-        return QString();
++        goto searchDependencies;
+ 
+-    uint numerus = 0;
+     if (n >= 0)
+         numerus = numerusHelper(n, numerusRulesArray, numerusRulesLength);
+ 
+@@ -971,6 +1004,13 @@ QString QTranslatorPrivate::do_translate(const char *context, const char *source
+             break;
+         comment = "";
+     }
++
++searchDependencies:
++    foreach (QTranslator *translator, subTranslators) {
++        QString tn = translator->translate(context, sourceText, comment, n);
++        if (!tn.isNull())
++            return tn;
++    }
+     return QString();
+ }
+ 
+@@ -1004,6 +1044,9 @@ void QTranslatorPrivate::clear()
+     offsetLength = 0;
+     numerusRulesLength = 0;
+ 
++    qDeleteAll(subTranslators);
++    subTranslators.clear();
++
+     if (QCoreApplicationPrivate::isTranslatorInstalled(q))
+         QCoreApplication::postEvent(QCoreApplication::instance(),
+                                     new QEvent(QEvent::LanguageChange));
+@@ -1039,7 +1082,7 @@ bool QTranslator::isEmpty() const
+ {
+     Q_D(const QTranslator);
+     return !d->unmapPointer && !d->unmapLength && !d->messageArray &&
+-           !d->offsetArray && !d->contextArray;
++           !d->offsetArray && !d->contextArray && d->subTranslators.isEmpty();
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/corelib/kernel/qtranslator.h b/src/corelib/kernel/qtranslator.h
+index f52db59..8ddf995 100644
+--- a/src/corelib/kernel/qtranslator.h
++++ b/src/corelib/kernel/qtranslator.h
+@@ -76,7 +76,7 @@ public:
+               const QString & prefix = QString(),
+               const QString & directory = QString(),
+               const QString & suffix = QString());
+-    bool load(const uchar *data, int len);
++    bool load(const uchar *data, int len, const QString &directory = QString());
+ 
+ private:
+     Q_DISABLE_COPY(QTranslator)
+diff --git a/tests/auto/corelib/kernel/qtranslator/dependencies_la.qm b/tests/auto/corelib/kernel/qtranslator/dependencies_la.qm
+new file mode 100644
+index 0000000..c7161f3
+Binary files /dev/null and b/tests/auto/corelib/kernel/qtranslator/dependencies_la.qm differ
+diff --git a/tests/auto/corelib/kernel/qtranslator/dependencies_la.ts b/tests/auto/corelib/kernel/qtranslator/dependencies_la.ts
+new file mode 100644
+index 0000000..7c298a3
+--- /dev/null
++++ b/tests/auto/corelib/kernel/qtranslator/dependencies_la.ts
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!DOCTYPE TS>
++<TS version="2.0" language="de">
++  <dependencies>
++    <dependency catalog="hellotr_la"/>
++  </dependencies>
++  <context>
++    <name>QPushButton</name>
++    <message>
++        <source>It's a small world</source>
++        <translation>Es ist eine kleine Welt</translation>
++    </message>
++  </context>
++</TS>
+diff --git a/tests/auto/corelib/kernel/qtranslator/tst_qtranslator.cpp b/tests/auto/corelib/kernel/qtranslator/tst_qtranslator.cpp
+index 4689fc4..7ddfe70 100644
+--- a/tests/auto/corelib/kernel/qtranslator/tst_qtranslator.cpp
++++ b/tests/auto/corelib/kernel/qtranslator/tst_qtranslator.cpp
+@@ -62,6 +62,7 @@ private slots:
+     void translate_qm_file_generated_with_msgfmt();
+     void loadFromResource();
+     void loadDirectory();
++    void dependencies();
+ 
+ private:
+     int languageChangeEventCounter;
+@@ -241,5 +242,37 @@ void tst_QTranslator::loadDirectory()
+     QVERIFY(tor.isEmpty());
+ }
+ 
++void tst_QTranslator::dependencies()
++{
++    {
++        // load
++        QTranslator tor;
++        tor.load("dependencies_la");
++        QVERIFY(!tor.isEmpty());
++        QCOMPARE(tor.translate("QPushButton", "Hello world!"), QString::fromLatin1("Hallo Welt!"));
++
++        // plural
++        QCoreApplication::installTranslator(&tor);
++        QCoreApplication::Encoding e = QCoreApplication::UnicodeUTF8;
++        QCOMPARE(QCoreApplication::translate("QPushButton", "Hello %n world(s)!", 0, e, 0), QString::fromLatin1("Hallo 0 Welten!"));
++        QCOMPARE(QCoreApplication::translate("QPushButton", "Hello %n world(s)!", 0, e, 1), QString::fromLatin1("Hallo 1 Welt!"));
++        QCOMPARE(QCoreApplication::translate("QPushButton", "Hello %n world(s)!", 0, e, 2), QString::fromLatin1("Hallo 2 Welten!"));
++
++        // pick up translation from the file with dependencies
++        QCOMPARE(tor.translate("QPushButton", "It's a small world"), QString::fromLatin1("Es ist eine kleine Welt"));
++    }
++
++    {
++        QTranslator tor( 0 );
++        QFile file("dependencies_la.qm");
++        file.open(QFile::ReadOnly);
++        QByteArray data = file.readAll();
++        tor.load((const uchar *)data.constData(), data.length());
++        QVERIFY(!tor.isEmpty());
++        QCOMPARE(tor.translate("QPushButton", "Hello world!"), QString::fromLatin1("Hallo Welt!"));
++    }
++}
++
++
+ QTEST_MAIN(tst_QTranslator)
+ #include "tst_qtranslator.moc"

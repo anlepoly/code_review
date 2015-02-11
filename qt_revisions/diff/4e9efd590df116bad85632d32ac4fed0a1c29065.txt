@@ -1,0 +1,170 @@
+diff --git a/src/quick/items/qquicktextinput.cpp b/src/quick/items/qquicktextinput.cpp
+index 8b44052..bb15acb 100644
+--- a/src/quick/items/qquicktextinput.cpp
++++ b/src/quick/items/qquicktextinput.cpp
+@@ -305,6 +305,7 @@ void QQuickTextInput::setFont(const QFont &font)
+     if (oldFont != d->font) {
+         d->updateLayout();
+         updateCursorRectangle();
++        qApp->inputPanel()->update(Qt::ImCursorRectangle | Qt::ImFont);
+     }
+     emit fontChanged(d->sourceFont);
+ }
+@@ -2312,7 +2313,6 @@ void QQuickTextInput::updateCursorRectangle()
+     d->updateHorizontalScroll();
+     d->updateVerticalScroll();
+     update();
+-    updateMicroFocus();
+     emit cursorRectangleChanged();
+     if (d->cursorItem) {
+         QRectF r = cursorRectangle();
+@@ -2673,6 +2673,8 @@ void QQuickTextInputPrivate::setSelection(int start, int length)
+     }
+     emit q->selectionChanged();
+     emitCursorPositionChanged();
++    qApp->inputPanel()->update(Qt::ImCursorRectangle | Qt::ImAnchorPosition
++                               | Qt::ImCursorPosition | Qt::ImCurrentSelection);
+ }
+ 
+ /*!
+@@ -2762,6 +2764,7 @@ void QQuickTextInputPrivate::moveCursor(int pos, bool mark)
+         emit q->selectionChanged();
+     }
+     emitCursorPositionChanged();
++    q->updateMicroFocus();
+ }
+ 
+ /*!
+@@ -2858,10 +2861,12 @@ void QQuickTextInputPrivate::processInputMethodEvent(QInputMethodEvent *event)
+     m_textLayout.setAdditionalFormats(formats);
+ 
+     updateDisplayText(/*force*/ true);
+-    if (cursorPositionChanged)
++    if (cursorPositionChanged) {
+         emitCursorPositionChanged();
+-    else if (m_preeditCursor != oldPreeditCursor)
++    } else if (m_preeditCursor != oldPreeditCursor) {
+         q->updateCursorRectangle();
++        qApp->inputPanel()->update(Qt::ImCursorRectangle);
++    }
+ 
+     bool tentativeCommitChanged = m_tentativeCommit != event->tentativeCommitString();
+ 
+@@ -2873,8 +2878,11 @@ void QQuickTextInputPrivate::processInputMethodEvent(QInputMethodEvent *event)
+     if (isGettingInput || tentativeCommitChanged)
+         finishChange(priorState);
+ 
+-    if (selectionChange)
++    if (selectionChange) {
+         emit q->selectionChanged();
++        qApp->inputPanel()->update(Qt::ImCursorRectangle | Qt::ImAnchorPosition
++                                   | Qt::ImCursorPosition | Qt::ImCurrentSelection);
++    }
+ }
+ 
+ /*!
+@@ -2915,6 +2923,7 @@ bool QQuickTextInputPrivate::finishChange(int validateFromState, bool update, bo
+     Q_Q(QQuickTextInput);
+ 
+     Q_UNUSED(update)
++    bool notifyInputPanel = m_textDirty || m_selDirty;
+ 
+     if (m_textDirty) {
+         // do validation
+@@ -2974,6 +2983,10 @@ bool QQuickTextInputPrivate::finishChange(int validateFromState, bool update, bo
+         m_selDirty = false;
+         emit q->selectionChanged();
+     }
++
++    notifyInputPanel |= (m_cursor == m_lastCursorPos);
++    if (notifyInputPanel)
++        q->updateMicroFocus();
+     emitCursorPositionChanged();
+ 
+     return true;
+diff --git a/tests/auto/qtquick2/qquicktextinput/tst_qquicktextinput.cpp b/tests/auto/qtquick2/qquicktextinput/tst_qquicktextinput.cpp
+index 44040f3..8ed8b9d 100644
+--- a/tests/auto/qtquick2/qquicktextinput/tst_qquicktextinput.cpp
++++ b/tests/auto/qtquick2/qquicktextinput/tst_qquicktextinput.cpp
+@@ -162,6 +162,7 @@ private slots:
+     void preeditCursorRectangle();
+     void inputContextMouseHandler();
+     void inputMethodComposing();
++    void inputPanelUpdate();
+     void cursorRectangleSize();
+ 
+     void getText_data();
+@@ -2769,6 +2770,73 @@ void tst_qquicktextinput::inputMethodComposing()
+     QCOMPARE(spy.count(), 2);
+ }
+ 
++void tst_qquicktextinput::inputPanelUpdate()
++{
++    PlatformInputContext platformInputContext;
++    QInputPanelPrivate *inputPanelPrivate = QInputPanelPrivate::get(qApp->inputPanel());
++    inputPanelPrivate->testContext = &platformInputContext;
++
++    QQuickView view(testFileUrl("inputContext.qml"));
++    view.show();
++    view.requestActivateWindow();
++    QTest::qWaitForWindowShown(&view);
++    QTRY_COMPARE(&view, qGuiApp->focusWindow());
++    QQuickTextInput *input = qobject_cast<QQuickTextInput *>(view.rootObject());
++    QVERIFY(input);
++
++    // text change even without cursor position change needs to trigger update
++    input->setText("test");
++    platformInputContext.clear();
++    input->setText("xxxx");
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // input method event replacing text
++    platformInputContext.clear();
++    {
++        QInputMethodEvent inputMethodEvent;
++        inputMethodEvent.setCommitString("y", -1, 1);
++        QGuiApplication::sendEvent(input, &inputMethodEvent);
++    }
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // input method changing selection
++    platformInputContext.clear();
++    {
++        QList<QInputMethodEvent::Attribute> attributes;
++        attributes << QInputMethodEvent::Attribute(QInputMethodEvent::Selection, 0, 2, QVariant());
++        QInputMethodEvent inputMethodEvent("", attributes);
++        QGuiApplication::sendEvent(input, &inputMethodEvent);
++    }
++    QVERIFY(input->selectionStart() != input->selectionEnd());
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // programmatical selections trigger update
++    platformInputContext.clear();
++    input->selectAll();
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // font changes
++    platformInputContext.clear();
++    QFont font = input->font();
++    font.setBold(!font.bold());
++    input->setFont(font);
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // normal input
++    platformInputContext.clear();
++    {
++        QInputMethodEvent inputMethodEvent;
++        inputMethodEvent.setCommitString("y");
++        QGuiApplication::sendEvent(input, &inputMethodEvent);
++    }
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++
++    // changing cursor position
++    platformInputContext.clear();
++    input->setCursorPosition(0);
++    QVERIFY(platformInputContext.m_updateCallCount > 0);
++}
++
+ void tst_qquicktextinput::cursorRectangleSize()
+ {
+     QQuickView *canvas = new QQuickView(testFileUrl("positionAt.qml"));

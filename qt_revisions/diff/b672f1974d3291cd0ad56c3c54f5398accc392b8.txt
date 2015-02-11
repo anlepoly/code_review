@@ -1,0 +1,260 @@
+diff --git a/src/quick/items/qquickpathview.cpp b/src/quick/items/qquickpathview.cpp
+index aa8ddfb..afc336f 100644
+--- a/src/quick/items/qquickpathview.cpp
++++ b/src/quick/items/qquickpathview.cpp
+@@ -55,6 +55,17 @@
+ #include <QtCore/qmath.h>
+ #include <math.h>
+ 
++// The number of samples to use in calculating the velocity of a flick
++#ifndef QML_FLICK_SAMPLEBUFFER
++#define QML_FLICK_SAMPLEBUFFER 3
++#endif
++
++// The number of samples to discard when calculating the flick velocity.
++// Touch panels often produce inaccurate results as the finger is lifted.
++#ifndef QML_FLICK_DISCARDSAMPLES
++#define QML_FLICK_DISCARDSAMPLES 1
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ inline qreal qmlMod(qreal x, qreal y)
+@@ -377,8 +388,8 @@ void QQuickPathViewPrivate::updateItem(QQuickItem *item, qreal percent)
+             att->setValue(attr.toUtf8(), path->attributeAt(attr, percent));
+     }
+     QPointF pf = path->pointAt(percent);
+-    item->setX(qRound(pf.x() - item->width()/2));
+-    item->setY(qRound(pf.y() - item->height()/2));
++    item->setX(pf.x() - item->width()/2);
++    item->setY(pf.y() - item->height()/2);
+ }
+ 
+ void QQuickPathViewPrivate::regenerate()
+@@ -1118,12 +1129,29 @@ void QQuickPathView::setPathItemCount(int i)
+ 
+ QPointF QQuickPathViewPrivate::pointNear(const QPointF &point, qreal *nearPercent) const
+ {
+-    //XXX maybe do recursively at increasing resolution.
++    qreal samples = qMin(path->path().length()/5, qreal(500.0));
++    qreal res = path->path().length()/samples;
++
+     qreal mindist = 1e10; // big number
+     QPointF nearPoint = path->pointAt(0);
+     qreal nearPc = 0;
+-    for (qreal i=1; i < 1000; i++) {
+-        QPointF pt = path->pointAt(i/1000.0);
++
++    // get rough pos
++    for (qreal i=1; i < samples; i++) {
++        QPointF pt = path->pointAt(i/samples);
++        QPointF diff = pt - point;
++        qreal dist = diff.x()*diff.x() + diff.y()*diff.y();
++        if (dist < mindist) {
++            nearPoint = pt;
++            nearPc = i;
++            mindist = dist;
++        }
++    }
++
++    // now refine
++    qreal approxPc = nearPc;
++    for (qreal i = approxPc-1.0; i < approxPc+1.0; i += 1/(2*res)) {
++        QPointF pt = path->pointAt(i/samples);
+         QPointF diff = pt - point;
+         qreal dist = diff.x()*diff.x() + diff.y()*diff.y();
+         if (dist < mindist) {
+@@ -1134,11 +1162,32 @@ QPointF QQuickPathViewPrivate::pointNear(const QPointF &point, qreal *nearPercen
+     }
+ 
+     if (nearPercent)
+-        *nearPercent = nearPc / 1000.0;
++        *nearPercent = nearPc / samples;
+ 
+     return nearPoint;
+ }
+ 
++void QQuickPathViewPrivate::addVelocitySample(qreal v)
++{
++    velocityBuffer.append(v);
++    if (velocityBuffer.count() > QML_FLICK_SAMPLEBUFFER)
++        velocityBuffer.remove(0);
++}
++
++qreal QQuickPathViewPrivate::calcVelocity() const
++{
++    qreal velocity = 0;
++    if (velocityBuffer.count() > QML_FLICK_DISCARDSAMPLES) {
++        int count = velocityBuffer.count()-QML_FLICK_DISCARDSAMPLES;
++        for (int i = 0; i < count; ++i) {
++            qreal v = velocityBuffer.at(i);
++            velocity += v;
++        }
++        velocity /= count;
++    }
++    return velocity;
++}
++
+ void QQuickPathView::mousePressEvent(QMouseEvent *event)
+ {
+     Q_D(QQuickPathView);
+@@ -1155,6 +1204,7 @@ void QQuickPathViewPrivate::handleMousePressEvent(QMouseEvent *event)
+     Q_Q(QQuickPathView);
+     if (!interactive || !items.count())
+         return;
++    velocityBuffer.clear();
+     QPointF scenePoint = q->mapToScene(event->localPos());
+     int idx = 0;
+     for (; idx < items.count(); ++idx) {
+@@ -1227,6 +1277,7 @@ void QQuickPathViewPrivate::handleMouseMoveEvent(QMouseEvent *event)
+             lastElapsed = QQuickItemPrivate::restart(lastPosTime);
+             lastDist = diff;
+             startPc = newPc;
++            addVelocitySample(diff / (qreal(lastElapsed) / 1000.));
+         }
+         if (!moving) {
+             moving = true;
+@@ -1256,18 +1307,18 @@ void QQuickPathViewPrivate::handleMouseReleaseEvent(QMouseEvent *)
+     if (!interactive || !lastPosTime.isValid())
+         return;
+ 
+-    qreal elapsed = qreal(lastElapsed + QQuickItemPrivate::elapsed(lastPosTime)) / 1000.;
+-    qreal velocity = elapsed > 0. ? lastDist / elapsed : 0;
+-    if (model && modelCount && qAbs(velocity) > 1.) {
++    qreal velocity = calcVelocity();
++    if (model && modelCount && qAbs(velocity) > 0.5) {
+         qreal count = pathItems == -1 ? modelCount : pathItems;
+         if (qAbs(velocity) > count * 2) // limit velocity
+             velocity = (velocity > 0 ? count : -count) * 2;
+         // Calculate the distance to be travelled
+         qreal v2 = velocity*velocity;
+         qreal accel = deceleration/10;
+-        // + 0.25 to encourage moving at least one item in the flick direction
+-        qreal dist = qMin(qreal(modelCount-1), qreal(v2 / (accel * 2.0) + 0.25));
++        qreal dist = 0;
+         if (haveHighlightRange && highlightRangeMode == QQuickPathView::StrictlyEnforceRange) {
++            // + 0.25 to encourage moving at least one item in the flick direction
++            dist = qMin(qreal(modelCount-1), qreal(v2 / (accel * 2.0) + 0.25));
+             // round to nearest item.
+             if (velocity > 0.)
+                 dist = qRound(dist + offset) - offset;
+@@ -1280,6 +1331,8 @@ void QQuickPathViewPrivate::handleMouseReleaseEvent(QMouseEvent *)
+             } else {
+                 accel = v2 / (2.0f * qAbs(dist));
+             }
++        } else {
++            dist = qMin(qreal(modelCount-1), qreal(v2 / (accel * 2.0)));
+         }
+         offsetAdj = 0.0;
+         moveOffset.setValue(offset);
+diff --git a/src/quick/items/qquickpathview_p_p.h b/src/quick/items/qquickpathview_p_p.h
+index 853851a..b57aa13 100644
+--- a/src/quick/items/qquickpathview_p_p.h
++++ b/src/quick/items/qquickpathview_p_p.h
+@@ -140,6 +140,8 @@ public:
+     void updateItem(QQuickItem *, qreal);
+     void snapToCurrent();
+     QPointF pointNear(const QPointF &point, qreal *nearPercent=0) const;
++    void addVelocitySample(qreal v);
++    qreal calcVelocity() const;
+ 
+     QDeclarativePath *path;
+     int currentIndex;
+@@ -191,6 +193,7 @@ public:
+     QQuickPathView::HighlightRangeMode highlightRangeMode;
+     int highlightMoveDuration;
+     int modelCount;
++    QPODVector<qreal,10> velocityBuffer;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/util/qdeclarativepath.cpp b/src/quick/util/qdeclarativepath.cpp
+index 2c526f9..2ee5348 100644
+--- a/src/quick/util/qdeclarativepath.cpp
++++ b/src/quick/util/qdeclarativepath.cpp
+@@ -654,12 +654,31 @@ QPointF QDeclarativePath::pointAt(qreal p) const
+         if (d->_pointCache.isEmpty())
+             return QPointF();
+     }
+-    int idx = qRound(p*d->_pointCache.size());
+-    if (idx >= d->_pointCache.size())
+-        idx = d->_pointCache.size() - 1;
+-    else if (idx < 0)
+-        idx = 0;
+-    return d->_pointCache.at(idx);
++
++    const int pointCacheSize = d->_pointCache.size();
++    qreal idxf = p*pointCacheSize;
++    int idx1 = qFloor(idxf);
++    qreal delta = idxf - idx1;
++    if (idx1 >= pointCacheSize)
++        idx1 = pointCacheSize - 1;
++    else if (idx1 < 0)
++        idx1 = 0;
++
++    if (delta == 0.0)
++        return d->_pointCache.at(idx1);
++
++    // interpolate between the two points.
++    int idx2 = qCeil(idxf);
++    if (idx2 >= pointCacheSize)
++        idx2 = pointCacheSize - 1;
++    else if (idx2 < 0)
++        idx2 = 0;
++
++    QPointF p1 = d->_pointCache.at(idx1);
++    QPointF p2 = d->_pointCache.at(idx2);
++    QPointF pos = p1 * (1.0-delta) + p2 * delta;
++
++    return pos;
+ }
+ 
+ qreal QDeclarativePath::attributeAt(const QString &name, qreal percent) const
+diff --git a/tests/auto/qtquick2/qquickpathview/tst_qquickpathview.cpp b/tests/auto/qtquick2/qquickpathview/tst_qquickpathview.cpp
+index 6b36c7e..8ed2ee7 100644
+--- a/tests/auto/qtquick2/qquickpathview/tst_qquickpathview.cpp
++++ b/tests/auto/qtquick2/qquickpathview/tst_qquickpathview.cpp
+@@ -718,7 +718,7 @@ void tst_QQuickPathView::pathMoved()
+     for (int i=0; i<model.count(); i++) {
+         QQuickRectangle *curItem = findItem<QQuickRectangle>(pathview, "wrapper", i);
+         QPointF itemPos(path->pointAt(0.25 + i*0.25));
+-        QCOMPARE(curItem->pos() + offset, QPointF(qRound(itemPos.x()), qRound(itemPos.y())));
++        QCOMPARE(curItem->pos() + offset, QPointF(itemPos.x(), itemPos.y()));
+     }
+ 
+     pathview->setOffset(0.0);
+@@ -1279,8 +1279,6 @@ void tst_QQuickPathView::changePreferredHighlight()
+     QDeclarativePath *path = qobject_cast<QDeclarativePath*>(pathview->path());
+     QVERIFY(path);
+     QPointF start = path->pointAt(0.5);
+-    start.setX(qRound(start.x()));
+-    start.setY(qRound(start.y()));
+     QPointF offset;//Center of item is at point, but pos is from corner
+     offset.setX(firstItem->width()/2);
+     offset.setY(firstItem->height()/2);
+@@ -1289,8 +1287,6 @@ void tst_QQuickPathView::changePreferredHighlight()
+     pathview->setPreferredHighlightBegin(0.8);
+     pathview->setPreferredHighlightEnd(0.8);
+     start = path->pointAt(0.8);
+-    start.setX(qRound(start.x()));
+-    start.setY(qRound(start.y()));
+     QTRY_COMPARE(firstItem->pos() + offset, start);
+     QCOMPARE(pathview->currentIndex(), 0);
+ 
+@@ -1345,7 +1341,6 @@ void tst_QQuickPathView::currentOffsetOnInsertion()
+     QVERIFY(path);
+ 
+     QPointF start = path->pointAt(0.5);
+-    start = QPointF(qRound(start.x()), qRound(start.y()));
+     QPointF offset;//Center of item is at point, but pos is from corner
+     offset.setX(item->width()/2);
+     offset.setY(item->height()/2);
+@@ -1442,7 +1437,7 @@ void tst_QQuickPathView::asynchronous()
+     for (int i=0; i<5; i++) {
+         QQuickItem *curItem = findItem<QQuickItem>(pathview, "wrapper", i);
+         QPointF itemPos(path->pointAt(0.2 + i*0.2));
+-        QCOMPARE(curItem->pos() + offset, QPointF(qRound(itemPos.x()), qRound(itemPos.y())));
++        QCOMPARE(curItem->pos() + offset, itemPos);
+     }
+ 
+     delete canvas;

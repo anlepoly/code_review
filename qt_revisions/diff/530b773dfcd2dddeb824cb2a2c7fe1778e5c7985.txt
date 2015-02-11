@@ -1,0 +1,463 @@
+diff --git a/src/quick/items/qquickgridview.cpp b/src/quick/items/qquickgridview.cpp
+index dc9a04f..fd5b50c 100644
+--- a/src/quick/items/qquickgridview.cpp
++++ b/src/quick/items/qquickgridview.cpp
+@@ -68,8 +68,6 @@ class FxGridItemSG : public FxViewItem
+ public:
+     FxGridItemSG(QQuickItem *i, QQuickGridView *v, bool own, bool trackGeometry) : FxViewItem(i, own, trackGeometry), view(v) {
+         attached = static_cast<QQuickGridViewAttached*>(qmlAttachedPropertiesObject<QQuickGridView>(item));
+-        if (attached)
+-            static_cast<QQuickGridViewAttached*>(attached)->setView(view);
+         if (trackGeometry) {
+             QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
+             itemPrivate->addItemChangeListener(QQuickItemViewPrivate::get(view), QQuickItemPrivate::Geometry);
+@@ -196,7 +194,7 @@ public:
+ 
+     void resetColumns();
+ 
+-    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, bool doBuffer);
++    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, qreal bufferFrom, qreal bufferTo, bool doBuffer);
+     virtual bool removeNonVisibleItems(qreal bufferFrom, qreal bufferTo);
+ 
+     virtual FxViewItem *newViewItem(int index, QQuickItem *item);
+@@ -485,7 +483,7 @@ void QQuickGridViewPrivate::initializeViewItem(FxViewItem *item)
+     itemPrivate->addItemChangeListener(this, QQuickItemPrivate::Geometry);
+ }
+ 
+-bool QQuickGridViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, bool doBuffer)
++bool QQuickGridViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, qreal bufferFrom, qreal bufferTo, bool doBuffer)
+ {
+     qreal colPos = colPosAt(visibleIndex);
+     qreal rowPos = rowPosAt(visibleIndex);
+@@ -503,8 +501,8 @@ bool QQuickGridViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, bool d
+     int modelIndex = findLastVisibleIndex();
+     modelIndex = modelIndex < 0 ? visibleIndex : modelIndex + 1;
+ 
+-    if (visibleItems.count() && (fillFrom > rowPos + rowSize()*2
+-        || fillTo < rowPosAt(visibleIndex) - rowSize())) {
++    if (visibleItems.count() && (bufferFrom > rowPos + rowSize()*2
++        || bufferTo < rowPosAt(visibleIndex) - rowSize())) {
+         // We've jumped more than a page.  Estimate which items are now
+         // visible and fill from there.
+         int count = (fillFrom - (rowPos + rowSize())) / (rowSize()) * columns;
+@@ -2107,6 +2105,15 @@ void QQuickGridView::geometryChanged(const QRectF &newGeometry, const QRectF &ol
+     QQuickItemView::geometryChanged(newGeometry, oldGeometry);
+ }
+ 
++void QQuickGridView::initItem(int index, QQuickItem *item)
++{
++    QQuickItemView::initItem(index, item);
++    QQuickGridViewAttached *attached = static_cast<QQuickGridViewAttached *>(
++            qmlAttachedPropertiesObject<QQuickGridView>(item));
++    if (attached)
++        attached->setView(this);
++}
++
+ /*!
+     \qmlmethod QtQuick2::GridView::moveCurrentIndexUp()
+ 
+diff --git a/src/quick/items/qquickgridview_p.h b/src/quick/items/qquickgridview_p.h
+index aa4e56e..034d851 100644
+--- a/src/quick/items/qquickgridview_p.h
++++ b/src/quick/items/qquickgridview_p.h
+@@ -112,6 +112,7 @@ protected:
+     virtual void viewportMoved(Qt::Orientations);
+     virtual void keyPressEvent(QKeyEvent *);
+     virtual void geometryChanged(const QRectF &newGeometry, const QRectF &oldGeometry);
++    virtual void initItem(int index, QQuickItem *item);
+ };
+ 
+ class QQuickGridViewAttached : public QQuickItemViewAttached
+diff --git a/src/quick/items/qquickitemview.cpp b/src/quick/items/qquickitemview.cpp
+index bd7bf32..cc2a352 100644
+--- a/src/quick/items/qquickitemview.cpp
++++ b/src/quick/items/qquickitemview.cpp
+@@ -403,7 +403,7 @@ int QQuickItemView::currentIndex() const
+ void QQuickItemView::setCurrentIndex(int index)
+ {
+     Q_D(QQuickItemView);
+-    if (d->requestedIndex >= 0 && !d->requestedAsync)  // currently creating item
++    if (d->inRequest)  // currently creating item
+         return;
+     d->currentIndexCleared = (index == -1);
+ 
+@@ -1420,7 +1420,7 @@ QQuickItemViewPrivate::QQuickItemViewPrivate()
+     , moveReason(Other)
+     , visibleIndex(0)
+     , currentIndex(-1), currentItem(0)
+-    , trackedItem(0), requestedIndex(-1), requestedItem(0)
++    , trackedItem(0), requestedIndex(-1)
+     , highlightComponent(0), highlight(0)
+     , highlightRange(QQuickItemView::NoHighlightRange)
+     , highlightRangeStart(0), highlightRangeEnd(0)
+@@ -1431,7 +1431,7 @@ QQuickItemViewPrivate::QQuickItemViewPrivate()
+     , ownModel(false), wrap(false)
+     , inLayout(false), inViewportMoved(false), forceLayout(false), currentIndexCleared(false)
+     , haveHighlightRange(false), autoHighlight(true), highlightRangeStartValid(false), highlightRangeEndValid(false)
+-    , fillCacheBuffer(false), inRequest(false), requestedAsync(false)
++    , fillCacheBuffer(false), inRequest(false)
+     , runDelayedRemoveTransition(false)
+ {
+     bufferPause.addAnimationChangeListener(this, QAbstractAnimationJob::Completion);
+@@ -1626,7 +1626,7 @@ void QQuickItemViewPrivate::clear()
+     createHighlight();
+     trackedItem = 0;
+ 
+-    if (requestedIndex >= 0 && requestedAsync) {
++    if (requestedIndex >= 0) {
+         if (model)
+             model->cancel(requestedIndex);
+         requestedIndex = -1;
+@@ -1676,7 +1676,7 @@ void QQuickItemViewPrivate::refill(qreal from, qreal to)
+     qreal fillFrom = from;
+     qreal fillTo = to;
+ 
+-    bool added = addVisibleItems(fillFrom, fillTo, false);
++    bool added = addVisibleItems(fillFrom, fillTo, bufferFrom, bufferTo, false);
+     bool removed = removeNonVisibleItems(bufferFrom, bufferTo);
+ 
+     if (requestedIndex == -1 && buffer && bufferMode != NoBuffer) {
+@@ -1689,7 +1689,7 @@ void QQuickItemViewPrivate::refill(qreal from, qreal to)
+                 fillTo = bufferTo;
+             if (bufferMode & BufferBefore)
+                 fillFrom = bufferFrom;
+-            added |= addVisibleItems(fillFrom, fillTo, true);
++            added |= addVisibleItems(fillFrom, fillTo, bufferFrom, bufferTo, true);
+         }
+     }
+ 
+@@ -2171,16 +2171,9 @@ FxViewItem *QQuickItemViewPrivate::createItem(int modelIndex, bool asynchronous)
+ {
+     Q_Q(QQuickItemView);
+ 
+-    if (requestedIndex == modelIndex && (asynchronous || requestedAsync == asynchronous))
++    if (requestedIndex == modelIndex && asynchronous)
+         return 0;
+ 
+-    if (requestedIndex != -1 && requestedIndex != modelIndex) {
+-        if (requestedItem && requestedItem->item)
+-            requestedItem->item->setParentItem(0);
+-        delete requestedItem;
+-        requestedItem = 0;
+-    }
+-
+     for (int i=0; i<releasePendingTransition.count(); i++) {
+         if (releasePendingTransition[i]->index == modelIndex
+                 && !releasePendingTransition[i]->isPendingRemoval()) {
+@@ -2189,16 +2182,15 @@ FxViewItem *QQuickItemViewPrivate::createItem(int modelIndex, bool asynchronous)
+         }
+     }
+ 
+-    requestedIndex = modelIndex;
+-    requestedAsync = asynchronous;
++    if (asynchronous)
++        requestedIndex = modelIndex;
+     inRequest = true;
+ 
+     if (QQuickItem *item = model->item(modelIndex, asynchronous)) {
+         item->setParentItem(q->contentItem());
+-        requestedIndex = -1;
+-        FxViewItem *viewItem = requestedItem;
+-        if (!viewItem)
+-            viewItem = newViewItem(modelIndex, item); // already in cache, so viewItem not initialized in initItem()
++        if (requestedIndex == modelIndex)
++            requestedIndex = -1;
++        FxViewItem *viewItem = newViewItem(modelIndex, item);
+         if (viewItem) {
+             viewItem->index = modelIndex;
+             // do other set up for the new item that should not happen
+@@ -2206,7 +2198,6 @@ FxViewItem *QQuickItemViewPrivate::createItem(int modelIndex, bool asynchronous)
+             initializeViewItem(viewItem);
+             unrequestedItems.remove(item);
+         }
+-        requestedItem = 0;
+         inRequest = false;
+         return viewItem;
+     }
+@@ -2218,31 +2209,26 @@ FxViewItem *QQuickItemViewPrivate::createItem(int modelIndex, bool asynchronous)
+ void QQuickItemView::createdItem(int index, QQuickItem *item)
+ {
+     Q_D(QQuickItemView);
+-    if (d->requestedIndex != index) {
+-        item->setParentItem(contentItem());
++
++    if (!d->inRequest) {
+         d->unrequestedItems.insert(item, index);
+-        QQuickItemPrivate::get(item)->setCulled(true);
+-        d->repositionPackageItemAt(item, index);
+-    } else {
+         d->requestedIndex = -1;
+-        if (!d->inRequest) {
+-            if (index == d->currentIndex)
+-                d->updateCurrent(index);
++        if (d->hasPendingChanges())
++            d->layout();
++        else
+             d->refill();
+-        }
++        if (d->unrequestedItems.contains(item))
++            d->repositionPackageItemAt(item, index);
++        else if (index == d->currentIndex)
++            d->updateCurrent(index);
+     }
+ }
+ 
+-void QQuickItemView::initItem(int index, QQuickItem *item)
++void QQuickItemView::initItem(int, QQuickItem *item)
+ {
+-    Q_D(QQuickItemView);
+     item->setZ(1);
+-    if (d->requestedIndex == index) {
+-        if (d->requestedAsync)
+-            QQuickItemPrivate::get(item)->setCulled(true);
+-        item->setParentItem(contentItem());
+-        d->requestedItem = d->newViewItem(index, item);
+-    }
++    item->setParentItem(contentItem());
++    QQuickItemPrivate::get(item)->setCulled(true);
+ }
+ 
+ void QQuickItemView::destroyingItem(QQuickItem *item)
+diff --git a/src/quick/items/qquickitemview_p.h b/src/quick/items/qquickitemview_p.h
+index 63f353e..93a3f52 100644
+--- a/src/quick/items/qquickitemview_p.h
++++ b/src/quick/items/qquickitemview_p.h
+@@ -261,7 +261,7 @@ protected slots:
+     virtual void updateSections() {}
+     void destroyRemoved();
+     void createdItem(int index, QQuickItem *item);
+-    void initItem(int index, QQuickItem *item);
++    virtual void initItem(int index, QQuickItem *item);
+     void modelUpdated(const QQuickChangeSet &changeSet, bool reset);
+     void destroyingItem(QQuickItem *item);
+     void animStopped();
+diff --git a/src/quick/items/qquickitemview_p_p.h b/src/quick/items/qquickitemview_p_p.h
+index f68baf2..b580181 100644
+--- a/src/quick/items/qquickitemview_p_p.h
++++ b/src/quick/items/qquickitemview_p_p.h
+@@ -264,7 +264,6 @@ public:
+     FxViewItem *trackedItem;
+     QHash<QQuickItem*,int> unrequestedItems;
+     int requestedIndex;
+-    FxViewItem *requestedItem;
+     QQuickItemViewChangeSet currentChanges;
+     QQuickItemViewChangeSet bufferedChanges;
+     QPauseAnimationJob bufferPause;
+@@ -305,7 +304,6 @@ public:
+     bool highlightRangeEndValid : 1;
+     bool fillCacheBuffer : 1;
+     bool inRequest : 1;
+-    bool requestedAsync : 1;
+     bool runDelayedRemoveTransition : 1;
+ 
+ protected:
+@@ -331,7 +329,7 @@ protected:
+     virtual void setPosition(qreal pos) = 0;
+     virtual void fixupPosition() = 0;
+ 
+-    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, bool doBuffer) = 0;
++    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, qreal bufferFrom, qreal bufferTo, bool doBuffer) = 0;
+     virtual bool removeNonVisibleItems(qreal bufferFrom, qreal bufferTo) = 0;
+     virtual void visibleItemsChanged() {}
+ 
+diff --git a/src/quick/items/qquicklistview.cpp b/src/quick/items/qquicklistview.cpp
+index eb0d013..d42d1cb 100644
+--- a/src/quick/items/qquicklistview.cpp
++++ b/src/quick/items/qquicklistview.cpp
+@@ -88,7 +88,7 @@ public:
+     virtual void init();
+     virtual void clear();
+ 
+-    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, bool doBuffer);
++    virtual bool addVisibleItems(qreal fillFrom, qreal fillTo, qreal bufferFrom, qreal bufferTo, bool doBuffer);
+     virtual bool removeNonVisibleItems(qreal bufferFrom, qreal bufferTo);
+     virtual void visibleItemsChanged();
+ 
+@@ -237,8 +237,6 @@ class FxListItemSG : public FxViewItem
+ public:
+     FxListItemSG(QQuickItem *i, QQuickListView *v, bool own, bool trackGeometry) : FxViewItem(i, own, trackGeometry), view(v) {
+         attached = static_cast<QQuickListViewAttached*>(qmlAttachedPropertiesObject<QQuickListView>(item));
+-        if (attached)
+-            static_cast<QQuickListViewAttached*>(attached)->setView(view);
+         if (trackGeometry) {
+             QQuickItemPrivate *itemPrivate = QQuickItemPrivate::get(item);
+             itemPrivate->addItemChangeListener(QQuickItemViewPrivate::get(view), QQuickItemPrivate::Geometry);
+@@ -569,18 +567,18 @@ FxViewItem *QQuickListViewPrivate::newViewItem(int modelIndex, QQuickItem *item)
+     // initialise attached properties
+     if (sectionCriteria) {
+         QString propValue = model->stringValue(modelIndex, sectionCriteria->property());
+-        listItem->attached->m_section = sectionCriteria->sectionString(propValue);
++        listItem->attached->setSection(sectionCriteria->sectionString(propValue));
+         if (modelIndex > 0) {
+             if (FxViewItem *item = itemBefore(modelIndex))
+-                listItem->attached->m_prevSection = item->attached->section();
++                listItem->attached->setPrevSection(item->attached->section());
+             else
+-                listItem->attached->m_prevSection = sectionAt(modelIndex-1);
++                listItem->attached->setPrevSection(sectionAt(modelIndex-1));
+         }
+         if (modelIndex < model->count()-1) {
+             if (FxViewItem *item = visibleItem(modelIndex+1))
+-                listItem->attached->m_nextSection = static_cast<QQuickListViewAttached*>(item->attached)->section();
++                listItem->attached->setNextSection(static_cast<QQuickListViewAttached*>(item->attached)->section());
+             else
+-                listItem->attached->m_nextSection = sectionAt(modelIndex+1);
++                listItem->attached->setNextSection(sectionAt(modelIndex+1));
+         }
+     }
+ 
+@@ -627,7 +625,7 @@ bool QQuickListViewPrivate::releaseItem(FxViewItem *item)
+     return released;
+ }
+ 
+-bool QQuickListViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, bool doBuffer)
++bool QQuickListViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, qreal bufferFrom, qreal bufferTo, bool doBuffer)
+ {
+     qreal itemEnd = visiblePos;
+     if (visibleItems.count()) {
+@@ -639,8 +637,8 @@ bool QQuickListViewPrivate::addVisibleItems(qreal fillFrom, qreal fillTo, bool d
+     bool haveValidItems = modelIndex >= 0;
+     modelIndex = modelIndex < 0 ? visibleIndex : modelIndex + 1;
+ 
+-    if (haveValidItems && (fillFrom > itemEnd+averageSize+spacing
+-        || fillTo < visiblePos - averageSize - spacing)) {
++    if (haveValidItems && (bufferFrom > itemEnd+averageSize+spacing
++        || bufferTo < visiblePos - averageSize - spacing)) {
+         // We've jumped more than a page.  Estimate which items are now
+         // visible and fill from there.
+         int count = (fillFrom - itemEnd) / (averageSize + spacing);
+@@ -2739,6 +2737,15 @@ void QQuickListView::geometryChanged(const QRectF &newGeometry, const QRectF &ol
+     QQuickItemView::geometryChanged(newGeometry, oldGeometry);
+ }
+ 
++void QQuickListView::initItem(int index, QQuickItem *item)
++{
++    QQuickItemView::initItem(index, item);
++    QQuickListViewAttached *attached = static_cast<QQuickListViewAttached *>(
++            qmlAttachedPropertiesObject<QQuickListView>(item));
++    if (attached)
++        attached->setView(this);
++}
++
+ 
+ /*!
+     \qmlmethod QtQuick2::ListView::incrementCurrentIndex()
+diff --git a/src/quick/items/qquicklistview_p.h b/src/quick/items/qquicklistview_p.h
+index 9775951..6bdd4cb 100644
+--- a/src/quick/items/qquicklistview_p.h
++++ b/src/quick/items/qquicklistview_p.h
+@@ -158,6 +158,7 @@ protected:
+     virtual void viewportMoved(Qt::Orientations orient);
+     virtual void keyPressEvent(QKeyEvent *);
+     virtual void geometryChanged(const QRectF &newGeometry,const QRectF &oldGeometry);
++    virtual void initItem(int index, QQuickItem *item);
+ 
+ protected Q_SLOTS:
+     void updateSections();
+diff --git a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+index ca2fcf2..92526a0 100644
+--- a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
++++ b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+@@ -141,6 +141,8 @@ private slots:
+     void qAbstractItemModel_sections();
+     void sectionsPositioning();
+     void sectionsDelegate();
++    void sectionsDragOutsideBounds_data();
++    void sectionsDragOutsideBounds();
+     void sectionPropertyChange();
+     void cacheBuffer();
+     void positionViewAtIndex();
+@@ -1939,7 +1941,7 @@ void tst_QQuickListView::sections(const QUrl &source)
+     int itemCount = findItems<QQuickItem>(contentItem, "wrapper").count();
+     for (int i = 0; i < model.count() && i < itemCount; ++i) {
+         QQuickItem *item = findItem<QQuickItem>(contentItem, "wrapper", i);
+-        QTRY_VERIFY(item);
++        QVERIFY(item);
+         QTRY_COMPARE(item->y(), qreal(i*20 + ((i+4)/5) * 20));
+         QQuickText *next = findItem<QQuickText>(item, "nextSection");
+         QCOMPARE(next->text().toInt(), (i+1)/5);
+@@ -2109,29 +2111,67 @@ void tst_QQuickListView::sectionsDelegate()
+         QTRY_COMPARE(item->y(), qreal(i*20*4));
+     }
+ 
++    delete canvas;
++}
++
++void tst_QQuickListView::sectionsDragOutsideBounds_data()
++{
++    QTest::addColumn<int>("distance");
++    QTest::addColumn<int>("cacheBuffer");
++
++    QTest::newRow("500, no cache buffer") << 500 << 0;
++    QTest::newRow("1000, no cache buffer") << 1000 << 0;
++    QTest::newRow("500, cache buffer") << 500 << 320;
++    QTest::newRow("1000, cache buffer") << 1000 << 320;
++}
++
++void tst_QQuickListView::sectionsDragOutsideBounds()
++{
++    QFETCH(int, distance);
++    QFETCH(int, cacheBuffer);
++
++    QQuickView *canvas = getView();
++
++    QmlListModel model;
++    for (int i = 0; i < 10; i++)
++        model.addItem("Item" + QString::number(i), QString::number(i/5));
++
++    QQmlContext *ctxt = canvas->rootContext();
++    ctxt->setContextProperty("testModel", &model);
++
++    canvas->setSource(testFileUrl("listview-sections_delegate.qml"));
++    canvas->show();
++    qApp->processEvents();
++
++    QQuickListView *listview = findItem<QQuickListView>(canvas->rootObject(), "list");
++    QTRY_VERIFY(listview != 0);
++    listview->setCacheBuffer(cacheBuffer);
++
++    QQuickItem *contentItem = listview->contentItem();
++    QTRY_VERIFY(contentItem != 0);
++
++    QTRY_COMPARE(QQuickItemPrivate::get(listview)->polishScheduled, false);
++
+     // QTBUG-17769
+-    model.removeItems(10, 20);
+-    // ensure view has settled.
+-    QTRY_COMPARE(findItems<QQuickItem>(contentItem, "wrapper").count(), 10);
+     // Drag view up beyond bounds
+     QTest::mousePress(canvas, Qt::LeftButton, 0, QPoint(20,20));
+-    {
+-        QMouseEvent mv(QEvent::MouseMove, QPoint(20,0), Qt::LeftButton, Qt::LeftButton,Qt::NoModifier);
+-        QGuiApplication::sendEvent(canvas, &mv);
+-    }
+-    {
+-        QMouseEvent mv(QEvent::MouseMove, QPoint(20,-50), Qt::LeftButton, Qt::LeftButton,Qt::NoModifier);
+-        QGuiApplication::sendEvent(canvas, &mv);
+-    }
+-    {
+-        QMouseEvent mv(QEvent::MouseMove, QPoint(20,-200), Qt::LeftButton, Qt::LeftButton,Qt::NoModifier);
+-        QGuiApplication::sendEvent(canvas, &mv);
+-    }
+-    QTest::mouseRelease(canvas, Qt::LeftButton, 0, QPoint(20,-200));
++    QTest::mouseMove(canvas, QPoint(20,0));
++    QTest::mouseMove(canvas, QPoint(20,-50));
++    QTest::mouseMove(canvas, QPoint(20,-distance));
++    QTest::mouseRelease(canvas, Qt::LeftButton, 0, QPoint(20,-distance));
+     // view should settle back at 0
+     QTRY_COMPARE(listview->contentY(), 0.0);
+ 
+-    delete canvas;
++    QTest::mousePress(canvas, Qt::LeftButton, 0, QPoint(20,0));
++    QTest::mouseMove(canvas, QPoint(20,20));
++    QTest::mouseMove(canvas, QPoint(20,70));
++    QTest::mouseMove(canvas, QPoint(20,distance));
++
++    QTest::mouseRelease(canvas, Qt::LeftButton, 0, QPoint(20,distance));
++    // view should settle back at 0
++    QTRY_COMPARE(listview->contentY(), 0.0);
++
++    releaseView(canvas);
+ }
+ 
+ void tst_QQuickListView::sectionsPositioning()

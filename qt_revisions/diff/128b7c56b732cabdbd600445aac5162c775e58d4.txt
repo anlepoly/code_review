@@ -1,0 +1,436 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.h b/src/plugins/platforms/cocoa/qcocoawindow.h
+index 68cf72b..0d7b8aa 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.h
++++ b/src/plugins/platforms/cocoa/qcocoawindow.h
+@@ -95,6 +95,7 @@ public:
+     void setCocoaGeometry(const QRect &rect);
+     void setVisible(bool visible);
+     Qt::WindowFlags setWindowFlags(Qt::WindowFlags flags);
++    Qt::WindowState setWindowState(Qt::WindowState state);
+     void setWindowTitle(const QString &title);
+     void raise();
+     void lower();
+@@ -129,6 +130,7 @@ protected:
+ 
+     QRect windowGeometry() const;
+     QCocoaWindow *parentCocoaWindow() const;
++    void syncWindowState(Qt::WindowState newState);
+ 
+ // private:
+ public: // for QNSView
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.mm b/src/plugins/platforms/cocoa/qcocoawindow.mm
+index f3458c2..5c8ea05 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.mm
++++ b/src/plugins/platforms/cocoa/qcocoawindow.mm
+@@ -165,15 +165,23 @@ void QCocoaWindow::setVisible(bool visible)
+         QWindowSystemInterface::handleSynchronousExposeEvent(window(), QRect(QPoint(), geometry().size()));
+ 
+         if (m_nsWindow) {
+-            if ([m_nsWindow canBecomeKeyWindow])
+-                [m_nsWindow makeKeyAndOrderFront:nil];
+-            else
+-                [m_nsWindow orderFront: nil];
++            // setWindowState might have been called while the window was hidden and
++            // will not change the NSWindow state in that case. Sync up here:
++            syncWindowState(window()->windowState());
++
++            if (window()->windowState() != Qt::WindowMinimized) {
++                if ([m_nsWindow canBecomeKeyWindow])
++                    [m_nsWindow makeKeyAndOrderFront:nil];
++                else
++                    [m_nsWindow orderFront: nil];
++            }
+         }
+     } else {
+         // qDebug() << "close" << this;
+         if (m_nsWindow)
+             [m_nsWindow orderOut:m_nsWindow];
++        if (!QCoreApplication::closingDown())
++            QWindowSystemInterface::handleExposeEvent(window(), QRegion());
+     }
+ }
+ 
+@@ -183,6 +191,14 @@ Qt::WindowFlags QCocoaWindow::setWindowFlags(Qt::WindowFlags flags)
+     return m_windowFlags;
+ }
+ 
++Qt::WindowState QCocoaWindow::setWindowState(Qt::WindowState state)
++{
++    if ([m_nsWindow isVisible])
++        syncWindowState(state);  // Window state set for hidden windows take effect when show() is called.
++
++    return state;
++}
++
+ void QCocoaWindow::setWindowTitle(const QString &title)
+ {
+     QCocoaAutoReleasePool pool;
+@@ -446,27 +462,12 @@ void QCocoaWindow::setNSWindow(NSWindow *window)
+     // QCocoaWindow is deleted by Qt.
+     [window setReleasedWhenClosed : NO];
+ 
+-    [[NSNotificationCenter defaultCenter] addObserver:m_contentView
+-                                          selector:@selector(windowDidBecomeKey)
+-                                          name:NSWindowDidBecomeKeyNotification
+-                                          object:m_nsWindow];
+-
+-    [[NSNotificationCenter defaultCenter] addObserver:m_contentView
+-                                          selector:@selector(windowDidResignKey)
+-                                          name:NSWindowDidResignKeyNotification
+-                                          object:m_nsWindow];
+-
+-    [[NSNotificationCenter defaultCenter] addObserver:m_contentView
+-                                          selector:@selector(windowDidBecomeMain)
+-                                          name:NSWindowDidBecomeMainNotification
+-                                          object:m_nsWindow];
+ 
+     [[NSNotificationCenter defaultCenter] addObserver:m_contentView
+-                                          selector:@selector(windowDidResignMain)
+-                                          name:NSWindowDidResignMainNotification
++                                          selector:@selector(windowNotification:)
++                                          name:nil // Get all notifications
+                                           object:m_nsWindow];
+ 
+-
+     // ### Accept touch events by default.
+     // Beware that enabling touch events has a negative impact on the overall performance.
+     // We probably need a QWindowSystemInterface API to enable/disable touch events.
+@@ -503,6 +504,49 @@ QCocoaWindow *QCocoaWindow::parentCocoaWindow() const
+     return 0;
+ }
+ 
++// Syncs the NSWindow minimize/maximize/fullscreen state with the current QWindow state
++void QCocoaWindow::syncWindowState(Qt::WindowState newState)
++{
++    if (!m_nsWindow)
++        return;
++
++    switch (newState) {
++        case Qt::WindowMinimized:
++            [m_nsWindow performMiniaturize : m_nsWindow];
++        break;
++        case Qt::WindowMaximized:
++            [m_nsWindow performZoom : m_nsWindow];
++        break;
++        case Qt::WindowFullScreen:
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7
++            if (QSysInfo::QSysInfo::MacintoshVersion >= QSysInfo::MV_10_7) {
++                [m_nsWindow toggleFullScreen : m_nsWindow];
++            } else {
++                qWarning("Not implemented: setWindowState WindowFullScreen");
++            }
++#endif
++        break;
++
++        default:
++            // Undo current states
++            if ([m_nsWindow isMiniaturized])
++                [m_nsWindow deminiaturize : m_nsWindow];
++
++            if ([m_nsWindow isZoomed])
++                [m_nsWindow performZoom : m_nsWindow]; // toggles
++
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7
++            if (QSysInfo::QSysInfo::MacintoshVersion >= QSysInfo::MV_10_7) {
++                if (window()->windowState() & Qt::WindowFullScreen)
++                    [m_nsWindow toggleFullScreen : m_nsWindow];
++            } else {
++                qWarning("Not implemented: setWindowState WindowFullScreen");
++            }
++#endif
++        break;
++    }
++}
++
+ bool QCocoaWindow::setWindowModified(bool modified)
+ {
+     if (!m_nsWindow)
+diff --git a/src/plugins/platforms/cocoa/qnsview.h b/src/plugins/platforms/cocoa/qnsview.h
+index aba9a2d..1677562 100644
+--- a/src/plugins/platforms/cocoa/qnsview.h
++++ b/src/plugins/platforms/cocoa/qnsview.h
+@@ -70,8 +70,7 @@ QT_END_NAMESPACE
+ - (void)setImage:(QImage *)image;
+ - (void)drawRect:(NSRect)dirtyRect;
+ - (void)updateGeometry;
+-- (void)windowDidBecomeKey;
+-- (void)windowDidResignKey;
++- (void)windowNotification : (NSNotification *) windowNotification;
+ 
+ - (BOOL)isFlipped;
+ - (BOOL)acceptsFirstResponder;
+diff --git a/src/plugins/platforms/cocoa/qnsview.mm b/src/plugins/platforms/cocoa/qnsview.mm
+index 66f5d12..a8372f7 100644
+--- a/src/plugins/platforms/cocoa/qnsview.mm
++++ b/src/plugins/platforms/cocoa/qnsview.mm
+@@ -144,29 +144,40 @@ static QTouchDevice *touchDevice = 0;
+         QWindowSystemInterface::handleSynchronousGeometryChange(m_window, geo);
+ }
+ 
+-- (void)windowDidBecomeKey
+-{
+-    if (!m_platformWindow->windowIsPopupType())
+-        QWindowSystemInterface::handleWindowActivated(m_window);
+-}
+-
+-- (void)windowDidResignKey
+-{
+-    if (!m_platformWindow->windowIsPopupType())
+-        QWindowSystemInterface::handleWindowActivated(0);
+-}
++- (void)windowNotification : (NSNotification *) windowNotification
++{
++    //qDebug() << "windowNotification" << QCFString::toQString([windowNotification name]);
++
++    NSString *notificationName = [windowNotification name];
++    if (notificationName == NSWindowDidBecomeKeyNotification) {
++        if (!m_platformWindow->windowIsPopupType())
++            QWindowSystemInterface::handleWindowActivated(m_window);
++    } else if (notificationName == NSWindowDidResignKeyNotification) {
++        if (!m_platformWindow->windowIsPopupType())
++            QWindowSystemInterface::handleWindowActivated(0);
++    } else if (notificationName == NSWindowDidMiniaturizeNotification) {
++        QWindowSystemInterface::handleWindowStateChanged(m_window, Qt::WindowMinimized);
++    } else if (notificationName == NSWindowDidDeminiaturizeNotification) {
++        QWindowSystemInterface::handleWindowStateChanged(m_window, Qt::WindowNoState);
++        // Qt expects an expose event after restore/deminiaturize. This also needs
++        // to be a non-synchronous event to make sure it gets processed after
++        // the state change event sent above.
++        QWindowSystemInterface::handleExposeEvent(m_window, QRegion(m_window->geometry()));
++    } else {
+ 
+-- (void)windowDidBecomeMain
+-{
+-//    qDebug() << "window did become main" << m_window;
+-}
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7
++    if (QSysInfo::QSysInfo::MacintoshVersion >= QSysInfo::MV_10_7) {
++        if (notificationName == NSWindowDidEnterFullScreenNotification) {
++            QWindowSystemInterface::handleWindowStateChanged(m_window, Qt::WindowFullScreen);
++        } else if (notificationName == NSWindowDidExitFullScreenNotification) {
++            QWindowSystemInterface::handleWindowStateChanged(m_window, Qt::WindowNoState);
++        }
++    }
++#endif
+ 
+-- (void)windowDidResignMain
+-{
+-//    qDebug() << "window did resign main" << m_window;
++    }
+ }
+ 
+-
+ - (void) setImage:(QImage *)image
+ {
+     CGImageRelease(m_cgImage);
+diff --git a/tests/auto/widgets/widgets/qstatusbar/tst_qstatusbar.cpp b/tests/auto/widgets/widgets/qstatusbar/tst_qstatusbar.cpp
+index 081e817..d23f69a 100644
+--- a/tests/auto/widgets/widgets/qstatusbar/tst_qstatusbar.cpp
++++ b/tests/auto/widgets/widgets/qstatusbar/tst_qstatusbar.cpp
+@@ -199,7 +199,9 @@ void tst_QStatusBar::setSizeGripEnabled()
+     QVERIFY(!sizeGrip);
+ 
+     qApp->processEvents();
++#ifndef Q_OS_MAC // Work around Lion fullscreen issues on CI system - QTQAINFRA-506
+     mainWindow.showFullScreen();
++#endif
+ #ifdef Q_WS_X11
+     qt_x11_wait_for_window_manager(&mainWindow);
+ #endif
+@@ -220,7 +222,9 @@ void tst_QStatusBar::setSizeGripEnabled()
+     QVERIFY(!sizeGrip->isVisible());
+ 
+     qApp->processEvents();
++#ifndef Q_OS_MAC
+     mainWindow.showNormal();
++#endif
+     qApp->processEvents();
+     QTRY_VERIFY(sizeGrip->isVisible());
+ }
+diff --git a/tests/manual/windowflags/controllerwindow.cpp b/tests/manual/windowflags/controllerwindow.cpp
+index 586691a..cee8976 100644
+--- a/tests/manual/windowflags/controllerwindow.cpp
++++ b/tests/manual/windowflags/controllerwindow.cpp
+@@ -62,6 +62,7 @@ ControllerWindow::ControllerWindow()
+     previewDialog = new PreviewDialog;
+ 
+     createTypeGroupBox();
++    createStateGroupBox();
+     createHintsGroupBox();
+ 
+     quitButton = new QPushButton(tr("&Quit"));
+@@ -73,6 +74,7 @@ ControllerWindow::ControllerWindow()
+ 
+     QVBoxLayout *mainLayout = new QVBoxLayout;
+     mainLayout->addWidget(widgetTypeGroupBox);
++    mainLayout->addWidget(windowStateGroupBox);
+     mainLayout->addWidget(additionalOptionsGroupBox);
+     mainLayout->addWidget(typeGroupBox);
+     mainLayout->addWidget(hintsGroupBox);
+@@ -165,7 +167,17 @@ void ControllerWindow::updatePreview()
+     if (pos.y() < 0)
+         pos.setY(0);
+     widget->move(pos);
+-    widget->show();
++
++    Qt::WindowState windowState = Qt::WindowNoState;
++    if (minimizeButton->isChecked())
++        windowState = Qt::WindowMinimized;
++    else if (maximizeButton->isChecked())
++        windowState = Qt::WindowMaximized;
++    else if (fullscreenButton->isChecked())
++        windowState = Qt::WindowFullScreen;
++
++    widget->setWindowState(windowState);
++    widget->setVisible(visibleCheckBox->isChecked());
+ }
+ 
+ void ControllerWindow::createTypeGroupBox()
+@@ -212,6 +224,27 @@ void ControllerWindow::createTypeGroupBox()
+ }
+ //! [5]
+ 
++void ControllerWindow::createStateGroupBox()
++{
++    windowStateGroupBox = new QGroupBox(tr("Window State"));
++    visibleCheckBox = createCheckBox(tr("Visible"));
++    visibleCheckBox->setChecked(true);
++
++    restoreButton = createRadioButton(tr("Normal"));
++    restoreButton->setChecked(true);
++    minimizeButton = createRadioButton(tr("Minimized"));
++    maximizeButton = createRadioButton(tr("Maximized"));
++    fullscreenButton = createRadioButton(tr("Fullscreen"));;
++
++    QHBoxLayout *l = new QHBoxLayout;
++    l->addWidget(visibleCheckBox);
++    l->addWidget(restoreButton);
++    l->addWidget(minimizeButton);
++    l->addWidget(maximizeButton);
++    l->addWidget(fullscreenButton);
++    windowStateGroupBox->setLayout(l);
++}
++
+ //! [6]
+ void ControllerWindow::createHintsGroupBox()
+ {
+diff --git a/tests/manual/windowflags/controllerwindow.h b/tests/manual/windowflags/controllerwindow.h
+index 02827cf..02a8eb9 100644
+--- a/tests/manual/windowflags/controllerwindow.h
++++ b/tests/manual/windowflags/controllerwindow.h
+@@ -42,7 +42,7 @@
+ #ifndef CONTROLLERWINDOW_H
+ #define CONTROLLERWINDOW_H
+ 
+-#include <QWidget>
++#include <QtWidgets/QWidget>
+ 
+ #include "previewwindow.h"
+ 
+@@ -68,6 +68,7 @@ private slots:
+ 
+ private:
+     void createTypeGroupBox();
++    void createStateGroupBox();
+     void createHintsGroupBox();
+     QCheckBox *createCheckBox(const QString &text);
+     QRadioButton *createRadioButton(const QString &text);
+@@ -77,6 +78,7 @@ private:
+     PreviewDialog *previewDialog;
+ 
+     QGroupBox *widgetTypeGroupBox;
++    QGroupBox *windowStateGroupBox;
+     QGroupBox *additionalOptionsGroupBox;
+     QGroupBox *typeGroupBox;
+     QGroupBox *hintsGroupBox;
+@@ -87,6 +89,12 @@ private:
+     QCheckBox *modalWindowCheckBox;
+     QCheckBox *fixedSizeWindowCheckBox;
+ 
++    QCheckBox *visibleCheckBox;
++    QRadioButton *restoreButton;
++    QRadioButton *minimizeButton;
++    QRadioButton *maximizeButton;
++    QRadioButton *fullscreenButton;
++
+     QRadioButton *windowRadioButton;
+     QRadioButton *dialogRadioButton;
+     QRadioButton *sheetRadioButton;
+diff --git a/tests/manual/windowflags/previewwindow.cpp b/tests/manual/windowflags/previewwindow.cpp
+index 684d1ee..ba5399d 100644
+--- a/tests/manual/windowflags/previewwindow.cpp
++++ b/tests/manual/windowflags/previewwindow.cpp
+@@ -107,6 +107,8 @@ PreviewWindow::PreviewWindow(QWidget *parent)
+ 
+     showNormalButton = new QPushButton(tr("Show normal"));
+     connect(showNormalButton, SIGNAL(clicked()), this, SLOT(showNormal()));
++    showMinimizedButton = new QPushButton(tr("Show minimized"));
++    connect(showMinimizedButton, SIGNAL(clicked()), this, SLOT(showMinimized()));
+     showMaximizedButton = new QPushButton(tr("Show maximized"));
+     connect(showMaximizedButton, SIGNAL(clicked()), this, SLOT(showMaximized()));
+     showFullScreenButton = new QPushButton(tr("Show fullscreen"));
+@@ -115,6 +117,7 @@ PreviewWindow::PreviewWindow(QWidget *parent)
+     QVBoxLayout *layout = new QVBoxLayout;
+     layout->addWidget(textEdit);
+     layout->addWidget(showNormalButton);
++    layout->addWidget(showMinimizedButton);
+     layout->addWidget(showMaximizedButton);
+     layout->addWidget(showFullScreenButton);
+     layout->addWidget(closeButton);
+@@ -143,6 +146,8 @@ PreviewDialog::PreviewDialog(QWidget *parent)
+ 
+     showNormalButton = new QPushButton(tr("Show normal"));
+     connect(showNormalButton, SIGNAL(clicked()), this, SLOT(showNormal()));
++    showMinimizedButton = new QPushButton(tr("Show minimized"));
++    connect(showMinimizedButton, SIGNAL(clicked()), this, SLOT(showMinimized()));
+     showMaximizedButton = new QPushButton(tr("Show maximized"));
+     connect(showMaximizedButton, SIGNAL(clicked()), this, SLOT(showMaximized()));
+     showFullScreenButton = new QPushButton(tr("Show fullscreen"));
+@@ -151,6 +156,7 @@ PreviewDialog::PreviewDialog(QWidget *parent)
+     QVBoxLayout *layout = new QVBoxLayout;
+     layout->addWidget(textEdit);
+     layout->addWidget(showNormalButton);
++    layout->addWidget(showMinimizedButton);
+     layout->addWidget(showMaximizedButton);
+     layout->addWidget(showFullScreenButton);
+     layout->addWidget(closeButton);
+diff --git a/tests/manual/windowflags/previewwindow.h b/tests/manual/windowflags/previewwindow.h
+index 4218901..9ff091f 100644
+--- a/tests/manual/windowflags/previewwindow.h
++++ b/tests/manual/windowflags/previewwindow.h
+@@ -42,8 +42,8 @@
+ #ifndef PREVIEWWINDOW_H
+ #define PREVIEWWINDOW_H
+ 
+-#include <QWidget>
+-#include <QDialog>
++#include <QtWidgets/QWidget>
++#include <QtWidgets/QDialog>
+ 
+ QT_BEGIN_NAMESPACE
+ class QPushButton;
+@@ -63,6 +63,7 @@ private:
+     QTextEdit *textEdit;
+     QPushButton *closeButton;
+     QPushButton *showNormalButton;
++    QPushButton *showMinimizedButton;
+     QPushButton *showMaximizedButton;
+     QPushButton *showFullScreenButton;
+ };
+@@ -80,6 +81,7 @@ private:
+     QTextEdit *textEdit;
+     QPushButton *closeButton;
+     QPushButton *showNormalButton;
++    QPushButton *showMinimizedButton;
+     QPushButton *showMaximizedButton;
+     QPushButton *showFullScreenButton;
+ };
+diff --git a/tests/manual/windowflags/windowflags.pro b/tests/manual/windowflags/windowflags.pro
+index 06def21..81ca7ad 100644
+--- a/tests/manual/windowflags/windowflags.pro
++++ b/tests/manual/windowflags/windowflags.pro
+@@ -5,3 +5,4 @@ HEADERS       = controllerwindow.h \
+ SOURCES       = controllerwindow.cpp \
+                 previewwindow.cpp \
+                 main.cpp
++QT += widgets

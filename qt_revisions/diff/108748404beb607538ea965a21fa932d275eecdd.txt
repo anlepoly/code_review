@@ -1,0 +1,147 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index e10f0df..ebe8ad5 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -446,6 +446,8 @@ Instead, pending (failed) changes cause new changes inappropriate to the
+ edit strategy to be refused. The application should resolve or revert pending
+ changes. insertRows() and insertRecord() also respect the edit strategy.
+ 
++* QSqlTableModel::setData() and setRecord() in OnRowChange no longer have the
++side effect of submitting the cached row when invoked on a different row.
+ ****************************************************************************
+ *                          Database Drivers                                *
+ ****************************************************************************
+diff --git a/src/sql/models/qsqltablemodel.cpp b/src/sql/models/qsqltablemodel.cpp
+index 0eb5447..153c2e8 100644
+--- a/src/sql/models/qsqltablemodel.cpp
++++ b/src/sql/models/qsqltablemodel.cpp
+@@ -516,14 +516,12 @@ bool QSqlTableModel::isDirty(const QModelIndex &index) const
+     For edit strategy OnFieldChange, an index may receive a change
+     only if no other index has a cached change. Changes are
+     submitted immediately. However, rows that have not yet been
+-    inserted in the database may be freely changed and and are not
+-    submitted automatically.
++    inserted in the database may be freely changed and are not
++    submitted automatically. Submitted changes are not reverted upon
++    failure.
+ 
+-    For OnRowChange, the first change to a row will cause cached
+-    operations on other rows to be submitted. If submitting fails,
+-    the new change is rejected.
+-
+-    Submitted changes are not reverted upon failure.
++    For OnRowChange, an index may receive a change only if no other
++    row has a cached change. Changes are not submitted automatically.
+ 
+     Returns true if the value could be set or false on error, for
+     example if \a index is out of bounds.
+@@ -542,21 +540,9 @@ bool QSqlTableModel::setData(const QModelIndex &index, const QVariant &value, in
+     if (!index.isValid() || index.column() >= d->rec.count() || index.row() >= rowCount())
+         return false;
+ 
+-    if (d->cache.value(index.row()).op() == QSqlTableModelPrivate::Delete)
++    if (!(flags(index) & Qt::ItemIsEditable))
+         return false;
+ 
+-    if (d->strategy == OnFieldChange) {
+-        if (d->cache.value(index.row()).op() != QSqlTableModelPrivate::Insert
+-            && !isDirty(index) && isDirty())
+-            return false;
+-    }
+-    else if (d->strategy == OnRowChange) {
+-        if (d->cache.value(index.row()).submitted()) {
+-            if (!submit())
+-                return false;
+-        }
+-    }
+-
+     QSqlTableModelPrivate::ModifiedRow &row = d->cache[index.row()];
+ 
+     if (row.op() == QSqlTableModelPrivate::None)
+@@ -1249,16 +1235,32 @@ Qt::ItemFlags QSqlTableModel::flags(const QModelIndex &index) const
+     if (index.internalPointer() || index.column() < 0 || index.column() >= d->rec.count()
+         || index.row() < 0)
+         return 0;
+-    if (d->rec.field(index.column()).isReadOnly())
+-        return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
+-    if (d->cache.value(index.row()).op() == QSqlTableModelPrivate::Delete)
+-        return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
+-    if (d->strategy == OnFieldChange
+-        && d->cache.value(index.row()).op() != QSqlTableModelPrivate::Insert
+-        && !isDirty(index) && isDirty())
+-        return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
+ 
+-    return Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsEditable;
++    bool editable = true;
++
++    if (d->rec.field(index.column()).isReadOnly()) {
++        editable = false;
++    }
++    else {
++        const QSqlTableModelPrivate::ModifiedRow mrow = d->cache.value(index.row());
++        if (mrow.op() == QSqlTableModelPrivate::Delete) {
++            editable = false;
++        }
++        else if (d->strategy == OnFieldChange) {
++            if (mrow.op() != QSqlTableModelPrivate::Insert)
++                if (!isDirty(index) && isDirty())
++                    editable = false;
++        }
++        else if (d->strategy == OnRowChange) {
++            if (mrow.submitted() && isDirty())
++                editable = false;
++        }
++    }
++
++    if (!editable)
++        return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
++    else
++        return Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsEditable;
+ }
+ 
+ /*!
+diff --git a/tests/auto/sql/models/qsqlrelationaltablemodel/tst_qsqlrelationaltablemodel.cpp b/tests/auto/sql/models/qsqlrelationaltablemodel/tst_qsqlrelationaltablemodel.cpp
+index ce0d8db..05d8438 100644
+--- a/tests/auto/sql/models/qsqlrelationaltablemodel/tst_qsqlrelationaltablemodel.cpp
++++ b/tests/auto/sql/models/qsqlrelationaltablemodel/tst_qsqlrelationaltablemodel.cpp
+@@ -1537,7 +1537,9 @@ void tst_QSqlRelationalTableModel::relationOnFirstColumn()
+ 
+     //modify the model data
+     QVERIFY_SQL(model, setData(model.index(0, 0), 40));
++    QVERIFY_SQL(model, submit());
+     QVERIFY_SQL(model, setData(model.index(1, 0), 50));
++    QVERIFY_SQL(model, submit());
+     QVERIFY_SQL(model, setData(model.index(2, 0), 30));
+ 
+     //verify the data after modificaiton
+diff --git a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+index 0bdcb3b..8bc7125 100644
+--- a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
++++ b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+@@ -1067,6 +1067,26 @@ void tst_QSqlTableModel::isDirty()
+         QFAIL_SQL(model, isDirty(model.index(0, 1)));
+     }
+ 
++    if (submitpolicy == QSqlTableModel::OnRowChange) {
++        // dirty row must block change on other rows
++        QCOMPARE(model.data(model.index(0, 1)).toString(), QString("harry"));
++        QVERIFY(model.rowCount() > 1);
++        QVERIFY_SQL(model, setData(model.index(0, 1), QString("sam i am")));
++        QCOMPARE(model.data(model.index(0, 1)).toString(), QString("sam i am"));
++        QVERIFY_SQL(model, isDirty());
++        QVERIFY_SQL(model, isDirty(model.index(0, 1)));
++        QVERIFY(!(model.flags(model.index(1, 1)) & Qt::ItemIsEditable));
++        QFAIL_SQL(model, setData(model.index(1, 1), QString("sam i am")));
++        QFAIL_SQL(model, setRecord(1, model.record(1)));
++        QFAIL_SQL(model, insertRow(1));
++        QFAIL_SQL(model, isDirty(model.index(1, 1)));
++
++        model.revertAll();
++        QCOMPARE(model.data(model.index(0, 1)).toString(), QString("harry"));
++        QFAIL_SQL(model, isDirty());
++        QFAIL_SQL(model, isDirty(model.index(0, 1)));
++    }
++
+     // setData() followed by submitAll()
+     QCOMPARE(model.data(model.index(0, 1)).toString(), QString("harry"));
+     QVERIFY_SQL(model, setData(model.index(0, 1), QString("sam i am")));

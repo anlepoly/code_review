@@ -1,0 +1,357 @@
+diff --git a/src/script/api/qscriptengine.cpp b/src/script/api/qscriptengine.cpp
+index 8f8c86d..d8eaf3f 100644
+--- a/src/script/api/qscriptengine.cpp
++++ b/src/script/api/qscriptengine.cpp
+@@ -1307,14 +1307,7 @@ void QScriptEnginePrivate::mark(JSC::MarkStack& markStack)
+     }
+ 
+ #ifndef QT_NO_QOBJECT
+-    markStack.drain(); // make sure everything is marked before marking qobject data
+-    {
+-        QHash<QObject*, QScript::QObjectData*>::const_iterator it;
+-        for (it = m_qobjectData.constBegin(); it != m_qobjectData.constEnd(); ++it) {
+-            QScript::QObjectData *qdata = it.value();
+-            qdata->mark(markStack);
+-        }
+-    }
++    markQObjectData(markStack);
+ #endif
+ }
+ 
+@@ -1417,6 +1410,37 @@ JSC::JSValue QScriptEnginePrivate::evaluateHelper(JSC::ExecState *exec, intptr_t
+ 
+ #ifndef QT_NO_QOBJECT
+ 
++void QScriptEnginePrivate::markQObjectData(JSC::MarkStack& markStack)
++{
++    QHash<QObject*, QScript::QObjectData*>::const_iterator it;
++    // 1. Clear connection mark bits for all objects
++    for (it = m_qobjectData.constBegin(); it != m_qobjectData.constEnd(); ++it) {
++        QScript::QObjectData *qdata = it.value();
++        qdata->clearConnectionMarkBits();
++    }
++
++    // 2. Iterate until no more connections are marked
++    int markedCount;
++    do {
++        // Drain the stack to ensure mark bits are set; this is used to determine
++        // whether a connection's sender object is weakly referenced
++        markStack.drain();
++
++        markedCount = 0;
++        for (it = m_qobjectData.constBegin(); it != m_qobjectData.constEnd(); ++it) {
++            QScript::QObjectData *qdata = it.value();
++            markedCount += qdata->markConnections(markStack);
++        }
++    } while (markedCount > 0);
++    markStack.drain(); // One last time before marking wrappers
++
++    // 3. Mark all wrappers
++    for (it = m_qobjectData.constBegin(); it != m_qobjectData.constEnd(); ++it) {
++        QScript::QObjectData *qdata = it.value();
++        qdata->markWrappers(markStack);
++    }
++}
++
+ JSC::JSValue QScriptEnginePrivate::newQObject(
+     QObject *object, QScriptEngine::ValueOwnership ownership,
+     const QScriptEngine::QObjectWrapOptions &options)
+diff --git a/src/script/api/qscriptengine_p.h b/src/script/api/qscriptengine_p.h
+index 09ecaf2..ddd5d88 100644
+--- a/src/script/api/qscriptengine_p.h
++++ b/src/script/api/qscriptengine_p.h
+@@ -315,6 +315,7 @@ public:
+     JSC::UString translationContextFromUrl(const JSC::UString &);
+ 
+ #ifndef QT_NO_QOBJECT
++    void markQObjectData(JSC::MarkStack&);
+     JSC::JSValue newQObject(QObject *object,
+         QScriptEngine::ValueOwnership ownership = QScriptEngine::QtOwnership,
+         const QScriptEngine:: QObjectWrapOptions &options = 0);
+diff --git a/src/script/bridge/qscriptqobject.cpp b/src/script/bridge/qscriptqobject.cpp
+index 3e82dbb..da1e0d6 100644
+--- a/src/script/bridge/qscriptqobject.cpp
++++ b/src/script/bridge/qscriptqobject.cpp
+@@ -62,15 +62,16 @@ namespace QScript
+ 
+ struct QObjectConnection
+ {
+-    int slotIndex;
++    uint marked:1;
++    uint slotIndex:31;
+     JSC::JSValue receiver;
+     JSC::JSValue slot;
+     JSC::JSValue senderWrapper;
+ 
+     QObjectConnection(int i, JSC::JSValue r, JSC::JSValue s,
+                       JSC::JSValue sw)
+-        : slotIndex(i), receiver(r), slot(s), senderWrapper(sw) {}
+-    QObjectConnection() : slotIndex(-1) {}
++        : marked(false), slotIndex(i), receiver(r), slot(s), senderWrapper(sw) {}
++    QObjectConnection() : marked(false), slotIndex(0) {}
+ 
+     bool hasTarget(JSC::JSValue r, JSC::JSValue s) const
+     {
+@@ -83,12 +84,9 @@ struct QObjectConnection
+         return (s == slot);
+     }
+ 
+-    void mark(JSC::MarkStack& markStack)
++    bool hasWeaklyReferencedSender() const
+     {
+         if (senderWrapper) {
+-            // see if the sender should be marked or not;
+-            // if the C++ object is owned by script, we don't want
+-            // it to stay alive due to a script connection.
+             Q_ASSERT(senderWrapper.inherits(&QScriptObject::info));
+             QScriptObject *scriptObject = static_cast<QScriptObject*>(JSC::asObject(senderWrapper));
+             if (!JSC::Heap::isCellMarked(scriptObject)) {
+@@ -98,16 +96,23 @@ struct QObjectConnection
+                 if ((inst->ownership() == QScriptEngine::ScriptOwnership)
+                     || ((inst->ownership() == QScriptEngine::AutoOwnership)
+                         && !inst->hasParent())) {
+-                    senderWrapper = JSC::JSValue();
+-                } else {
+-                    markStack.append(senderWrapper);
++                    return true;
+                 }
+             }
+         }
++        return false;
++    }
++
++    void mark(JSC::MarkStack& markStack)
++    {
++        Q_ASSERT(!marked);
++        if (senderWrapper)
++            markStack.append(senderWrapper);
+         if (receiver)
+             markStack.append(receiver);
+         if (slot)
+             markStack.append(slot);
++        marked = true;
+     }
+ };
+ 
+@@ -129,7 +134,8 @@ public:
+ 
+     void execute(int slotIndex, void **argv);
+ 
+-    void mark(JSC::MarkStack&);
++    void clearMarkBits();
++    int mark(JSC::MarkStack&);
+ 
+ private:
+     QScriptEnginePrivate *engine;
+@@ -2212,13 +2218,41 @@ QObjectConnectionManager::~QObjectConnectionManager()
+ {
+ }
+ 
+-void QObjectConnectionManager::mark(JSC::MarkStack& markStack)
++void QObjectConnectionManager::clearMarkBits()
+ {
+     for (int i = 0; i < connections.size(); ++i) {
+         QVector<QObjectConnection> &cs = connections[i];
+         for (int j = 0; j < cs.size(); ++j)
+-            cs[j].mark(markStack);
++            cs[j].marked = false;
++    }
++}
++
++/*!
++  \internal
++
++  Marks connections owned by this manager.
++  Returns the number of connections that were marked by this pass
++  (i.e., excluding connections that were already marked).
++*/
++int QObjectConnectionManager::mark(JSC::MarkStack& markStack)
++{
++    int markedCount = 0;
++    for (int i = 0; i < connections.size(); ++i) {
++        QVector<QObjectConnection> &cs = connections[i];
++        for (int j = 0; j < cs.size(); ++j) {
++            QObjectConnection &c = cs[j];
++            if (!c.marked) {
++                if (c.hasWeaklyReferencedSender()) {
++                    // Don't mark the connection; we don't want the script-owned
++                    // sender object to stay alive merely due to a connection.
++                } else {
++                    c.mark(markStack);
++                    ++markedCount;
++                }
++            }
++        }
+     }
++    return markedCount;
+ }
+ 
+ bool QObjectConnectionManager::addSignalHandler(
+@@ -2269,26 +2303,35 @@ QObjectData::~QObjectData()
+     }
+ }
+ 
++void QObjectData::clearConnectionMarkBits()
++{
++    if (connectionManager)
++        connectionManager->clearMarkBits();
++}
++
++int QObjectData::markConnections(JSC::MarkStack& markStack)
++{
++    if (connectionManager)
++        return connectionManager->mark(markStack);
++    return 0;
++}
++
+ // This function assumes all objects reachable elsewhere in the JS environment
+ // (stack, heap) have been marked already (see QScriptEnginePrivate::mark()).
+ // This determines whether any of QtScript's internal QObject wrappers are only
+ // weakly referenced and can be discarded.
+-void QObjectData::mark(JSC::MarkStack& markStack)
+-{
+-    if (connectionManager)
+-        connectionManager->mark(markStack);
+-    {
+-        QList<QScript::QObjectWrapperInfo>::iterator it;
+-        for (it = wrappers.begin(); it != wrappers.end(); ) {
+-            const QScript::QObjectWrapperInfo &info = *it;
+-            if (JSC::Heap::isCellMarked(info.object)) {
+-                ++it;
+-            } else if (info.isCollectableWhenWeaklyReferenced()) {
+-                it = wrappers.erase(it);
+-            } else {
+-                markStack.append(info.object);
+-                ++it;
+-            }
++void QObjectData::markWrappers(JSC::MarkStack& markStack)
++{
++    QList<QScript::QObjectWrapperInfo>::iterator it;
++    for (it = wrappers.begin(); it != wrappers.end(); ) {
++        const QScript::QObjectWrapperInfo &info = *it;
++        if (JSC::Heap::isCellMarked(info.object)) {
++            ++it;
++        } else if (info.isCollectableWhenWeaklyReferenced()) {
++            it = wrappers.erase(it);
++        } else {
++            markStack.append(info.object);
++            ++it;
+         }
+     }
+ }
+diff --git a/src/script/bridge/qscriptqobject_p.h b/src/script/bridge/qscriptqobject_p.h
+index 55ed0f7..992b03c 100644
+--- a/src/script/bridge/qscriptqobject_p.h
++++ b/src/script/bridge/qscriptqobject_p.h
+@@ -183,7 +183,9 @@ public:
+                          QScriptEngine::ValueOwnership ownership,
+                          const QScriptEngine::QObjectWrapOptions &options);
+ 
+-    void mark(JSC::MarkStack&);
++    void clearConnectionMarkBits();
++    int markConnections(JSC::MarkStack&);
++    void markWrappers(JSC::MarkStack&);
+ 
+ private:
+     QScriptEnginePrivate *engine;
+diff --git a/tests/auto/qscriptextqobject/qscriptextqobject.pro b/tests/auto/qscriptextqobject/qscriptextqobject.pro
+index 8ddebef..784037f 100644
+--- a/tests/auto/qscriptextqobject/qscriptextqobject.pro
++++ b/tests/auto/qscriptextqobject/qscriptextqobject.pro
+@@ -2,4 +2,5 @@ TARGET = tst_qscriptextqobject
+ CONFIG += testcase
+ QT = core gui widgets script testlib
+ SOURCES  += tst_qscriptextqobject.cpp
++include(../shared/util.pri)
+ DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0
+diff --git a/tests/auto/qscriptextqobject/tst_qscriptextqobject.cpp b/tests/auto/qscriptextqobject/tst_qscriptextqobject.cpp
+index bbf72ad..43e640a 100644
+--- a/tests/auto/qscriptextqobject/tst_qscriptextqobject.cpp
++++ b/tests/auto/qscriptextqobject/tst_qscriptextqobject.cpp
+@@ -50,6 +50,8 @@
+ #include <qpushbutton.h>
+ #include <qlineedit.h>
+ 
++#include "../shared/util.h"
++
+ struct CustomType
+ {
+     QString string;
+@@ -586,6 +588,8 @@ private slots:
+     void nestedObjectAsSlotArgument();
+     void propertyAccessThroughActivationObject();
+     void connectionRemovedAfterQueuedCall();
++    void collectQObjectWithClosureSlot();
++    void collectQObjectWithClosureSlot2();
+ 
+ private:
+     QScriptEngine *m_engine;
+@@ -3705,5 +3709,68 @@ void tst_QScriptExtQObject::connectionRemovedAfterQueuedCall()
+     QVERIFY(m_engine->evaluate("pass").toBool());
+ }
+ 
++// QTBUG-26590
++void tst_QScriptExtQObject::collectQObjectWithClosureSlot()
++{
++    QScriptEngine eng;
++    QScriptValue fun = eng.evaluate("(function(obj) {\n"
++        "    obj.mySignal.connect(function() { obj.mySlot(); });\n"
++        "})");
++    QVERIFY(fun.isFunction());
++
++    QPointer<MyQObject> obj = new MyQObject;
++    {
++        QScriptValue wrapper = eng.newQObject(obj, QScriptEngine::ScriptOwnership);
++        QVERIFY(fun.call(QScriptValue(), QScriptValueList() << wrapper).isUndefined());
++    }
++    QVERIFY(obj != 0);
++    QCOMPARE(obj->qtFunctionInvoked(), -1);
++    obj->emitMySignal();
++    QCOMPARE(obj->qtFunctionInvoked(), 20);
++
++    collectGarbage_helper(eng);
++    // The closure that's connected to obj's signal has the only JS reference
++    // to obj, and the closure is only referenced by the connection. Hence, obj
++    // should have been collected.
++    if (obj != 0)
++        QEXPECT_FAIL("", "Test can fail because the garbage collector is conservative", Continue);
++    QVERIFY(obj == 0);
++}
++
++void tst_QScriptExtQObject::collectQObjectWithClosureSlot2()
++{
++    QScriptEngine eng;
++    QScriptValue fun = eng.evaluate("(function(obj1, obj2) {\n"
++        "    obj2.mySignal.connect(function() { obj1.mySlot(); });\n"
++        "    obj1.mySignal.connect(function() { obj2.mySlot(); });\n"
++        "})");
++    QVERIFY(fun.isFunction());
++
++    QPointer<MyQObject> obj1 = new MyQObject;
++    QScriptValue wrapper1 = eng.newQObject(obj1, QScriptEngine::ScriptOwnership);
++    QPointer<MyQObject> obj2 = new MyQObject;
++    {
++        QScriptValue wrapper2 = eng.newQObject(obj2, QScriptEngine::ScriptOwnership);
++        QVERIFY(fun.call(QScriptValue(), QScriptValueList() << wrapper1 << wrapper2).isUndefined());
++    }
++    QVERIFY(obj1 != 0);
++    QVERIFY(obj2 != 0);
++
++    collectGarbage_helper(eng);
++    // obj1 is referenced by a QScriptValue, so it (and its connections) should not be collected.
++    QVERIFY(obj1 != 0);
++    // obj2 is referenced from the closure that's connected to obj1's signal, so it
++    // (and its connections) should not be collected.
++    QVERIFY(obj2 != 0);
++
++    QCOMPARE(obj2->qtFunctionInvoked(), -1);
++    obj1->emitMySignal();
++    QCOMPARE(obj2->qtFunctionInvoked(), 20);
++
++    QCOMPARE(obj1->qtFunctionInvoked(), -1);
++    obj2->emitMySignal();
++    QCOMPARE(obj1->qtFunctionInvoked(), 20);
++}
++
+ QTEST_MAIN(tst_QScriptExtQObject)
+ #include "tst_qscriptextqobject.moc"

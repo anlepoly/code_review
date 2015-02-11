@@ -1,0 +1,990 @@
+diff --git a/tools/qdoc3/cppcodemarker.cpp b/tools/qdoc3/cppcodemarker.cpp
+index 2f259b2..5f698b4 100644
+--- a/tools/qdoc3/cppcodemarker.cpp
++++ b/tools/qdoc3/cppcodemarker.cpp
+@@ -1181,10 +1181,25 @@ QList<Section> CppCodeMarker::qmlSections(const QmlClassNode* qmlClassNode,
+                     }
+                     else if ((*c)->type() == Node::QmlProperty) {
+                         const QmlPropertyNode* pn = static_cast<const QmlPropertyNode*>(*c);
+-                        if (pn->isAttached())
+-                            insert(qmlattachedproperties,*c,style,Okay);
+-                        else
+-                            insert(qmlproperties,*c,style,Okay);
++                        if (pn->qmlPropNodes().isEmpty()) {
++                            if (pn->isAttached())
++                                insert(qmlattachedproperties,*c,style,Okay);
++                            else
++                                insert(qmlproperties,*c,style,Okay);
++                        }
++                        else {
++                            NodeList::ConstIterator p = pn->qmlPropNodes().begin();
++                            while (p != pn->qmlPropNodes().end()) {
++                                if ((*p)->type() == Node::QmlProperty) {
++                                    const QmlPropertyNode* pn = static_cast<const QmlPropertyNode*>(*p);
++                                    if (pn->isAttached())
++                                        insert(qmlattachedproperties,*p,style,Okay);
++                                    else
++                                        insert(qmlproperties,*p,style,Okay);
++                                }
++                                ++p;
++                            }
++                        }
+                     }
+                     else if ((*c)->type() == Node::QmlSignal) {
+                         const FunctionNode* sn = static_cast<const FunctionNode*>(*c);
+diff --git a/tools/qdoc3/ditaxmlgenerator.cpp b/tools/qdoc3/ditaxmlgenerator.cpp
+index d7c9ab7..457866a 100644
+--- a/tools/qdoc3/ditaxmlgenerator.cpp
++++ b/tools/qdoc3/ditaxmlgenerator.cpp
+@@ -4431,28 +4431,79 @@ void DitaXmlGenerator::generateDetailedQmlMember(const Node* node,
+     }
+     else if (node->type() == Node::QmlProperty) {
+         qpn = static_cast<const QmlPropertyNode*>(node);
+-        writeStartTag(DT_ul);
+-        writeStartTag(DT_li);
+-        writeGuidAttribute((Node*)qpn);
+-        QString attr;
+-        int ro = qpn->getReadOnly();
+-        if (ro < 0) {
+-            const ClassNode* cn = qpn->declarativeCppNode();
+-            if (cn && !qpn->isWritable(myTree))
+-                attr = "read-only";
++        /*
++          If the QML property node has a single subproperty,
++          override, replace qpn with that override node and
++          proceed as normal.
++         */
++        if (qpn->qmlPropNodes().size() == 1) {
++            Node* n = qpn->qmlPropNodes().at(0);
++            if (n->type() == Node::QmlProperty)
++                qpn = static_cast<const QmlPropertyNode*>(n);
+         }
+-        else if (ro > 0)
+-            attr = "read-only";
+-        if (qpn->isDefault()) {
++        /*
++          Now qpn either has no overrides, or it has more
++          than 1. If it has none, proceed to output as nortmal.
++         */
++        if (qpn->qmlPropNodes().isEmpty()) {
++            writeStartTag(DT_ul);
++            writeStartTag(DT_li);
++            writeGuidAttribute((Node*)qpn);
++            QString attr;
++            int ro = qpn->getReadOnly();
++            if (ro < 0) {
++                const ClassNode* cn = qpn->declarativeCppNode();
++                if (cn && !qpn->isWritable(myTree))
++                    attr = "read-only";
++            }
++            else if (ro > 0)
++                attr = "read-only";
++            if (qpn->isDefault()) {
++                if (!attr.isEmpty())
++                    attr += QLatin1Char(' ');
++                attr += "default";
++            }
+             if (!attr.isEmpty())
+-                attr += QLatin1Char(' ');
+-            attr += "default";
++                xmlWriter().writeAttribute("outputclass",attr);
++            generateQmlItem(qpn, relative, marker, false);
++            writeEndTag(); // </li>
++            writeEndTag(); // </ul>
++        }
++        else {
++            /*
++              The QML property node has multiple override nodes.
++              Process the whole list as we would for a QML property
++              group.
++             */
++            NodeList::ConstIterator p = qpn->qmlPropNodes().begin();
++            writeStartTag(DT_ul);
++            while (p != qpn->qmlPropNodes().end()) {
++                if ((*p)->type() == Node::QmlProperty) {
++                    QmlPropertyNode* q = static_cast<QmlPropertyNode*>(*p);
++                    writeStartTag(DT_li);
++                    writeGuidAttribute((Node*)q);
++                    QString attr;
++                    int ro = qpn->getReadOnly();
++                    if (ro < 0) {
++                        if (!qpn->isWritable(myTree))
++                            attr = "read-only";
++                    }
++                    else if (ro > 0)
++                        attr = "read-only";
++                    if (qpn->isDefault()) {
++                        if (!attr.isEmpty())
++                            attr += QLatin1Char(' ');
++                        attr += "default";
++                    }
++                    if (!attr.isEmpty())
++                        xmlWriter().writeAttribute("outputclass",attr);
++                    generateQmlItem(q, relative, marker, false);
++                    writeEndTag(); // </li>
++                }
++                ++p;
++            }
++            writeEndTag(); // </ul>
+         }
+-        if (!attr.isEmpty())
+-            xmlWriter().writeAttribute("outputclass",attr);
+-        generateQmlItem(qpn, relative, marker, false);
+-        writeEndTag(); // </li>
+-        writeEndTag(); // </ul>
+     }
+     else if (node->type() == Node::QmlSignal) {
+         Node* n = const_cast<Node*>(node);
+diff --git a/tools/qdoc3/doc.cpp b/tools/qdoc3/doc.cpp
+index 93bf891..1008919 100644
+--- a/tools/qdoc3/doc.cpp
++++ b/tools/qdoc3/doc.cpp
+@@ -55,10 +55,12 @@
+ #include <qregexp.h>
+ #include <ctype.h>
+ #include <limits.h>
++#include <qdebug.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ Q_GLOBAL_STATIC(QSet<QString>, null_Set_QString)
++Q_GLOBAL_STATIC(TopicList, nullTopicList)
+ Q_GLOBAL_STATIC(QStringList, null_QStringList)
+ Q_GLOBAL_STATIC(QList<Text>, null_QList_Text)
+ //Q_GLOBAL_STATIC(QStringMap, null_QStringMap)
+@@ -354,6 +356,7 @@ class DocPrivate : public Shared
+     bool hasLegalese : 1;
+     bool hasSectioningUnits : 1;
+     DocPrivateExtra *extra;
++    TopicList topics;
+ };
+ 
+ DocPrivate::DocPrivate(const Location& start,
+@@ -411,7 +414,8 @@ class DocParser
+   public:
+     void parse(const QString &source,
+                DocPrivate *docPrivate,
+-               const QSet<QString> &metaCommandSet);
++               const QSet<QString> &metaCommandSet,
++               const QSet<QString>& possibleTopics);
+ 
+     static int endCmdFor(int cmd);
+     static QString cmdName(int cmd);
+@@ -526,7 +530,8 @@ bool DocParser::quoting;
+  */
+ void DocParser::parse(const QString& source,
+                       DocPrivate *docPrivate,
+-                      const QSet<QString>& metaCommandSet)
++                      const QSet<QString>& metaCommandSet,
++                      const QSet<QString>& possibleTopics)
+ {
+     in = source;
+     pos = 0;
+@@ -535,6 +540,7 @@ void DocParser::parse(const QString& source,
+     cachedPos = 0;
+     priv = docPrivate;
+     priv->text << Atom::Nop;
++    priv->topics.clear();
+ 
+     paraState = OutsideParagraph;
+     inTableHeader = false;
+@@ -1324,8 +1330,11 @@ void DocParser::parse(const QString& source,
+                     case NOT_A_CMD:
+                         if (metaCommandSet.contains(cmdStr)) {
+                             priv->metacommandsUsed.insert(cmdStr);
+-                            QString xxx = getMetaCommandArgument(cmdStr);
+-                            priv->metaCommandMap[cmdStr].append(xxx);
++                            QString arg = getMetaCommandArgument(cmdStr);
++                            priv->metaCommandMap[cmdStr].append(arg);
++                            if (possibleTopics.contains(cmdStr)) {
++                                priv->topics.append(Topic(cmdStr,arg));
++                            }
+                         }
+                         else if (macroHash()->contains(cmdStr)) {
+                             const Macro &macro = macroHash()->value(cmdStr);
+@@ -2706,7 +2715,26 @@ Doc::Doc(const Location& start_loc,
+ {
+     priv = new DocPrivate(start_loc,end_loc,source);
+     DocParser parser;
+-    parser.parse(source,priv,metaCommandSet);
++    parser.parse(source,priv,metaCommandSet,QSet<QString>());
++}
++
++/*!
++  Parse the qdoc comment \a source. Build up a list of all the topic
++  commands found including their arguments.  This constructor is used
++  when there can be more than one topic command in theqdoc comment.
++  Normally, there is only one topic command in a qdoc comment, but in
++  QML documentation, there is the case where the qdoc \e{qmlproperty}
++  command can appear multiple times in a qdoc comment.
++ */
++Doc::Doc(const Location& start_loc,
++         const Location& end_loc,
++         const QString& source,
++         const QSet<QString>& metaCommandSet,
++         const QSet<QString>& topics)
++{
++    priv = new DocPrivate(start_loc,end_loc,source);
++    DocParser parser;
++    parser.parse(source,priv,metaCommandSet,topics);
+ }
+ 
+ Doc::Doc(const Doc& doc)
+@@ -2960,6 +2988,16 @@ const QSet<QString> &Doc::metaCommandsUsed() const
+     return priv == 0 ? *null_Set_QString() : priv->metacommandsUsed;
+ }
+ 
++/*!
++  Returns a reference to the list of topic commands used in the
++  current qdoc comment. Normally there is only one, but there
++  can be multiple \e{qmlproperty} commands, for example.
++ */
++const TopicList& Doc::topicsUsed() const
++{
++    return priv == 0 ? *nullTopicList() : priv->topics;
++}
++
+ QStringList Doc::metaCommandArgs(const QString& metacommand) const
+ {
+     return priv == 0 ? QStringList() : priv->metaCommandMap.value(metacommand);
+diff --git a/tools/qdoc3/doc.h b/tools/qdoc3/doc.h
+index 529c3fc..66c841a 100644
+--- a/tools/qdoc3/doc.h
++++ b/tools/qdoc3/doc.h
+@@ -66,6 +66,14 @@ typedef QMap<QString, QStringList> QCommandMap;
+ typedef QMap<QString, QString> QStringMap;
+ typedef QMultiMap<QString, QString> QStringMultiMap;
+ 
++struct Topic
++{
++    QString topic;
++    QString args;
++  Topic(QString& t, QString a) : topic(t), args(a) { }
++};
++typedef QList<Topic> TopicList;
++
+ class Doc
+ {
+  public:
+@@ -85,6 +93,11 @@ class Doc
+         const Location &end_loc, 
+         const QString &source, 
+         const QSet<QString> &metaCommandSet);
++    Doc(const Location& start_loc,
++        const Location& end_loc,
++        const QString& source,
++        const QSet<QString>& metaCommandSet,
++        const QSet<QString>& topics);
+     Doc(const Doc &doc);
+     ~Doc();
+ 
+@@ -108,6 +121,7 @@ class Doc
+     const QStringList &enumItemNames() const;
+     const QStringList &omitEnumItemNames() const;
+     const QSet<QString> &metaCommandsUsed() const;
++    const TopicList& topicsUsed() const;
+     QStringList metaCommandArgs( const QString& metaCommand ) const;
+     const QList<Text> &alsoList() const;
+     bool hasTableOfContents() const;
+diff --git a/tools/qdoc3/htmlgenerator.cpp b/tools/qdoc3/htmlgenerator.cpp
+index 2e57919..16765e2 100644
+--- a/tools/qdoc3/htmlgenerator.cpp
++++ b/tools/qdoc3/htmlgenerator.cpp
+@@ -1041,8 +1041,6 @@ int HtmlGenerator::generateAtom(const Atom *atom,
+                 if (atom->count() > 1)
+                     p2 = atom->string(1);
+             }
+-            if (p1 == "borderless" || p2 == "borderless")
+-                qDebug() << "ATOM::TABLELEFT:" << atom->count() << p1 << p2;
+             if (!p1.isEmpty()) {
+                 if (p1 == "borderless")
+                     attr = p1;
+@@ -3348,6 +3346,8 @@ QString HtmlGenerator::refForNode(const Node *node)
+     return registerRef(ref);
+ }
+ 
++#define DEBUG_ABSTRACT 0
++
+ /*!
+   Construct the link string for the \a node and return it.
+   The \a relative node is use to decide the link we are
+@@ -4047,7 +4047,6 @@ void HtmlGenerator::generateDetailedQmlMember(const Node *node,
+         NodeList::ConstIterator p = qpgn->childNodes().begin();
+         out() << "<div class=\"qmlproto\">";
+         out() << "<table class=\"qmlname\">";
+-
+         while (p != qpgn->childNodes().end()) {
+             if ((*p)->type() == Node::QmlProperty) {
+                 qpn = static_cast<const QmlPropertyNode*>(*p);
+@@ -4076,27 +4075,78 @@ void HtmlGenerator::generateDetailedQmlMember(const Node *node,
+     }
+     else if (node->type() == Node::QmlProperty) {
+         qpn = static_cast<const QmlPropertyNode*>(node);
+-        out() << "<div class=\"qmlproto\">";
+-        out() << "<table class=\"qmlname\">";
+-        out() << "<tr valign=\"top\" class=\"odd\">";
+-        out() << "<td class=\"tblQmlPropNode\"><p>";
+-        out() << "<a name=\"" + refForNode(qpn) + "\"></a>";
+-        int ro = qpn->getReadOnly();
+-        if (ro < 0) {
+-            const ClassNode* cn = qpn->declarativeCppNode();
+-            if (cn && !qpn->isWritable(myTree)) {
++        /*
++          If the QML property node has a single subproperty,
++          override, replace qpn with that override node and
++          proceed as normal.
++         */
++        if (qpn->qmlPropNodes().size() == 1) {
++            Node* n = qpn->qmlPropNodes().at(0);
++            if (n->type() == Node::QmlProperty)
++                qpn = static_cast<const QmlPropertyNode*>(n);
++        }
++        /*
++          Now qpn either has no overrides, or it has more
++          than 1. If it has none, proceed to output as nortmal.
++         */
++        if (qpn->qmlPropNodes().isEmpty()) {
++            out() << "<div class=\"qmlproto\">";
++            out() << "<table class=\"qmlname\">";
++            out() << "<tr valign=\"top\" class=\"odd\">";
++            out() << "<td class=\"tblQmlPropNode\"><p>";
++            out() << "<a name=\"" + refForNode(qpn) + "\"></a>";
++            int ro = qpn->getReadOnly();
++            if (ro < 0) {
++                const ClassNode* cn = qpn->declarativeCppNode();
++                if (cn && !qpn->isWritable(myTree)) {
++                    out() << "<span class=\"qmlreadonly\">read-only</span>";
++                }
++            }
++            else if (ro > 0) {
+                 out() << "<span class=\"qmlreadonly\">read-only</span>";
+             }
++            if (qpn->isDefault())
++                out() << "<span class=\"qmldefault\">default</span>";
++            generateQmlItem(qpn, relative, marker, false);
++            out() << "</p></td></tr>";
++            out() << "</table>";
++            out() << "</div>";
+         }
+-        else if (ro > 0) {
+-            out() << "<span class=\"qmlreadonly\">read-only</span>";
++        else {
++            /*
++              The QML property node has multiple override nodes.
++              Process the whole list as we would for a QML property
++              group.
++             */
++            NodeList::ConstIterator p = qpn->qmlPropNodes().begin();
++            out() << "<div class=\"qmlproto\">";
++            out() << "<table class=\"qmlname\">";
++            while (p != qpn->qmlPropNodes().end()) {
++                if ((*p)->type() == Node::QmlProperty) {
++                    QmlPropertyNode* q = static_cast<QmlPropertyNode*>(*p);
++                    out() << "<tr valign=\"top\" class=\"odd\">";
++                    out() << "<td class=\"tblQmlPropNode\"><p>";
++                    out() << "<a name=\"" + refForNode(q) + "\"></a>";
++
++                    int ro = qpn->getReadOnly();
++                    if (ro < 0) {
++                        if (!qpn->isWritable(myTree)) {
++                            out() << "<span class=\"qmlreadonly\">read-only</span>";
++                        }
++                    }
++                    else if (ro > 0) {
++                        out() << "<span class=\"qmlreadonly\">read-only</span>";
++                    }
++                    if (qpn->isDefault())
++                        out() << "<span class=\"qmldefault\">default</span>";
++                    generateQmlItem(q, relative, marker, false);
++                    out() << "</p></td></tr>";
++                }
++                ++p;
++            }
++            out() << "</table>";
++            out() << "</div>";
+         }
+-        if (qpn->isDefault())
+-            out() << "<span class=\"qmldefault\">default</span>";
+-        generateQmlItem(qpn, relative, marker, false);
+-        out() << "</p></td></tr>";
+-        out() << "</table>";
+-        out() << "</div>";
+     }
+     else if (node->type() == Node::QmlSignal) {
+         const FunctionNode* qsn = static_cast<const FunctionNode*>(node);
+diff --git a/tools/qdoc3/node.cpp b/tools/qdoc3/node.cpp
+index 7223126..44aad63 100644
+--- a/tools/qdoc3/node.cpp
++++ b/tools/qdoc3/node.cpp
+@@ -93,7 +93,7 @@ void Node::setDoc(const Doc& doc, bool replace)
+   parent's child list.
+  */
+ Node::Node(Type type, InnerNode *parent, const QString& name)
+-    : type_(type),
++    : nodeType_(type),
+       access_(Public),
+       safeness_(UnspecifiedSafeness),
+       pageType_(NoPageType),
+@@ -1223,6 +1223,34 @@ LeafNode::LeafNode(Type type, InnerNode *parent, const QString& name)
+ }
+ 
+ /*!
++  This constructor should only be used when this node's parent
++  is meant to be \a parent, but this node is not to be listed
++  as a child of \a parent. It is currently only used for the
++  documentation case where a \e{qmlproperty} command is used
++  to override the QML definition of a QML property.
++ */
++LeafNode::LeafNode(InnerNode* parent, Type type, const QString& name)
++    : Node(type, 0, name)
++{
++    setParent(parent);
++    switch (type) {
++    case Enum:
++    case Function:
++    case Typedef:
++    case Variable:
++    case QmlProperty:
++    case QmlSignal:
++    case QmlSignalHandler:
++    case QmlMethod:
++        setPageType(ApiPage);
++        break;
++    default:
++        break;
++    }
++}
++
++
++/*!
+   \class NamespaceNode
+  */
+ 
+@@ -1378,7 +1406,7 @@ const QmlClassNode* ClassNode::findQmlBaseNode() const
+   the page index is set here.
+  */
+ FakeNode::FakeNode(InnerNode* parent, const QString& name, SubType subtype, Node::PageType ptype)
+-    : InnerNode(Fake, parent, name), subtype_(subtype)
++    : InnerNode(Fake, parent, name), nodeSubtype_(subtype)
+ {
+     switch (subtype) {
+     case Page:
+@@ -1419,19 +1447,19 @@ QString FakeNode::title() const
+  */
+ QString FakeNode::fullTitle() const
+ {
+-    if (subtype_ == File) {
++    if (nodeSubtype_ == File) {
+         if (title().isEmpty())
+             return name().mid(name().lastIndexOf('/') + 1) + " Example File";
+         else
+             return title();
+     }
+-    else if (subtype_ == Image) {
++    else if (nodeSubtype_ == Image) {
+         if (title().isEmpty())
+             return name().mid(name().lastIndexOf('/') + 1) + " Image File";
+         else
+             return title();
+     }
+-    else if ((subtype_ == HeaderFile) || (subtype_ == Collision)) {
++    else if ((nodeSubtype_ == HeaderFile) || (nodeSubtype_ == Collision)) {
+         if (title().isEmpty())
+             return name();
+         else
+@@ -1450,7 +1478,7 @@ QString FakeNode::subTitle() const
+     if (!subtitle_.isEmpty())
+         return subtitle_;
+ 
+-    if ((subtype_ == File) || (subtype_ == Image)) {
++    if ((nodeSubtype_ == File) || (nodeSubtype_ == Image)) {
+         if (title().isEmpty() && name().contains(QLatin1Char('/')))
+             return name();
+     }
+@@ -1607,7 +1635,7 @@ FunctionNode::FunctionNode(InnerNode *parent, const QString& name)
+       sta(false),
+       ove(false),
+       reimp(false),
+-      att(false),
++      attached_(false),
+       rf(0),
+       ap(0)
+ {
+@@ -1627,7 +1655,7 @@ FunctionNode::FunctionNode(Type type, InnerNode *parent, const QString& name, bo
+       sta(false),
+       ove(false),
+       reimp(false),
+-      att(attached),
++      attached_(attached),
+       rf(0),
+       ap(0)
+ {
+@@ -1879,20 +1907,20 @@ void PropertyNode::setOverriddenFrom(const PropertyNode* baseProperty)
+ QString PropertyNode::qualifiedDataType() const
+ {
+     if (setters().isEmpty() && resetters().isEmpty()) {
+-        if (dt.contains(QLatin1Char('*')) || dt.contains(QLatin1Char('&'))) {
++        if (type_.contains(QLatin1Char('*')) || type_.contains(QLatin1Char('&'))) {
+             // 'QWidget *' becomes 'QWidget *' const
+-            return dt + " const";
++            return type_ + " const";
+         }
+         else {
+             /*
+               'int' becomes 'const int' ('int const' is
+               correct C++, but looks wrong)
+             */
+-            return "const " + dt;
++            return "const " + type_;
+         }
+     }
+     else {
+-        return dt;
++        return type_;
+     }
+ }
+ 
+@@ -2160,45 +2188,78 @@ QmlPropGroupNode::QmlPropGroupNode(QmlClassNode* parent,
+                                    const QString& name,
+                                    bool attached)
+     : FakeNode(parent, name, QmlPropertyGroup, Node::ApiPage),
+-      isdefault(false),
+-      att(attached),
+-      readOnly(-1)
++      isdefault_(false),
++      attached_(attached),
++      readOnly_(-1)
+ {
+     // nothing.
+ }
+ 
+ /*!
+-  Constructor for the QML property node.
++  Constructor for the QML property node, when the \a parent
++  is QML property group node. This constructor is only used
++  for creating QML property nodes for QML elements, i.e.
++  not for creating QML property nodes for QML components.
++  Hopefully, this constructor will become obsolete, so don't
++  use it unless one of the other two constructors can't be
++  used.
+  */
+ QmlPropertyNode::QmlPropertyNode(QmlPropGroupNode *parent,
+                                  const QString& name,
+                                  const QString& type,
+                                  bool attached)
+     : LeafNode(QmlProperty, parent, name),
+-      dt(type),
++      type_(type),
+       sto(Trool_Default),
+       des(Trool_Default),
+-      isdefault(false),
+-      att(attached),
+-      readOnly(-1)
++      isdefault_(false),
++      attached_(attached),
++      readOnly_(-1)
+ {
+     setPageType(ApiPage);
+ }
+ 
+ /*!
+-  Constructor for the QML property node.
++  Constructor for the QML property node, when the \a parent
++  is a QML class node.
+  */
+ QmlPropertyNode::QmlPropertyNode(QmlClassNode *parent,
+                                  const QString& name,
+                                  const QString& type,
+                                  bool attached)
+     : LeafNode(QmlProperty, parent, name),
+-      dt(type),
++      type_(type),
++      sto(Trool_Default),
++      des(Trool_Default),
++      isdefault_(false),
++      attached_(attached),
++      readOnly_(-1)
++{
++    setPageType(ApiPage);
++}
++
++/*!
++  Constructor for the QML property node, when the \a parent
++  is a QML property node. Strictly speaking, this is not the
++  way QML property nodes were originally meant to be built,
++  because this constructor has another QML property node as
++  its parent. But this constructor is useful for documenting
++  QML properties in QML components, i.e., when you override
++  the definition of a property with the \e{qmlproperty}
++  command. It actually uses the parent of \a parent as the
++  parent.
++ */
++QmlPropertyNode::QmlPropertyNode(QmlPropertyNode* parent,
++                                 const QString& name,
++                                 const QString& type,
++                                 bool attached)
++    : LeafNode(parent->parent(), QmlProperty, name),
++      type_(type),
+       sto(Trool_Default),
+       des(Trool_Default),
+-      isdefault(false),
+-      att(attached),
+-      readOnly(-1)
++      isdefault_(false),
++      attached_(attached),
++      readOnly_(-1)
+ {
+     setPageType(ApiPage);
+ }
+diff --git a/tools/qdoc3/node.h b/tools/qdoc3/node.h
+index 4af209b..def2890 100644
+--- a/tools/qdoc3/node.h
++++ b/tools/qdoc3/node.h
+@@ -181,7 +181,7 @@ class Node
+     virtual bool isAbstract() const { return false; }
+     virtual void setAbstract(bool ) { }
+     virtual QString title() const { return QString(); }
+-    Type type() const { return type_; }
++    Type type() const { return nodeType_; }
+     virtual SubType subType() const { return NoSubType; }
+     InnerNode* parent() const { return parent_; }
+     InnerNode* relates() const { return relatesTo_; }
+@@ -239,13 +239,13 @@ class Node
+  private:
+ 
+ #ifdef Q_WS_WIN
+-    Type type_;
++    Type nodeType_;
+     Access access_;
+     ThreadSafeness safeness_;
+     PageType pageType_;
+     Status status_;
+ #else
+-    Type type_ : 4;
++    Type nodeType_ : 4;
+     Access access_ : 2;
+     ThreadSafeness safeness_ : 2;
+     PageType pageType_ : 4;
+@@ -350,6 +350,7 @@ class LeafNode : public Node
+ 
+  protected:
+     LeafNode(Type type, InnerNode* parent, const QString& name);
++    LeafNode(InnerNode* parent, Type type, const QString& name);
+ };
+ 
+ class NamespaceNode : public InnerNode
+@@ -431,7 +432,7 @@ class FakeNode : public InnerNode
+     void addGroupMember(Node* node) { nodeList.append(node); }
+     void addQmlModuleMember(Node* node) { nodeList.append(node); }
+ 
+-    SubType subType() const { return subtype_; }
++    SubType subType() const { return nodeSubtype_; }
+     virtual QString title() const;
+     virtual QString fullTitle() const;
+     virtual QString subTitle() const;
+@@ -442,7 +443,7 @@ class FakeNode : public InnerNode
+     virtual void setImageFileName(const QString& ) { }
+ 
+   protected:
+-    SubType subtype_;
++    SubType nodeSubtype_;
+     QString title_;
+     QString subtitle_;
+     NodeList nodeList;
+@@ -543,19 +544,21 @@ class QmlPropGroupNode : public FakeNode
+     virtual QString qmlModuleIdentifier() const { return parent()->qmlModuleIdentifier(); }
+ 
+     const QString& element() const { return parent()->name(); }
+-    void setDefault() { isdefault = true; }
+-    void setReadOnly(int ro) { readOnly = ro; }
+-    int getReadOnly() const { return readOnly; }
+-    bool isDefault() const { return isdefault; }
+-    bool isAttached() const { return att; }
+-    bool isReadOnly() const { return (readOnly > 0); }
++    void setDefault() { isdefault_ = true; }
++    void setReadOnly(int ro) { readOnly_ = ro; }
++    int getReadOnly() const { return readOnly_; }
++    bool isDefault() const { return isdefault_; }
++    bool isAttached() const { return attached_; }
++    bool isReadOnly() const { return (readOnly_ > 0); }
+ 
+  private:
+-    bool    isdefault;
+-    bool    att;
+-    int     readOnly;
++    bool    isdefault_;
++    bool    attached_;
++    int     readOnly_;
+ };
+ 
++class QmlPropertyNode;
++
+ class QmlPropertyNode : public LeafNode
+ {
+  public:
+@@ -567,24 +570,28 @@ class QmlPropertyNode : public LeafNode
+                     const QString& name,
+                     const QString& type,
+                     bool attached);
++    QmlPropertyNode(QmlPropertyNode* parent,
++                    const QString& name,
++                    const QString& type,
++                    bool attached);
+     virtual ~QmlPropertyNode() { }
+ 
+-    void setDataType(const QString& dataType) { dt = dataType; }
++    void setDataType(const QString& dataType) { type_ = dataType; }
+     void setStored(bool stored) { sto = toTrool(stored); }
+     void setDesignable(bool designable) { des = toTrool(designable); }
+     void setWritable(bool writable) { wri = toTrool(writable); }
+ 
+-    const QString &dataType() const { return dt; }
+-    QString qualifiedDataType() const { return dt; }
+-    void setDefault() { isdefault = true; }
+-    void setReadOnly(int ro) { readOnly = ro; }
+-    int getReadOnly() const { return readOnly; }
+-    bool isDefault() const { return isdefault; }
++    const QString &dataType() const { return type_; }
++    QString qualifiedDataType() const { return type_; }
++    void setDefault() { isdefault_ = true; }
++    void setReadOnly(int ro) { readOnly_ = ro; }
++    int getReadOnly() const { return readOnly_; }
++    bool isDefault() const { return isdefault_; }
+     bool isStored() const { return fromTrool(sto,true); }
+     bool isDesignable() const { return fromTrool(des,false); }
+     bool isWritable(const Tree* tree) const;
+-    bool isAttached() const { return att; }
+-    bool isReadOnly() const { return (readOnly > 0); }
++    bool isAttached() const { return attached_; }
++    bool isReadOnly() const { return (readOnly_ > 0); }
+     virtual bool isQmlNode() const { return true; }
+     virtual bool isQtQuickNode() const { return parent()->isQtQuickNode(); }
+     virtual QString qmlModuleName() const { return parent()->qmlModuleName(); }
+@@ -594,6 +601,8 @@ class QmlPropertyNode : public LeafNode
+     const PropertyNode *correspondingProperty(const Tree *tree) const;
+ 
+     const QString& element() const { return static_cast<QmlPropGroupNode*>(parent())->element(); }
++    void appendQmlPropNode(QmlPropertyNode* p) { qmlPropNodes_.append(p); }
++    const NodeList& qmlPropNodes() const { return qmlPropNodes_; }
+ 
+  private:
+     enum Trool { Trool_True, Trool_False, Trool_Default };
+@@ -601,13 +610,14 @@ class QmlPropertyNode : public LeafNode
+     static Trool toTrool(bool boolean);
+     static bool fromTrool(Trool troolean, bool defaultValue);
+ 
+-    QString dt;
++    QString type_;
+     Trool   sto;
+     Trool   des;
+     Trool   wri;
+-    bool    isdefault;
+-    bool    att;
+-    int     readOnly;
++    bool    isdefault_;
++    bool    attached_;
++    int     readOnly_;
++    NodeList qmlPropNodes_;
+ };
+ 
+ class EnumItem
+@@ -761,7 +771,7 @@ class FunctionNode : public LeafNode
+     QStringList reconstructParams(bool values = false) const;
+     QString signature(bool values = false) const;
+     const QString& element() const { return parent()->name(); }
+-    bool isAttached() const { return att; }
++    bool isAttached() const { return attached_; }
+     virtual bool isInternal() const;
+     virtual bool isQmlNode() const { 
+         return ((type() == QmlSignal) ||
+@@ -794,7 +804,7 @@ class FunctionNode : public LeafNode
+     bool sta : 1;
+     bool ove : 1;
+     bool reimp: 1; 
+-    bool att: 1;
++    bool attached_: 1;
+     QList<Parameter> params;
+     const FunctionNode* rf;
+     const PropertyNode* ap;
+@@ -810,7 +820,7 @@ class PropertyNode : public LeafNode
+     PropertyNode(InnerNode* parent, const QString& name);
+     virtual ~PropertyNode() { }
+ 
+-    void setDataType(const QString& dataType) { dt = dataType; }
++    void setDataType(const QString& dataType) { type_ = dataType; }
+     void addFunction(FunctionNode* function, FunctionRole role);
+     void addSignal(FunctionNode* function, FunctionRole role);
+     void setStored(bool stored) { sto = toTrool(stored); }
+@@ -825,7 +835,7 @@ class PropertyNode : public LeafNode
+     void setFinal() { fnl = true; }
+     void setRevision(int revision) { rev = revision; }
+ 
+-    const QString &dataType() const { return dt; }
++    const QString &dataType() const { return type_; }
+     QString qualifiedDataType() const;
+     NodeList functions() const;
+     NodeList functions(FunctionRole role) const { return funcs[(int)role]; }
+@@ -856,7 +866,7 @@ class PropertyNode : public LeafNode
+     static Trool toTrool(bool boolean);
+     static bool fromTrool(Trool troolean, bool defaultValue);
+ 
+-    QString dt;
++    QString type_;
+     QString runtimeDesFunc;
+     QString runtimeScrFunc;
+     NodeList funcs[NumFunctionRoles];
+diff --git a/tools/qdoc3/qmlcodeparser.cpp b/tools/qdoc3/qmlcodeparser.cpp
+index 450be18..1b0e87a 100644
+--- a/tools/qdoc3/qmlcodeparser.cpp
++++ b/tools/qdoc3/qmlcodeparser.cpp
+@@ -159,8 +159,7 @@ void QmlCodeParser::parseSourceFile(const Location& location,
+ 
+     QSet<QString> topicCommandsAllowed = topicCommands();
+     QSet<QString> otherMetacommandsAllowed = otherMetaCommands();
+-    QSet<QString> metacommandsAllowed = topicCommandsAllowed +
+-        otherMetacommandsAllowed;
++    QSet<QString> metacommandsAllowed = topicCommandsAllowed + otherMetacommandsAllowed;
+ 
+     if (parser->parse()) {
+         QDeclarativeJS::AST::UiProgram *ast = parser->ast();
+diff --git a/tools/qdoc3/qmlvisitor.cpp b/tools/qdoc3/qmlvisitor.cpp
+index 5fc6502..0365834 100644
+--- a/tools/qdoc3/qmlvisitor.cpp
++++ b/tools/qdoc3/qmlvisitor.cpp
+@@ -161,7 +161,7 @@ bool QmlDocVisitor::applyDocumentation(QDeclarativeJS::AST::SourceLocation locat
+         finish.setLineNo(loc.startLine);
+         finish.setColumnNo(loc.startColumn);
+ 
+-        Doc doc(start, finish, source.mid(1), commands);
++        Doc doc(start, finish, source.mid(1), commands, topics);
+         node->setDoc(doc);
+         applyMetacommands(loc, node, doc);
+         usedComments.insert(loc.offset);
+@@ -176,12 +176,83 @@ bool QmlDocVisitor::applyDocumentation(QDeclarativeJS::AST::SourceLocation locat
+ }
+ 
+ /*!
++  A QML property argument has the form...
++
++  <type> <component>::<name>
++  <type> <QML-module>::<component>::<name>
++
++  This function splits the argument into one of those
++  two forms. The three part form is the old form, which
++  was used before the creation of QtQuick 2 and Qt
++  Components. A <QML-module> is the QML equivalent of a
++  C++ namespace. So this function splits \a arg on "::"
++  and stores the parts in the \e {type}, \e {module},
++  \e {component}, and \a {name}, fields of \a qpa. If it
++  is successful, it returns true. If not enough parts
++  are found, a qdoc warning is emitted and false is
++  returned.
++ */
++bool QmlDocVisitor::splitQmlPropertyArg(const Doc& doc,
++                                        const QString& arg,
++                                        QmlPropArgs& qpa)
++{
++    qpa.clear();
++    QStringList blankSplit = arg.split(QLatin1Char(' '));
++    if (blankSplit.size() > 1) {
++        qpa.type_ = blankSplit[0];
++        QStringList colonSplit(blankSplit[1].split("::"));
++        if (colonSplit.size() == 3) {
++            qpa.module_ = colonSplit[0];
++            qpa.component_ = colonSplit[1];
++            qpa.name_ = colonSplit[2];
++            return true;
++        }
++        else if (colonSplit.size() == 2) {
++            qpa.component_ = colonSplit[0];
++            qpa.name_ = colonSplit[1];
++            return true;
++        }
++        else if (colonSplit.size() == 1) {
++            qpa.name_ = colonSplit[0];
++            return true;
++        }
++        QString msg = "Unrecognizable QML module/component qualifier for " + arg;
++        doc.location().warning(tr(msg.toLatin1().data()));
++    }
++    else {
++        QString msg = "Missing property type for " + arg;
++        doc.location().warning(tr(msg.toLatin1().data()));
++    }
++    return false;
++}
++
++/*!
+   Applies the metacommands found in the comment.
+  */
+ void QmlDocVisitor::applyMetacommands(QDeclarativeJS::AST::SourceLocation,
+                                       Node* node,
+                                       Doc& doc)
+ {
++    const TopicList& topicsUsed = doc.topicsUsed();
++    if (topicsUsed.size() > 0) {
++        if (node->type() == Node::QmlProperty) {
++            QmlPropertyNode* qpn = static_cast<QmlPropertyNode*>(node);
++            for (int i=0; i<topicsUsed.size(); ++i) {
++                if (topicsUsed.at(i).topic == "qmlproperty") {
++                    QmlPropArgs qpa;
++                    if (splitQmlPropertyArg(doc, topicsUsed.at(i).args, qpa)) {
++                        QmlPropertyNode* n = new QmlPropertyNode(qpn, qpa.name_, qpa.type_, false);
++                        qpn->appendQmlPropNode(n);
++                    }
++                    else
++                        qDebug() << "  FAILED TO PARSE QML PROPERTY:"
++                                 << topicsUsed.at(i).topic << topicsUsed.at(i).args;
++                }
++            }
++        }
++        else if (topicsUsed.size() > 0)
++            qDebug() << "  " << topicsUsed.at(0).topic << topicsUsed.at(0).args;
++    }
+     QSet<QString> metacommands = doc.metaCommandsUsed();
+     if (metacommands.count() > 0) {
+         QString topic;
+@@ -430,7 +501,6 @@ bool QmlDocVisitor::visit(QDeclarativeJS::AST::UiPublicMember *member)
+     {
+         QString type = member->memberType.toString();
+         QString name = member->name.toString();
+-
+         if (current->type() == Node::Fake) {
+             QmlClassNode *qmlClass = static_cast<QmlClassNode *>(current);
+             if (qmlClass) {
+diff --git a/tools/qdoc3/qmlvisitor.h b/tools/qdoc3/qmlvisitor.h
+index 7288162..617e78b 100644
+--- a/tools/qdoc3/qmlvisitor.h
++++ b/tools/qdoc3/qmlvisitor.h
+@@ -49,6 +49,21 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++struct QmlPropArgs
++{
++    QString type_;
++    QString module_;
++    QString component_;
++    QString name_;
++
++    void clear() {
++        type_.clear();
++        module_.clear();
++        component_.clear();
++        name_.clear();
++    }
++};
++
+ class QmlDocVisitor : public QDeclarativeJS::AST::Visitor
+ {
+ public:
+@@ -84,6 +99,9 @@ private:
+     QDeclarativeJS::AST::SourceLocation precedingComment(quint32 offset) const;
+     bool applyDocumentation(QDeclarativeJS::AST::SourceLocation location, Node *node);
+     void applyMetacommands(QDeclarativeJS::AST::SourceLocation location, Node* node, Doc& doc);
++    bool splitQmlPropertyArg(const Doc& doc,
++                             const QString& arg,
++                             QmlPropArgs& qpa);
+ 
+     QDeclarativeJS::Engine *engine;
+     quint32 lastEndOffset;

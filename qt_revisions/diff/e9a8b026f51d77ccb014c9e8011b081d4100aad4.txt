@@ -1,0 +1,135 @@
+diff --git a/src/plugins/platforms/windows/qwindowscontext.cpp b/src/plugins/platforms/windows/qwindowscontext.cpp
+index aaa55738..28269e8 100644
+--- a/src/plugins/platforms/windows/qwindowscontext.cpp
++++ b/src/plugins/platforms/windows/qwindowscontext.cpp
+@@ -171,7 +171,8 @@ QWindowsUser32DLL::QWindowsUser32DLL() :
+     setLayeredWindowAttributes(0), updateLayeredWindow(0),
+     updateLayeredWindowIndirect(0),
+     isHungAppWindow(0),
+-    registerTouchWindow(0), getTouchInputInfo(0), closeTouchInputHandle(0)
++    registerTouchWindow(0), unregisterTouchWindow(0),
++    getTouchInputInfo(0), closeTouchInputHandle(0)
+ {
+ }
+ 
+@@ -192,9 +193,10 @@ bool QWindowsUser32DLL::initTouch()
+ {
+     QSystemLibrary library(QStringLiteral("user32"));
+     registerTouchWindow = (RegisterTouchWindow)(library.resolve("RegisterTouchWindow"));
++    unregisterTouchWindow = (UnregisterTouchWindow)(library.resolve("UnregisterTouchWindow"));
+     getTouchInputInfo = (GetTouchInputInfo)(library.resolve("GetTouchInputInfo"));
+     closeTouchInputHandle = (CloseTouchInputHandle)(library.resolve("CloseTouchInputHandle"));
+-    return registerTouchWindow && getTouchInputInfo && getTouchInputInfo;
++    return registerTouchWindow && unregisterTouchWindow && getTouchInputInfo && getTouchInputInfo;
+ }
+ 
+ /*!
+diff --git a/src/plugins/platforms/windows/qwindowscontext.h b/src/plugins/platforms/windows/qwindowscontext.h
+index 21a846e..13e63d1 100644
+--- a/src/plugins/platforms/windows/qwindowscontext.h
++++ b/src/plugins/platforms/windows/qwindowscontext.h
+@@ -71,6 +71,7 @@ struct QWindowsUser32DLL
+     inline bool initTouch();
+ 
+     typedef BOOL (WINAPI *RegisterTouchWindow)(HWND, ULONG);
++    typedef BOOL (WINAPI *UnregisterTouchWindow)(HWND);
+     typedef BOOL (WINAPI *GetTouchInputInfo)(HANDLE, UINT, PVOID, int);
+     typedef BOOL (WINAPI *CloseTouchInputHandle)(HANDLE);
+     typedef BOOL (WINAPI *SetLayeredWindowAttributes)(HWND, COLORREF, BYTE, DWORD);
+@@ -90,6 +91,7 @@ struct QWindowsUser32DLL
+ 
+     // Touch functions from Windows 7 onwards (also for use with Q_CC_MSVC).
+     RegisterTouchWindow registerTouchWindow;
++    UnregisterTouchWindow unregisterTouchWindow;
+     GetTouchInputInfo getTouchInputInfo;
+     CloseTouchInputHandle closeTouchInputHandle;
+ };
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.cpp b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+index d202da1..357def5 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.cpp
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+@@ -395,34 +395,40 @@ bool QWindowsMouseHandler::translateTouchEvent(QWindow *window, HWND,
+     QWindowsContext::user32dll.getTouchInputInfo((HANDLE) msg.lParam, msg.wParam, winTouchInputs.data(), sizeof(TOUCHINPUT));
+     for (int i = 0; i < winTouchPointCount; ++i) {
+         const TOUCHINPUT &winTouchInput = winTouchInputs[i];
++        int id = m_touchInputIDToTouchPointID.value(winTouchInput.dwID, -1);
++        if (id == -1) {
++            id = m_touchInputIDToTouchPointID.size();
++            m_touchInputIDToTouchPointID.insert(winTouchInput.dwID, id);
++        }
+         QTouchPoint touchPoint;
+         touchPoint.pressure = 1.0;
+-        touchPoint.id = m_touchInputIDToTouchPointID.value(winTouchInput.dwID, -1);
+-        if (touchPoint.id == -1) {
+-            touchPoint.id = m_touchInputIDToTouchPointID.size();
+-            m_touchInputIDToTouchPointID.insert(winTouchInput.dwID, touchPoint.id);
+-        }
++        touchPoint.id = id;
++        if (m_lastTouchPositions.contains(id))
++            touchPoint.normalPosition = m_lastTouchPositions.value(id);
+ 
+         QPointF screenPos = QPointF(qreal(winTouchInput.x) / qreal(100.), qreal(winTouchInput.y) / qreal(100.));
+         if (winTouchInput.dwMask & TOUCHINPUTMASKF_CONTACTAREA)
+             touchPoint.area.setSize(QSizeF(qreal(winTouchInput.cxContact) / qreal(100.),
+                                            qreal(winTouchInput.cyContact) / qreal(100.)));
+         touchPoint.area.moveCenter(screenPos);
++        QPointF normalPosition = QPointF(screenPos.x() / screenGeometry.width(),
++                                         screenPos.y() / screenGeometry.height());
++        const bool stationaryTouchPoint = (normalPosition == touchPoint.normalPosition);
++        touchPoint.normalPosition = normalPosition;
+ 
+         if (winTouchInput.dwFlags & TOUCHEVENTF_DOWN) {
+             touchPoint.state = Qt::TouchPointPressed;
++            m_lastTouchPositions.insert(id, touchPoint.normalPosition);
+         } else if (winTouchInput.dwFlags & TOUCHEVENTF_UP) {
+             touchPoint.state = Qt::TouchPointReleased;
++            m_lastTouchPositions.remove(id);
+         } else {
+-            // TODO: Previous code checked"
+-            // screenPos == touchPoint.normalPosition -> Qt::TouchPointStationary, but
+-            // but touchPoint.normalPosition was never initialized?
+-            touchPoint.state = touchPoint.state;
++            touchPoint.state = (stationaryTouchPoint
++                     ? Qt::TouchPointStationary
++                     : Qt::TouchPointMoved);
++            m_lastTouchPositions.insert(id, touchPoint.normalPosition);
+         }
+ 
+-        touchPoint.normalPosition = QPointF(screenPos.x() / screenGeometry.width(),
+-                                 screenPos.y() / screenGeometry.height());
+-
+         allStates |= touchPoint.state;
+ 
+         touchPoints.append(touchPoint);
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.h b/src/plugins/platforms/windows/qwindowsmousehandler.h
+index 965deb4..c652f86 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.h
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.h
+@@ -80,6 +80,7 @@ private:
+     QPointer<QWindow> m_windowUnderMouse;
+     QPointer<QWindow> m_trackedWindow;
+     QHash<DWORD, int> m_touchInputIDToTouchPointID;
++    QHash<int, QPointF> m_lastTouchPositions;
+     QTouchDevice *m_touchDevice;
+     bool m_leftButtonDown;
+     QWindow *m_previousCaptureWindow;
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index 123607c..1f62534 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -728,11 +728,15 @@ QWindowsWindow::QWindowsWindow(QWindow *aWindow, const WindowData &data) :
+             break;
+         }
+     }
++    if (QWindowsContext::instance()->systemInfo() & QWindowsContext::SI_SupportsTouch)
++        QWindowsContext::user32dll.registerTouchWindow(m_data.hwnd, 0);
+     setWindowState(aWindow->windowState());
+ }
+ 
+ QWindowsWindow::~QWindowsWindow()
+ {
++    if (QWindowsContext::instance()->systemInfo() & QWindowsContext::SI_SupportsTouch)
++        QWindowsContext::user32dll.unregisterTouchWindow(m_data.hwnd);
+     destroyWindow();
+     destroyIcon();
+ }

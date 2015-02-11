@@ -1,0 +1,1706 @@
+diff --git a/src/multimedia/audio/audio.pri b/src/multimedia/audio/audio.pri
+index 33fd5a8..a2cdaa3 100644
+--- a/src/multimedia/audio/audio.pri
++++ b/src/multimedia/audio/audio.pri
+@@ -18,7 +18,8 @@ PRIVATE_HEADERS += \
+            audio/qaudiodevicefactory_p.h \
+            audio/qaudiopluginloader_p.h \
+            audio/qwavedecoder_p.h \
+-           audio/qsamplecache_p.h
++           audio/qsamplecache_p.h \
++           audio/qaudiodecoder_p.h
+ 
+ SOURCES += \
+            audio/qaudio.cpp \
+@@ -35,7 +36,8 @@ SOURCES += \
+            audio/qsamplecache_p.cpp \
+            audio/qsound.cpp \
+            audio/qaudiobuffer.cpp \
+-           audio/qaudioprobe.cpp
++           audio/qaudioprobe.cpp \
++           audio/qaudiodecoder_p.cpp
+ 
+ mac {
+     PRIVATE_HEADERS +=  audio/qaudioinput_mac_p.h \
+diff --git a/src/multimedia/audio/qaudiodecoder_p.cpp b/src/multimedia/audio/qaudiodecoder_p.cpp
+new file mode 100644
+index 0000000..fea9337
+--- /dev/null
++++ b/src/multimedia/audio/qaudiodecoder_p.cpp
+@@ -0,0 +1,494 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qaudiodecoder_p.h"
++
++#include "qmediaobject_p.h"
++#include <qmediaservice.h>
++#include "qaudiodecodercontrol_p.h"
++#include <private/qmediaserviceprovider_p.h>
++
++#include <QtCore/qcoreevent.h>
++#include <QtCore/qmetaobject.h>
++#include <QtCore/qtimer.h>
++#include <QtCore/qdebug.h>
++#include <QtCore/qpointer.h>
++
++QT_BEGIN_NAMESPACE
++
++/*!
++    \class QAudioDecoder
++    \brief The QAudioDecoder class allows decoding audio.
++    \inmodule QtMultimedia
++    \ingroup multimedia
++    \ingroup multimedia_audio
++
++    \preliminary
++
++    The QAudioDecoder class is a high level class for decoding local
++    audio media files.  It is similar to the QMediaPlayer class except
++    that audio is provided back through this API rather than routed
++    directly to audio hardware, and playlists and network and streaming
++    based media is not supported.
++
++    \sa QAudioBuffer, QAudioDecoder
++*/
++
++namespace
++{
++class AudioDecoderRegisterMetaTypes
++{
++public:
++    AudioDecoderRegisterMetaTypes()
++    {
++        qRegisterMetaType<QAudioDecoder::State>("QAudioDecoder::State");
++        qRegisterMetaType<QAudioDecoder::Error>("QAudioDecoder::Error");
++    }
++} _registerPlayerMetaTypes;
++}
++
++class QAudioDecoderPrivate : public QMediaObjectPrivate
++{
++    Q_DECLARE_NON_CONST_PUBLIC(QAudioDecoder)
++
++public:
++    QAudioDecoderPrivate()
++        : provider(0)
++        , control(0)
++        , state(QAudioDecoder::StoppedState)
++        , error(QAudioDecoder::NoError)
++    {}
++
++    QMediaServiceProvider *provider;
++    QAudioDecoderControl *control;
++    QAudioDecoder::State state;
++    QAudioDecoder::Error error;
++    QString errorString;
++
++    void _q_stateChanged(QAudioDecoder::State state);
++    void _q_error(int error, const QString &errorString);
++};
++
++void QAudioDecoderPrivate::_q_stateChanged(QAudioDecoder::State ps)
++{
++    Q_Q(QAudioDecoder);
++
++    if (ps != state) {
++        state = ps;
++
++        emit q->stateChanged(ps);
++    }
++}
++
++void QAudioDecoderPrivate::_q_error(int error, const QString &errorString)
++{
++    Q_Q(QAudioDecoder);
++
++    this->error = QAudioDecoder::Error(error);
++    this->errorString = errorString;
++
++    emit q->error(this->error);
++}
++
++/*!
++    Construct an QAudioDecoder instance
++    parented to \a parent and with \a flags.
++*/
++QAudioDecoder::QAudioDecoder(QObject *parent)
++    : QMediaObject(*new QAudioDecoderPrivate,
++                   parent,
++                   QMediaServiceProvider::defaultServiceProvider()->requestService(Q_MEDIASERVICE_AUDIODECODER))
++{
++    Q_D(QAudioDecoder);
++
++    d->provider = QMediaServiceProvider::defaultServiceProvider();
++    if (d->service == 0) {
++        d->error = ServiceMissingError;
++    } else {
++        d->control = qobject_cast<QAudioDecoderControl*>(d->service->requestControl(QAudioDecoderControl_iid));
++        if (d->control != 0) {
++            connect(d->control, SIGNAL(stateChanged(QAudioDecoder::State)), SLOT(_q_stateChanged(QAudioDecoder::State)));
++            connect(d->control, SIGNAL(error(int,QString)), SLOT(_q_error(int,QString)));
++
++            connect(d->control, SIGNAL(formatChanged(QAudioFormat)), SIGNAL(formatChanged(QAudioFormat)));
++            connect(d->control, SIGNAL(bufferReady()), this, SIGNAL(bufferReady()));
++            connect(d->control ,SIGNAL(bufferAvailableChanged(bool)), this, SIGNAL(bufferAvailableChanged(bool)));
++        }
++    }
++}
++
++
++/*!
++    Destroys the audio decoder object.
++*/
++QAudioDecoder::~QAudioDecoder()
++{
++    Q_D(QAudioDecoder);
++
++    if (d->service) {
++        if (d->control)
++            d->service->releaseControl(d->control);
++
++        d->provider->releaseService(d->service);
++    }
++}
++
++QAudioDecoder::State QAudioDecoder::state() const
++{
++    return d_func()->state;
++}
++
++/*!
++    Returns the current error state.
++*/
++
++QAudioDecoder::Error QAudioDecoder::error() const
++{
++    return d_func()->error;
++}
++
++QString QAudioDecoder::errorString() const
++{
++    return d_func()->errorString;
++}
++
++/*!
++    Starts decoding the audio resource.
++
++    As data gets decoded, the \l bufferReady() signal will be emitted
++    when enough data has been decoded.  Calling \l read() will then return
++    an audio buffer without blocking.
++
++    Alternatively, if you wish to block until enough data has been decoded,
++    you can call read() at any time to block until a buffer is ready.
++
++    \sa read(), bufferSize()
++*/
++void QAudioDecoder::start()
++{
++    Q_D(QAudioDecoder);
++
++    if (d->control == 0) {
++        QMetaObject::invokeMethod(this, "_q_error", Qt::QueuedConnection,
++                                    Q_ARG(int, QAudioDecoder::ServiceMissingError),
++                                    Q_ARG(QString, tr("The QAudioDecoder object does not have a valid service")));
++        return;
++    }
++
++    // Reset error conditions
++    d->error = NoError;
++    d->errorString.clear();
++
++    d->control->start();
++}
++
++/*!
++    Stop decoding audio.  Calling \l start() again will resume decoding from the beginning.
++*/
++void QAudioDecoder::stop()
++{
++    Q_D(QAudioDecoder);
++
++    if (d->control != 0)
++        d->control->stop();
++}
++
++/*!
++    Returns the current file name to decode.
++    If \l setSourceDevice was called, this will
++    be empty.
++*/
++QString QAudioDecoder::sourceFilename() const
++{
++    Q_D(const QAudioDecoder);
++    if (d->control)
++        return d->control->sourceFilename();
++    return QString();
++}
++
++/*!
++    Sets the current audio file name to \a fileName.
++
++    When this property is set any current decoding is stopped,
++    and any audio buffers are discarded.
++
++    You can only specify either a source filename or
++    a source QIODevice.  Setting one will unset the other.
++*/
++void QAudioDecoder::setSourceFilename(const QString &fileName)
++{
++    Q_D(QAudioDecoder);
++
++    if (d->control != 0)
++        d_func()->control->setSourceFilename(fileName);
++}
++
++/*!
++    Returns the current source QIODevice, if one was set.
++    If \l setSourceFilename was called, this will be 0.
++*/
++QIODevice *QAudioDecoder::sourceDevice() const
++{
++    Q_D(const QAudioDecoder);
++    if (d->control)
++        return d->control->sourceDevice();
++    return 0;
++}
++
++/*!
++    Sets the current audio QIODevice to \a device.
++
++    When this property is set any current decoding is stopped,
++    and any audio buffers are discarded.
++
++    You can only specify either a source filename or
++    a source QIODevice.  Setting one will unset the other.
++*/
++void QAudioDecoder::setSourceDevice(QIODevice *device)
++{
++    Q_D(QAudioDecoder);
++
++    if (d->control != 0)
++        d_func()->control->setSourceDevice(device);
++}
++
++/*!
++    Returns the current audio format of the decoded stream.
++
++    Any buffers returned should have this format.
++
++    \sa setAudioFormat, audioFormatChanged
++*/
++QAudioFormat QAudioDecoder::audioFormat() const
++{
++    Q_D(const QAudioDecoder);
++    if (d->control)
++        return d->control->audioFormat();
++    return QAudioFormat();
++}
++
++/*!
++    Set the desired audio format for decoded samples to \a format.
++
++    This property can only be set while the decoder is stopped.
++    Setting this property at other times will be ignored.
++
++    If the decoder does not support this format, \l error() will
++    be set to \c FormatError.
++
++    If you do not specify a format, the format of the decoded
++    audio itself will be used.  Otherwise, some format conversion
++    will be applied.
++
++    If you wish to reset the decoded format to that of the original
++    audio file, you can specify an invalid \a format.
++*/
++void QAudioDecoder::setAudioFormat(const QAudioFormat &format)
++{
++    Q_D(QAudioDecoder);
++
++    if (state() != QAudioDecoder::StoppedState)
++        return;
++
++    if (d->control != 0)
++        d_func()->control->setAudioFormat(format);
++}
++
++/*!
++    \internal
++*/
++
++bool QAudioDecoder::bind(QObject *obj)
++{
++    return QMediaObject::bind(obj);
++}
++
++/*!
++    \internal
++*/
++
++void QAudioDecoder::unbind(QObject *obj)
++{
++    QMediaObject::unbind(obj);
++}
++
++/*!
++    Returns the level of support an audio decoder has for a \a mimeType and a set of \a codecs.
++*/
++QtMultimedia::SupportEstimate QAudioDecoder::hasSupport(const QString &mimeType,
++                                               const QStringList& codecs)
++{
++    return QMediaServiceProvider::defaultServiceProvider()->hasSupport(QByteArray(Q_MEDIASERVICE_AUDIODECODER),
++                                                                    mimeType,
++                                                                    codecs);
++}
++
++/*!
++    Returns true if a buffer is available to be read,
++    and false otherwise.  If there is no buffer available, calling
++    the \l read() function may block until a buffer is available or
++    the end of the media is reached
++*/
++bool QAudioDecoder::bufferAvailable() const
++{
++    Q_D(const QAudioDecoder);
++    if (d->control)
++        return d->control->bufferAvailable();
++    return false;
++}
++
++/*!
++    Read a buffer from the decoder, with the success or failure stored in \a ok.
++*/
++QAudioBuffer QAudioDecoder::read(bool *ok) const
++{
++    Q_D(const QAudioDecoder);
++
++    if (d->control) {
++        return d->control->read(ok);
++    } else {
++        if (ok)
++            *ok = false;
++        return QAudioBuffer();
++    }
++}
++
++// Enums
++/*!
++    \enum QAudioDecoder::State
++
++    Defines the current state of a media player.
++
++    \value DecodingState The audio player is currently decoding media.
++    \value StoppedState The decoder is not decoding.  Decoding will
++           start at the start of the media.
++    \value WaitingState The decoder is either waiting for more data
++           to decode, or has filled the required number of buffers.
++*/
++
++/*!
++    \enum QAudioDecoder::Error
++
++    Defines a media player error condition.
++
++    \value NoError No error has occurred.
++    \value ResourceError A media resource couldn't be resolved.
++    \value FormatError The format of a media resource isn't supported.
++    \value AccessDeniedError There are not the appropriate permissions to play a media resource.
++    \value ServiceMissingError A valid playback service was not found, playback cannot proceed.
++*/
++
++// Signals
++/*!
++    \fn QAudioDecoder::error(QAudioDecoder::Error error)
++
++    Signals that an \a error condition has occurred.
++
++    \sa errorString()
++*/
++
++/*!
++    \fn void QAudioDecoder::stateChanged(State state)
++
++    Signal the \a state of the decoder object has changed.
++*/
++
++/*!
++    \fn void QAudioDecoder::sourceChanged()
++
++    Signals that the current source of the decoder has changed.
++
++    \sa sourceFilename(), sourceDevice()
++*/
++
++/*!
++    \fn void QAudioDecoder::formatChanged(const QAudioFormat &format)
++
++    Signals that the current audio format of the decoder has changed to \a format.
++
++    \sa audioFormat(), setAudioFormat
++*/
++
++/*!
++    \fn void QAudioDecoder::bufferReady()
++
++    Signals that a new decoded audio buffer is available to be read.
++
++    \sa read(), bufferAvailable()
++*/
++
++/*!
++    \fn void QAudioDecoder::bufferAvailableChanged(bool available)
++
++    Signals the availability (if \a available is true) of a new buffer.
++
++    If \a available is false, there are no buffers available.
++
++    \sa bufferAvailable(), bufferReady()
++*/
++
++
++
++// Properties
++/*!
++    \property QAudioDecoder::state
++    \brief the audio decoder's playback state.
++
++    By default this property is QAudioDecoder::Stopped
++
++    \sa start(), stop()
++*/
++
++/*!
++    \property QAudioDecoder::error
++    \brief a string describing the last error condition.
++
++    \sa error()
++*/
++
++/*!
++    \property QAudioDecoder::sourceFilename
++    \brief the active filename being decoded by the decoder object.
++*/
++
++#include "moc_qaudiodecoder_p.cpp"
++QT_END_NAMESPACE
++
+diff --git a/src/multimedia/audio/qaudiodecoder_p.h b/src/multimedia/audio/qaudiodecoder_p.h
+new file mode 100644
+index 0000000..3a4072d
+--- /dev/null
++++ b/src/multimedia/audio/qaudiodecoder_p.h
+@@ -0,0 +1,145 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QAUDIODECODER_H
++#define QAUDIODECODER_H
++
++#include "qmediaobject.h"
++#include "qmediaenumdebug.h"
++
++#include "qaudiobuffer.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Multimedia)
++
++class QAudioDecoderPrivate;
++class Q_MULTIMEDIA_EXPORT QAudioDecoder : public QMediaObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QString sourceFilename READ sourceFilename WRITE setSourceFilename NOTIFY sourceChanged)
++    Q_PROPERTY(State state READ state NOTIFY stateChanged)
++    Q_PROPERTY(QString error READ errorString)
++    Q_PROPERTY(bool bufferAvailable READ bufferAvailable NOTIFY bufferAvailableChanged)
++
++    Q_ENUMS(State)
++    Q_ENUMS(Error)
++
++public:
++    enum State
++    {
++        StoppedState,
++        DecodingState,
++        WaitingState
++    };
++
++    enum Error
++    {
++        NoError,
++        ResourceError,
++        FormatError,
++        AccessDeniedError,
++        ServiceMissingError
++    };
++
++    QAudioDecoder(QObject *parent = 0);
++    ~QAudioDecoder();
++
++    static QtMultimedia::SupportEstimate hasSupport(const QString &mimeType, const QStringList& codecs = QStringList());
++
++    State state() const;
++
++    QString sourceFilename() const;
++    void setSourceFilename(const QString &fileName);
++
++    QIODevice* sourceDevice() const;
++    void setSourceDevice(QIODevice *device);
++
++    QAudioFormat audioFormat() const;
++    void setAudioFormat(const QAudioFormat &format);
++
++    Error error() const;
++    QString errorString() const;
++
++    // Do we need position or duration?
++
++    QAudioBuffer read(bool *ok = 0) const;
++    bool bufferAvailable() const;
++
++public Q_SLOTS:
++    void start();
++    void stop();
++
++Q_SIGNALS:
++    void bufferAvailableChanged(bool);
++    void bufferReady();
++
++    void stateChanged(QAudioDecoder::State newState);
++    void formatChanged(const QAudioFormat &format);
++
++    void error(QAudioDecoder::Error error);
++
++    void sourceChanged();
++
++public:
++    virtual bool bind(QObject *);
++    virtual void unbind(QObject *);
++
++private:
++    Q_DISABLE_COPY(QAudioDecoder)
++    Q_DECLARE_PRIVATE(QAudioDecoder)
++    Q_PRIVATE_SLOT(d_func(), void _q_stateChanged(QAudioDecoder::State))
++    Q_PRIVATE_SLOT(d_func(), void _q_error(int, const QString &))
++};
++
++QT_END_NAMESPACE
++
++Q_DECLARE_METATYPE(QAudioDecoder::State)
++Q_DECLARE_METATYPE(QAudioDecoder::Error)
++
++Q_MEDIA_ENUM_DEBUG(QAudioDecoder, State)
++Q_MEDIA_ENUM_DEBUG(QAudioDecoder, Error)
++
++QT_END_HEADER
++
++#endif  // QAUDIODECODER_H
+diff --git a/src/multimedia/controls/controls.pri b/src/multimedia/controls/controls.pri
+index 87ce6b3..99c9631 100644
+--- a/src/multimedia/controls/controls.pri
++++ b/src/multimedia/controls/controls.pri
+@@ -35,6 +35,9 @@ PUBLIC_HEADERS += \
+     controls/qmediaaudioprobecontrol.h \
+     controls/qmediavideoprobecontrol.h
+ 
++PRIVATE_HEADERS += \
++    controls/qaudiodecodercontrol_p.h
++
+ SOURCES += \
+     controls/qaudioencodercontrol.cpp \
+     controls/qcameracapturebufferformatcontrol.cpp \
+@@ -67,4 +70,5 @@ SOURCES += \
+     controls/qvideoencodercontrol.cpp \
+     controls/qvideorenderercontrol.cpp \
+     controls/qmediaaudioprobecontrol.cpp \
+-    controls/qmediavideoprobecontrol.cpp
++    controls/qmediavideoprobecontrol.cpp \
++    controls/qaudiodecodercontrol_p.cpp
+diff --git a/src/multimedia/controls/qaudiodecodercontrol_p.cpp b/src/multimedia/controls/qaudiodecodercontrol_p.cpp
+new file mode 100644
+index 0000000..2044456
+--- /dev/null
++++ b/src/multimedia/controls/qaudiodecodercontrol_p.cpp
+@@ -0,0 +1,212 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qmediacontrol_p.h"
++#include "qaudiodecodercontrol_p.h"
++
++QT_BEGIN_NAMESPACE
++
++
++/*!
++    \class QAudioDecoderControl
++    \inmodule QtMultimedia
++
++    \ingroup multimedia
++    \ingroup multimedia_control
++
++    \brief The QAudioDecoderControl class provides access to the audio decoding
++    functionality of a QMediaService.
++
++    \preliminary
++
++    The functionality provided by this control is exposed to application
++    code through the QAudioDecoder class.
++
++    The interface name of QAudioDecoderControl is \c com.nokia.Qt.QAudioDecoderControl/1.0 as
++    defined in QAudioDecoderControl_iid.
++
++    \sa QMediaService::requestControl(), QAudioDecoder
++*/
++
++/*!
++    \macro QAudioDecoderControl_iid
++
++    \c com.nokia.Qt.QAudioDecoderControl/1.0
++
++    Defines the interface name of the QAudioDecoderControl class.
++
++    \relates QAudioDecoderControl
++*/
++
++/*!
++    Destroys an audio decoder control.
++*/
++QAudioDecoderControl::~QAudioDecoderControl()
++{
++}
++
++/*!
++    Constructs a new audio decoder control with the given \a parent.
++*/
++QAudioDecoderControl::QAudioDecoderControl(QObject *parent):
++    QMediaControl(*new QMediaControlPrivate, parent)
++{
++}
++
++/*!
++    \fn QAudioDecoderControl::state() const
++
++    Returns the state of a player control.
++*/
++
++/*!
++    \fn QAudioDecoderControl::stateChanged(QAudioDecoder::State state)
++
++    Signals that the \a state of a player control has changed.
++
++    \sa state()
++*/
++
++/*!
++    \fn QAudioDecoderControl::sourceFilename() const
++
++    Returns the current media source filename, or a null QString if none (or a device)
++*/
++
++/*!
++    \fn QAudioDecoderControl::setSourceFilename(const QString &fileName)
++
++    Sets the current source to \a fileName.  Changing the source will
++    stop any current decoding and discard any buffers.
++
++    Sources are exclusive, so only one can be set.
++*/
++
++/*!
++    \fn QAudioDecoderControl::sourceDevice() const
++
++    Returns the current media source QIODevice, or 0 if none (or a file).
++*/
++
++/*!
++    \fn QAudioDecoderControl::setSourceDevice(QIODevice *device)
++
++    Sets the current source to \a device.  Changing the source will
++    stop any current decoding and discard any buffers.
++
++    Sources are exclusive, so only one can be set.
++*/
++
++/*!
++    \fn QAudioDecoderControl::start()
++
++    Starts decoding the current media.
++
++    If successful the player control will immediately enter the \l {QAudioDecoder::DecodingState}
++    {decoding} state.
++
++    \sa state(), read()
++*/
++
++/*!
++    \fn QAudioDecoderControl::stop()
++
++    Stops playback of the current media and discards any buffers.
++
++    If successful the player control will immediately enter the \l {QAudioDecoder::StoppedState}
++    {stopped} state.
++*/
++
++/*!
++    \fn QAudioDecoderControl::error(int error, const QString &errorString)
++
++    Signals that an \a error has occurred.  The \a errorString provides a more detailed explanation.
++*/
++
++/*!
++    \fn QAudioDecoderControl::bufferAvailableChanged(bool available)
++
++    Signals that the bufferAvailable property has changed to \a available.
++*/
++
++/*!
++    \fn QAudioDecoderControl::bufferReady()
++
++    Signals that a new buffer is ready for reading.
++*/
++
++/*!
++    \fn QAudioDecoderControl::formatChanged(const QAudioFormat &format)
++
++    Signals that the current audio format of the decoder has changed to \a format.
++
++    \sa audioFormat(), setAudioFormat
++*/
++
++
++
++/*!
++    \fn QAudioDecoderControl::audioFormat()
++    Returns the current audio format of the decoded stream.
++
++    Any buffers returned should have this format.
++
++    \sa setAudioFormat, audioFormatChanged
++*/
++
++/*!
++    \fn QAudioDecoderControl::setAudioFormat(const QAudioFormat &format)
++    Set the desired audio format for decoded samples to \a format.
++
++    If the decoder does not support this format, \l error() will
++    be set to \c FormatError.
++
++    If you do not specify a format, the format of the decoded
++    audio itself will be used.  Otherwise, some format conversion
++    will be applied.
++
++    If you wish to reset the decoded format to that of the original
++    audio file, you can specify an invalid \a format.
++*/
++
++#include "moc_qaudiodecodercontrol_p.cpp"
++QT_END_NAMESPACE
++
+diff --git a/src/multimedia/controls/qaudiodecodercontrol_p.h b/src/multimedia/controls/qaudiodecodercontrol_p.h
+new file mode 100644
+index 0000000..1130661
+--- /dev/null
++++ b/src/multimedia/controls/qaudiodecodercontrol_p.h
+@@ -0,0 +1,103 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QAUDIODECODERCONTROL_H
++#define QAUDIODECODERCONTROL_H
++
++#include "qmediacontrol.h"
++#include <private/qaudiodecoder_p.h>
++
++#include <QtCore/qpair.h>
++
++#include "qaudiobuffer.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Multimedia)
++
++class QIODevice;
++class Q_MULTIMEDIA_EXPORT QAudioDecoderControl : public QMediaControl
++{
++    Q_OBJECT
++
++public:
++    ~QAudioDecoderControl();
++
++    virtual QAudioDecoder::State state() const = 0;
++
++    virtual QString sourceFilename() const = 0;
++    virtual void setSourceFilename(const QString &fileName) = 0;
++
++    virtual QIODevice* sourceDevice() const = 0;
++    virtual void setSourceDevice(QIODevice *device) = 0;
++
++    virtual void start() = 0;
++    virtual void stop() = 0;
++
++    virtual QAudioFormat audioFormat() const = 0;
++    virtual void setAudioFormat(const QAudioFormat &format) = 0;
++
++    virtual QAudioBuffer read(bool *ok) = 0;
++    virtual bool bufferAvailable() const = 0;
++
++Q_SIGNALS:
++    void stateChanged(QAudioDecoder::State newState);
++    void formatChanged(const QAudioFormat &format);
++
++    void error(int error, const QString &errorString);
++
++    void bufferReady();
++    void bufferAvailableChanged(bool available);
++
++protected:
++    QAudioDecoderControl(QObject* parent = 0);
++};
++
++#define QAudioDecoderControl_iid "com.nokia.Qt.QAudioDecoderControl/1.0"
++Q_MEDIA_DECLARE_CONTROL(QAudioDecoderControl, QAudioDecoderControl_iid)
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif  // QAUDIODECODERCONTROL_H
+diff --git a/src/multimedia/qmediaserviceproviderplugin.h b/src/multimedia/qmediaserviceproviderplugin.h
+index 55101c4..6a66315 100644
+--- a/src/multimedia/qmediaserviceproviderplugin.h
++++ b/src/multimedia/qmediaserviceproviderplugin.h
+@@ -218,6 +218,14 @@ public:
+ */
+ #define Q_MEDIASERVICE_RADIO "com.nokia.qt.radio"
+ 
++/*!
++    Service with support for decoding audio.
++    Required Controls: QAudioDecoderControl
++    Optional: that streams control
++*/
++#define Q_MEDIASERVICE_AUDIODECODER "com.nokia.qt.audiodecode"
++
++
+ 
+ QT_END_NAMESPACE
+ 
+diff --git a/tests/auto/unit/multimedia.pro b/tests/auto/unit/multimedia.pro
+index ee5dba8..3fa3f98 100644
+--- a/tests/auto/unit/multimedia.pro
++++ b/tests/auto/unit/multimedia.pro
+@@ -31,4 +31,5 @@ SUBDIRS += \
+     qwavedecoder \
+     qaudiobuffer \
+     qdeclarativeaudio \
+-    qdeclarativeaudio_4
++    qdeclarativeaudio_4 \
++    qaudiodecoder
+diff --git a/tests/auto/unit/qaudiodecoder/qaudiodecoder.pro b/tests/auto/unit/qaudiodecoder/qaudiodecoder.pro
+new file mode 100644
+index 0000000..5b18952
+--- /dev/null
++++ b/tests/auto/unit/qaudiodecoder/qaudiodecoder.pro
+@@ -0,0 +1,22 @@
++#-------------------------------------------------
++#
++# Project created by QtCreator 2012-02-07T15:27:07
++#
++#-------------------------------------------------
++
++QT += multimedia multimedia-private testlib gui
++
++TARGET = tst_qaudiodecoder
++
++CONFIG += testcase no_private_qt_headers_warning
++
++TEMPLATE = app
++
++INCLUDEPATH += \
++    ../../../../src/multimedia/audio
++
++include (../qmultimedia_common/mock.pri)
++include (../qmultimedia_common/mockdecoder.pri)
++
++SOURCES += tst_qaudiodecoder.cpp
++DEFINES += SRCDIR=\\\"$$PWD/\\\"
+diff --git a/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp b/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp
+new file mode 100644
+index 0000000..aacc607
+--- /dev/null
++++ b/tests/auto/unit/qaudiodecoder/tst_qaudiodecoder.cpp
+@@ -0,0 +1,306 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++
++#include <QtCore/QString>
++#include <QtTest/QtTest>
++
++#include "qaudiodecoder_p.h"
++#include "mockaudiodecoderservice.h"
++#include "mockmediaserviceprovider.h"
++
++class tst_QAudioDecoder : public QObject
++{
++    Q_OBJECT
++
++public:
++    tst_QAudioDecoder();
++
++private Q_SLOTS:
++    void init();
++    void ctors();
++    void read();
++    void stop();
++    void format();
++    void source();
++
++private:
++    MockAudioDecoderService  *mockAudioDecoderService;
++    MockMediaServiceProvider *mockProvider;
++};
++
++tst_QAudioDecoder::tst_QAudioDecoder()
++{
++}
++
++void tst_QAudioDecoder::init()
++{
++    mockAudioDecoderService = new MockAudioDecoderService(this);
++    mockProvider = new MockMediaServiceProvider(mockAudioDecoderService);
++
++    QMediaServiceProvider::setDefaultServiceProvider(mockProvider);
++}
++
++void tst_QAudioDecoder::ctors()
++{
++    QAudioDecoder d;
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++    QCOMPARE(d.sourceFilename(), QString(""));
++
++    d.setSourceFilename("");
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++    QCOMPARE(d.sourceFilename(), QString(""));
++}
++
++void tst_QAudioDecoder::read()
++{
++    QAudioDecoder d;
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++
++    QSignalSpy readySpy(&d, SIGNAL(bufferReady()));
++    QSignalSpy bufferChangedSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
++    QSignalSpy errorSpy(&d, SIGNAL(error(QAudioDecoder::Error)));
++
++    // Starting with empty source == error
++    d.start();
++
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++
++    QCOMPARE(readySpy.count(), 0);
++    QCOMPARE(bufferChangedSpy.count(), 0);
++    QCOMPARE(errorSpy.count(), 1);
++
++    // Set the source to something
++    d.setSourceFilename("Blah");
++    QCOMPARE(d.sourceFilename(), QString("Blah"));
++
++    readySpy.clear();
++    errorSpy.clear();
++    bufferChangedSpy.clear();
++
++    d.start();
++    QCOMPARE(d.state(), QAudioDecoder::DecodingState);
++    QCOMPARE(d.bufferAvailable(), false); // not yet
++
++    // Try to read
++    bool ok = false;
++    QAudioBuffer b = d.read(&ok);
++
++    QVERIFY(ok == false);
++    QVERIFY(!b.isValid());
++
++    // Read again with no parameter
++    b = d.read();
++    QVERIFY(!b.isValid());
++
++    // Wait a while
++    QTRY_COMPARE(d.bufferAvailable(), 1);
++
++    QVERIFY(d.bufferAvailable());
++
++    b = d.read(&ok);
++    QVERIFY(b.format().isValid());
++    QVERIFY(b.isValid());
++    QVERIFY(b.format().channelCount() == 1);
++    QVERIFY(b.sampleCount() == 4);
++
++    QVERIFY(readySpy.count() >= 1);
++    QVERIFY(errorSpy.count() == 0);
++
++    if (d.bufferAvailable()) {
++        QVERIFY(bufferChangedSpy.count() == 1);
++    } else {
++        QVERIFY(bufferChangedSpy.count() == 2);
++    }
++}
++
++void tst_QAudioDecoder::stop()
++{
++    QAudioDecoder d;
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++
++    QSignalSpy readySpy(&d, SIGNAL(bufferReady()));
++    QSignalSpy bufferChangedSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
++    QSignalSpy errorSpy(&d, SIGNAL(error(QAudioDecoder::Error)));
++
++    // Starting with empty source == error
++    d.start();
++
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++
++    QCOMPARE(readySpy.count(), 0);
++    QCOMPARE(bufferChangedSpy.count(), 0);
++    QCOMPARE(errorSpy.count(), 1);
++
++    // Set the source to something
++    d.setSourceFilename("Blah");
++    QCOMPARE(d.sourceFilename(), QString("Blah"));
++
++    readySpy.clear();
++    errorSpy.clear();
++    bufferChangedSpy.clear();
++
++    d.start();
++    QCOMPARE(d.state(), QAudioDecoder::DecodingState);
++    QCOMPARE(d.bufferAvailable(), false); // not yet
++
++    // Try to read
++    bool ok = false;
++    QAudioBuffer b = d.read(&ok);
++
++    QVERIFY(ok == false);
++    QVERIFY(!b.isValid());
++
++    // Read again with no parameter
++    b = d.read();
++    QVERIFY(!b.isValid());
++
++    // Wait a while
++    QTRY_COMPARE(d.bufferAvailable(), 1);
++
++    QVERIFY(d.bufferAvailable());
++
++    // Now stop
++    d.stop();
++
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++}
++
++void tst_QAudioDecoder::format()
++{
++    QAudioDecoder d;
++    QVERIFY(d.state() == QAudioDecoder::StoppedState);
++    QVERIFY(d.bufferAvailable() == false);
++
++    QSignalSpy readySpy(&d, SIGNAL(bufferReady()));
++    QSignalSpy bufferChangedSpy(&d, SIGNAL(bufferAvailableChanged(bool)));
++    QSignalSpy errorSpy(&d, SIGNAL(error(QAudioDecoder::Error)));
++
++    // Set the source to something
++    d.setSourceFilename("Blah");
++    QCOMPARE(d.sourceFilename(), QString("Blah"));
++
++    readySpy.clear();
++    errorSpy.clear();
++    bufferChangedSpy.clear();
++
++    d.start();
++    QCOMPARE(d.state(), QAudioDecoder::DecodingState);
++    QCOMPARE(d.bufferAvailable(), false); // not yet
++
++    // Try to read
++    bool ok = false;
++    QAudioBuffer b = d.read(&ok);
++
++    QVERIFY(ok == false);
++    QVERIFY(!b.isValid());
++
++    // Read again with no parameter
++    b = d.read();
++    QVERIFY(!b.isValid());
++
++    // Wait a while
++    QTRY_COMPARE(d.bufferAvailable(), 1);
++
++    b = d.read(&ok);
++    QVERIFY(d.audioFormat() == b.format());
++
++    // Setting format while decoding is forbidden
++    QAudioFormat f(d.audioFormat());
++    f.setChannelCount(2);
++
++    d.setAudioFormat(f);
++    QVERIFY(d.audioFormat() != f);
++    QVERIFY(d.audioFormat() == b.format());
++
++    // Now stop, and set something specific
++    d.stop();
++    d.setAudioFormat(f);
++    QVERIFY(d.audioFormat() == f);
++
++    // Decode again
++    d.start();
++    QTRY_COMPARE(d.bufferAvailable(), 1);
++
++    b = d.read(&ok);
++    QVERIFY(d.audioFormat() == f);
++    QVERIFY(b.format() == f);
++}
++
++void tst_QAudioDecoder::source()
++{
++    QAudioDecoder d;
++
++    QVERIFY(d.sourceFilename().isEmpty());
++    QVERIFY(d.sourceDevice() == 0);
++
++    QFile f;
++    d.setSourceDevice(&f);
++    QVERIFY(d.sourceFilename().isEmpty());
++    QVERIFY(d.sourceDevice() == &f);
++
++    d.setSourceFilename("Foo");
++    QVERIFY(d.sourceFilename() == QString("Foo"));
++    QVERIFY(d.sourceDevice() == 0);
++
++    d.setSourceDevice(0);
++    QVERIFY(d.sourceFilename().isEmpty());
++    QVERIFY(d.sourceDevice() == 0);
++
++    d.setSourceFilename("Foo");
++    QVERIFY(d.sourceFilename() == QString("Foo"));
++    QVERIFY(d.sourceDevice() == 0);
++
++    d.setSourceFilename(QString());
++    QVERIFY(d.sourceFilename() == QString());
++    QVERIFY(d.sourceDevice() == 0);
++}
++
++QTEST_MAIN(tst_QAudioDecoder)
++
++#include "tst_qaudiodecoder.moc"
+diff --git a/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h b/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h
+new file mode 100644
+index 0000000..938da31
+--- /dev/null
++++ b/tests/auto/unit/qmultimedia_common/mockaudiodecodercontrol.h
+@@ -0,0 +1,204 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef MOCKAUDIODECODERCONTROL_H
++#define MOCKAUDIODECODERCONTROL_H
++
++#include "qmediacontrol.h"
++#include <private/qaudiodecodercontrol_p.h>
++
++#include <QtCore/qpair.h>
++
++#include "qaudiobuffer.h"
++#include <QTimer>
++#include <QIODevice>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Multimedia)
++
++class MockAudioDecoderControl : public QAudioDecoderControl
++{
++    Q_OBJECT
++
++public:
++    MockAudioDecoderControl(QObject *parent = 0)
++        : QAudioDecoderControl(parent)
++        , mState(QAudioDecoder::StoppedState)
++        , mDevice(0)
++        , mSerial(0)
++    {
++        mFormat.setChannels(1);
++        mFormat.setSampleSize(8);
++        mFormat.setFrequency(1000);
++        mFormat.setCodec("audio/x-raw");
++        mFormat.setSampleType(QAudioFormat::UnSignedInt);
++    }
++
++    QAudioDecoder::State state() const
++    {
++        return mState;
++    }
++
++    QString sourceFilename() const
++    {
++        return mSource;
++    }
++
++    QAudioFormat audioFormat() const
++    {
++        return mFormat;
++    }
++
++    void setAudioFormat(const QAudioFormat &format)
++    {
++        if (mFormat != format) {
++            mFormat = format;
++            emit formatChanged(mFormat);
++        }
++    }
++
++    void setSourceFilename(const QString &fileName)
++    {
++        mSource = fileName;
++        mDevice = 0;
++        stop();
++    }
++
++    QIODevice* sourceDevice() const
++    {
++        return mDevice;
++    }
++
++    void setSourceDevice(QIODevice *device)
++    {
++        mDevice = device;
++        mSource.clear();
++        stop();
++    }
++
++    // When decoding we decode to first buffer, then second buffer
++    // we then stop until the first is read again and so on, for
++    // 5 buffers
++    void start()
++    {
++        if (mState == QAudioDecoder::StoppedState) {
++            if (!mSource.isEmpty()) {
++                mState = QAudioDecoder::DecodingState;
++                emit stateChanged(mState);
++
++                QTimer::singleShot(50, this, SLOT(pretendDecode()));
++            } else {
++                emit error(QAudioDecoder::ResourceError, "No source set");
++            }
++        }
++    }
++
++    void stop()
++    {
++        if (mState != QAudioDecoder::StoppedState) {
++            mState = QAudioDecoder::StoppedState;
++            mSerial = 0;
++            mBuffers.clear();
++            emit stateChanged(mState);
++            emit bufferAvailableChanged(false);
++        }
++    }
++
++    QAudioBuffer read(bool *ok)
++    {
++        if (mBuffers.length() > 0) {
++            if (ok)
++                *ok = true;
++            QAudioBuffer a = mBuffers.takeFirst();
++            if (mBuffers.length() == 0)
++                emit bufferAvailableChanged(false);
++            QTimer::singleShot(50, this, SLOT(pretendDecode()));
++            return a;
++        } else {
++            // Can't do anything here :(
++            if (ok)
++                *ok = false;
++            return QAudioBuffer();
++        }
++    }
++
++    bool bufferAvailable() const
++    {
++        return mBuffers.length() > 0;
++    }
++
++private slots:
++    void pretendDecode()
++    {
++        // We just keep the length of mBuffers to 3 or less.
++        if (mBuffers.length() < 3) {
++            QByteArray b(sizeof(mSerial), 0);
++            memcpy(b.data(), &mSerial, sizeof(mSerial));
++            mSerial++;
++            mBuffers.push_back(QAudioBuffer(b, mFormat));
++            emit bufferReady();
++            if (mBuffers.count() == 1)
++                emit bufferAvailableChanged(true);
++        } else {
++            // Can't do anything here, wait for a read to restart the timer
++            mState = QAudioDecoder::WaitingState;
++            emit stateChanged(mState);
++        }
++    }
++
++public:
++    QAudioDecoder::State mState;
++    QString mSource;
++    QIODevice *mDevice;
++    QAudioFormat mFormat;
++
++    int mSerial;
++    QList<QAudioBuffer> mBuffers;
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif  // QAUDIODECODERCONTROL_H
+diff --git a/tests/auto/unit/qmultimedia_common/mockaudiodecoderservice.h b/tests/auto/unit/qmultimedia_common/mockaudiodecoderservice.h
+new file mode 100644
+index 0000000..35db819
+--- /dev/null
++++ b/tests/auto/unit/qmultimedia_common/mockaudiodecoderservice.h
+@@ -0,0 +1,82 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef MOCKAUDIODECODERSERVICE_H
++#define MOCKAUDIODECODERSERVICE_H
++
++#include "qmediaservice.h"
++
++#include "mockaudiodecodercontrol.h"
++
++class MockAudioDecoderService : public QMediaService
++{
++    Q_OBJECT
++
++public:
++    MockAudioDecoderService(QObject *parent = 0)
++        : QMediaService(parent)
++    {
++        mockControl = new MockAudioDecoderControl(this);
++    }
++
++    ~MockAudioDecoderService()
++    {
++        delete mockControl;
++    }
++
++    QMediaControl* requestControl(const char *iid)
++    {
++        if (qstrcmp(iid, QAudioDecoderControl_iid) == 0)
++            return mockControl;
++        return 0;
++    }
++
++    void releaseControl(QMediaControl *control)
++    {
++        Q_UNUSED(control);
++    }
++
++    MockAudioDecoderControl *mockControl;
++};
++
++
++
++#endif // MOCKAUDIODECODERSERVICE_H
+diff --git a/tests/auto/unit/qmultimedia_common/mockdecoder.pri b/tests/auto/unit/qmultimedia_common/mockdecoder.pri
+new file mode 100644
+index 0000000..8b486e4
+--- /dev/null
++++ b/tests/auto/unit/qmultimedia_common/mockdecoder.pri
+@@ -0,0 +1,9 @@
++# Audio decoder related mock backend files
++INCLUDEPATH += $$PWD \
++    ../../../src/multimedia \
++    ../../../src/multimedia/audio \
++    ../../../src/multimedia/controls
++
++HEADERS *= \
++    ../qmultimedia_common/mockaudiodecoderservice.h \
++    ../qmultimedia_common/mockaudiodecodercontrol.h

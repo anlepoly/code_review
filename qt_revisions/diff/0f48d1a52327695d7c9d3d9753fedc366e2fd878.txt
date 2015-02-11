@@ -1,0 +1,815 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index 2bbe8a7..ae83ddd 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -181,6 +181,9 @@ information about a particular change.
+ - QDir::convertSeparators() (deprecated since Qt 4.2) has been removed. Use
+   QDir::toNativeSeparators() instead.
+ 
++- QIconEngineV2 was merged into QIconEngine
++  You might need to adjust your code if it used a QIconEngine.
++
+ - qmake
+   * several functions and built-in variables were modified to return normalized paths.
+ 
+diff --git a/src/widgets/kernel/qicon.cpp b/src/widgets/kernel/qicon.cpp
+index 52fe2f8..1d3236a 100644
+--- a/src/widgets/kernel/qicon.cpp
++++ b/src/widgets/kernel/qicon.cpp
+@@ -128,9 +128,7 @@ static void qt_cleanup_icon_cache()
+ QIconPrivate::QIconPrivate()
+     : engine(0), ref(1),
+     serialNum(serialNumCounter.fetchAndAddRelaxed(1)),
+-    detach_no(0),
+-    engine_version(2),
+-    v1RefCount(0)
++    detach_no(0)
+ {
+ }
+ 
+@@ -139,7 +137,7 @@ QPixmapIconEngine::QPixmapIconEngine()
+ }
+ 
+ QPixmapIconEngine::QPixmapIconEngine(const QPixmapIconEngine &other)
+-    : QIconEngineV2(other), pixmaps(other.pixmaps)
++    : QIconEngine(other), pixmaps(other.pixmaps)
+ {
+ }
+ 
+@@ -374,7 +372,7 @@ QString QPixmapIconEngine::key() const
+     return QLatin1String("QPixmapIconEngine");
+ }
+ 
+-QIconEngineV2 *QPixmapIconEngine::clone() const
++QIconEngine *QPixmapIconEngine::clone() const
+ {
+     return new QPixmapIconEngine(*this);
+ }
+@@ -430,9 +428,9 @@ bool QPixmapIconEngine::write(QDataStream &out) const
+ void QPixmapIconEngine::virtual_hook(int id, void *data)
+ {
+     switch (id) {
+-    case QIconEngineV2::AvailableSizesHook: {
+-        QIconEngineV2::AvailableSizesArgument &arg =
+-            *reinterpret_cast<QIconEngineV2::AvailableSizesArgument*>(data);
++    case QIconEngine::AvailableSizesHook: {
++        QIconEngine::AvailableSizesArgument &arg =
++            *reinterpret_cast<QIconEngine::AvailableSizesArgument*>(data);
+         arg.sizes.clear();
+         for (int i = 0; i < pixmaps.size(); ++i) {
+             QPixmapIconEngineEntry &pe = pixmaps[i];
+@@ -446,15 +444,13 @@ void QPixmapIconEngine::virtual_hook(int id, void *data)
+         break;
+     }
+     default:
+-        QIconEngineV2::virtual_hook(id, data);
++        QIconEngine::virtual_hook(id, data);
+     }
+ }
+ 
+ #ifndef QT_NO_LIBRARY
+ Q_GLOBAL_STATIC_WITH_ARGS(QFactoryLoader, loader,
+     (QIconEngineFactoryInterface_iid, QLatin1String("/iconengines"), Qt::CaseInsensitive))
+-Q_GLOBAL_STATIC_WITH_ARGS(QFactoryLoader, loaderV2,
+-    (QIconEngineFactoryInterfaceV2_iid, QLatin1String("/iconengines"), Qt::CaseInsensitive))
+ #endif
+ 
+ 
+@@ -584,19 +580,6 @@ QIcon::QIcon(const QString &fileName)
+ QIcon::QIcon(QIconEngine *engine)
+     :d(new QIconPrivate)
+ {
+-    d->engine_version = 1;
+-    d->engine = engine;
+-    d->v1RefCount = new QAtomicInt(1);
+-}
+-
+-/*!
+-    Creates an icon with a specific icon \a engine. The icon takes
+-    ownership of the engine.
+-*/
+-QIcon::QIcon(QIconEngineV2 *engine)
+-    :d(new QIconPrivate)
+-{
+-    d->engine_version = 2;
+     d->engine = engine;
+ }
+ 
+@@ -777,15 +760,7 @@ void QIcon::detach()
+     if (d) {
+         if (d->ref.load() != 1) {
+             QIconPrivate *x = new QIconPrivate;
+-            if (d->engine_version > 1) {
+-                QIconEngineV2 *engine = static_cast<QIconEngineV2 *>(d->engine);
+-                x->engine = engine->clone();
+-            } else {
+-                x->engine = d->engine;
+-                x->v1RefCount = d->v1RefCount;
+-                x->v1RefCount->ref();
+-            }
+-            x->engine_version = d->engine_version;
++            x->engine = d->engine->clone();
+             if (!d->ref.deref())
+                 delete d;
+             d = x;
+@@ -851,23 +826,12 @@ void QIcon::addFile(const QString &fileName, const QSize &size, Mode mode, State
+         QString suffix = info.suffix();
+         if (!suffix.isEmpty()) {
+             // first try version 2 engines..
+-            if (QIconEngineFactoryInterfaceV2 *factory = qobject_cast<QIconEngineFactoryInterfaceV2*>(loaderV2()->instance(suffix))) {
++            if (QIconEngineFactoryInterface *factory = qobject_cast<QIconEngineFactoryInterface*>(loader()->instance(suffix))) {
+                 if (QIconEngine *engine = factory->create(fileName)) {
+                     d = new QIconPrivate;
+                     d->engine = engine;
+                 }
+             }
+-            // ..then fall back and try to load version 1 engines
+-            if (!d) {
+-                if (QIconEngineFactoryInterface *factory = qobject_cast<QIconEngineFactoryInterface*>(loader()->instance(suffix))) {
+-                    if (QIconEngine *engine = factory->create(fileName)) {
+-                        d = new QIconPrivate;
+-                        d->engine = engine;
+-                        d->engine_version = 1;
+-                        d->v1RefCount = new QAtomicInt(1);
+-                    }
+-                }
+-            }
+         }
+ #endif
+         // ...then fall back to the default engine
+@@ -889,10 +853,9 @@ void QIcon::addFile(const QString &fileName, const QSize &size, Mode mode, State
+ */
+ QList<QSize> QIcon::availableSizes(Mode mode, State state) const
+ {
+-    if (!d || !d->engine || d->engine_version < 2)
++    if (!d || !d->engine)
+         return QList<QSize>();
+-    QIconEngineV2 *engine = static_cast<QIconEngineV2*>(d->engine);
+-    return engine->availableSizes(mode, state);
++    return d->engine->availableSizes(mode, state);
+ }
+ 
+ /*!
+@@ -908,10 +871,9 @@ QList<QSize> QIcon::availableSizes(Mode mode, State state) const
+ */
+ QString QIcon::name() const
+ {
+-    if (!d || !d->engine || d->engine_version < 2)
++    if (!d || !d->engine)
+         return QString();
+-    QIconEngineV2 *engine = static_cast<QIconEngineV2*>(d->engine);
+-    return engine->iconName();
++    return d->engine->iconName();
+ }
+ 
+ /*!
+@@ -1066,14 +1028,8 @@ QDataStream &operator<<(QDataStream &s, const QIcon &icon)
+         if (icon.isNull()) {
+             s << QString();
+         } else {
+-            if (icon.d->engine_version > 1) {
+-                QIconEngineV2 *engine = static_cast<QIconEngineV2 *>(icon.d->engine);
+-                s << engine->key();
+-                engine->write(s);
+-            } else {
+-                // not really supported
+-                qWarning("QIcon: Cannot stream QIconEngine. Use QIconEngineV2 instead.");
+-            }
++            s << icon.d->engine->key();
++            icon.d->engine->write(s);
+         }
+     } else if (s.version() == QDataStream::Qt_4_2) {
+         if (icon.isNull()) {
+@@ -1113,17 +1069,17 @@ QDataStream &operator>>(QDataStream &s, QIcon &icon)
+         s >> key;
+         if (key == QLatin1String("QPixmapIconEngine")) {
+             icon.d = new QIconPrivate;
+-            QIconEngineV2 *engine = new QPixmapIconEngine;
++            QIconEngine *engine = new QPixmapIconEngine;
+             icon.d->engine = engine;
+             engine->read(s);
+         } else if (key == QLatin1String("QIconLoaderEngine")) {
+             icon.d = new QIconPrivate;
+-            QIconEngineV2 *engine = new QIconLoaderEngine();
++            QIconEngine *engine = new QIconLoaderEngine();
+             icon.d->engine = engine;
+             engine->read(s);
+ #if !defined (QT_NO_LIBRARY) && !defined(QT_NO_SETTINGS)
+-        } else if (QIconEngineFactoryInterfaceV2 *factory = qobject_cast<QIconEngineFactoryInterfaceV2*>(loaderV2()->instance(key))) {
+-            if (QIconEngineV2 *engine= factory->create()) {
++        } else if (QIconEngineFactoryInterface *factory = qobject_cast<QIconEngineFactoryInterface*>(loader()->instance(key))) {
++            if (QIconEngine *engine= factory->create()) {
+                 icon.d = new QIconPrivate;
+                 icon.d->engine = engine;
+                 engine->read(s);
+diff --git a/src/widgets/kernel/qicon.h b/src/widgets/kernel/qicon.h
+index d7c2f8f..7bef500 100644
+--- a/src/widgets/kernel/qicon.h
++++ b/src/widgets/kernel/qicon.h
+@@ -54,7 +54,6 @@ QT_BEGIN_NAMESPACE
+ 
+ class QIconPrivate;
+ class QIconEngine;
+-class QIconEngineV2;
+ 
+ class Q_WIDGETS_EXPORT QIcon
+ {
+@@ -67,7 +66,6 @@ public:
+     QIcon(const QIcon &other);
+     explicit QIcon(const QString &fileName); // file or resource name
+     explicit QIcon(QIconEngine *engine);
+-    explicit QIcon(QIconEngineV2 *engine);
+     ~QIcon();
+     QIcon &operator=(const QIcon &other);
+ #ifdef Q_COMPILER_RVALUE_REFS
+diff --git a/src/widgets/kernel/qicon_p.h b/src/widgets/kernel/qicon_p.h
+index 378e913..37c4b7c 100644
+--- a/src/widgets/kernel/qicon_p.h
++++ b/src/widgets/kernel/qicon_p.h
+@@ -69,14 +69,7 @@ public:
+     QIconPrivate();
+ 
+     ~QIconPrivate() {
+-        if (engine_version == 1) {
+-            if (!v1RefCount->deref()) {
+-                delete engine;
+-                delete v1RefCount;
+-            }
+-        } else if (engine_version == 2) {
+-            delete engine;
+-        }
++        delete engine;
+     }
+ 
+     QIconEngine *engine;
+@@ -84,9 +77,6 @@ public:
+     QAtomicInt ref;
+     int serialNum;
+     int detach_no;
+-    int engine_version;
+-
+-    QAtomicInt *v1RefCount;
+ };
+ 
+ 
+@@ -107,7 +97,7 @@ struct QPixmapIconEngineEntry
+ 
+ 
+ 
+-class QPixmapIconEngine : public QIconEngineV2 {
++class QPixmapIconEngine : public QIconEngine {
+ public:
+     QPixmapIconEngine();
+     QPixmapIconEngine(const QPixmapIconEngine &);
+@@ -119,9 +109,8 @@ public:
+     void addPixmap(const QPixmap &pixmap, QIcon::Mode mode, QIcon::State state);
+     void addFile(const QString &fileName, const QSize &size, QIcon::Mode mode, QIcon::State state);
+ 
+-    // v2 functions
+     QString key() const;
+-    QIconEngineV2 *clone() const;
++    QIconEngine *clone() const;
+     bool read(QDataStream &in);
+     bool write(QDataStream &out) const;
+     void virtual_hook(int id, void *data);
+diff --git a/src/widgets/kernel/qiconengine.cpp b/src/widgets/kernel/qiconengine.cpp
+index 9f36d7e..0a2d92e 100644
+--- a/src/widgets/kernel/qiconengine.cpp
++++ b/src/widgets/kernel/qiconengine.cpp
+@@ -52,8 +52,6 @@ QT_BEGIN_NAMESPACE
+   \ingroup painting
+   \inmodule QtWidgets
+ 
+-  \bold {Use QIconEngineV2 instead.}
+-
+   An icon engine provides the rendering functions for a QIcon. Each icon has a
+   corresponding icon engine that is responsible for drawing the icon with a
+   requested size, mode and state.
+@@ -67,7 +65,7 @@ QT_BEGIN_NAMESPACE
+   The paint(), pixmap(), and addPixmap() functions are all virtual, and can
+   therefore be reimplemented in subclasses of QIconEngine.
+ 
+-  \sa QIconEngineV2, QIconEnginePlugin
++  \sa QIconEnginePlugin
+ 
+ */
+ 
+@@ -136,45 +134,8 @@ void QIconEngine::addFile(const QString &/*fileName*/, const QSize &/*size*/, QI
+ }
+ 
+ 
+-
+-// version 2 functions
+-
+-
+ /*!
+-    \class QIconEngineV2
+-
+-    \brief The QIconEngineV2 class provides an abstract base class for QIcon renderers.
+-
+-    \ingroup painting
+-    \inmodule QtWidgets
+-
+-    \since 4.3
+-
+-    An icon engine renders \l{QIcon}s. With icon engines, you can
+-    customize icons. Qt provides a default engine that makes icons
+-    adhere to the current style by scaling the icons and providing a
+-    disabled appearance.
+-
+-    An engine is installed on an icon either through a QIcon
+-    constructor or through a QIconEnginePluginV2. The plugins are used
+-    by Qt if a specific engine is not given when the icon is created.
+-    See the QIconEngineV2 class description to learn how to create
+-    icon engine plugins.
+-
+-    An icon engine provides the rendering functions for a QIcon. Each
+-    icon has a corresponding icon engine that is responsible for drawing
+-    the icon with a requested size, mode and state.
+-
+-    QIconEngineV2 extends the API of QIconEngine to allow streaming of
+-    the icon engine contents, and should be used instead of QIconEngine
+-    for implementing new icon engines.
+-
+-    \sa QIconEnginePluginV2
+-
+-*/
+-
+-/*!
+-    \enum QIconEngineV2::IconEngineHook
++    \enum QIconEngine::IconEngineHook
+     \since 4.5
+ 
+     These enum values are used for virtual_hook() to allow additional
+@@ -194,33 +155,33 @@ void QIconEngine::addFile(const QString &/*fileName*/, const QSize &/*size*/, QI
+  */
+ 
+ /*!
+-    \class QIconEngineV2::AvailableSizesArgument
++    \class QIconEngine::AvailableSizesArgument
+     \since 4.5
+ 
+     \inmodule QtWidgets
+ 
+     This struct represents arguments to virtual_hook() function when
+-    \a id parameter is QIconEngineV2::AvailableSizesHook.
++    \a id parameter is QIconEngine::AvailableSizesHook.
+ 
+-    \sa virtual_hook(), QIconEngineV2::IconEngineHook
++    \sa virtual_hook(), QIconEngine::IconEngineHook
+  */
+ 
+ /*!
+-    \variable QIconEngineV2::AvailableSizesArgument::mode
++    \variable QIconEngine::AvailableSizesArgument::mode
+     \brief the requested mode of an image.
+ 
+     \sa QIcon::Mode
+ */
+ 
+ /*!
+-    \variable QIconEngineV2::AvailableSizesArgument::state
++    \variable QIconEngine::AvailableSizesArgument::state
+     \brief the requested state of an image.
+ 
+     \sa QIcon::State
+ */
+ 
+ /*!
+-    \variable QIconEngineV2::AvailableSizesArgument::sizes
++    \variable QIconEngine::AvailableSizesArgument::sizes
+ 
+     \brief image sizes that are available with specified \a mode and
+     \a state. This is an output parameter and is filled after call to
+@@ -232,26 +193,23 @@ void QIconEngine::addFile(const QString &/*fileName*/, const QSize &/*size*/, QI
+ /*!
+     Returns a key that identifies this icon engine.
+  */
+-QString QIconEngineV2::key() const
++QString QIconEngine::key() const
+ {
+     return QString();
+ }
+ 
+-/*!
+-    Returns a clone of this icon engine.
++/*! \fn QIconEngine *QIconEngine::clone() const
++
++    Reimplement this method to return a clone of this icon engine.
+  */
+-QIconEngineV2 *QIconEngineV2::clone() const
+-{
+-    return 0;
+-}
+ 
+ /*!
+     Reads icon engine contents from the QDataStream \a in. Returns
+     true if the contents were read; otherwise returns false.
+ 
+-    QIconEngineV2's default implementation always return false.
++    QIconEngine's default implementation always return false.
+  */
+-bool QIconEngineV2::read(QDataStream &)
++bool QIconEngine::read(QDataStream &)
+ {
+     return false;
+ }
+@@ -260,9 +218,9 @@ bool QIconEngineV2::read(QDataStream &)
+     Writes the contents of this engine to the QDataStream \a out.
+     Returns true if the contents were written; otherwise returns false.
+ 
+-    QIconEngineV2's default implementation always return false.
++    QIconEngine's default implementation always return false.
+  */
+-bool QIconEngineV2::write(QDataStream &) const
++bool QIconEngine::write(QDataStream &) const
+ {
+     return false;
+ }
+@@ -270,19 +228,19 @@ bool QIconEngineV2::write(QDataStream &) const
+ /*!
+     \since 4.5
+ 
+-    Additional method to allow extending QIconEngineV2 without
++    Additional method to allow extending QIconEngine without
+     adding new virtual methods (and without breaking binary compatibility).
+     The actual action and format of \a data depends on \a id argument
+     which is in fact a constant from IconEngineHook enum.
+ 
+     \sa IconEngineHook
+ */
+-void QIconEngineV2::virtual_hook(int id, void *data)
++void QIconEngine::virtual_hook(int id, void *data)
+ {
+     switch (id) {
+-    case QIconEngineV2::AvailableSizesHook: {
+-        QIconEngineV2::AvailableSizesArgument &arg =
+-            *reinterpret_cast<QIconEngineV2::AvailableSizesArgument*>(data);
++    case QIconEngine::AvailableSizesHook: {
++        QIconEngine::AvailableSizesArgument &arg =
++            *reinterpret_cast<QIconEngine::AvailableSizesArgument*>(data);
+         arg.sizes.clear();
+         break;
+     }
+@@ -301,12 +259,12 @@ void QIconEngineV2::virtual_hook(int id, void *data)
+     virtual_hook() method, hence this method depends on icon engine support
+     and may not work with all icon engines.
+  */
+-QList<QSize> QIconEngineV2::availableSizes(QIcon::Mode mode, QIcon::State state)
++QList<QSize> QIconEngine::availableSizes(QIcon::Mode mode, QIcon::State state) const
+ {
+     AvailableSizesArgument arg;
+     arg.mode = mode;
+     arg.state = state;
+-    virtual_hook(QIconEngineV2::AvailableSizesHook, reinterpret_cast<void*>(&arg));
++    const_cast<QIconEngine *>(this)->virtual_hook(QIconEngine::AvailableSizesHook, reinterpret_cast<void*>(&arg));
+     return arg.sizes;
+ }
+ 
+@@ -319,10 +277,10 @@ QList<QSize> QIconEngineV2::availableSizes(QIcon::Mode mode, QIcon::State state)
+     virtual_hook() method, hence this method depends on icon engine support
+     and may not work with all icon engines.
+  */
+-QString QIconEngineV2::iconName()
++QString QIconEngine::iconName() const
+ {
+     QString name;
+-    virtual_hook(QIconEngineV2::IconNameHook, reinterpret_cast<void*>(&name));
++    const_cast<QIconEngine *>(this)->virtual_hook(QIconEngine::IconNameHook, reinterpret_cast<void*>(&name));
+     return name;
+ }
+ 
+diff --git a/src/widgets/kernel/qiconengine.h b/src/widgets/kernel/qiconengine.h
+index 99e1b72..9f96404 100644
+--- a/src/widgets/kernel/qiconengine.h
++++ b/src/widgets/kernel/qiconengine.h
+@@ -62,23 +62,11 @@ public:
+     virtual void addPixmap(const QPixmap &pixmap, QIcon::Mode mode, QIcon::State state);
+     virtual void addFile(const QString &fileName, const QSize &size, QIcon::Mode mode, QIcon::State state);
+ 
+-#if 0
+-    virtual int frameCount(QIcon::Mode fromMode, QIcon::State fromState, QIcon::Mode toMode, QIcon::State toState);
+-    virtual void paintFrame(QPainter *painter, const QRect &rect, int frameNumber, QIcon::Mode fromMode, QIcon::State fromState, QIcon::Mode toMode, QIcon::State toState);
+-#endif
+-};
+-
+-// ### Qt 5: move the below into QIconEngine
+-class Q_WIDGETS_EXPORT QIconEngineV2 : public QIconEngine
+-{
+-public:
+     virtual QString key() const;
+-    virtual QIconEngineV2 *clone() const;
++    virtual QIconEngine *clone() const = 0;
+     virtual bool read(QDataStream &in);
+     virtual bool write(QDataStream &out) const;
+-    virtual void virtual_hook(int id, void *data);
+ 
+-public:
+     enum IconEngineHook { AvailableSizesHook = 1, IconNameHook };
+ 
+     struct AvailableSizesArgument
+@@ -88,12 +76,12 @@ public:
+         QList<QSize> sizes;
+     };
+ 
+-    // ### Qt 5: make this function const and virtual.
+-    QList<QSize> availableSizes(QIcon::Mode mode = QIcon::Normal,
+-                                QIcon::State state = QIcon::Off);
++    virtual QList<QSize> availableSizes(QIcon::Mode mode = QIcon::Normal,
++                                    QIcon::State state = QIcon::Off) const;
+ 
+-    // ### Qt 5: make this function const and virtual.
+-    QString iconName();
++    virtual QString iconName() const;
++
++    virtual void virtual_hook(int id, void *data);
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/widgets/kernel/qiconengineplugin.cpp b/src/widgets/kernel/qiconengineplugin.cpp
+index fbf3463..ced4f5d 100644
+--- a/src/widgets/kernel/qiconengineplugin.cpp
++++ b/src/widgets/kernel/qiconengineplugin.cpp
+@@ -103,72 +103,5 @@ QIconEnginePlugin::~QIconEnginePlugin()
+ {
+ }
+ 
+-// version 2
+-
+-/*!
+-    \class QIconEnginePluginV2
+-    \brief The QIconEnginePluginV2 class provides an abstract base for custom QIconEngineV2 plugins.
+-
+-    \ingroup plugins
+-    \inmodule QtWidgets
+-
+-    \since 4.3
+- 
+-    Icon engine plugins produces \l{QIconEngine}s for \l{QIcon}s; an
+-    icon engine is used to render the icon. The keys that identifies
+-    the engines the plugin can create are suffixes of 
+-    icon filenames; they are returned by keys(). The create() function
+-    receives the icon filename to return an engine for; it should
+-    return 0 if it cannot produce an engine for the file.
+-
+-    Writing an icon engine plugin is achieved by inheriting
+-    QIconEnginePluginV2, reimplementing keys() and create(), and
+-    adding the Q_EXPORT_PLUGIN2() macro.
+-
+-    You should ensure that you do not duplicate keys. Qt will query
+-    the plugins for icon engines in the order in which the plugins are
+-    found during plugin search (see the plugins \l{How to Create Qt
+-    Plugins}{overview document}).
+-
+-    \sa {How to Create Qt Plugins}
+-*/
+-
+-/*!
+-    \fn QStringList QIconEnginePluginV2::keys() const
+-
+-    Returns a list of icon engine keys that this plugin supports. The keys correspond
+-    to the suffix of the file or resource name used when the plugin was created.
+-    Keys are case insensitive.
+-
+-    \sa create()
+-*/
+-
+-/*!
+-    \fn QIconEngineV2* QIconEnginePluginV2::create(const QString& filename = QString())
+-
+-    Creates and returns a QIconEngine object for the icon with the given
+-    \a filename.
+-
+-    \sa keys()
+-*/
+-
+-/*!
+-    Constructs a icon engine plugin with the given \a parent. This is invoked
+-    automatically by the Q_EXPORT_PLUGIN2() macro.
+-*/
+-QIconEnginePluginV2::QIconEnginePluginV2(QObject *parent)
+-    : QObject(parent)
+-{
+-}
+-
+-/*!
+-    Destroys the icon engine plugin.
+-
+-    You never have to call this explicitly. Qt destroys a plugin
+-    automatically when it is no longer used.
+-*/
+-QIconEnginePluginV2::~QIconEnginePluginV2()
+-{
+-}
+ 
+ QT_END_NAMESPACE
+diff --git a/src/widgets/kernel/qiconengineplugin.h b/src/widgets/kernel/qiconengineplugin.h
+index 20ddb7e..a30c547 100644
+--- a/src/widgets/kernel/qiconengineplugin.h
++++ b/src/widgets/kernel/qiconengineplugin.h
+@@ -51,11 +51,10 @@ QT_BEGIN_NAMESPACE
+ 
+ 
+ class QIconEngine;
+-class QIconEngineV2;
+ 
+ struct Q_WIDGETS_EXPORT QIconEngineFactoryInterface : public QFactoryInterface
+ {
+-    virtual QIconEngine *create(const QString &filename) = 0;
++    virtual QIconEngine *create(const QString &filename = QString()) = 0;
+ };
+ 
+ #define QIconEngineFactoryInterface_iid \
+@@ -71,29 +70,7 @@ public:
+     ~QIconEnginePlugin();
+ 
+     virtual QStringList keys() const = 0;
+-    virtual QIconEngine *create(const QString &filename) = 0;
+-};
+-
+-// ### Qt 5: remove version 2
+-struct Q_WIDGETS_EXPORT QIconEngineFactoryInterfaceV2 : public QFactoryInterface
+-{
+-    virtual QIconEngineV2 *create(const QString &filename = QString()) = 0;
+-};
+-
+-#define QIconEngineFactoryInterfaceV2_iid \
+-    "org.qt-project.Qt.QIconEngineFactoryInterfaceV2"
+-Q_DECLARE_INTERFACE(QIconEngineFactoryInterfaceV2, QIconEngineFactoryInterfaceV2_iid)
+-
+-class Q_WIDGETS_EXPORT QIconEnginePluginV2 : public QObject, public QIconEngineFactoryInterfaceV2
+-{
+-    Q_OBJECT
+-    Q_INTERFACES(QIconEngineFactoryInterfaceV2:QFactoryInterface)
+-public:
+-    QIconEnginePluginV2(QObject *parent = 0);
+-    ~QIconEnginePluginV2();
+-
+-    virtual QStringList keys() const = 0;
+-    virtual QIconEngineV2 *create(const QString &filename = QString()) = 0;
++    virtual QIconEngine *create(const QString &filename = QString()) = 0;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/widgets/kernel/qiconloader.cpp b/src/widgets/kernel/qiconloader.cpp
+index 9031c4c..0b86189 100644
+--- a/src/widgets/kernel/qiconloader.cpp
++++ b/src/widgets/kernel/qiconloader.cpp
+@@ -45,6 +45,7 @@
+ #include <private/qicon_p.h>
+ #include <private/qguiplatformplugin_p.h>
+ 
++#include <QtWidgets/QApplication>
+ #include <QtWidgets/QIconEnginePlugin>
+ #include <QtGui/QPixmapCache>
+ #include <QtWidgets/QIconEngine>
+@@ -104,7 +105,7 @@ void QIconLoader::ensureInitialized()
+         if (m_systemTheme.isEmpty())
+             m_systemTheme = fallbackTheme();
+ #ifndef QT_NO_LIBRARY
+-        QFactoryLoader iconFactoryLoader(QIconEngineFactoryInterfaceV2_iid,
++        QFactoryLoader iconFactoryLoader(QIconEngineFactoryInterface_iid,
+                                          QLatin1String("/iconengines"),
+                                          Qt::CaseInsensitive);
+         if (iconFactoryLoader.keys().contains(QLatin1String("svg")))
+@@ -322,13 +323,13 @@ QIconLoaderEngine::~QIconLoaderEngine()
+ }
+ 
+ QIconLoaderEngine::QIconLoaderEngine(const QIconLoaderEngine &other)
+-        : QIconEngineV2(other),
++        : QIconEngine(other),
+         m_iconName(other.m_iconName),
+         m_key(0)
+ {
+ }
+ 
+-QIconEngineV2 *QIconLoaderEngine::clone() const
++QIconEngine *QIconLoaderEngine::clone() const
+ {
+     return new QIconLoaderEngine(*this);
+ }
+@@ -477,7 +478,7 @@ QSize QIconLoaderEngine::actualSize(const QSize &size, QIcon::Mode mode,
+             return QSize(result, result);
+         }
+     }
+-    return QIconEngineV2::actualSize(size, mode, state);
++    return QIconEngine::actualSize(size, mode, state);
+ }
+ 
+ QPixmap PixmapEntry::pixmap(const QSize &size, QIcon::Mode mode, QIcon::State state)
+@@ -489,7 +490,6 @@ QPixmap PixmapEntry::pixmap(const QSize &size, QIcon::Mode mode, QIcon::State st
+     if (basePixmap.isNull())
+         basePixmap.load(filename);
+ 
+-#if 0 // ### Qt5
+     int actualSize = qMin(size.width(), size.height());
+     QString key = QLatin1Literal("$qt_theme_")
+                   % HexString<qint64>(basePixmap.cacheKey())
+@@ -507,9 +507,6 @@ QPixmap PixmapEntry::pixmap(const QSize &size, QIcon::Mode mode, QIcon::State st
+         QPixmapCache::insert(key, cachedPixmap);
+     }
+     return cachedPixmap;
+-#else
+-    return basePixmap;
+-#endif
+ }
+ 
+ QPixmap ScalableEntry::pixmap(const QSize &size, QIcon::Mode mode, QIcon::State state)
+@@ -543,10 +540,10 @@ void QIconLoaderEngine::virtual_hook(int id, void *data)
+     ensureLoaded();
+ 
+     switch (id) {
+-    case QIconEngineV2::AvailableSizesHook:
++    case QIconEngine::AvailableSizesHook:
+         {
+-            QIconEngineV2::AvailableSizesArgument &arg
+-                    = *reinterpret_cast<QIconEngineV2::AvailableSizesArgument*>(data);
++            QIconEngine::AvailableSizesArgument &arg
++                    = *reinterpret_cast<QIconEngine::AvailableSizesArgument*>(data);
+             const QList<QIconDirInfo> directoryKey = iconLoaderInstance()->theme().keyList();
+             arg.sizes.clear();
+ 
+@@ -557,14 +554,14 @@ void QIconLoaderEngine::virtual_hook(int id, void *data)
+             }
+         }
+         break;
+-    case QIconEngineV2::IconNameHook:
++    case QIconEngine::IconNameHook:
+         {
+             QString &name = *reinterpret_cast<QString*>(data);
+             name = m_iconName;
+         }
+         break;
+     default:
+-        QIconEngineV2::virtual_hook(id, data);
++        QIconEngine::virtual_hook(id, data);
+     }
+ }
+ 
+diff --git a/src/widgets/kernel/qiconloader_p.h b/src/widgets/kernel/qiconloader_p.h
+index 9c0349c..1b90436 100644
+--- a/src/widgets/kernel/qiconloader_p.h
++++ b/src/widgets/kernel/qiconloader_p.h
+@@ -109,7 +109,7 @@ struct PixmapEntry : public QIconLoaderEngineEntry
+ 
+ typedef QList<QIconLoaderEngineEntry*> QThemeIconEntries;
+ 
+-class QIconLoaderEngine : public QIconEngineV2
++class QIconLoaderEngine : public QIconEngine
+ {
+ public:
+     QIconLoaderEngine(const QString& iconName = QString());
+@@ -118,7 +118,7 @@ public:
+     void paint(QPainter *painter, const QRect &rect, QIcon::Mode mode, QIcon::State state);
+     QPixmap pixmap(const QSize &size, QIcon::Mode mode, QIcon::State state);
+     QSize actualSize(const QSize &size, QIcon::Mode mode, QIcon::State state);
+-    QIconEngineV2 *clone() const;
++    QIconEngine *clone() const;
+     bool read(QDataStream &in);
+     bool write(QDataStream &out) const;
+ 
+diff --git a/tests/auto/gui/image/qicon/tst_qicon.cpp b/tests/auto/gui/image/qicon/tst_qicon.cpp
+index c391ced..7d455f1 100644
+--- a/tests/auto/gui/image/qicon/tst_qicon.cpp
++++ b/tests/auto/gui/image/qicon/tst_qicon.cpp
+@@ -74,7 +74,6 @@ private slots:
+ 
+     void task184901_badCache();
+     void task223279_inconsistentAddFile();
+-    void task239461_custom_iconengine_crash();
+ 
+ private:
+     bool haveImageFormat(QByteArray const&);
+@@ -722,32 +721,5 @@ void tst_QIcon::task223279_inconsistentAddFile()
+ }
+ 
+ 
+-// During detach, v2 engines are cloned, while v1 engines are only
+-// passed on, so v1 engines need to be referenced counted. This test
+-// verifies that the engine is destroyed once and only once.
+-
+-class IconEngine : public QIconEngine
+-{
+-public:
+-    ~IconEngine() { destructorCalled++; }
+-    virtual void paint(QPainter *, const QRect &, QIcon::Mode, QIcon::State) { }
+-    static int destructorCalled;
+-};
+-int IconEngine::destructorCalled = 0;
+-
+-void tst_QIcon::task239461_custom_iconengine_crash()
+-{
+-    QIconEngine *engine = new IconEngine();
+-    {
+-        QIcon icon(engine);
+-        QIcon icon2 = icon;
+-
+-        QPixmap pixmap(32, 32);
+-        icon.addPixmap(pixmap);
+-    }
+-    QCOMPARE(IconEngine::destructorCalled, 1);
+-}
+-
+-
+ QTEST_MAIN(tst_QIcon)
+ #include "tst_qicon.moc"

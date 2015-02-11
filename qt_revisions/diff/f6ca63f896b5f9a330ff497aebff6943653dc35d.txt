@@ -1,0 +1,281 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index 3bc23c8..c85749f 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -420,6 +420,7 @@ ignore the rest of the range.
+   map were simply ignored.
+   -For OnManualSubmit, insertRecord() no longer leaves behind an empty
+   row if setRecord() fails.
++  -setRecord() now automatically submits for OnRowChange.
+ 
+ * QSqlQueryModel::indexInQuery() is now virtual. See
+ QSqlTableModel::indexInQuery() as example of how to implement in a
+@@ -439,6 +440,12 @@ selectRow() is called to refresh only the affected row.
+ * QSqlTableModel::isDirty(): New overloaded method to check whether model
+ has any changes to submit. QTBUG-3108
+ 
++* QSqlTableModel::setData() and setRecord() no longer revert pending changes
++that fail upon resubmitting for edit strategies OnFieldChange and OnRowChange.
++Instead, pending (failed) changes cause new changes inappropriate to the
++edit strategy to be refused. The application should resolve or revert pending
++changes.
++
+ ****************************************************************************
+ *                          Database Drivers                                *
+ ****************************************************************************
+diff --git a/src/sql/models/qsqltablemodel.cpp b/src/sql/models/qsqltablemodel.cpp
+index 30e01b0..a001b26 100644
+--- a/src/sql/models/qsqltablemodel.cpp
++++ b/src/sql/models/qsqltablemodel.cpp
+@@ -511,8 +511,19 @@ bool QSqlTableModel::isDirty(const QModelIndex &index) const
+ 
+ /*!
+     Sets the data for the item \a index for the role \a role to \a
+-    value. Depending on the edit strategy, the value might be applied
+-    to the database at once or cached in the model.
++    value.
++
++    For edit strategy OnFieldChange, an index may receive a change
++    only if no other index has a cached change. Changes are
++    submitted immediately. However, rows that have not yet been
++    inserted in the database may be freely changed and and are not
++    submitted automatically.
++
++    For OnRowChange, the first change to a row will cause cached
++    operations on other rows to be submitted. If submitting fails,
++    the new change is rejected.
++
++    Submitted changes are not reverted upon failure.
+ 
+     Returns true if the value could be set or false on error, for
+     example if \a index is out of bounds.
+@@ -534,11 +545,16 @@ bool QSqlTableModel::setData(const QModelIndex &index, const QVariant &value, in
+     if (d->cache.value(index.row()).op() == QSqlTableModelPrivate::Delete)
+         return false;
+ 
+-    if (d->strategy == OnFieldChange && d->cache.value(index.row()).op() != QSqlTableModelPrivate::Insert) {
+-        revertAll();
+-    } else if (d->strategy == OnRowChange && !d->cache.isEmpty() && !d->cache.contains(index.row())) {
+-        submit();
+-        revertAll();
++    if (d->strategy == OnFieldChange) {
++        if (d->cache.value(index.row()).op() != QSqlTableModelPrivate::Insert
++            && !isDirty(index) && isDirty())
++            return false;
++    }
++    else if (d->strategy == OnRowChange) {
++        if (d->cache.value(index.row()).submitted()) {
++            if (!submit())
++                return false;
++        }
+     }
+ 
+     QSqlTableModelPrivate::ModifiedRow &row = d->cache[index.row()];
+@@ -1132,25 +1148,20 @@ bool QSqlTableModel::insertRows(int row, int count, const QModelIndex &parent)
+     Returns true if the record could be inserted, otherwise false.
+ 
+     Changes are submitted immediately for OnFieldChange and
+-    OnRowChange. Note the contrast with setRecord() in respect to
+-    OnRowChange.
++    OnRowChange. Failure does not leave a new row in the model.
+ 
+     \sa insertRows(), removeRows(), setRecord()
+ */
+ bool QSqlTableModel::insertRecord(int row, const QSqlRecord &record)
+ {
+-    Q_D(QSqlTableModel);
+     if (row < 0)
+         row = rowCount();
+     if (!insertRow(row, QModelIndex()))
+         return false;
+     if (!setRecord(row, record)) {
+-        if (d->strategy == OnManualSubmit)
+-            revertRow(row);
++        revertRow(row);
+         return false;
+     }
+-    if (d->strategy == OnFieldChange || d->strategy == OnRowChange)
+-        return submit();
+     return true;
+ }
+ 
+@@ -1240,6 +1251,11 @@ Qt::ItemFlags QSqlTableModel::flags(const QModelIndex &index) const
+         return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
+     if (d->cache.value(index.row()).op() == QSqlTableModelPrivate::Delete)
+         return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
++    if (d->strategy == OnFieldChange
++        && d->cache.value(index.row()).op() != QSqlTableModelPrivate::Insert
++        && !isDirty(index) && isDirty())
++        return Qt::ItemIsSelectable | Qt::ItemIsEnabled;
++
+     return Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsEditable;
+ }
+ 
+@@ -1247,15 +1263,14 @@ Qt::ItemFlags QSqlTableModel::flags(const QModelIndex &index) const
+     Sets the values at the specified \a row to the values of \a
+     record for fields where generated flag is true.
+ 
++    For edit strategies OnFieldChange and OnRowChange, a row may
++    receive a change only if no other row has a cached change.
++    Changes are submitted immediately. Submitted changes are not
++    reverted upon failure.
++
+     Returns true if all the values could be set; otherwise returns
+     false.
+ 
+-    The edit strategy affects automatic submitting.
+-    With OnFieldChange, setRecord() commits its changed row.
+-    With OnRowChange, setRecord() does not commit its changed row,
+-    but making a change to another row causes previous changes to
+-    be submitted.
+-
+     \sa record(), editStrategy()
+ */
+ bool QSqlTableModel::setRecord(int row, const QSqlRecord &values)
+@@ -1271,10 +1286,8 @@ bool QSqlTableModel::setRecord(int row, const QSqlRecord &values)
+     if (d->cache.value(row).op() == QSqlTableModelPrivate::Delete)
+         return false;
+ 
+-    if (d->strategy == OnFieldChange && d->cache.value(row).op() != QSqlTableModelPrivate::Insert)
+-        revertAll();
+-    else if (d->strategy == OnRowChange && !d->cache.isEmpty() && !d->cache.contains(row))
+-        submit();
++    if (d->strategy != OnManualSubmit && d->cache.value(row).submitted() && isDirty())
++        return false;
+ 
+     // Check field names and remember mapping
+     typedef QMap<int, int> Map;
+@@ -1301,7 +1314,7 @@ bool QSqlTableModel::setRecord(int row, const QSqlRecord &values)
+     if (columnCount())
+         emit dataChanged(createIndex(row, 0), createIndex(row, columnCount() - 1));
+ 
+-    if (d->strategy == OnFieldChange)
++    if (d->strategy != OnManualSubmit)
+         return submit();
+ 
+     return true;
+diff --git a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+index 7dcc109..bb11316 100644
+--- a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
++++ b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+@@ -83,6 +83,8 @@ private slots:
+     void setRecord();
+     void insertRow_data() { generic_data_with_strategies(); }
+     void insertRow();
++    void insertRowFailure_data() { generic_data_with_strategies(); }
++    void insertRowFailure();
+     void insertRecord_data() { generic_data(); }
+     void insertRecord();
+     void insertMultiRecords_data() { generic_data(); }
+@@ -161,7 +163,8 @@ void tst_QSqlTableModel::dropTestTables()
+                    << qTableName("test4", __FILE__)
+                    << qTableName("emptytable", __FILE__)
+                    << qTableName("bigtable", __FILE__)
+-                   << qTableName("foo", __FILE__);
++                   << qTableName("foo", __FILE__)
++                   << qTableName("pktest", __FILE__);
+         if (testWhiteSpaceNames(db.driverName()))
+             tableNames << qTableName("qtestw hitespace", db.driver());
+ 
+@@ -197,6 +200,8 @@ void tst_QSqlTableModel::createTestTables()
+             QString qry = "create table " + qTableName("qtestw hitespace", db.driver()) + " ("+ db.driver()->escapeIdentifier("a field", QSqlDriver::FieldName) + " int)";
+             QVERIFY_SQL( q, exec(qry));
+         }
++
++        QVERIFY_SQL( q, exec("create table "+qTableName("pktest", __FILE__)+"(id int not null primary key, a varchar(20))"));
+     }
+ }
+ 
+@@ -414,7 +419,7 @@ void tst_QSqlTableModel::setRecord()
+                 model.submit();
+             else {
+                 // dataChanged() emitted by selectRow() as well as setRecord()
+-                if ((QSqlTableModel::EditStrategy)submitpolicy == QSqlTableModel::OnFieldChange)
++                if ((QSqlTableModel::EditStrategy)submitpolicy != QSqlTableModel::OnManualSubmit)
+                     QCOMPARE(spy.count(), 2);
+                 else
+                     QCOMPARE(spy.count(), 1);
+@@ -541,6 +546,65 @@ void tst_QSqlTableModel::insertRow()
+     QCOMPARE(model.data(model.index(3, 2)).toInt(), 2);
+ }
+ 
++void tst_QSqlTableModel::insertRowFailure()
++{
++    QFETCH(QString, dbName);
++    QSqlDatabase db = QSqlDatabase::database(dbName);
++    QFETCH(int, submitpolicy_i);
++    QSqlTableModel::EditStrategy submitpolicy = (QSqlTableModel::EditStrategy) submitpolicy_i;
++    CHECK_DATABASE(db);
++
++    QSqlTableModel model(0, db);
++    model.setTable(qTableName("pktest", __FILE__));
++    model.setEditStrategy(submitpolicy);
++
++    QSqlRecord values = model.record();
++    values.setValue(0, 42);
++    values.setGenerated(0, true);
++    values.setValue(1, QString("blah"));
++    values.setGenerated(1, true);
++
++    // populate 1 row
++    QVERIFY_SQL(model, insertRecord(0, values));
++    QVERIFY_SQL(model, submitAll());
++    QVERIFY_SQL(model, select());
++    QCOMPARE(model.rowCount(), 1);
++    QCOMPARE(model.data(model.index(0, 0)).toInt(), 42);
++    QCOMPARE(model.data(model.index(0, 1)).toString(), QString("blah"));
++
++    // primary key conflict will succeed in model but fail in database
++    QVERIFY_SQL(model, insertRow(0));
++    QVERIFY_SQL(model, setData(model.index(0, 0), 42));
++    QVERIFY_SQL(model, setData(model.index(0, 1), "conflict"));
++    QFAIL_SQL(model, submitAll());
++
++    // failed insert is still cached
++    QCOMPARE(model.rowCount(), 2);
++    QCOMPARE(model.data(model.index(0, 1)).toString(), QString("conflict"));
++    QCOMPARE(model.data(model.index(1, 1)).toString(), QString("blah"));
++
++    // cached insert affects subsequent operations
++    values.setValue(1, QString("spam"));
++    if (submitpolicy != QSqlTableModel::OnManualSubmit) {
++        QFAIL_SQL(model, setData(model.index(1, 1), QString("eggs")));
++        QCOMPARE(model.data(model.index(1, 1)).toString(), QString("blah"));
++        QFAIL_SQL(model, setRecord(1, values));
++        QCOMPARE(model.data(model.index(1, 1)).toString(), QString("blah"));
++    } else {
++        QVERIFY_SQL(model, setData(model.index(1, 1), QString("eggs")));
++        QCOMPARE(model.data(model.index(1, 1)).toString(), QString("eggs"));
++        QVERIFY_SQL(model, setRecord(1, values));
++        QCOMPARE(model.data(model.index(1, 1)).toString(), QString("spam"));
++    }
++
++    // restore empty table
++    model.revertAll();
++    QVERIFY_SQL(model, removeRow(0));
++    QVERIFY_SQL(model, submitAll());
++    QVERIFY_SQL(model, select());
++    QCOMPARE(model.rowCount(), 0);
++}
++
+ void tst_QSqlTableModel::insertRecord()
+ {
+     QFETCH(QString, dbName);
+@@ -1026,7 +1090,7 @@ void tst_QSqlTableModel::isDirty()
+     QSqlRecord newvals = model.record(0);
+     newvals.setValue(1, QString("sam i am"));
+     newvals.setGenerated(1, true);
+-    if (submitpolicy != QSqlTableModel::OnFieldChange) {
++    if (submitpolicy == QSqlTableModel::OnManualSubmit) {
+         // setRecord() followed by revertAll()
+         QCOMPARE(model.data(model.index(0, 1)).toString(), QString("harry"));
+         QVERIFY_SQL(model, setRecord(0, newvals));
+@@ -1054,7 +1118,7 @@ void tst_QSqlTableModel::isDirty()
+     QCOMPARE(model.data(model.index(0, 1)).toString(), QString("harry"));
+     QVERIFY_SQL(model, setRecord(0, newvals));
+     QCOMPARE(model.data(model.index(0, 1)).toString(), QString("sam i am"));
+-    if (submitpolicy != QSqlTableModel::OnFieldChange) {
++    if (submitpolicy == QSqlTableModel::OnManualSubmit) {
+         QVERIFY_SQL(model, isDirty());
+         QVERIFY_SQL(model, isDirty(model.index(0, 1)));
+     }

@@ -1,0 +1,552 @@
+diff --git a/src/serialportengine_p.h b/src/serialportengine_p.h
+index f7332bf..690e897 100755
+--- a/src/serialportengine_p.h
++++ b/src/serialportengine_p.h
+@@ -116,6 +116,7 @@ public:
+ 
+ protected:
+     virtual void detectDefaultSettings() = 0;
++    virtual SerialPort::PortError decodeSystemError() const = 0;
+ 
+ protected:
+     SerialPortPrivate *dptr;
+diff --git a/src/serialportengine_symbian.cpp b/src/serialportengine_symbian.cpp
+index 427cc3c..f8a6253 100755
+--- a/src/serialportengine_symbian.cpp
++++ b/src/serialportengine_symbian.cpp
+@@ -70,8 +70,6 @@
+ #include <f32file.h>
+ 
+ #include <QtCore/qregexp.h>
+-//#include <QtCore/QDebug>
+-
+ 
+ // Physical device driver.
+ #if defined (__WINS__)
+@@ -129,6 +127,7 @@ QT_BEGIN_NAMESPACE_SERIALPORT
+     SerialPortPrivate is used to call some common methods.
+ */
+ SymbianSerialPortEngine::SymbianSerialPortEngine(SerialPortPrivate *d)
++    : m_errno(KErrNone)
+ {
+     Q_ASSERT(d);
+     // Impl me
+@@ -169,50 +168,39 @@ bool SymbianSerialPortEngine::open(const QString &location, QIODevice::OpenMode
+     }
+ 
+     RCommServ server;
+-    TInt r = server.Connect();
+-    if (r != KErrNone) {
+-        dptr->setError(SerialPort::UnknownPortError);
++    m_errno = server.Connect();
++    if (m_errno != KErrNone) {
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+     if (location.contains("BTCOMM"))
+-        r = server.LoadCommModule(KBluetoothModuleName);
++        m_errno = server.LoadCommModule(KBluetoothModuleName);
+     else if (location.contains("IRCOMM"))
+-        r = server.LoadCommModule(KInfraRedModuleName);
++        m_errno = server.LoadCommModule(KInfraRedModuleName);
+     else if (location.contains("ACM"))
+-        r = server.LoadCommModule(KACMModuleName);
++        m_errno = server.LoadCommModule(KACMModuleName);
+     else
+-        r = server.LoadCommModule(KRS232ModuleName);
++        m_errno = server.LoadCommModule(KRS232ModuleName);
+ 
+-    if (r != KErrNone) {
+-        dptr->setError(SerialPort::UnknownPortError);
++    if (m_errno != KErrNone) {
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+     // In Symbian OS port opening only in R/W mode !?
+     TPtrC portName(static_cast<const TUint16*>(location.utf16()), location.length());
+-    r = m_descriptor.Open(server, portName, ECommExclusive);
+-
+-    if (r != KErrNone) {
+-        switch (r) {
+-        case KErrPermissionDenied:
+-            dptr->setError(SerialPort::NoSuchDeviceError);
+-            break;
+-        case KErrLocked:
+-        case KErrAccessDenied:
+-            dptr->setError(SerialPort::PermissionDeniedError);
+-            break;
+-        default:
+-            dptr->setError(SerialPort::UnknownPortError);
+-            break;
+-        }
++    m_errno = m_descriptor.Open(server, portName, ECommExclusive);
++
++    if (m_errno != KErrNone) {
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+     // Save current port settings.
+-    r = m_descriptor.Config(m_restoredSettings);
+-    if (r != KErrNone) {
+-        dptr->setError(SerialPort::UnknownPortError);
++    m_errno = m_descriptor.Config(m_restoredSettings);
++    if (m_errno != KErrNone) {
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+@@ -414,9 +402,9 @@ qint64 SymbianSerialPortEngine::read(char *data, qint64 len)
+     TRequestStatus status;
+     m_descriptor.Read(status, TTimeIntervalMicroSeconds32(0), buffer);
+     User::WaitForRequest(status);
+-    TInt err = status.Int();
++    TInt r = status.Int();
+ 
+-    if (err != KErrNone)
++    if (r != KErrNone)
+         return -1;
+ 
+     return buffer.Length();
+@@ -446,9 +434,9 @@ qint64 SymbianSerialPortEngine::write(const char *data, qint64 len)
+     TRequestStatus status;
+     m_descriptor.Write(status, buffer);
+     User::WaitForRequest(status);
+-    TInt err = status.Int();
++    TInt r = status.Int();
+ 
+-    if (err != KErrNone)
++    if (r != KErrNone)
+         return -1;
+ 
+     // FIXME: How to get the actual number of bytes written?
+@@ -604,8 +592,8 @@ bool SymbianSerialPortEngine::setDataBits(SerialPort::DataBits dataBits)
+         m_currentSettings().iDataBits = EData8;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentSettings().iDataBits = EData8;
++        break;
+     }
+ 
+     return updateCommConfig();
+@@ -637,8 +625,8 @@ bool SymbianSerialPortEngine::setParity(SerialPort::Parity parity)
+         m_currentSettings().iParity = EParitySpace;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentSettings().iParity = EParityNone;
++        break;
+     }
+ 
+     return updateCommConfig();
+@@ -661,8 +649,8 @@ bool SymbianSerialPortEngine::setStopBits(SerialPort::StopBits stopBits)
+         m_currentSettings().iStopBits = EStop2;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentSettings().iStopBits = EStop1;
++        break;
+     }
+ 
+     return updateCommConfig();
+@@ -689,8 +677,8 @@ bool SymbianSerialPortEngine::setFlowControl(SerialPort::FlowControl flow)
+         m_currentSettings().iHandshake = KConfigObeyXoff | KConfigSendXoff;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentSettings().iHandshake = KConfigFailDSR;
++        break;
+     }
+ 
+     return updateCommConfig();
+@@ -933,6 +921,30 @@ void SymbianSerialPortEngine::detectDefaultSettings()
+         dptr->options.flow = SerialPort::UnknownFlowControl;
+ }
+ 
++/*!
++    Converts the platform-depend code of system error to the
++    corresponding value a SerialPort::PortError.
++*/
++SerialPort::PortError SymbianSerialPortEngine::decodeSystemError() const
++{
++    SerialPort::PortError error;
++    switch (m_errno) {
++    case KErrPermissionDenied:
++        error = SerialPort::NoSuchDeviceError;
++        break;
++    case KErrLocked:
++        error = SerialPort::PermissionDeniedError;
++        break;
++    case KErrAccessDenied:
++        error = SerialPort::PermissionDeniedError;
++        break;
++    default:
++        error = SerialPort::UnknownPortError;
++        break;
++    }
++    return error;
++}
++
+ /* Private methods */
+ 
+ /*!
+diff --git a/src/serialportengine_symbian_p.h b/src/serialportengine_symbian_p.h
+index 2757dcf..649fa12 100755
+--- a/src/serialportengine_symbian_p.h
++++ b/src/serialportengine_symbian_p.h
+@@ -106,6 +106,7 @@ public:
+ 
+ protected:
+     virtual void detectDefaultSettings();
++    virtual SerialPort::PortError decodeSystemError() const;
+     //virtual bool eventFilter(QObject *obj, QEvent *e);
+ 
+ private:
+@@ -116,6 +117,7 @@ private:
+     TCommConfig m_restoredSettings;
+     RComm m_descriptor;
+     mutable RTimer m_selectTimer;
++    TInt m_errno;
+ };
+ 
+ QT_END_NAMESPACE_SERIALPORT
+diff --git a/src/serialportengine_unix.cpp b/src/serialportengine_unix.cpp
+index d5be7cc..3934f95 100755
+--- a/src/serialportengine_unix.cpp
++++ b/src/serialportengine_unix.cpp
+@@ -178,17 +178,7 @@ bool UnixSerialPortEngine::open(const QString &location, QIODevice::OpenMode mod
+     m_descriptor = ::open(location.toLocal8Bit().constData(), flags);
+ 
+     if (m_descriptor == -1) {
+-        switch (errno) {
+-        case ENODEV:
+-            dptr->setError(SerialPort::NoSuchDeviceError);
+-            break;
+-        case EACCES:
+-            dptr->setError(SerialPort::PermissionDeniedError);
+-            break;
+-        default:
+-            dptr->setError(SerialPort::UnknownPortError);
+-            break;
+-        }
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+@@ -206,7 +196,7 @@ bool UnixSerialPortEngine::open(const QString &location, QIODevice::OpenMode mod
+ 
+     // Save current port settings.
+     if (::tcgetattr(m_descriptor, &m_restoredTermios) == -1) {
+-        dptr->setError(SerialPort::UnknownPortError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     ::memcpy(&m_currentTermios, &m_restoredTermios, sizeof(struct termios));
+@@ -700,9 +690,8 @@ bool UnixSerialPortEngine::setRate(qint32 rate, SerialPort::Directions dir)
+ 
+     if (ret) // finally, set rate
+         ret = updateTermios();
+-
+-    if (!ret)
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
++    else
++        dptr->setError(decodeSystemError());
+     return ret;
+ }
+ 
+@@ -730,8 +719,8 @@ bool UnixSerialPortEngine::setDataBits(SerialPort::DataBits dataBits)
+         m_currentTermios.c_cflag |= CS8;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentTermios.c_cflag |= CS8;
++        break;
+     }
+     return updateTermios();
+ }
+@@ -799,8 +788,8 @@ bool UnixSerialPortEngine::setStopBits(SerialPort::StopBits stopBits)
+         m_currentTermios.c_cflag |= CSTOPB;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentTermios.c_cflag &= ~CSTOPB;
++        break;
+     }
+     return updateTermios();
+ }
+@@ -829,8 +818,9 @@ bool UnixSerialPortEngine::setFlowControl(SerialPort::FlowControl flow)
+         m_currentTermios.c_iflag |= IXON | IXOFF | IXANY;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentTermios.c_cflag &= ~CRTSCTS;
++        m_currentTermios.c_iflag &= ~(IXON | IXOFF | IXANY);
++        break;
+     }
+     return updateTermios();
+ }
+@@ -866,8 +856,8 @@ bool UnixSerialPortEngine::setDataErrorPolicy(SerialPort::DataErrorPolicy policy
+         m_currentTermios.c_iflag |= parmrkMask | INPCK;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentTermios.c_iflag &= ~INPCK;
++        break;
+     }
+     return updateTermios();
+ }
+@@ -1220,6 +1210,33 @@ void UnixSerialPortEngine::detectDefaultSettings()
+ }
+ 
+ /*!
++    Converts the platform-depend code of system error to the
++    corresponding value a SerialPort::PortError.
++*/
++SerialPort::PortError UnixSerialPortEngine::decodeSystemError() const
++{
++    SerialPort::PortError error;
++    switch (errno) {
++    case ENODEV:
++        error = SerialPort::NoSuchDeviceError;
++        break;
++    case EACCES:
++        error = SerialPort::PermissionDeniedError;
++        break;
++    case EBUSY:
++        error = SerialPort::PermissionDeniedError;
++        break;
++    case ENOTTY:
++        error = SerialPort::IoError;
++        break;
++    default:
++        error = SerialPort::UnknownPortError;
++        break;
++    }
++    return error;
++}
++
++/*!
+     POSIX event loop for notification subsystem.
+     Asynchronously in event loop continuous mode tracking the
+     events from the serial port, as: fderror, fdread, and fdwrite.
+@@ -1255,7 +1272,7 @@ bool UnixSerialPortEngine::eventFilter(QObject *obj, QEvent *e)
+ bool UnixSerialPortEngine::updateTermios()
+ {
+     if (::tcsetattr(m_descriptor, TCSANOW, &m_currentTermios) == -1) {
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     return true;
+diff --git a/src/serialportengine_unix_p.h b/src/serialportengine_unix_p.h
+index fd137b8..029c058 100755
+--- a/src/serialportengine_unix_p.h
++++ b/src/serialportengine_unix_p.h
+@@ -111,6 +111,7 @@ public:
+ 
+ protected:
+     virtual void detectDefaultSettings();
++    virtual SerialPort::PortError decodeSystemError() const;
+     virtual bool eventFilter(QObject *obj, QEvent *e);
+ 
+ private:
+diff --git a/src/serialportengine_win.cpp b/src/serialportengine_win.cpp
+index ae1ca50..fcbeb8f 100755
+--- a/src/serialportengine_win.cpp
++++ b/src/serialportengine_win.cpp
+@@ -216,24 +216,14 @@ bool WinSerialPortEngine::open(const QString &location, QIODevice::OpenMode mode
+                                 desiredAccess, shareMode, 0, OPEN_EXISTING, flagsAndAttributes, 0);
+ 
+     if (m_descriptor == INVALID_HANDLE_VALUE) {
+-        switch (::GetLastError()) {
+-        case ERROR_FILE_NOT_FOUND:
+-            dptr->setError(SerialPort::NoSuchDeviceError);
+-            break;
+-        case ERROR_ACCESS_DENIED:
+-            dptr->setError(SerialPort::PermissionDeniedError);
+-            break;
+-        default:
+-            dptr->setError(SerialPort::UnknownPortError);
+-            break;
+-        }
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ 
+     // Save current DCB port settings.
+     DWORD confSize = sizeof(DCB);
+     if (::GetCommState(m_descriptor, &m_restoredDcb) == 0) {
+-        dptr->setError(SerialPort::UnknownPortError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     ::memcpy(&m_currentDcb, &m_restoredDcb, confSize);
+@@ -253,7 +243,7 @@ bool WinSerialPortEngine::open(const QString &location, QIODevice::OpenMode mode
+     // Save current port timeouts.
+     confSize = sizeof(COMMTIMEOUTS);
+     if (::GetCommTimeouts(m_descriptor, &m_restoredCommTimeouts) == 0) {
+-        dptr->setError(SerialPort::UnknownPortError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     ::memcpy(&m_currentCommTimeouts, &m_restoredCommTimeouts, confSize);
+@@ -268,7 +258,7 @@ bool WinSerialPortEngine::open(const QString &location, QIODevice::OpenMode mode
+ 
+ #if !defined (Q_OS_WINCE)
+     if (!createEvents(rxflag, txflag)) {
+-        dptr->setError(SerialPort::UnknownPortError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+ #endif
+@@ -754,21 +744,22 @@ bool WinSerialPortEngine::setParity(SerialPort::Parity parity)
+         m_currentDcb.Parity = NOPARITY;
+         m_currentDcb.fParity = false;
+         break;
+-    case SerialPort::SpaceParity:
+-        m_currentDcb.Parity = SPACEPARITY;
+-        break;
+-    case SerialPort::MarkParity:
+-        m_currentDcb.Parity = MARKPARITY;
++    case SerialPort::OddParity:
++        m_currentDcb.Parity = ODDPARITY;
+         break;
+     case SerialPort::EvenParity:
+         m_currentDcb.Parity = EVENPARITY;
+         break;
+-    case SerialPort::OddParity:
+-        m_currentDcb.Parity = ODDPARITY;
++    case SerialPort::MarkParity:
++        m_currentDcb.Parity = MARKPARITY;
++        break;
++    case SerialPort::SpaceParity:
++        m_currentDcb.Parity = SPACEPARITY;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentDcb.Parity = NOPARITY;
++        m_currentDcb.fParity = false;
++        break;
+     }
+     return updateDcb();
+ }
+@@ -793,8 +784,8 @@ bool WinSerialPortEngine::setStopBits(SerialPort::StopBits stopBits)
+         m_currentDcb.StopBits = TWOSTOPBITS;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentDcb.StopBits = ONESTOPBIT;
++        break;
+     }
+     return updateDcb();
+ }
+@@ -813,21 +804,27 @@ bool WinSerialPortEngine::setFlowControl(SerialPort::FlowControl flow)
+     case SerialPort::NoFlowControl:
+         m_currentDcb.fOutxCtsFlow = false;
+         m_currentDcb.fRtsControl = RTS_CONTROL_DISABLE;
+-        m_currentDcb.fInX = m_currentDcb.fOutX = false;
++        m_currentDcb.fInX = false;
++        m_currentDcb.fOutX = false;
+         break;
+     case SerialPort::SoftwareControl:
+         m_currentDcb.fOutxCtsFlow = false;
+         m_currentDcb.fRtsControl = RTS_CONTROL_DISABLE;
+-        m_currentDcb.fInX = m_currentDcb.fOutX = true;
++        m_currentDcb.fInX = true;
++        m_currentDcb.fOutX = true;
+         break;
+     case SerialPort::HardwareControl:
+         m_currentDcb.fOutxCtsFlow = true;
+         m_currentDcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
+-        m_currentDcb.fInX = m_currentDcb.fOutX = false;
++        m_currentDcb.fInX = false;
++        m_currentDcb.fOutX = false;
+         break;
+     default:
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
+-        return false;
++        m_currentDcb.fOutxCtsFlow = false;
++        m_currentDcb.fRtsControl = RTS_CONTROL_DISABLE;
++        m_currentDcb.fInX = false;
++        m_currentDcb.fOutX = false;
++        break;
+     }
+     return updateDcb();
+ }
+@@ -1121,6 +1118,33 @@ void WinSerialPortEngine::detectDefaultSettings()
+         dptr->options.flow = SerialPort::UnknownFlowControl;
+ }
+ 
++/*!
++    Converts the platform-depend code of system error to the
++    corresponding value a SerialPort::PortError.
++*/
++SerialPort::PortError WinSerialPortEngine::decodeSystemError() const
++{
++    SerialPort::PortError error;
++    switch (::GetLastError()) {
++    case ERROR_FILE_NOT_FOUND:
++        error = SerialPort::NoSuchDeviceError;
++        break;
++    case ERROR_ACCESS_DENIED:
++        error = SerialPort::PermissionDeniedError;
++        break;
++    case ERROR_INVALID_HANDLE:
++        error = SerialPort::DeviceIsNotOpenedError;
++        break;
++    case ERROR_INVALID_PARAMETER:
++        error = SerialPort::UnsupportedPortOperationError;
++        break;
++    default:
++        error = SerialPort::UnknownPortError;
++        break;
++    }
++    return error;
++}
++
+ #if defined (Q_OS_WINCE)
+ 
+ /*!
+@@ -1320,7 +1344,7 @@ bool WinSerialPortEngine::updateDcb()
+     ::SetCommMask(m_descriptor, 0);
+ #endif
+     if (::SetCommState(m_descriptor, &m_currentDcb) == 0) {
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     return true;
+@@ -1335,7 +1359,7 @@ bool WinSerialPortEngine::updateDcb()
+ bool WinSerialPortEngine::updateCommTimeouts()
+ {
+     if (::SetCommTimeouts(m_descriptor, &m_currentCommTimeouts) == 0) {
+-        dptr->setError(SerialPort::UnsupportedPortOperationError);
++        dptr->setError(decodeSystemError());
+         return false;
+     }
+     return true;
+diff --git a/src/serialportengine_win_p.h b/src/serialportengine_win_p.h
+index 1aa709b..7ae3918 100755
+--- a/src/serialportengine_win_p.h
++++ b/src/serialportengine_win_p.h
+@@ -168,6 +168,7 @@ public:
+ 
+ protected:
+     virtual void detectDefaultSettings();
++    virtual SerialPort::PortError decodeSystemError() const;
+ 
+ #if defined (Q_OS_WINCE)
+     virtual void run();

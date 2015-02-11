@@ -1,0 +1,303 @@
+diff --git a/src/3rdparty/freetype/src/gzip/zutil.h b/src/3rdparty/freetype/src/gzip/zutil.h
+index 8e3c69a..9560b48 100644
+--- a/src/3rdparty/freetype/src/gzip/zutil.h
++++ b/src/3rdparty/freetype/src/gzip/zutil.h
+@@ -182,7 +182,7 @@ typedef unsigned long  ulg;
+ #endif
+ 
+ /* Diagnostic functions */
+-#ifdef DEBUG
++#if defined(DEBUG) && !defined(_WIN32_WCE)
+ #  include <stdio.h>
+    extern int z_verbose;
+    extern void z_error    OF((char *m));
+diff --git a/src/platformsupport/fontdatabases/basic/qbasicfontdatabase.cpp b/src/platformsupport/fontdatabases/basic/qbasicfontdatabase.cpp
+index e96659d..68aafd8 100644
+--- a/src/platformsupport/fontdatabases/basic/qbasicfontdatabase.cpp
++++ b/src/platformsupport/fontdatabases/basic/qbasicfontdatabase.cpp
+@@ -48,6 +48,7 @@
+ #include <QtCore/QLibraryInfo>
+ #include <QtCore/QDir>
+ #include <QtCore/QUuid>
++#include <QtCore/QtEndian>
+ 
+ #undef QT_NO_FREETYPE
+ #include <QtGui/private/qfontengine_ft_p.h>
+@@ -135,6 +136,37 @@ static int requiredUnicodeBits[QFontDatabase::WritingSystemsCount][2] = {
+     { 14, 127 },
+ };
+ 
++typedef struct {
++    quint16 majorVersion;
++    quint16 minorVersion;
++    quint16 numTables;
++    quint16 searchRange;
++    quint16 entrySelector;
++    quint16 rangeShift;
++} OFFSET_TABLE;
++
++typedef struct {
++    quint32 tag;
++    quint32 checkSum;
++    quint32 offset;
++    quint32 length;
++} TABLE_DIRECTORY;
++
++typedef struct {
++    quint16 fontSelector;
++    quint16 nrCount;
++    quint16 storageOffset;
++} NAME_TABLE_HEADER;
++
++typedef struct {
++    quint16 platformID;
++    quint16 encodingID;
++    quint16 languageID;
++    quint16 nameID;
++    quint16 stringLength;
++    quint16 stringOffset;
++} NAME_RECORD;
++
+ QSupportedWritingSystems QBasicFontDatabase::determineWritingSystemsFromTrueTypeBits(quint32 unicodeRange[4], quint32 codePageRange[2])
+ {
+     QSupportedWritingSystems writingSystems;
+@@ -430,4 +462,92 @@ QStringList QBasicFontDatabase::addTTFile(const QByteArray &fontData, const QByt
+     return families;
+ }
+ 
++QString QBasicFontDatabase::fontNameFromTTFile(const QString &filename)
++{
++    QFile f(filename);
++    QString retVal;
++    qint64 bytesRead;
++    qint64 bytesToRead;
++
++    if (f.open(QIODevice::ReadOnly)) {
++        OFFSET_TABLE ttOffsetTable;
++        bytesToRead = sizeof(OFFSET_TABLE);
++        bytesRead = f.read((char*)&ttOffsetTable, bytesToRead);
++        if (bytesToRead != bytesRead)
++            return retVal;
++        ttOffsetTable.numTables = qFromBigEndian(ttOffsetTable.numTables);
++        ttOffsetTable.majorVersion = qFromBigEndian(ttOffsetTable.majorVersion);
++        ttOffsetTable.minorVersion = qFromBigEndian(ttOffsetTable.minorVersion);
++
++        if (ttOffsetTable.majorVersion != 1 || ttOffsetTable.minorVersion != 0)
++            return retVal;
++
++        TABLE_DIRECTORY tblDir;
++        bool found = false;
++
++        for (int i = 0; i < ttOffsetTable.numTables; i++) {
++            bytesToRead = sizeof(TABLE_DIRECTORY);
++            bytesRead = f.read((char*)&tblDir, bytesToRead);
++            if (bytesToRead != bytesRead)
++                return retVal;
++            if (qFromBigEndian(tblDir.tag) == MAKE_TAG('n', 'a', 'm', 'e')) {
++                found = true;
++                tblDir.length = qFromBigEndian(tblDir.length);
++                tblDir.offset = qFromBigEndian(tblDir.offset);
++                break;
++            }
++        }
++
++        if (found) {
++            f.seek(tblDir.offset);
++            NAME_TABLE_HEADER ttNTHeader;
++            bytesToRead = sizeof(NAME_TABLE_HEADER);
++            bytesRead = f.read((char*)&ttNTHeader, bytesToRead);
++            if (bytesToRead != bytesRead)
++                return retVal;
++            ttNTHeader.nrCount = qFromBigEndian(ttNTHeader.nrCount);
++            ttNTHeader.storageOffset = qFromBigEndian(ttNTHeader.storageOffset);
++            NAME_RECORD ttRecord;
++            found = false;
++
++            for (int i = 0; i < ttNTHeader.nrCount; i++) {
++                bytesToRead = sizeof(NAME_RECORD);
++                bytesRead = f.read((char*)&ttRecord, bytesToRead);
++                if (bytesToRead != bytesRead)
++                    return retVal;
++                ttRecord.nameID = qFromBigEndian(ttRecord.nameID);
++                if (ttRecord.nameID == 1) {
++                    ttRecord.stringLength = qFromBigEndian(ttRecord.stringLength);
++                    ttRecord.stringOffset = qFromBigEndian(ttRecord.stringOffset);
++                    int nPos = f.pos();
++                    f.seek(tblDir.offset + ttRecord.stringOffset + ttNTHeader.storageOffset);
++
++                    QByteArray nameByteArray = f.read(ttRecord.stringLength);
++                    if (!nameByteArray.isEmpty()) {
++                        if (ttRecord.encodingID == 256 || ttRecord.encodingID == 768) {
++                            //This is UTF-16 in big endian
++                            int stringLength = ttRecord.stringLength / 2;
++                            retVal.resize(stringLength);
++                            QChar *data = retVal.data();
++                            const ushort *srcData = (const ushort *)nameByteArray.data();
++                            for (int i = 0; i < stringLength; ++i)
++                                data[i] = qFromBigEndian(srcData[i]);
++                            return retVal;
++                        } else if (ttRecord.encodingID == 0) {
++                            //This is Latin1
++                            retVal = QString::fromLatin1(nameByteArray);
++                        } else {
++                            qWarning("Could not retrieve Font name from file: %s", qPrintable(QDir::toNativeSeparators(filename)));
++                        }
++                        break;
++                    }
++                    f.seek(nPos);
++                }
++            }
++        }
++        f.close();
++    }
++    return retVal;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/platformsupport/fontdatabases/basic/qbasicfontdatabase_p.h b/src/platformsupport/fontdatabases/basic/qbasicfontdatabase_p.h
+index eb4b11c..832acd9 100644
+--- a/src/platformsupport/fontdatabases/basic/qbasicfontdatabase_p.h
++++ b/src/platformsupport/fontdatabases/basic/qbasicfontdatabase_p.h
+@@ -66,6 +66,7 @@ public:
+ 
+     static QStringList addTTFile(const QByteArray &fontData, const QByteArray &file);
+     static QSupportedWritingSystems determineWritingSystemsFromTrueTypeBits(quint32 unicodeRange[4], quint32 codePageRange[2]);
++    static QString fontNameFromTTFile(const QString &filename);
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp b/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
+index ab85b58..7d72e10 100644
+--- a/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
++++ b/src/plugins/platforms/windows/qwindowsfontdatabase_ft.cpp
+@@ -47,6 +47,7 @@
+ #include FT_TRUETYPE_TABLES_H
+ 
+ #include <QtCore/QDir>
++#include <QtCore/QDirIterator>
+ #include <QtCore/QSettings>
+ #include <QtGui/private/qfontengine_ft_p.h>
+ #include <QtGui/QGuiApplication>
+@@ -189,6 +190,7 @@ static bool addFontToDatabase(QString familyName, const QString &scriptName,
+             writingSystems.setSupported(ws);
+     }
+ 
++#ifndef Q_OS_WINCE
+     const QSettings fontRegistry(QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"),
+                                 QSettings::NativeFormat);
+ 
+@@ -225,6 +227,51 @@ static bool addFontToDatabase(QString familyName, const QString &scriptName,
+         if (!value.isEmpty())
+             break;
+     }
++#else
++    QString value;
++    int index = 0;
++
++    static QHash<QString, QString> fontCache;
++
++    if (fontCache.isEmpty()) {
++        QSettings settings(QSettings::SystemScope, QStringLiteral("Qt-Project"), QStringLiteral("Qtbase"));
++        settings.beginGroup(QStringLiteral("CEFontCache"));
++
++        foreach (const QString &fontName, settings.allKeys()) {
++            const QString fontFileName = settings.value(fontName).toString();
++            fontCache.insert(fontName, fontFileName);
++        }
++
++        settings.endGroup(); // CEFontCache
++    }
++
++    value = fontCache.value(faceName);
++
++    //Fallback if we havent cached the font yet or the font got removed/renamed iterate again over all fonts
++    if (value.isEmpty() || !QFile::exists(value)) {
++        QSettings settings(QSettings::SystemScope, QStringLiteral("Qt-Project"), QStringLiteral("Qtbase"));
++        settings.beginGroup(QStringLiteral("CEFontCache"));
++
++        //empty the cache first, as it seems that it is dirty
++        foreach (const QString &fontName, settings.allKeys())
++            settings.remove(fontName);
++
++        QDirIterator it(QStringLiteral("/Windows"), QStringList(QStringLiteral("*.ttf")), QDir::Files | QDir::Hidden | QDir::System);
++
++        while (it.hasNext()) {
++            const QString fontFile = it.next();
++            const QString fontName = QBasicFontDatabase::fontNameFromTTFile(fontFile);
++            if (fontName.isEmpty())
++                continue;
++            fontCache.insert(fontName, fontFile);
++            settings.setValue(fontName, fontFile);
++        }
++
++        value = fontCache.value(faceName);
++
++        settings.endGroup(); // CEFontCache
++    }
++#endif
+ 
+     if (value.isEmpty())
+         return false;
+diff --git a/tests/auto/gui/text/qfontdatabase/qfontdatabase.pro b/tests/auto/gui/text/qfontdatabase/qfontdatabase.pro
+index 0a99e84..3111f51 100644
+--- a/tests/auto/gui/text/qfontdatabase/qfontdatabase.pro
++++ b/tests/auto/gui/text/qfontdatabase/qfontdatabase.pro
+@@ -4,6 +4,7 @@ TARGET = tst_qfontdatabase
+ SOURCES  += tst_qfontdatabase.cpp
+ DEFINES += SRCDIR=\\\"$$PWD\\\"
+ QT += testlib
++!mac: QT += core-private gui-private platformsupport-private
+ 
+ wince* {
+     additionalFiles.files = FreeMono.ttf
+diff --git a/tests/auto/gui/text/qfontdatabase/tst_qfontdatabase.cpp b/tests/auto/gui/text/qfontdatabase/tst_qfontdatabase.cpp
+index ef37b53..a87513e 100644
+--- a/tests/auto/gui/text/qfontdatabase/tst_qfontdatabase.cpp
++++ b/tests/auto/gui/text/qfontdatabase/tst_qfontdatabase.cpp
+@@ -44,6 +44,9 @@
+ #include <qfontdatabase.h>
+ #include <qfontinfo.h>
+ #include <qfontmetrics.h>
++#ifndef Q_OS_MAC
++#include <QtPlatformSupport/private/qbasicfontdatabase_p.h>
++#endif
+ 
+ class tst_QFontDatabase : public QObject
+ {
+@@ -73,6 +76,10 @@ private slots:
+ 
+     void addAppFont_data();
+     void addAppFont();
++
++#ifndef Q_OS_MAC
++    void fontName();
++#endif
+ };
+ 
+ tst_QFontDatabase::tst_QFontDatabase()
+@@ -268,5 +275,13 @@ void tst_QFontDatabase::addAppFont()
+     QCOMPARE(db.families(), oldFamilies);
+ }
+ 
++#ifndef Q_OS_MAC
++void tst_QFontDatabase::fontName()
++{
++    QString fontName = QBasicFontDatabase::fontNameFromTTFile(QStringLiteral("FreeMono.ttf"));
++    QCOMPARE(fontName, QStringLiteral("FreeMono"));
++}
++#endif
++
+ QTEST_MAIN(tst_QFontDatabase)
+ #include "tst_qfontdatabase.moc"
+diff --git a/tools/configure/configureapp.cpp b/tools/configure/configureapp.cpp
+index 8358a00..792bdc4 100644
+--- a/tools/configure/configureapp.cpp
++++ b/tools/configure/configureapp.cpp
+@@ -1482,7 +1482,6 @@ void Configure::applySpecSpecifics()
+         dictionary[ "STYLE_WINDOWSMOBILE" ] = "yes";
+         dictionary[ "STYLE_MOTIF" ]         = "no";
+         dictionary[ "STYLE_CDE" ]           = "no";
+-        dictionary[ "FREETYPE" ]            = "no";
+         dictionary[ "OPENGL" ]              = "no";
+         dictionary[ "OPENSSL" ]             = "no";
+         dictionary[ "RTTI" ]                = "no";

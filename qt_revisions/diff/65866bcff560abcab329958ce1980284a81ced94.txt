@@ -1,0 +1,212 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoaaccessibility.h b/src/plugins/platforms/cocoa/qcocoaaccessibility.h
+index ad2267c..e2a6433 100644
+--- a/src/plugins/platforms/cocoa/qcocoaaccessibility.h
++++ b/src/plugins/platforms/cocoa/qcocoaaccessibility.h
+@@ -44,6 +44,18 @@
+ #include <Cocoa/Cocoa.h>
+ 
+ #include <QtGui>
++#include <qpa/qplatformaccessibility.h>
++
++class QCococaAccessibility : public QPlatformAccessibility
++{
++public:
++    QCococaAccessibility();
++    ~QCococaAccessibility();
++    void notifyAccessibilityUpdate(QAccessibleEvent *event);
++    void setRootObject(QObject *o);
++    void initialize();
++    void cleanup();
++};
+ 
+ namespace QCocoaAccessible {
+ 
+@@ -52,9 +64,9 @@ namespace QCocoaAccessible {
+ 
+     Cocoa accessibility is implemented in the following files:
+ 
++    - qcocoaaccessibility (this file) : QCocoaAccessibility "plugin", conversion and helper functions.
+     - qnsviewaccessibility            : Root accessibility implementation for QNSView
+     - qcocoaaccessibilityelement      : Cocoa accessibility protocol wrapper for QAccessibleInterface
+-    - qcocoaaccessibility (this file) : Conversion and helper functions.
+ 
+     The accessibility implementation wraps QAccessibleInterfaces in QCocoaAccessibleElements, which
+     implements the cocoa accessibility protocol. The root QAccessibleInterface (the one returned
+@@ -70,6 +82,8 @@ bool shouldBeIgnrored(QAccessibleInterface *interface);
+ NSString *getTranslatedAction(const QString &qtAction);
+ NSMutableArray *createTranslatedActionsList(const QStringList &qtActions);
+ QString translateAction(NSString *nsAction);
++bool hasValueAttribute(QAccessibleInterface *interface);
++id getValueAttribute(QAccessibleInterface *interface);
+ 
+ }
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoaaccessibility.mm b/src/plugins/platforms/cocoa/qcocoaaccessibility.mm
+index 4b897fc..2a03829 100644
+--- a/src/plugins/platforms/cocoa/qcocoaaccessibility.mm
++++ b/src/plugins/platforms/cocoa/qcocoaaccessibility.mm
+@@ -39,6 +39,58 @@
+ **
+ ****************************************************************************/
+ #include "qcocoaaccessibility.h"
++#include "qcocoaaccessibilityelement.h"
++#include <qaccessible.h>
++#include <qaccessible2.h>
++#include <private/qcore_mac_p.h>
++
++QCococaAccessibility::QCococaAccessibility()
++{
++
++}
++
++QCococaAccessibility::~QCococaAccessibility()
++{
++
++}
++
++void QCococaAccessibility::notifyAccessibilityUpdate(QAccessibleEvent *event)
++{
++    QObject *object = event->object();
++    if (!object)
++        return;
++
++    QAccessibleInterface *interface = QAccessible::queryAccessibleInterface(object);
++    if (!interface)
++        return;
++
++    switch (event->type()) {
++        case QAccessible::TextInserted :
++        case QAccessible::TextRemoved :
++        case QAccessible::TextUpdated : {
++            QCocoaAccessibleElement *element = [QCocoaAccessibleElement elementWithInterface : interface parent : nil];
++            NSAccessibilityPostNotification(element, NSAccessibilityValueChangedNotification);
++        break; }
++        default:
++            delete interface;
++        break;
++    }
++}
++
++void QCococaAccessibility::setRootObject(QObject *o)
++{
++    Q_UNUSED(o)
++}
++
++void QCococaAccessibility::initialize()
++{
++
++}
++
++void QCococaAccessibility::cleanup()
++{
++
++}
+ 
+ namespace QCocoaAccessible {
+ 
+@@ -218,4 +270,38 @@ QString translateAction(NSString *nsAction)
+     return QString();
+ }
+ 
++bool hasValueAttribute(QAccessibleInterface *interface)
++{
++    const QAccessible::Role qtrole = interface->role();
++    if (qtrole == QAccessible::EditableText) {
++        return true;
++    }
++
++    return false;
++}
++
++id getValueAttribute(QAccessibleInterface *interface)
++{
++    const QAccessible::Role qtrole = interface->role();
++    if (qtrole == QAccessible::EditableText) {
++        if (QAccessibleTextInterface *textInterface = interface->textInterface()) {
++            // VoiceOver will read out the entire text string at once when returning
++            // text as a value. For large text edits the size of the returned string
++            // needs to be limited and text range attributes need to be used instead.
++            // NSTextEdit returns the first sentence as the value, Do the same here:
++            int begin = 0;
++            int end = textInterface->characterCount();
++            // ### call to textAfterOffset hangs. Booo!
++            //if (textInterface->characterCount() > 0)
++            //    textInterface->textAfterOffset(0, QAccessible2::SentenceBoundary, &begin, &end);
++
++            QString text = textInterface->text(begin, end);
++            //qDebug() << "text" << begin << end << text;
++            return QCFString::toNSString(text);
++        }
++    }
++
++    return nil;
++}
++
+ } // namespace QCocoaAccessible
+diff --git a/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm b/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm
+index c392903..cc1d393 100644
+--- a/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm
++++ b/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm
+@@ -96,9 +96,9 @@ static QAccessibleInterface *acast(void *ptr)
+ // attributes
+ 
+ - (NSArray *)accessibilityAttributeNames {
+-    static NSArray *attributes = nil;
+-    if (attributes == nil) {
+-        attributes = [[NSArray alloc] initWithObjects:
++    static NSArray *defaultAttributes = nil;
++    if (defaultAttributes == nil) {
++        defaultAttributes = [[NSArray alloc] initWithObjects:
+         NSAccessibilityRoleAttribute,
+         NSAccessibilityRoleDescriptionAttribute,
+         NSAccessibilityChildrenAttribute,
+@@ -112,6 +112,14 @@ static QAccessibleInterface *acast(void *ptr)
+         NSAccessibilityEnabledAttribute,
+         nil];
+     }
++
++    NSMutableArray *attributes = [[NSMutableArray alloc] initWithCapacity : [defaultAttributes count]];
++    [attributes addObjectsFromArray : defaultAttributes];
++
++    if (QCocoaAccessible::hasValueAttribute(acast(accessibleInterface))) {
++        [attributes addObject : NSAccessibilityValueAttribute];
++    }
++
+     return attributes;
+ }
+ 
+@@ -153,6 +161,13 @@ static QAccessibleInterface *acast(void *ptr)
+         return QCFString::toNSString(acast(accessibleInterface)->text(QAccessible::Name));
+     } else if ([attribute isEqualToString:NSAccessibilityEnabledAttribute]) {
+         return [NSNumber numberWithBool:!acast(accessibleInterface)->state().disabled];
++    } else if ([attribute isEqualToString:NSAccessibilityValueAttribute]) {
++        // VoiceOver asks for the value attribute for all elements. Return nil
++        // if we don't want the element to have a value attribute.
++        if (!QCocoaAccessible::hasValueAttribute(acast(accessibleInterface)))
++            return nil;
++
++        return QCocoaAccessible::getValueAttribute(acast(accessibleInterface));
+     }
+ 
+     return nil;
+diff --git a/src/plugins/platforms/cocoa/qcocoaintegration.mm b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+index a361027..83c3efb 100644
+--- a/src/plugins/platforms/cocoa/qcocoaintegration.mm
++++ b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+@@ -53,6 +53,7 @@
+ #include "qcocoatheme.h"
+ #include "qcocoainputcontext.h"
+ #include "qmacmime.h"
++#include "qcocoaaccessibility.h"
+ 
+ #include <qpa/qplatformaccessibility.h>
+ #include <QtCore/qcoreapplication.h>
+@@ -180,7 +181,7 @@ QCocoaIntegration::QCocoaIntegration()
+     , mEventDispatcher(new QCocoaEventDispatcher())
+     , mInputContext(new QCocoaInputContext)
+ #ifndef QT_NO_ACCESSIBILITY
+-    , mAccessibility(new QPlatformAccessibility)
++    , mAccessibility(new QCococaAccessibility)
+ #endif
+     , mCocoaClipboard(new QCocoaClipboard)
+     , mCocoaDrag(new QCocoaDrag)

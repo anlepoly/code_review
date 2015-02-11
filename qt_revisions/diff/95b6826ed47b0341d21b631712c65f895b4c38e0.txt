@@ -1,0 +1,129 @@
+diff --git a/src/corelib/statemachine/qstatemachine.cpp b/src/corelib/statemachine/qstatemachine.cpp
+index ec4f3de..72f4a12 100644
+--- a/src/corelib/statemachine/qstatemachine.cpp
++++ b/src/corelib/statemachine/qstatemachine.cpp
+@@ -1739,6 +1739,7 @@ void QStateMachinePrivate::registerSignalTransition(QSignalTransition *transitio
+     while (meta->method(signalIndex).attributes() & QMetaMethod::Cloned)
+         --signalIndex;
+ 
++    connectionsMutex.lock();
+     QVector<int> &connectedSignalIndexes = connections[sender];
+     if (connectedSignalIndexes.size() <= signalIndex)
+         connectedSignalIndexes.resize(signalIndex+1);
+@@ -1757,6 +1758,8 @@ void QStateMachinePrivate::registerSignalTransition(QSignalTransition *transitio
+         }
+     }
+     ++connectedSignalIndexes[signalIndex];
++    connectionsMutex.unlock();
++
+     QSignalTransitionPrivate::get(transition)->signalIndex = signalIndex;
+     QSignalTransitionPrivate::get(transition)->originalSignalIndex = originalSignalIndex;
+ #ifdef QSTATEMACHINE_DEBUG
+@@ -1777,6 +1780,8 @@ void QStateMachinePrivate::unregisterSignalTransition(QSignalTransition *transit
+     if (!sender || (sender->thread() != q->thread()))
+         return;
+     QSignalTransitionPrivate::get(transition)->signalIndex = -1;
++
++    connectionsMutex.lock();
+     QVector<int> &connectedSignalIndexes = connections[sender];
+     Q_ASSERT(connectedSignalIndexes.size() > signalIndex);
+     Q_ASSERT(connectedSignalIndexes.at(signalIndex) != 0);
+@@ -1790,6 +1795,7 @@ void QStateMachinePrivate::unregisterSignalTransition(QSignalTransition *transit
+         if (sum == 0)
+             connections.remove(sender);
+     }
++    connectionsMutex.unlock();
+ }
+ 
+ void QStateMachinePrivate::unregisterAllTransitions()
+@@ -1878,7 +1884,11 @@ void QStateMachinePrivate::handleFilteredEvent(QObject *watched, QEvent *event)
+ void QStateMachinePrivate::handleTransitionSignal(QObject *sender, int signalIndex,
+                                                   void **argv)
+ {
++#ifndef QT_NO_DEBUG
++    connectionsMutex.lock();
+     Q_ASSERT(connections[sender].at(signalIndex) != 0);
++    connectionsMutex.unlock();
++#endif
+     const QMetaObject *meta = sender->metaObject();
+     QMetaMethod method = meta->method(signalIndex);
+     QList<QByteArray> parameterTypes = method.parameterTypes();
+diff --git a/src/corelib/statemachine/qstatemachine_p.h b/src/corelib/statemachine/qstatemachine_p.h
+index f3291e7..9e1f425 100644
+--- a/src/corelib/statemachine/qstatemachine_p.h
++++ b/src/corelib/statemachine/qstatemachine_p.h
+@@ -257,6 +257,7 @@ public:
+     QSignalEventGenerator *signalEventGenerator;
+ 
+     QHash<const QObject*, QVector<int> > connections;
++    QMutex connectionsMutex;
+ #ifndef QT_NO_STATEMACHINE_EVENTFILTER
+     QHash<QObject*, QHash<QEvent::Type, int> > qobjectEvents;
+ #endif
+diff --git a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+index 8c67c0e..77dc8dd 100644
+--- a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
++++ b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+@@ -209,6 +209,7 @@ private slots:
+     void createSignalTransitionWhenRunning();
+     void createEventTransitionWhenRunning();
+     void signalTransitionSenderInDifferentThread();
++    void signalTransitionRegistrationThreadSafety();
+ };
+ 
+ class TestState : public QState
+@@ -4884,5 +4885,54 @@ void tst_QStateMachine::signalTransitionSenderInDifferentThread()
+     QTRY_VERIFY(thread.wait());
+ }
+ 
++class SignalTransitionMutatorThread : public QThread
++{
++public:
++    SignalTransitionMutatorThread(QSignalTransition *transition)
++        : m_transition(transition)
++    {}
++    void run()
++    {
++        // Cause repeated registration and unregistration
++        for (int i = 0; i < 50000; ++i) {
++            m_transition->setSenderObject(this);
++            m_transition->setSenderObject(0);
++        }
++    }
++private:
++    QSignalTransition *m_transition;
++};
++
++// Should not crash:
++void tst_QStateMachine::signalTransitionRegistrationThreadSafety()
++{
++    QStateMachine machine;
++    QState *s1 = new QState(&machine);
++    machine.setInitialState(s1);
++    machine.start();
++    QTRY_VERIFY(machine.configuration().contains(s1));
++
++    QSignalTransition *t1 = new QSignalTransition();
++    t1->setSignal(SIGNAL(objectNameChanged(QString)));
++    s1->addTransition(t1);
++
++    QSignalTransition *t2 = new QSignalTransition();
++    t2->setSignal(SIGNAL(objectNameChanged(QString)));
++    s1->addTransition(t2);
++
++    SignalTransitionMutatorThread thread(t1);
++    thread.start();
++    QTRY_VERIFY(thread.isRunning());
++
++    // Cause repeated registration and unregistration
++    for (int i = 0; i < 50000; ++i) {
++        t2->setSenderObject(this);
++        t2->setSenderObject(0);
++    }
++
++    thread.quit();
++    QTRY_VERIFY(thread.wait());
++}
++
+ QTEST_MAIN(tst_QStateMachine)
+ #include "tst_qstatemachine.moc"

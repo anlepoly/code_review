@@ -1,0 +1,253 @@
+diff --git a/src/3rdparty/zlib/zconf.h b/src/3rdparty/zlib/zconf.h
+index 806a51e..06e7786 100644
+--- a/src/3rdparty/zlib/zconf.h
++++ b/src/3rdparty/zlib/zconf.h
+@@ -8,6 +8,9 @@
+ #ifndef ZCONF_H
+ #define ZCONF_H
+ 
++/* Since QtCore must export these symbols, define Z_PREFIX to avoid clashes system zlib */
++#define Z_PREFIX
++
+ /*
+  * If you *really* need a unique prefix for all types and library functions,
+  * compile with -DZ_PREFIX. The "standard" zlib should be compiled without it.
+diff --git a/src/gui/text/qzip.cpp b/src/gui/text/qzip.cpp
+index e9ff5e8..e3c20f0 100644
+--- a/src/gui/text/qzip.cpp
++++ b/src/gui/text/qzip.cpp
+@@ -358,7 +358,7 @@ struct FileHeader
+ };
+ 
+ QZipReader::FileInfo::FileInfo()
+-    : isDir(false), isFile(false), isSymLink(false), crc32(0), size(0)
++    : isDir(false), isFile(false), isSymLink(false), crc(0), size(0)
+ {
+ }
+ 
+@@ -378,7 +378,7 @@ QZipReader::FileInfo& QZipReader::FileInfo::operator=(const FileInfo &other)
+     isFile = other.isFile;
+     isSymLink = other.isSymLink;
+     permissions = other.permissions;
+-    crc32 = other.crc32;
++    crc = other.crc;
+     size = other.size;
+     lastModified = other.lastModified;
+     return *this;
+@@ -424,7 +424,7 @@ void QZipPrivate::fillFileInfo(int index, QZipReader::FileInfo &fileInfo) const
+     fileInfo.isFile = S_ISREG(mode);
+     fileInfo.isSymLink = S_ISLNK(mode);
+     fileInfo.permissions = modeToPermissions(mode);
+-    fileInfo.crc32 = readUInt(header.h.crc_32);
++    fileInfo.crc = readUInt(header.h.crc_32);
+     fileInfo.size = readUInt(header.h.uncompressed_size);
+     fileInfo.lastModified = readMSDosDate(header.h.last_mod_file);
+ }
+@@ -701,8 +701,8 @@ void QZipWriterPrivate::addEntry(EntryType type, const QString &fileName, const
+ */
+ 
+ /*!
+-    \variable FileInfo::crc32
+-    The calculated checksum as a crc32 type.
++    \variable FileInfo::crc
++    The calculated checksum as a crc type.
+ */
+ 
+ /*!
+diff --git a/src/gui/text/qzipreader_p.h b/src/gui/text/qzipreader_p.h
+index 4dbf1d0..7783c5b 100644
+--- a/src/gui/text/qzipreader_p.h
++++ b/src/gui/text/qzipreader_p.h
+@@ -88,7 +88,7 @@ public:
+         uint isFile : 1;
+         uint isSymLink : 1;
+         QFile::Permissions permissions;
+-        uint crc32;
++        uint crc;
+         qint64 size;
+         QDateTime lastModified;
+         void *d;
+diff --git a/src/network/access/qhttpnetworkreply.cpp b/src/network/access/qhttpnetworkreply.cpp
+index 8c8c834..dc6f997 100644
+--- a/src/network/access/qhttpnetworkreply.cpp
++++ b/src/network/access/qhttpnetworkreply.cpp
+@@ -52,6 +52,10 @@
+ #    include <QtNetwork/qsslconfiguration.h>
+ #endif
+ 
++#ifndef QT_NO_COMPRESS
++#include <zlib.h>
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ QHttpNetworkReply::QHttpNetworkReply(const QUrl &url, QObject *parent)
+@@ -67,8 +71,8 @@ QHttpNetworkReply::~QHttpNetworkReply()
+     }
+ 
+ #ifndef QT_NO_COMPRESS
+-    if (d->autoDecompress && d->isCompressed())
+-        inflateEnd(&d->inflateStrm);
++    if (d->autoDecompress && d->isCompressed() && d->inflateStrm)
++        inflateEnd(d->inflateStrm);
+ #endif
+ }
+ 
+@@ -281,11 +285,19 @@ QHttpNetworkReplyPrivate::QHttpNetworkReplyPrivate(const QUrl &newUrl)
+       autoDecompress(false), responseData(), requestIsPrepared(false)
+       ,pipeliningUsed(false), downstreamLimited(false)
+       ,userProvidedDownloadBuffer(0)
++#ifndef QT_NO_COMPRESS
++      ,inflateStrm(0)
++#endif
++
+ {
+ }
+ 
+ QHttpNetworkReplyPrivate::~QHttpNetworkReplyPrivate()
+ {
++#ifndef QT_NO_COMPRESS
++      if (inflateStrm)
++          delete inflateStrm;
++#endif
+ }
+ 
+ void QHttpNetworkReplyPrivate::clearHttpLayerInformation()
+@@ -300,8 +312,8 @@ void QHttpNetworkReplyPrivate::clearHttpLayerInformation()
+     lastChunkRead = false;
+     connectionCloseEnabled = true;
+ #ifndef QT_NO_COMPRESS
+-    if (autoDecompress)
+-        inflateEnd(&inflateStrm);
++    if (autoDecompress && inflateStrm)
++        inflateEnd(inflateStrm);
+ #endif
+     fields.clear();
+ }
+@@ -530,15 +542,17 @@ qint64 QHttpNetworkReplyPrivate::readHeader(QAbstractSocket *socket)
+ #ifndef QT_NO_COMPRESS
+         if (autoDecompress && isCompressed()) {
+             // allocate inflate state
+-            inflateStrm.zalloc = Z_NULL;
+-            inflateStrm.zfree = Z_NULL;
+-            inflateStrm.opaque = Z_NULL;
+-            inflateStrm.avail_in = 0;
+-            inflateStrm.next_in = Z_NULL;
++            if (!inflateStrm)
++                inflateStrm = new z_stream;
++            inflateStrm->zalloc = Z_NULL;
++            inflateStrm->zfree = Z_NULL;
++            inflateStrm->opaque = Z_NULL;
++            inflateStrm->avail_in = 0;
++            inflateStrm->next_in = Z_NULL;
+             // "windowBits can also be greater than 15 for optional gzip decoding.
+             // Add 32 to windowBits to enable zlib and gzip decoding with automatic header detection"
+             // http://www.zlib.net/manual.html
+-            int ret = inflateInit2(&inflateStrm, MAX_WBITS+32);
++            int ret = inflateInit2(inflateStrm, MAX_WBITS+32);
+             if (ret != Z_OK)
+                 return -1;
+         }
+@@ -685,47 +699,50 @@ qint64 QHttpNetworkReplyPrivate::readBody(QAbstractSocket *socket, QByteDataBuff
+ #ifndef QT_NO_COMPRESS
+ qint64 QHttpNetworkReplyPrivate::uncompressBodyData(QByteDataBuffer *in, QByteDataBuffer *out)
+ {
++    if (!inflateStrm)
++        return -1;
++
+     bool triedRawDeflate = false;
+     for (int i = 0; i < in->bufferCount(); i++) {
+         QByteArray &bIn = (*in)[i];
+ 
+-        inflateStrm.avail_in = bIn.size();
+-        inflateStrm.next_in = reinterpret_cast<Bytef*>(bIn.data());
++        inflateStrm->avail_in = bIn.size();
++        inflateStrm->next_in = reinterpret_cast<Bytef*>(bIn.data());
+ 
+         do {
+             QByteArray bOut;
+             // make a wild guess about the uncompressed size.
+-            bOut.reserve(inflateStrm.avail_in * 3 + 512);
+-            inflateStrm.avail_out = bOut.capacity();
+-            inflateStrm.next_out = reinterpret_cast<Bytef*>(bOut.data());
++            bOut.reserve(inflateStrm->avail_in * 3 + 512);
++            inflateStrm->avail_out = bOut.capacity();
++            inflateStrm->next_out = reinterpret_cast<Bytef*>(bOut.data());
+ 
+-            int ret = inflate(&inflateStrm, Z_NO_FLUSH);
++            int ret = inflate(inflateStrm, Z_NO_FLUSH);
+             //All negative return codes are errors, in the context of HTTP compression, Z_NEED_DICT is also an error.
+             // in the case where we get Z_DATA_ERROR this could be because we recieved raw deflate compressed data.
+             if (ret == Z_DATA_ERROR && !triedRawDeflate) {
+-                inflateEnd(&inflateStrm);
++                inflateEnd(inflateStrm);
+                 triedRawDeflate = true;
+-                inflateStrm.zalloc = Z_NULL;
+-                inflateStrm.zfree = Z_NULL;
+-                inflateStrm.opaque = Z_NULL;
+-                inflateStrm.avail_in = 0;
+-                inflateStrm.next_in = Z_NULL;
+-                int ret = inflateInit2(&inflateStrm, -MAX_WBITS);
++                inflateStrm->zalloc = Z_NULL;
++                inflateStrm->zfree = Z_NULL;
++                inflateStrm->opaque = Z_NULL;
++                inflateStrm->avail_in = 0;
++                inflateStrm->next_in = Z_NULL;
++                int ret = inflateInit2(inflateStrm, -MAX_WBITS);
+                 if (ret != Z_OK) {
+                     return -1;
+                 } else {
+-                    inflateStrm.avail_in = bIn.size();
+-                    inflateStrm.next_in = reinterpret_cast<Bytef*>(bIn.data());
++                    inflateStrm->avail_in = bIn.size();
++                    inflateStrm->next_in = reinterpret_cast<Bytef*>(bIn.data());
+                     continue;
+                 }
+             } else if (ret < 0 || ret == Z_NEED_DICT) {
+                 return -1;
+             }
+-            bOut.resize(bOut.capacity() - inflateStrm.avail_out);
++            bOut.resize(bOut.capacity() - inflateStrm->avail_out);
+             out->append(bOut);
+             if (ret == Z_STREAM_END)
+                 return out->byteAmount();
+-        } while (inflateStrm.avail_in > 0);
++        } while (inflateStrm->avail_in > 0);
+     }
+ 
+     return out->byteAmount();
+diff --git a/src/network/access/qhttpnetworkreply_p.h b/src/network/access/qhttpnetworkreply_p.h
+index b3c16a8..75139f4 100644
+--- a/src/network/access/qhttpnetworkreply_p.h
++++ b/src/network/access/qhttpnetworkreply_p.h
+@@ -56,7 +56,7 @@
+ #ifndef QT_NO_HTTP
+ 
+ #ifndef QT_NO_COMPRESS
+-#include <zlib.h>
++struct z_stream_s;
+ #endif
+ 
+ #include <QtNetwork/qtcpsocket.h>
+@@ -227,11 +227,6 @@ public:
+     QPointer<QHttpNetworkConnection> connection;
+     QPointer<QHttpNetworkConnectionChannel> connectionChannel;
+ 
+-#ifndef QT_NO_COMPRESS
+-    z_stream inflateStrm;
+-    qint64 uncompressBodyData(QByteDataBuffer *in, QByteDataBuffer *out);
+-#endif
+-
+     bool autoDecompress;
+ 
+     QByteDataBuffer responseData; // uncompressed body
+@@ -242,6 +237,11 @@ public:
+     bool downstreamLimited;
+ 
+     char* userProvidedDownloadBuffer;
++
++#ifndef QT_NO_COMPRESS
++    z_stream_s *inflateStrm;
++    qint64 uncompressBodyData(QByteDataBuffer *in, QByteDataBuffer *out);
++#endif
+ };

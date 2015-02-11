@@ -1,0 +1,210 @@
+diff --git a/src/linguist/shared/qm.cpp b/src/linguist/shared/qm.cpp
+index 566dd36..4be719a 100644
+--- a/src/linguist/shared/qm.cpp
++++ b/src/linguist/shared/qm.cpp
+@@ -163,7 +163,7 @@ public:
+         uint o;
+     };
+ 
+-    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88 };
++    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88, Dependencies = 0x96 };
+ 
+     Releaser() : m_codec(0) {}
+ 
+@@ -180,6 +180,7 @@ public:
+     void squeeze(TranslatorSaveMode mode);
+ 
+     void setNumerusRules(const QByteArray &rules);
++    void setDependencies(const QStringList &dependencies);
+ 
+ private:
+     Q_DISABLE_COPY(Releaser)
+@@ -204,6 +205,8 @@ private:
+     QByteArray m_contextArray;
+     QMap<ByteTranslatorMessage, void *> m_messages;
+     QByteArray m_numerusRules;
++    QStringList m_dependencies;
++    QByteArray m_dependencyArray;
+ 
+     // Used to reproduce the original bytes
+     QTextCodec *m_codec;
+@@ -271,6 +274,11 @@ bool Releaser::save(QIODevice *iod)
+     QDataStream s(iod);
+     s.writeRawData((const char *)magic, MagicLength);
+ 
++    if (!m_dependencyArray.isEmpty()) {
++        quint32 das = quint32(m_dependencyArray.size());
++        s << quint8(Dependencies) << das;
++        s.writeRawData(m_dependencyArray.constData(), das);
++    }
+     if (!m_offsetArray.isEmpty()) {
+         quint32 oas = quint32(m_offsetArray.size());
+         s << quint8(Hashes) << oas;
+@@ -296,6 +304,11 @@ bool Releaser::save(QIODevice *iod)
+ 
+ void Releaser::squeeze(TranslatorSaveMode mode)
+ {
++    m_dependencyArray.clear();
++    QDataStream depstream(&m_dependencyArray, QIODevice::WriteOnly);
++    foreach (const QString &dep, m_dependencies)
++        depstream << dep;
++
+     if (m_messages.isEmpty() && mode == SaveEverything)
+         return;
+ 
+@@ -452,6 +465,11 @@ void Releaser::setNumerusRules(const QByteArray &rules)
+     m_numerusRules = rules;
+ }
+ 
++void Releaser::setDependencies(const QStringList &dependencies)
++{
++    m_dependencies = dependencies;
++}
++
+ static quint8 read8(const uchar *data)
+ {
+     return *data;
+@@ -498,7 +516,7 @@ bool loadQM(Translator &translator, QIODevice &dev, ConversionData &cd)
+         return false;
+     }
+ 
+-    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88 };
++    enum { Contexts = 0x2f, Hashes = 0x42, Messages = 0x69, NumerusRules = 0x88, Dependencies = 0x96 };
+ 
+     // for squeezed but non-file data, this is what needs to be deleted
+     const uchar *messageArray = 0;
+@@ -529,6 +547,15 @@ bool loadQM(Translator &translator, QIODevice &dev, ConversionData &cd)
+         } else if (tag == Messages) {
+             messageArray = data;
+             //qDebug() << "MESSAGES: " << blockLen << QByteArray((const char *)data, blockLen).toHex();
++        } else if (tag == Dependencies) {
++            QStringList dependencies;
++            QDataStream stream(QByteArray::fromRawData((const char*)data, blockLen));
++            QString dep;
++            while (!stream.atEnd()) {
++                stream >> dep;
++                dependencies.append(dep);
++            }
++            translator.setDependencies(dependencies);
+         }
+ 
+         data += blockLen;
+@@ -754,6 +781,7 @@ bool saveQM(const Translator &translator, QIODevice &dev, ConversionData &cd)
+             "Excess context/disambiguation dropped from %n message(s).", 0,
+             QCoreApplication::DefaultCodec, droppedData));
+ 
++    releaser.setDependencies(translator.dependencies());
+     releaser.squeeze(cd.m_saveMode);
+     bool saved = releaser.save(&dev);
+     if (saved && cd.isVerbose()) {
+diff --git a/src/linguist/shared/translator.h b/src/linguist/shared/translator.h
+index 5721500..9194d11 100644
+--- a/src/linguist/shared/translator.h
++++ b/src/linguist/shared/translator.h
+@@ -190,6 +190,9 @@ public:
+     const TranslatorMessage &constMessage(int i) const { return m_messages.at(i); }
+     void dump() const;
+ 
++    void setDependencies(const QStringList &dependencies) { m_dependencies = dependencies; }
++    QStringList dependencies() const { return m_dependencies; }
++
+     // additional file format specific data
+     // note: use '<fileformat>:' as prefix for file format specific members,
+     // e.g. "po-flags", "po-msgid_plural"
+@@ -243,6 +246,7 @@ private:
+     // 'por_BR'     Brazilian portuguese (ISO 639-2 language code)
+     QString m_language;
+     QString m_sourceLanguage;
++    QStringList m_dependencies;
+     ExtraData m_extra;
+ 
+     mutable bool m_indexOk;
+diff --git a/src/linguist/shared/ts.cpp b/src/linguist/shared/ts.cpp
+index 28fa148..f98a56c 100644
+--- a/src/linguist/shared/ts.cpp
++++ b/src/linguist/shared/ts.cpp
+@@ -213,9 +213,12 @@ bool TSReader::read(Translator &translator)
+ {
+     STRING(both);
+     STRING(byte);
++    STRING(catalog);
+     STRING(comment);
+     STRING(context);
+     STRING(defaultcodec);
++    STRING(dependencies);
++    STRING(dependency);
+     STRING(encoding);
+     STRING(extracomment);
+     STRING(filename);
+@@ -288,6 +291,33 @@ bool TSReader::read(Translator &translator)
+                     QString tag = name().toString();
+                     translator.setExtra(tag.mid(6), readContents());
+                     // </extra-...>
++                } else if (elementStarts(strdependencies)) {
++                    /*
++                     * <dependencies>
++                     *   <dependency catalog="qtsystems_no"/>
++                     *   <dependency catalog="qtbase_no"/>
++                     * </dependencies>
++                     **/
++                    QStringList dependencies;
++                    while (!atEnd()) {
++                        readNext();
++                        if (isEndElement()) {
++                            // </dependencies> found, finish local loop
++                            break;
++                        } else if (elementStarts(strdependency)) {
++                            // <dependency>
++                            QXmlStreamAttributes atts = attributes();
++                            dependencies.append(atts.value(strcatalog).toString());
++                            while (!atEnd()) {
++                                readNext();
++                                if (isEndElement()) {
++                                    // </dependency> found, finish local loop
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    translator.setDependencies(dependencies);
+                 } else if (elementStarts(strcontext)) {
+                     // <context>
+                     QString context;
+@@ -567,6 +597,14 @@ bool saveTS(const Translator &translator, QIODevice &dev, ConversionData &cd, in
+     if (codecName != "ISO-8859-1")
+         t << "<defaultcodec>" << codecName << "</defaultcodec>\n";
+ 
++    QStringList deps = translator.dependencies();
++    if (!deps.isEmpty()) {
++        t << "<dependencies>\n";
++        foreach (const QString &dep, deps)
++            t << "<dependency catalog=\"" << dep << "\"/>\n";
++        t << "</dependencies>\n";
++    }
++
+     QRegExp drops(cd.dropTags().join(QLatin1String("|")));
+ 
+     if (format == 20)
+diff --git a/src/linguist/shared/ts.dtd b/src/linguist/shared/ts.dtd
+index 12d3562..d9df1d9 100644
+--- a/src/linguist/shared/ts.dtd
++++ b/src/linguist/shared/ts.dtd
+@@ -27,7 +27,7 @@
+  !   extra-loc-blank
+   -->
+ <!ELEMENT extra-* %evilstring; >
+-<!ELEMENT TS (defaultcodec?, extra-**, (context|message)+) > 
++<!ELEMENT TS (defaultcodec?, extra-**, dependencies?, (context|message)+) >
+ <!ATTLIST TS
+           version CDATA #IMPLIED
+           sourcelanguage CDATA #IMPLIED
+@@ -37,6 +37,9 @@
+ <!ELEMENT context (name, comment?, (context|message)+) >
+ <!ATTLIST context
+           encoding CDATA #IMPLIED>
++<!ELEMENT dependencies (dependency+) >
++<!ATTLIST dependency
++          catalog CDATA #IMPLIED>
+ <!ELEMENT name %evilstring; >
+ <!-- This is "disambiguation" in the (new) API, or "msgctxt" in gettext speak -->
+ <!ELEMENT comment %evilstring; >

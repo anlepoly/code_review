@@ -1,0 +1,253 @@
+diff --git a/src/gui/text/qfontdatabase_qpa.cpp b/src/gui/text/qfontdatabase_qpa.cpp
+index 1a1f08f..0014efc 100644
+--- a/src/gui/text/qfontdatabase_qpa.cpp
++++ b/src/gui/text/qfontdatabase_qpa.cpp
+@@ -207,7 +207,9 @@ QFontEngine *loadEngine(int script, const QFontDef &request,
+             fallbacks = family->fallbackFamilies;
+ 
+         QPlatformFontDatabase *pfdb = QGuiApplicationPrivate::platformIntegration()->fontDatabase();
+-        engine = pfdb->fontEngineMulti(engine, QUnicodeTables::Script(script), fallbacks);
++        QFontEngineMulti *pfMultiEngine = pfdb->fontEngineMulti(engine, QUnicodeTables::Script(script));
++        pfMultiEngine->setFallbackFamiliesList(fallbacks);
++        engine = pfMultiEngine;
+ 
+         // Cache Multi font engine as well in case we got the FT single
+         // font engine when we are actually looking for a Multi one
+diff --git a/src/gui/text/qfontengine.cpp b/src/gui/text/qfontengine.cpp
+index 364a356..5c18dde 100644
+--- a/src/gui/text/qfontengine.cpp
++++ b/src/gui/text/qfontengine.cpp
+@@ -1366,6 +1366,7 @@ bool QFontEngineMulti::stringToCMap(const QChar *str, int len,
+     if (!engine(0)->stringToCMap(str, len, glyphs, &ng, flags))
+         return false;
+ 
++    const_cast<QFontEngineMulti *>(this)->ensureFallbackFamiliesQueried();
+     int glyph_pos = 0;
+     for (int i = 0; i < len; ++i) {
+         bool surrogate = (str[i].isHighSurrogate() && i < len-1 && str[i+1].isLowSurrogate());
+diff --git a/src/gui/text/qfontengine_p.h b/src/gui/text/qfontengine_p.h
+index 1114cdf..4741de3 100644
+--- a/src/gui/text/qfontengine_p.h
++++ b/src/gui/text/qfontengine_p.h
+@@ -395,12 +395,14 @@ public:
+     }
+ 
+     virtual bool shouldLoadFontEngineForCharacter(int at, uint ucs4) const;
++    virtual void setFallbackFamiliesList(const QStringList &) {}
+ 
+ protected:
+     friend class QPSPrintEnginePrivate;
+     friend class QPSPrintEngineFontMulti;
+     friend class QRawFont;
+     virtual void loadEngine(int at) = 0;
++    virtual void ensureFallbackFamiliesQueried() {}
+     QVector<QFontEngine *> engines;
+ };
+ 
+diff --git a/src/gui/text/qfontengine_qpa.cpp b/src/gui/text/qfontengine_qpa.cpp
+index 4867982..d12e2d6 100644
+--- a/src/gui/text/qfontengine_qpa.cpp
++++ b/src/gui/text/qfontengine_qpa.cpp
+@@ -674,6 +674,7 @@ QFontEngineMultiQPA::QFontEngineMultiQPA(QFontEngine *fe, int _script)
+     , script(_script)
+     , fallbacksQueried(false)
+ {
++    fallbackFamilies << QString();
+     init(fe);
+ }
+ 
+@@ -688,36 +689,43 @@ void QFontEngineMultiQPA::init(QFontEngine *fe)
+ 
+ void QFontEngineMultiQPA::loadEngine(int at)
+ {
+-    bool canLoadFallbackEngine = true;
+-    if (!fallbacksQueried) {
+-        // Original FontEngine to restore after the fill.
+-        QFontEngine *fe = engines[0];
+-        fallbackFamilies = QGuiApplicationPrivate::instance()->platformIntegration()->fontDatabase()->fallbacksForFamily(fe->fontDef.family, QFont::Style(fe->fontDef.style)
+-                                                                                                                         , QFont::AnyStyle, QUnicodeTables::Script(script));
+-        if (fallbackFamilies.size() > 1) {
+-            engines.fill(0, fallbackFamilies.size() + 1);
+-            engines[0] = fe;
+-        } else {
+-            // Turns out we lied about having any fallback at all.
+-            canLoadFallbackEngine = false;
+-            engines[1] = fe;
+-        }
+-        fallbacksQueried = true;
+-    }
++    ensureFallbackFamiliesQueried();
+     Q_ASSERT(at < engines.size());
+     Q_ASSERT(engines.at(at) == 0);
+     QFontDef request = fontDef;
+-    if (canLoadFallbackEngine) {
+-        request.styleStrategy |= QFont::NoFontMerging;
+-        request.family = fallbackFamilies.at(at-1);
+-        engines[at] = QFontDatabase::findFont(script,
+-                                              /*fontprivate = */0,
+-                                              request, /*multi = */false);
+-    }
++    request.styleStrategy |= QFont::NoFontMerging;
++    request.family = fallbackFamilies.at(at-1);
++    engines[at] = QFontDatabase::findFont(script,
++                                          /*fontprivate = */0,
++                                          request, /*multi = */false);
+     Q_ASSERT(engines[at]);
+     engines[at]->ref.ref();
+     engines[at]->fontDef = request;
+ }
++void QFontEngineMultiQPA::ensureFallbackFamiliesQueried()
++{
++    if (fallbacksQueried)
++        return;
++    QStringList fallbacks = QGuiApplicationPrivate::instance()->platformIntegration()->fontDatabase()->fallbacksForFamily(engine(0)->fontDef.family, QFont::Style(engine(0)->fontDef.style)
++                                                                                                                     , QFont::AnyStyle, QUnicodeTables::Script(script));
++    setFallbackFamiliesList(fallbacks);
++}
++
++void QFontEngineMultiQPA::setFallbackFamiliesList(const QStringList &fallbacks)
++{
++    // Original FontEngine to restore after the fill.
++    QFontEngine *fe = engines[0];
++    fallbackFamilies = fallbacks;
++    if (!fallbackFamilies.isEmpty()) {
++        engines.fill(0, fallbackFamilies.size() + 1);
++        engines[0] = fe;
++    } else {
++        // Turns out we lied about having any fallback at all.
++        fallbackFamilies << fe->fontDef.family;
++        engines[1] = fe;
++    }
++    fallbacksQueried = true;
++}
+ 
+ /*
+   This is used indirectly by QtWebKit when using QTextLayout::setRawFont
+@@ -750,7 +758,7 @@ QFontEngine* QFontEngineMultiQPA::createMultiFontEngine(QFontEngine *fe, int scr
+         it++;
+     }
+     if (!engine) {
+-        engine = new QFontEngineMultiQPA(fe, script);
++        engine = QGuiApplicationPrivate::instance()->platformIntegration()->fontDatabase()->fontEngineMulti(fe, QUnicodeTables::Script(script));
+         QFontCache::instance()->insertEngine(key, engine, /* insertMulti */ !faceIsLocal);
+     }
+     Q_ASSERT(engine);
+diff --git a/src/gui/text/qfontengine_qpa_p.h b/src/gui/text/qfontengine_qpa_p.h
+index 16991ad..e690714 100644
+--- a/src/gui/text/qfontengine_qpa_p.h
++++ b/src/gui/text/qfontengine_qpa_p.h
+@@ -247,6 +247,7 @@ class Q_GUI_EXPORT QFontEngineMultiQPA : public QFontEngineMulti
+ {
+ public:
+     QFontEngineMultiQPA(QFontEngine *fe, int script, const QStringList &fallbacks);
++    QFontEngineMultiQPA(QFontEngine *fe, int script);
+ 
+     void loadEngine(int at);
+     static QFontEngine* createMultiFontEngine(QFontEngine *fe, int script);
+@@ -254,13 +255,15 @@ public:
+     int fallbackFamilyCount() const { return fallbackFamilies.size(); }
+     QString fallbackFamilyAt(int at) const { return fallbackFamilies.at(at); }
+ 
++    virtual void ensureFallbackFamiliesQueried();
++    virtual void setFallbackFamiliesList(const QStringList &fallbacks);
++
+ private:
+-    QFontEngineMultiQPA(QFontEngine *fe, int script);
+     void init(QFontEngine *fe);
+ 
+-    QStringList fallbackFamilies;
++    mutable QStringList fallbackFamilies;
+     int script;
+-    bool fallbacksQueried;
++    mutable bool fallbacksQueried;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/gui/text/qplatformfontdatabase_qpa.cpp b/src/gui/text/qplatformfontdatabase_qpa.cpp
+index 47a9fe5..6bd8284 100644
+--- a/src/gui/text/qplatformfontdatabase_qpa.cpp
++++ b/src/gui/text/qplatformfontdatabase_qpa.cpp
+@@ -276,10 +276,9 @@ void QPlatformFontDatabase::populateFontDatabase()
+     a certain character.
+ */
+ QFontEngineMulti *QPlatformFontDatabase::fontEngineMulti(QFontEngine *fontEngine,
+-                                                         QUnicodeTables::Script script,
+-                                                         const QStringList &fallbacks)
++                                                         QUnicodeTables::Script script)
+ {
+-    return new QFontEngineMultiQPA(fontEngine, script, fallbacks);
++    return new QFontEngineMultiQPA(fontEngine, script);
+ }
+ 
+ /*!
+diff --git a/src/gui/text/qplatformfontdatabase_qpa.h b/src/gui/text/qplatformfontdatabase_qpa.h
+index 5a5a8f3..3810b75 100644
+--- a/src/gui/text/qplatformfontdatabase_qpa.h
++++ b/src/gui/text/qplatformfontdatabase_qpa.h
+@@ -89,7 +89,7 @@ class Q_GUI_EXPORT QPlatformFontDatabase
+ public:
+     virtual ~QPlatformFontDatabase();
+     virtual void populateFontDatabase();
+-    virtual QFontEngineMulti *fontEngineMulti(QFontEngine *fontEngine, QUnicodeTables::Script script, const QStringList &fallbacks);
++    virtual QFontEngineMulti *fontEngineMulti(QFontEngine *fontEngine, QUnicodeTables::Script script);
+     virtual QFontEngine *fontEngine(const QFontDef &fontDef, QUnicodeTables::Script script, void *handle);
+     virtual QStringList fallbacksForFamily(const QString family, const QFont::Style &style, const QFont::StyleHint &styleHint, const QUnicodeTables::Script &script) const;
+     virtual QStringList addApplicationFont(const QByteArray &fontData, const QString &fileName);
+diff --git a/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase.cpp b/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase.cpp
+index 28a99cf..a4d2778 100644
+--- a/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase.cpp
++++ b/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase.cpp
+@@ -472,10 +472,9 @@ void QFontconfigDatabase::populateFontDatabase()
+ }
+ 
+ QFontEngineMulti *QFontconfigDatabase::fontEngineMulti(QFontEngine *fontEngine,
+-                                                       QUnicodeTables::Script script,
+-                                                       const QStringList &fallbacks)
++                                                       QUnicodeTables::Script script)
+ {
+-    return new QFontEngineMultiFontConfig(fontEngine, script, fallbacks);
++    return new QFontEngineMultiFontConfig(fontEngine, script);
+ }
+ 
+ QFontEngine *QFontconfigDatabase::fontEngine(const QFontDef &f, QUnicodeTables::Script script, void *usrPtr)
+diff --git a/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase_p.h b/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase_p.h
+index d474216..df62dde 100644
+--- a/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase_p.h
++++ b/src/platformsupport/fontdatabases/fontconfig/qfontconfigdatabase_p.h
+@@ -51,7 +51,7 @@ class QFontconfigDatabase : public QBasicFontDatabase
+ {
+ public:
+     void populateFontDatabase();
+-    QFontEngineMulti *fontEngineMulti(QFontEngine *fontEngine, QUnicodeTables::Script script, const QStringList &fallbacks);
++    QFontEngineMulti *fontEngineMulti(QFontEngine *fontEngine, QUnicodeTables::Script script);
+     QFontEngine *fontEngine(const QFontDef &fontDef, QUnicodeTables::Script script, void *handle);
+     QStringList fallbacksForFamily(const QString family, const QFont::Style &style, const QFont::StyleHint &styleHint, const QUnicodeTables::Script &script) const;
+     QStringList addApplicationFont(const QByteArray &fontData, const QString &fileName);
+diff --git a/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig.cpp b/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig.cpp
+index 2016500..31828ef 100644
+--- a/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig.cpp
++++ b/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig.cpp
+@@ -46,9 +46,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-QFontEngineMultiFontConfig::QFontEngineMultiFontConfig(QFontEngine *fe, int script,
+-                                                       const QStringList &fallbacks)
+-    : QFontEngineMultiQPA(fe, script, fallbacks)
++QFontEngineMultiFontConfig::QFontEngineMultiFontConfig(QFontEngine *fe, int script)
++    : QFontEngineMultiQPA(fe, script)
+ {
+ }
+ 
+diff --git a/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig_p.h b/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig_p.h
+index 260a9b5..046d63c 100644
+--- a/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig_p.h
++++ b/src/platformsupport/fontdatabases/fontconfig/qfontenginemultifontconfig_p.h
+@@ -51,7 +51,7 @@ class QFontEngineMultiFontConfig : public QFontEngineMultiQPA
+ {
+     Q_OBJECT
+ public:
+-    explicit QFontEngineMultiFontConfig(QFontEngine *fe, int script, const QStringList &fallbacks);
++    explicit QFontEngineMultiFontConfig(QFontEngine *fe, int script);
+ 
+     ~QFontEngineMultiFontConfig();

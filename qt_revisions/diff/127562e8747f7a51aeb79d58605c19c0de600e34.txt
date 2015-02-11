@@ -1,0 +1,266 @@
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/highlight.cpp b/src/plugins/qmltooling/qmldbg_qtquick2/highlight.cpp
+index f886978..a2ec34e 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/highlight.cpp
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/highlight.cpp
+@@ -41,7 +41,9 @@
+ 
+ #include "highlight.h"
+ 
++#include <QtCore/QTimer>
+ #include <QtGui/QPainter>
++#include <QtGui/QStaticText>
+ #include <QtQuick/QQuickCanvas>
+ 
+ namespace QmlJSDebugger {
+@@ -135,6 +137,13 @@ void HoverHighlight::paint(QPainter *painter)
+ }
+ 
+ 
++SelectionHighlight::SelectionHighlight(const QString &name, QQuickItem *item, QQuickItem *parent)
++    : Highlight(item, parent),
++      m_name(name),
++      m_nameDisplayActive(false)
++{
++}
++
+ void SelectionHighlight::paint(QPainter *painter)
+ {
+     if (!item())
+@@ -148,6 +157,48 @@ void SelectionHighlight::paint(QPainter *painter)
+     painter->setCompositionMode(QPainter::CompositionMode_Clear);
+     painter->fillRect(0, 0, item()->width(), item()->height(), Qt::black);
+     painter->restore();
++
++    // Use the painter with the original transform and not with the
++    // item's transform for display of name.
++    if (!m_nameDisplayActive)
++        return;
++
++    // Paint the text in gray background if display name is active..
++    QRect textRect = painter->boundingRect(QRect(10, contentsSize().height() - 10 ,
++                                 contentsSize().width() - 20, contentsSize().height()),
++                                 Qt::AlignCenter | Qt::ElideRight, m_name);
++
++    qreal xPosition = m_displayPoint.x();
++    if (xPosition + textRect.width() > contentsSize().width())
++        xPosition = contentsSize().width() - textRect.width();
++    if (xPosition < 0) {
++        xPosition = 0;
++        textRect.setWidth(contentsSize().width());
++    }
++    qreal yPosition = m_displayPoint.y() - textRect.height() - 20;
++    if (yPosition < 50 )
++        yPosition = 50;
++
++    painter->fillRect(QRectF(xPosition - 5, yPosition - 5,
++                      textRect.width() + 10, textRect.height() + 10), Qt::gray);
++    painter->drawRect(QRectF(xPosition - 5, yPosition - 5,
++                      textRect.width() + 10, textRect.height() + 10));
++
++    painter->drawStaticText(xPosition, yPosition, QStaticText(m_name));
++}
++
++void SelectionHighlight::showName(const QPointF &displayPoint)
++{
++    m_displayPoint = displayPoint;
++    m_nameDisplayActive = true;
++    QTimer::singleShot(1500, this, SLOT(disableNameDisplay()));
++    update();
++}
++
++void SelectionHighlight::disableNameDisplay()
++{
++    m_nameDisplayActive = false;
++    update();
+ }
+ 
+ } // namespace QtQuick2
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/highlight.h b/src/plugins/qmltooling/qmldbg_qtquick2/highlight.h
+index 2900b9c..f058fde 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/highlight.h
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/highlight.h
+@@ -43,6 +43,7 @@
+ #define HIGHLIGHT_H
+ 
+ #include <QtCore/QPointer>
++#include <QtCore/QPointF>
+ #include <QtGui/QTransform>
+ #include <QtQuick/QQuickPaintedItem>
+ 
+@@ -80,12 +81,20 @@ private:
+  */
+ class SelectionHighlight : public Highlight
+ {
+-public:
+-    SelectionHighlight(QQuickItem *item, QQuickItem *parent)
+-        : Highlight(item, parent)
+-    {}
++    Q_OBJECT
+ 
++public:
++    SelectionHighlight(const QString &name, QQuickItem *item, QQuickItem *parent);
+     void paint(QPainter *painter);
++    void showName(const QPointF &displayPoint);
++
++private slots:
++    void disableNameDisplay();
++
++private:
++    QPointF m_displayPoint;
++    QString m_name;
++    bool m_nameDisplayActive;
+ };
+ 
+ /**
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.cpp b/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.cpp
+index 796549f..47b1519 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.cpp
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.cpp
+@@ -81,6 +81,10 @@ InspectTool::InspectTool(QQuickViewInspector *inspector, QQuickView *view) :
+     m_pressAndHoldTimer.setSingleShot(true);
+     m_pressAndHoldTimer.setInterval(Constants::PressAndHoldTimeout);
+     connect(&m_pressAndHoldTimer, SIGNAL(timeout()), SLOT(zoomTo100()));
++    //Timer to display selected item's name
++    m_nameDisplayTimer.setSingleShot(true);
++    m_nameDisplayTimer.setInterval(qApp->styleHints()->mouseDoubleClickInterval());
++    connect(&m_nameDisplayTimer, SIGNAL(timeout()), SLOT(showSelectedItemName()));
+     enable(true);
+ }
+ 
+@@ -259,10 +263,13 @@ void InspectTool::touchEvent(QTouchEvent *event)
+             m_tapEvent = false;
+             bool doubleTap = event->timestamp() - m_touchTimestamp
+                     < static_cast<ulong>(qApp->styleHints()->mouseDoubleClickInterval());
+-            if (doubleTap)
++            if (doubleTap) {
++                m_nameDisplayTimer.stop();
+                 selectNextItem();
+-            else
++            }
++            else {
+                 selectItem();
++            }
+             m_touchTimestamp = event->timestamp();
+         }
+         m_didPressAndHold = false;
+@@ -387,6 +394,7 @@ void InspectTool::selectNextItem()
+             else
+                 m_lastItem = items[0];
+             inspector()->setSelectedItems(QList<QQuickItem*>() << m_lastItem);
++            showSelectedItemName();
+             break;
+         }
+     }
+@@ -396,11 +404,14 @@ void InspectTool::selectItem()
+ {
+     if (!inspector()->topVisibleItemAt(m_mousePosition))
+         return;
+-    if (m_lastClickedItem == inspector()->topVisibleItemAt(m_mousePosition))
++    if (m_lastClickedItem == inspector()->topVisibleItemAt(m_mousePosition)) {
++        m_nameDisplayTimer.start();
+         return;
++    }
+     m_lastClickedItem = inspector()->topVisibleItemAt(m_mousePosition);
+     m_lastItem = m_lastClickedItem;
+     inspector()->setSelectedItems(QList<QQuickItem*>() << m_lastClickedItem);
++    showSelectedItemName();
+ }
+ 
+ QQuickViewInspector *InspectTool::inspector() const
+@@ -408,5 +419,10 @@ QQuickViewInspector *InspectTool::inspector() const
+     return static_cast<QQuickViewInspector*>(AbstractTool::inspector());
+ }
+ 
++void InspectTool::showSelectedItemName()
++{
++    inspector()->showSelectedItemName(m_lastItem, m_mousePosition);
++}
++
+ } // namespace QtQuick2
+ } // namespace QmlJSDebugger
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.h b/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.h
+index f452802..7cf2e20 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.h
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/inspecttool.h
+@@ -100,6 +100,7 @@ private:
+ 
+ private slots:
+     void zoomTo100();
++    void showSelectedItemName();
+ 
+ private:
+     bool m_originalSmooth;
+@@ -117,6 +118,7 @@ private:
+     qreal m_originalScale;
+     ulong m_touchTimestamp;
+     QTimer m_pressAndHoldTimer;
++    QTimer m_nameDisplayTimer;
+ 
+     HoverHighlight *m_hoverHighlight;
+     QQuickItem *m_lastItem;
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.cpp b/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.cpp
+index f92fbb9..cc3f370 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.cpp
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.cpp
+@@ -270,13 +270,20 @@ bool QQuickViewInspector::syncSelectedItems(const QList<QQuickItem *> &items)
+         connect(item, SIGNAL(destroyed(QObject*)), this, SLOT(removeFromSelectedItems(QObject*)));
+         m_selectedItems.append(item);
+         SelectionHighlight *selectionHighlightItem;
+-        selectionHighlightItem = new SelectionHighlight(item, m_overlay);
++        selectionHighlightItem = new SelectionHighlight(titleForItem(item), item, m_overlay);
+         m_highlightItems.insert(item, selectionHighlightItem);
+     }
+ 
+     return selectionChanged;
+ }
+ 
++void QQuickViewInspector::showSelectedItemName(QQuickItem *item, const QPointF &point)
++{
++    SelectionHighlight *highlightItem = m_highlightItems.value(item, 0);
++    if (highlightItem)
++        highlightItem->showName(point);
++}
++
+ void QQuickViewInspector::removeFromSelectedItems(QObject *object)
+ {
+     if (QQuickItem *item = qobject_cast<QQuickItem*>(object)) {
+diff --git a/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.h b/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.h
+index bcc008c..c523ea2 100644
+--- a/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.h
++++ b/src/plugins/qmltooling/qmldbg_qtquick2/qquickviewinspector.h
+@@ -83,6 +83,7 @@ public:
+     void setSelectedItems(const QList<QQuickItem*> &items);
+ 
+     QString titleForItem(QQuickItem *item) const;
++    void showSelectedItemName(QQuickItem *item, const QPointF &point);
+ 
+ protected:
+     bool eventFilter(QObject *obj, QEvent *event);
+diff --git a/src/plugins/qmltooling/shared/abstractviewinspector.cpp b/src/plugins/qmltooling/shared/abstractviewinspector.cpp
+index 60a9598..40125b9 100644
+--- a/src/plugins/qmltooling/shared/abstractviewinspector.cpp
++++ b/src/plugins/qmltooling/shared/abstractviewinspector.cpp
+@@ -48,6 +48,7 @@
+ #include <QtQml/QQmlComponent>
+ #include <QtCore/private/qabstractanimation_p.h>
+ #include <QtQml/private/qqmlinspectorservice_p.h>
++#include <QtQml/private/qqmlcontext_p.h>
+ 
+ #include <QtGui/QMouseEvent>
+ #include <QtGui/QTouchEvent>
+@@ -484,8 +485,13 @@ void AbstractViewInspector::sendShowAppOnTop(bool showAppOnTop)
+ 
+ QString AbstractViewInspector::idStringForObject(QObject *obj) const
+ {
+-    const int id = QQmlDebugService::idForObject(obj);
+-    return m_stringIdForObjectId.value(id);
++    QQmlContext *context = qmlContext(obj);
++    if (context) {
++        QQmlContextData *cdata = QQmlContextData::get(context);
++        if (cdata)
++            return cdata->findObjectId(obj);
++    }
++    return QString();
+ }
+ 
+ } // namespace QmlJSDebugger

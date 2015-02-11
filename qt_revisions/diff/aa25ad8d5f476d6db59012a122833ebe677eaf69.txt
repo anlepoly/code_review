@@ -1,0 +1,810 @@
+diff --git a/src/qml/qml/qqmlbinding.cpp b/src/qml/qml/qqmlbinding.cpp
+index 38d305a..5860cbe 100644
+--- a/src/qml/qml/qqmlbinding.cpp
++++ b/src/qml/qml/qqmlbinding.cpp
+@@ -50,6 +50,7 @@
+ #include <private/qqmltrace_p.h>
+ #include <private/qqmlexpression_p.h>
+ #include <private/qqmlrewrite_p.h>
++#include <private/qqmlscriptstring_p.h>
+ 
+ #include <QVariant>
+ #include <QtCore/qdebug.h>
+@@ -114,6 +115,53 @@ QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContext *ctxt)
+     v8function = evalFunction(context(), obj, code, QString(), 0);
+ }
+ 
++QQmlBinding::QQmlBinding(const QQmlScriptString &script, QObject *obj, QQmlContext *ctxt)
++: QQmlJavaScriptExpression(&QQmlBinding_jsvtable), QQmlAbstractBinding(Binding)
++{
++    if (ctxt && !ctxt->isValid())
++        return;
++
++    const QQmlScriptStringPrivate *scriptPrivate = script.d.data();
++    if (!ctxt && (!scriptPrivate->context || !scriptPrivate->context->isValid()))
++        return;
++
++    bool needRewrite = true;
++    QString code;
++
++    int id = scriptPrivate->bindingId;
++    if (id >= 0) {
++        QQmlContextData *ctxtdata = QQmlContextData::get(scriptPrivate->context);
++        QQmlEnginePrivate *engine = QQmlEnginePrivate::get(scriptPrivate->context->engine());
++        if (engine && ctxtdata && !ctxtdata->url.isEmpty()) {
++            QQmlTypeData *typeData = engine->typeLoader.getType(ctxtdata->url);
++            Q_ASSERT(typeData);
++
++            if (QQmlCompiledData *cdata = typeData->compiledData()) {
++                needRewrite = false;
++                code = cdata->primitives.at(id);
++                m_url = cdata->name;
++            }
++
++            typeData->release();
++        }
++    }
++
++    if (needRewrite) {
++        QQmlRewrite::RewriteBinding rewriteBinding;
++        code = rewriteBinding(scriptPrivate->script);
++    }
++
++    setNotifyOnValueChanged(true);
++    QQmlAbstractExpression::setContext(QQmlContextData::get(ctxt ? ctxt : scriptPrivate->context));
++    setScopeObject(obj ? obj : scriptPrivate->scope);
++
++    m_expression = scriptPrivate->script.toUtf8();
++    m_lineNumber = scriptPrivate->lineNumber;
++    m_columnNumber = scriptPrivate->columnNumber;
++
++    v8function = evalFunction(context(), scopeObject(), code, QString(), m_lineNumber);
++}
++
+ QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContextData *ctxt)
+ : QQmlJavaScriptExpression(&QQmlBinding_jsvtable), QQmlAbstractBinding(Binding),
+   m_lineNumber(-1), m_columnNumber(-1)
+diff --git a/src/qml/qml/qqmlbinding_p.h b/src/qml/qml/qqmlbinding_p.h
+index bea74e4..8881451 100644
+--- a/src/qml/qml/qqmlbinding_p.h
++++ b/src/qml/qml/qqmlbinding_p.h
+@@ -57,6 +57,7 @@
+ #include "qqmlpropertyvaluesource.h"
+ #include "qqmlexpression.h"
+ #include "qqmlproperty.h"
++#include "qqmlscriptstring.h"
+ #include "qqmlproperty_p.h"
+ 
+ #include <QtCore/QObject>
+@@ -79,6 +80,7 @@ public:
+     Q_DECLARE_FLAGS(EvaluateFlags, EvaluateFlag)
+ 
+     QQmlBinding(const QString &, QObject *, QQmlContext *);
++    QQmlBinding(const QQmlScriptString &, QObject *, QQmlContext *);
+     QQmlBinding(const QString &, QObject *, QQmlContextData *);
+     QQmlBinding(const QString &, bool isRewritten, QObject *, QQmlContextData *, 
+                 const QString &url, int lineNumber, int columnNumber);
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index 539b6c4..453ee08 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -1265,6 +1265,9 @@ void QQmlCompiler::genObjectBody(QQmlScript::Object *obj)
+         ss.bindingId = rewriteBinding(prop->values.first()->value, QString()); // XXX
+         ss.line = prop->location.start.line;
+         ss.column = prop->location.start.column;
++        ss.isStringLiteral = prop->values.first()->value.isString();
++        ss.isNumberLiteral = prop->values.first()->value.isNumber();
++        ss.numberValue = prop->values.first()->value.asNumber();
+         output->addInstruction(ss);
+     }
+ 
+diff --git a/src/qml/qml/qqmlexpression.cpp b/src/qml/qml/qqmlexpression.cpp
+index 2ab412b..76d3144 100644
+--- a/src/qml/qml/qqmlexpression.cpp
++++ b/src/qml/qml/qqmlexpression.cpp
+@@ -202,38 +202,38 @@ QQmlExpression::QQmlExpression(QQmlContextData *ctxt,
+     Create a QQmlExpression object that is a child of \a parent.
+ 
+     The \a script provides the expression to be evaluated, the context to evaluate it in,
+-    and the scope object to evaluate it with.
+-
+-    This constructor is functionally equivalent to the following, but in most cases
+-    is more efficient.
+-    \code
+-    QQmlExpression expression(script.context(), script.scopeObject(), script.script(), parent);
+-    \endcode
++    and the scope object to evaluate it with. If provided, \a ctxt and \a scope will override
++    the context and scope object provided by \a script.
+ 
+     \sa QQmlScriptString
+ */
+-QQmlExpression::QQmlExpression(const QQmlScriptString &script, QObject *parent)
++QQmlExpression::QQmlExpression(const QQmlScriptString &script, QQmlContext *ctxt, QObject *scope, QObject *parent)
+ : QObject(*new QQmlExpressionPrivate, parent)
+ {
+     Q_D(QQmlExpression);
++    if (ctxt && !ctxt->isValid())
++        return;
+ 
+-    if (!script.context()->isValid())
++    const QQmlScriptStringPrivate *scriptPrivate = script.d.data();
++    if (!ctxt && (!scriptPrivate->context || !scriptPrivate->context->isValid()))
+         return;
+ 
+     bool defaultConstruction = true;
++    QQmlContextData *evalCtxtData = QQmlContextData::get(ctxt ? ctxt : scriptPrivate->context);
++    QObject *scopeObject = scope ? scope : scriptPrivate->scope;
+ 
+-    int id = script.d.data()->bindingId;
++    int id = scriptPrivate->bindingId;
+     if (id >= 0) {
+-        QQmlContextData *ctxtdata = QQmlContextData::get(script.context());
+-        QQmlEnginePrivate *engine = QQmlEnginePrivate::get(script.context()->engine());
++        QQmlContextData *ctxtdata = QQmlContextData::get(scriptPrivate->context);
++        QQmlEnginePrivate *engine = QQmlEnginePrivate::get(scriptPrivate->context->engine());
+         if (engine && ctxtdata && !ctxtdata->url.isEmpty()) {
+             QQmlTypeData *typeData = engine->typeLoader.getType(ctxtdata->url);
+             Q_ASSERT(typeData);
+ 
+             if (QQmlCompiledData *cdata = typeData->compiledData()) {
+                 defaultConstruction = false;
+-                d->init(ctxtdata, cdata->primitives.at(id), true, script.scopeObject(),
+-                        cdata->name, script.d.data()->lineNumber, script.d.data()->columnNumber);
++                d->init(evalCtxtData, cdata->primitives.at(id), true, scopeObject,
++                        cdata->name, scriptPrivate->lineNumber, scriptPrivate->columnNumber);
+             }
+ 
+             typeData->release();
+@@ -241,7 +241,7 @@ QQmlExpression::QQmlExpression(const QQmlScriptString &script, QObject *parent)
+     }
+ 
+     if (defaultConstruction)
+-        d->init(QQmlContextData::get(script.context()), script.script(), script.scopeObject());
++        d->init(evalCtxtData, scriptPrivate->script, scopeObject);
+ }
+ 
+ /*!
+diff --git a/src/qml/qml/qqmlexpression.h b/src/qml/qml/qqmlexpression.h
+index b60d9f1..e60af0b 100644
+--- a/src/qml/qml/qqmlexpression.h
++++ b/src/qml/qml/qqmlexpression.h
+@@ -65,7 +65,7 @@ class Q_QML_EXPORT QQmlExpression : public QObject
+ public:
+     QQmlExpression();
+     QQmlExpression(QQmlContext *, QObject *, const QString &, QObject * = 0);
+-    explicit QQmlExpression(const QQmlScriptString &, QObject * = 0);
++    explicit QQmlExpression(const QQmlScriptString &, QQmlContext * = 0, QObject * = 0, QObject * = 0);
+     virtual ~QQmlExpression();
+ 
+     QQmlEngine *engine() const;
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index 313aed1..5cd06c2 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -332,6 +332,9 @@ union QQmlInstruction
+         int bindingId;
+         ushort line;
+         ushort column;
++        double numberValue;
++        bool isStringLiteral;
++        bool isNumberLiteral;
+     }; 
+     struct instr_storeScript {
+         QML_INSTR_HEADER
+diff --git a/src/qml/qml/qqmlscriptstring.cpp b/src/qml/qml/qqmlscriptstring.cpp
+index ed7a6af..c38105d 100644
+--- a/src/qml/qml/qqmlscriptstring.cpp
++++ b/src/qml/qml/qqmlscriptstring.cpp
+@@ -73,6 +73,11 @@ expr.evaluate();
+ \sa QQmlExpression
+ */
+ 
++const QQmlScriptStringPrivate* QQmlScriptStringPrivate::get(const QQmlScriptString &script)
++{
++    return script.d.constData();
++}
++
+ /*!
+ Constructs an empty instance.
+ */
+@@ -82,6 +87,17 @@ QQmlScriptString::QQmlScriptString()
+ }
+ 
+ /*!
++    \internal
++*/
++QQmlScriptString::QQmlScriptString(const QString &script, QQmlContext *context, QObject *scope)
++:  d(new QQmlScriptStringPrivate)
++{
++    d->script = script;
++    d->context = context;
++    d->scope = scope;
++}
++
++/*!
+ Copies \a other.
+ */
+ QQmlScriptString::QQmlScriptString(const QQmlScriptString &other)
+@@ -106,51 +122,62 @@ QQmlScriptString &QQmlScriptString::operator=(const QQmlScriptString &other)
+ }
+ 
+ /*!
+-Returns the context for the script.
++Returns whether the QQmlScriptString is empty.
+ */
+-QQmlContext *QQmlScriptString::context() const
++bool QQmlScriptString::isEmpty() const
+ {
+-    return d->context;
++    return d->script.isEmpty();
+ }
+ 
+ /*!
+-Sets the \a context for the script.
++Returns whether the content of the QQmlScriptString is the \c undefined literal.
+ */
+-void QQmlScriptString::setContext(QQmlContext *context)
++bool QQmlScriptString::isUndefinedLiteral() const
+ {
+-    d->context = context;
++    return d->script == QStringLiteral("undefined");
+ }
+ 
+ /*!
+-Returns the scope object for the script.
++Returns whether the content of the QQmlScriptString is the \c null literal.
+ */
+-QObject *QQmlScriptString::scopeObject() const
++bool QQmlScriptString::isNullLiteral() const
+ {
+-    return d->scope;
++    return d->script == QStringLiteral("null");
+ }
+ 
+ /*!
+-Sets the scope \a object for the script.
++If the content of the QQmlScriptString is a string literal, returns that string.
++Otherwise returns a null QString.
+ */
+-void QQmlScriptString::setScopeObject(QObject *object)
++QString QQmlScriptString::stringLiteral() const
+ {
+-    d->scope = object;
++    if (d->isStringLiteral)
++        return d->script.mid(1, d->script.length()-2);
++    return QString();
+ }
+ 
+ /*!
+-Returns the script text.
++If the content of the QQmlScriptString is a number literal, returns that number and
++sets \a ok to true. Otherwise returns 0.0 and sets \a ok to false.
+ */
+-QString QQmlScriptString::script() const
++qreal QQmlScriptString::numberLiteral(bool *ok) const
+ {
+-    return d->script;
++    if (ok)
++        *ok = d->isNumberLiteral;
++    return d->isNumberLiteral ? d->numberValue : 0.;
+ }
+ 
+ /*!
+-Sets the \a script text.
++If the content of the QQmlScriptString is a boolean literal, returns the boolean value and
++sets \a ok to true. Otherwise returns false and sets \a ok to false.
+ */
+-void QQmlScriptString::setScript(const QString &script)
++bool QQmlScriptString::booleanLiteral(bool *ok) const
+ {
+-    d->script = script;
++    bool isTrue = d->script == QStringLiteral("true");
++    bool isFalse = !isTrue && d->script == QStringLiteral("false");
++    if (ok)
++        *ok = isTrue || isFalse;
++    return isTrue ? true : false;
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlscriptstring.h b/src/qml/qml/qqmlscriptstring.h
+index 15db908..f2ccbb7 100644
+--- a/src/qml/qml/qqmlscriptstring.h
++++ b/src/qml/qml/qqmlscriptstring.h
+@@ -64,20 +64,22 @@ public:
+ 
+     QQmlScriptString &operator=(const QQmlScriptString &);
+ 
+-    QQmlContext *context() const;
+-    void setContext(QQmlContext *);
++    bool isEmpty() const;
+ 
+-    QObject *scopeObject() const;
+-    void setScopeObject(QObject *);
+-
+-    QString script() const;
+-    void setScript(const QString &);
++    bool isUndefinedLiteral() const;
++    bool isNullLiteral() const;
++    QString stringLiteral() const;
++    qreal numberLiteral(bool *ok) const;
++    bool booleanLiteral(bool *ok) const;
+ 
+ private:
++    QQmlScriptString(const QString &script, QQmlContext *context, QObject *scope);
+     QSharedDataPointer<QQmlScriptStringPrivate> d;
+ 
++    friend class QQmlScriptStringPrivate;
+     friend class QQmlVME;
+     friend class QQmlExpression;
++    friend class QQmlBinding;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlscriptstring_p.h b/src/qml/qml/qqmlscriptstring_p.h
+index 15786c7..97c02d2 100644
+--- a/src/qml/qml/qqmlscriptstring_p.h
++++ b/src/qml/qml/qqmlscriptstring_p.h
+@@ -42,14 +42,19 @@
+ #ifndef QQMLSCRIPTSTRING_P_H
+ #define QQMLSCRIPTSTRING_P_H
+ 
++#include "qqmlscriptstring.h"
+ #include <QtQml/qqmlcontext.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QQmlScriptStringPrivate : public QSharedData
++class Q_AUTOTEST_EXPORT QQmlScriptStringPrivate : public QSharedData
+ {
+ public:
+-    QQmlScriptStringPrivate() : context(0), scope(0), bindingId(-1), lineNumber(-1), columnNumber(-1) {}
++    QQmlScriptStringPrivate() : context(0), scope(0), bindingId(-1), lineNumber(-1), columnNumber(-1),
++        numberValue(0), isStringLiteral(false), isNumberLiteral(false) {}
++
++    //for testing
++    static const QQmlScriptStringPrivate* get(const QQmlScriptString &script);
+ 
+     QQmlContext *context;
+     QObject *scope;
+@@ -57,6 +62,9 @@ public:
+     int bindingId;
+     int lineNumber;
+     int columnNumber;
++    double numberValue;
++    bool isStringLiteral;
++    bool isNumberLiteral;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index b33f7ee..f764b60 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -772,13 +772,13 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+         QML_BEGIN_INSTR(StoreScriptString)
+             QObject *target = objects.top();
+             QObject *scope = objects.at(objects.count() - 1 - instr.scope);
+-            QQmlScriptString ss;
+-            ss.setContext(CTXT->asQQmlContext());
+-            ss.setScopeObject(scope);
+-            ss.setScript(PRIMITIVES.at(instr.value));
++            QQmlScriptString ss(PRIMITIVES.at(instr.value), CTXT->asQQmlContext(), scope);
+             ss.d.data()->bindingId = instr.bindingId;
+             ss.d.data()->lineNumber = instr.line;
+             ss.d.data()->columnNumber = instr.column;
++            ss.d.data()->isStringLiteral = instr.isStringLiteral;
++            ss.d.data()->isNumberLiteral = instr.isNumberLiteral;
++            ss.d.data()->numberValue = instr.numberValue;
+ 
+             void *a[] = { &ss, 0, &status, &flags };
+             QMetaObject::metacall(target, QMetaObject::WriteProperty, 
+diff --git a/src/quick/items/qquickstateoperations.cpp b/src/quick/items/qquickstateoperations.cpp
+index 7ef1cf8..18d6c6b 100644
+--- a/src/quick/items/qquickstateoperations.cpp
++++ b/src/quick/items/qquickstateoperations.cpp
+@@ -356,13 +356,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->xString.isValid()) {
+         bool ok = false;
+-        QString script = d->xString.value.script();
+-        qreal x = script.toFloat(&ok);
++        qreal x = d->xString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction xa(d->target, QLatin1String("x"), x);
+             actions << xa;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->xString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("x"));
+             newBinding->setTarget(property);
+             QQuickAction xa;
+@@ -376,13 +375,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->yString.isValid()) {
+         bool ok = false;
+-        QString script = d->yString.value.script();
+-        qreal y = script.toFloat(&ok);
++        qreal y = d->yString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction ya(d->target, QLatin1String("y"), y);
+             actions << ya;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->yString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("y"));
+             newBinding->setTarget(property);
+             QQuickAction ya;
+@@ -396,13 +394,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->scaleString.isValid()) {
+         bool ok = false;
+-        QString script = d->scaleString.value.script();
+-        qreal scale = script.toFloat(&ok);
++        qreal scale = d->scaleString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction sa(d->target, QLatin1String("scale"), scale);
+             actions << sa;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->scaleString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("scale"));
+             newBinding->setTarget(property);
+             QQuickAction sa;
+@@ -416,13 +413,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->rotationString.isValid()) {
+         bool ok = false;
+-        QString script = d->rotationString.value.script();
+-        qreal rotation = script.toFloat(&ok);
++        qreal rotation = d->rotationString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction ra(d->target, QLatin1String("rotation"), rotation);
+             actions << ra;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->rotationString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("rotation"));
+             newBinding->setTarget(property);
+             QQuickAction ra;
+@@ -436,13 +432,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->widthString.isValid()) {
+         bool ok = false;
+-        QString script = d->widthString.value.script();
+-        qreal width = script.toFloat(&ok);
++        qreal width = d->widthString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction wa(d->target, QLatin1String("width"), width);
+             actions << wa;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->widthString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("width"));
+             newBinding->setTarget(property);
+             QQuickAction wa;
+@@ -456,13 +451,12 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+ 
+     if (d->heightString.isValid()) {
+         bool ok = false;
+-        QString script = d->heightString.value.script();
+-        qreal height = script.toFloat(&ok);
++        qreal height = d->heightString.value.numberLiteral(&ok);
+         if (ok) {
+             QQuickAction ha(d->target, QLatin1String("height"), height);
+             actions << ha;
+         } else {
+-            QQmlBinding *newBinding = new QQmlBinding(script, d->target, qmlContext(this));
++            QQmlBinding *newBinding = new QQmlBinding(d->heightString.value, d->target, qmlContext(this));
+             QQmlProperty property(d->target, QLatin1String("height"));
+             newBinding->setTarget(property);
+             QQuickAction ha;
+@@ -632,7 +626,7 @@ void QQuickAnchorSet::setTop(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::TopAnchor;
+     d->topScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetTop();
+ }
+ 
+@@ -654,7 +648,7 @@ void QQuickAnchorSet::setBottom(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::BottomAnchor;
+     d->bottomScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetBottom();
+ }
+ 
+@@ -676,7 +670,7 @@ void QQuickAnchorSet::setVerticalCenter(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::VCenterAnchor;
+     d->vCenterScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetVerticalCenter();
+ }
+ 
+@@ -698,7 +692,7 @@ void QQuickAnchorSet::setBaseline(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::BaselineAnchor;
+     d->baselineScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetBaseline();
+ }
+ 
+@@ -720,7 +714,7 @@ void QQuickAnchorSet::setLeft(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::LeftAnchor;
+     d->leftScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetLeft();
+ }
+ 
+@@ -742,7 +736,7 @@ void QQuickAnchorSet::setRight(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::RightAnchor;
+     d->rightScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetRight();
+ }
+ 
+@@ -764,7 +758,7 @@ void QQuickAnchorSet::setHorizontalCenter(const QQmlScriptString &edge)
+     Q_D(QQuickAnchorSet);
+     d->usedAnchors |= QQuickAnchors::HCenterAnchor;
+     d->hCenterScript = edge;
+-    if (edge.script() == QLatin1String("undefined"))
++    if (edge.isUndefinedLiteral())
+         resetHorizontalCenter();
+ }
+ 
+@@ -880,31 +874,31 @@ QQuickAnchorChanges::ActionList QQuickAnchorChanges::actions()
+     d->baselineProp = QQmlProperty(d->target, QLatin1String("anchors.baseline"));
+ 
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::LeftAnchor) {
+-        d->leftBinding = new QQmlBinding(d->anchorSet->d_func()->leftScript.script(), d->target, qmlContext(this));
++        d->leftBinding = new QQmlBinding(d->anchorSet->d_func()->leftScript, d->target, qmlContext(this));
+         d->leftBinding->setTarget(d->leftProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::RightAnchor) {
+-        d->rightBinding = new QQmlBinding(d->anchorSet->d_func()->rightScript.script(), d->target, qmlContext(this));
++        d->rightBinding = new QQmlBinding(d->anchorSet->d_func()->rightScript, d->target, qmlContext(this));
+         d->rightBinding->setTarget(d->rightProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::HCenterAnchor) {
+-        d->hCenterBinding = new QQmlBinding(d->anchorSet->d_func()->hCenterScript.script(), d->target, qmlContext(this));
++        d->hCenterBinding = new QQmlBinding(d->anchorSet->d_func()->hCenterScript, d->target, qmlContext(this));
+         d->hCenterBinding->setTarget(d->hCenterProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::TopAnchor) {
+-        d->topBinding = new QQmlBinding(d->anchorSet->d_func()->topScript.script(), d->target, qmlContext(this));
++        d->topBinding = new QQmlBinding(d->anchorSet->d_func()->topScript, d->target, qmlContext(this));
+         d->topBinding->setTarget(d->topProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::BottomAnchor) {
+-        d->bottomBinding = new QQmlBinding(d->anchorSet->d_func()->bottomScript.script(), d->target, qmlContext(this));
++        d->bottomBinding = new QQmlBinding(d->anchorSet->d_func()->bottomScript, d->target, qmlContext(this));
+         d->bottomBinding->setTarget(d->bottomProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::VCenterAnchor) {
+-        d->vCenterBinding = new QQmlBinding(d->anchorSet->d_func()->vCenterScript.script(), d->target, qmlContext(this));
++        d->vCenterBinding = new QQmlBinding(d->anchorSet->d_func()->vCenterScript, d->target, qmlContext(this));
+         d->vCenterBinding->setTarget(d->vCenterProp);
+     }
+     if (d->anchorSet->d_func()->usedAnchors & QQuickAnchors::BaselineAnchor) {
+-        d->baselineBinding = new QQmlBinding(d->anchorSet->d_func()->baselineScript.script(), d->target, qmlContext(this));
++        d->baselineBinding = new QQmlBinding(d->anchorSet->d_func()->baselineScript, d->target, qmlContext(this));
+         d->baselineBinding->setTarget(d->baselineProp);
+     }
+ 
+diff --git a/src/quick/util/qquickanimation.cpp b/src/quick/util/qquickanimation.cpp
+index 912a8e3..10996d8 100644
+--- a/src/quick/util/qquickanimation.cpp
++++ b/src/quick/util/qquickanimation.cpp
+@@ -951,7 +951,7 @@ void QQuickScriptActionPrivate::execute()
+ 
+     QQmlScriptString scriptStr = hasRunScriptScript ? runScriptScript : script;
+ 
+-    if (!scriptStr.script().isEmpty()) {
++    if (!scriptStr.isEmpty()) {
+         QQmlExpression expr(scriptStr);
+         expr.evaluate();
+         if (expr.hasError())
+diff --git a/src/quick/util/qquickstatechangescript.cpp b/src/quick/util/qquickstatechangescript.cpp
+index ef89496..8ab4576 100644
+--- a/src/quick/util/qquickstatechangescript.cpp
++++ b/src/quick/util/qquickstatechangescript.cpp
+@@ -130,7 +130,7 @@ void QQuickStateChangeScript::setName(const QString &n)
+ void QQuickStateChangeScript::execute(Reason)
+ {
+     Q_D(QQuickStateChangeScript);
+-    if (!d->script.script().isEmpty()) {
++    if (!d->script.isEmpty()) {
+         QQmlExpression expr(d->script);
+         expr.evaluate();
+         if (expr.hasError())
+diff --git a/tests/auto/qml/qqmlexpression/tst_qqmlexpression.cpp b/tests/auto/qml/qqmlexpression/tst_qqmlexpression.cpp
+index 5cc6289..8e53efe 100644
+--- a/tests/auto/qml/qqmlexpression/tst_qqmlexpression.cpp
++++ b/tests/auto/qml/qqmlexpression/tst_qqmlexpression.cpp
+@@ -88,14 +88,14 @@ void tst_qqmlexpression::scriptString()
+     QVERIFY(testObj != 0);
+ 
+     QQmlScriptString script = testObj->scriptString();
+-    QCOMPARE(script.script(), QLatin1String("value1 + value2"));
++    QVERIFY(!script.isEmpty());
+ 
+     QQmlExpression expression(script);
+     QVariant value = expression.evaluate();
+     QCOMPARE(value.toInt(), 15);
+ 
+     QQmlScriptString scriptError = testObj->scriptStringError();
+-    QCOMPARE(scriptError.script(), QLatin1String("value3 * 5"));
++    QVERIFY(!scriptError.isEmpty());
+ 
+     //verify that the expression has the correct error location information
+     QQmlExpression expressionError(scriptError);
+diff --git a/tests/auto/qml/qqmllanguage/data/scriptString5.qml b/tests/auto/qml/qqmllanguage/data/scriptString5.qml
+new file mode 100644
+index 0000000..12485bb
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/scriptString5.qml
+@@ -0,0 +1,5 @@
++import Test 1.0
++
++MyTypeObject {
++    scriptProperty: null
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/scriptString6.qml b/tests/auto/qml/qqmllanguage/data/scriptString6.qml
+new file mode 100644
+index 0000000..c30f224
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/scriptString6.qml
+@@ -0,0 +1,5 @@
++import Test 1.0
++
++MyTypeObject {
++    scriptProperty: undefined
++}
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 316d7e2..04a4bf7 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -52,6 +52,7 @@
+ #include <private/qqmlproperty_p.h>
+ #include <private/qqmlmetatype_p.h>
+ #include <private/qqmlglobal_p.h>
++#include <private/qqmlscriptstring_p.h>
+ 
+ #include "testtypes.h"
+ #include "testhttpserver.h"
+@@ -1693,14 +1694,23 @@ void tst_qqmllanguage::scriptString()
+ 
+         MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
+         QVERIFY(object != 0);
+-        QCOMPARE(object->scriptProperty().script(), QString("foo + bar"));
+-        QCOMPARE(object->scriptProperty().scopeObject(), qobject_cast<QObject*>(object));
+-        QCOMPARE(object->scriptProperty().context(), qmlContext(object));
++        QVERIFY(!object->scriptProperty().isEmpty());
++        QCOMPARE(object->scriptProperty().stringLiteral(), QString());
++        bool ok;
++        QCOMPARE(object->scriptProperty().numberLiteral(&ok), qreal(0.));
++        QCOMPARE(ok, false);
++
++        const QQmlScriptStringPrivate *scriptPrivate = QQmlScriptStringPrivate::get(object->scriptProperty());
++        QVERIFY(scriptPrivate != 0);
++        QCOMPARE(scriptPrivate->script, QString("foo + bar"));
++        QCOMPARE(scriptPrivate->scope, qobject_cast<QObject*>(object));
++        QCOMPARE(scriptPrivate->context, qmlContext(object));
+ 
+         QVERIFY(object->grouped() != 0);
+-        QCOMPARE(object->grouped()->script().script(), QString("console.log(1921)"));
+-        QCOMPARE(object->grouped()->script().scopeObject(), qobject_cast<QObject*>(object));
+-        QCOMPARE(object->grouped()->script().context(), qmlContext(object));
++        const QQmlScriptStringPrivate *groupedPrivate = QQmlScriptStringPrivate::get(object->grouped()->script());
++        QCOMPARE(groupedPrivate->script, QString("console.log(1921)"));
++        QCOMPARE(groupedPrivate->scope, qobject_cast<QObject*>(object));
++        QCOMPARE(groupedPrivate->context, qmlContext(object));
+     }
+ 
+     {
+@@ -1709,7 +1719,7 @@ void tst_qqmllanguage::scriptString()
+ 
+         MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
+         QVERIFY(object != 0);
+-        QCOMPARE(object->scriptProperty().script(), QString("\"hello\\n\\\"world\\\"\""));
++        QCOMPARE(object->scriptProperty().stringLiteral(), QString("hello\\n\\\"world\\\""));
+     }
+ 
+     {
+@@ -1718,7 +1728,10 @@ void tst_qqmllanguage::scriptString()
+ 
+         MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
+         QVERIFY(object != 0);
+-        QCOMPARE(object->scriptProperty().script(), QString("12.345"));
++        bool ok;
++        QCOMPARE(object->scriptProperty().numberLiteral(&ok), qreal(12.345));
++        QCOMPARE(ok, true);
++
+     }
+ 
+     {
+@@ -1727,7 +1740,27 @@ void tst_qqmllanguage::scriptString()
+ 
+         MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
+         QVERIFY(object != 0);
+-        QCOMPARE(object->scriptProperty().script(), QString("true"));
++        bool ok;
++        QCOMPARE(object->scriptProperty().booleanLiteral(&ok), true);
++        QCOMPARE(ok, true);
++    }
++
++    {
++        QQmlComponent component(&engine, testFileUrl("scriptString5.qml"));
++        VERIFY_ERRORS(0);
++
++        MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
++        QVERIFY(object != 0);
++        QCOMPARE(object->scriptProperty().isNullLiteral(), true);
++    }
++
++    {
++        QQmlComponent component(&engine, testFileUrl("scriptString6.qml"));
++        VERIFY_ERRORS(0);
++
++        MyTypeObject *object = qobject_cast<MyTypeObject*>(component.create());
++        QVERIFY(object != 0);
++        QCOMPARE(object->scriptProperty().isUndefinedLiteral(), true);
+     }
+ }
+ 
+diff --git a/tests/auto/quick/qquickstates/tst_qquickstates.cpp b/tests/auto/quick/qquickstates/tst_qquickstates.cpp
+index 0a42ae5..b8a3a49 100644
+--- a/tests/auto/quick/qquickstates/tst_qquickstates.cpp
++++ b/tests/auto/quick/qquickstates/tst_qquickstates.cpp
+@@ -702,8 +702,9 @@ void tst_qquickstates::anchorChanges()
+     QQuickAnchorChanges *aChanges = qobject_cast<QQuickAnchorChanges*>(state->operationAt(0));
+     QVERIFY(aChanges != 0);
+ 
+-    QCOMPARE(aChanges->anchors()->left().script(), QLatin1String("undefined"));
+-    QCOMPARE(aChanges->anchors()->right().script(), QLatin1String("container.right"));
++    QCOMPARE(aChanges->anchors()->left().isUndefinedLiteral(), true);
++    QVERIFY(!aChanges->anchors()->left().isEmpty());
++    QVERIFY(!aChanges->anchors()->right().isEmpty());
+ 
+     rectPrivate->setState("right");
+     QCOMPARE(innerRect->x(), qreal(150));
+@@ -765,8 +766,8 @@ void tst_qquickstates::anchorChanges3()
+     QQuickAnchorChanges *aChanges = qobject_cast<QQuickAnchorChanges*>(state->operationAt(0));
+     QVERIFY(aChanges != 0);
+ 
+-    QCOMPARE(aChanges->anchors()->top().script(), QLatin1String("container.top"));
+-    QCOMPARE(aChanges->anchors()->bottom().script(), QLatin1String("bottomGuideline.bottom"));
++    QVERIFY(!aChanges->anchors()->top().isEmpty());
++    QVERIFY(!aChanges->anchors()->bottom().isEmpty());
+ 
+     rectPrivate->setState("reanchored");
+     QCOMPARE(aChanges->object(), qobject_cast<QQuickItem*>(innerRect));
+@@ -818,8 +819,8 @@ void tst_qquickstates::anchorChanges4()
+     QQuickAnchorChanges *aChanges = qobject_cast<QQuickAnchorChanges*>(state->operationAt(0));
+     QVERIFY(aChanges != 0);
+ 
+-    QCOMPARE(aChanges->anchors()->horizontalCenter().script(), QLatin1String("bottomGuideline.horizontalCenter"));
+-    QCOMPARE(aChanges->anchors()->verticalCenter().script(), QLatin1String("leftGuideline.verticalCenter"));
++    QVERIFY(!aChanges->anchors()->horizontalCenter().isEmpty());
++    QVERIFY(!aChanges->anchors()->verticalCenter().isEmpty());
+ 
+     QQuickItemPrivate::get(rect)->setState("reanchored");
+     QCOMPARE(aChanges->object(), qobject_cast<QQuickItem*>(innerRect));
+@@ -856,7 +857,7 @@ void tst_qquickstates::anchorChanges5()
+     QQuickAnchorChanges *aChanges = qobject_cast<QQuickAnchorChanges*>(state->operationAt(0));
+     QVERIFY(aChanges != 0);
+ 
+-    QCOMPARE(aChanges->anchors()->baseline().script(), QLatin1String("leftGuideline.baseline"));
++    QVERIFY(!aChanges->anchors()->baseline().isEmpty());
+ 
+     QQuickItemPrivate::get(rect)->setState("reanchored");
+     QCOMPARE(aChanges->object(), qobject_cast<QQuickItem*>(innerRect));

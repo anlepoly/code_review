@@ -1,0 +1,165 @@
+diff --git a/src/corelib/kernel/qmetatype.h b/src/corelib/kernel/qmetatype.h
+index f969875..06ada13 100644
+--- a/src/corelib/kernel/qmetatype.h
++++ b/src/corelib/kernel/qmetatype.h
+@@ -364,33 +364,11 @@ void qMetaTypeLoadHelper(QDataStream &stream, void *t)
+ template <> inline void qMetaTypeLoadHelper<void>(QDataStream &, void *) {}
+ #endif // QT_NO_DATASTREAM
+ 
+-template <typename T>
+-struct QMetaTypeId
+-{
+-    enum { Defined = 0 };
+-};
+-
+-template <typename T>
+-struct QMetaTypeId2
+-{
+-    enum { Defined = QMetaTypeId<T>::Defined };
+-    static inline int qt_metatype_id() { return QMetaTypeId<T>::qt_metatype_id(); }
+-};
+-
+ class QObject;
+ class QWidget;
+ 
+-namespace QtPrivate {
+-    template <typename T, bool Defined = QMetaTypeId2<T>::Defined>
+-    struct QMetaTypeIdHelper {
+-        static inline int qt_metatype_id()
+-        { return QMetaTypeId2<T>::qt_metatype_id(); }
+-    };
+-    template <typename T> struct QMetaTypeIdHelper<T, false> {
+-        static inline int qt_metatype_id()
+-        { return -1; }
+-    };
+-
++namespace QtPrivate
++{
+     template<typename T>
+     struct IsPointerToTypeDerivedFromQObject
+     {
+@@ -427,6 +405,38 @@ namespace QtPrivate {
+         Q_STATIC_ASSERT_X(sizeof(T), "Type argument of Q_DECLARE_METATYPE(T*) must be fully defined");
+         enum { Value = sizeof(checkType(static_cast<T*>(0))) == sizeof(yes_type) };
+     };
++}
++
++template <typename T, bool = QtPrivate::IsPointerToTypeDerivedFromQObject<T>::Value>
++struct QMetaTypeIdQObject
++{
++    enum {
++        Defined = 0
++    };
++};
++
++template <typename T>
++struct QMetaTypeId : public QMetaTypeIdQObject<T>
++{
++};
++
++template <typename T>
++struct QMetaTypeId2
++{
++    enum { Defined = QMetaTypeId<T>::Defined };
++    static inline int qt_metatype_id() { return QMetaTypeId<T>::qt_metatype_id(); }
++};
++
++namespace QtPrivate {
++    template <typename T, bool Defined = QMetaTypeId2<T>::Defined>
++    struct QMetaTypeIdHelper {
++        static inline int qt_metatype_id()
++        { return QMetaTypeId2<T>::qt_metatype_id(); }
++    };
++    template <typename T> struct QMetaTypeIdHelper<T, false> {
++        static inline int qt_metatype_id()
++        { return -1; }
++    };
+ 
+     // Function pointers don't derive from QObject
+     template <class Result> struct IsPointerToTypeDerivedFromQObject<Result(*)()> { enum { Value = false }; };
+@@ -501,6 +511,23 @@ inline int qRegisterMetaType(
+ #endif
+ }
+ 
++template <typename T>
++struct QMetaTypeIdQObject<T*, /* isPointerToTypeDerivedFromQObject */ true>
++{
++    enum {
++        Defined = 1
++    };
++
++    static int qt_metatype_id()
++    {
++        static QBasicAtomicInt metatype_id = Q_BASIC_ATOMIC_INITIALIZER(0);
++        if (!metatype_id.load())
++            metatype_id.storeRelease(qRegisterMetaType<T*>(QByteArray(T::staticMetaObject.className() + QByteArrayLiteral("*")).constData(),
++                        reinterpret_cast<T**>(quintptr(-1))));
++        return metatype_id.loadAcquire();
++    }
++};
++
+ #ifndef QT_NO_DATASTREAM
+ template <typename T>
+ inline int qRegisterMetaTypeStreamOperators()
+diff --git a/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp b/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
+index f8403f1..572ecc9 100644
+--- a/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
++++ b/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
+@@ -100,12 +100,29 @@ private slots:
+ 
+ struct Foo { int i; };
+ 
++
++class CustomQObject : public QObject
++{
++    Q_OBJECT
++public:
++    CustomQObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++    }
++};
++
++class CustomNonQObject {};
++
+ void tst_QMetaType::defined()
+ {
+     QCOMPARE(int(QMetaTypeId2<QString>::Defined), 1);
+     QCOMPARE(int(QMetaTypeId2<Foo>::Defined), 0);
+     QCOMPARE(int(QMetaTypeId2<void*>::Defined), 1);
+     QCOMPARE(int(QMetaTypeId2<int*>::Defined), 0);
++    QVERIFY(QMetaTypeId2<CustomQObject*>::Defined);
++    QVERIFY(!QMetaTypeId2<CustomQObject>::Defined);
++    QVERIFY(!QMetaTypeId2<CustomNonQObject>::Defined);
++    QVERIFY(!QMetaTypeId2<CustomNonQObject*>::Defined);
+ }
+ 
+ struct Bar
+diff --git a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+index ccdab17..5aa1389 100644
+--- a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
++++ b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+@@ -2541,9 +2541,24 @@ public:
+ };
+ Q_DECLARE_METATYPE(CustomQObjectDerived*)
+ 
++class CustomQObjectDerivedNoMetaType : public CustomQObject {
++    Q_OBJECT
++public:
++    CustomQObjectDerivedNoMetaType(QObject *parent = 0) : CustomQObject(parent) {}
++};
++
+ void tst_QVariant::qvariant_cast_QObject_derived()
+ {
+     {
++        CustomQObjectDerivedNoMetaType *object = new CustomQObjectDerivedNoMetaType(this);
++        QVariant data = QVariant::fromValue(object);
++        QVERIFY(data.userType() == qMetaTypeId<CustomQObjectDerivedNoMetaType*>());
++        QCOMPARE(data.value<QObject *>(), object);
++        QCOMPARE(data.value<CustomQObjectDerivedNoMetaType *>(), object);
++        QCOMPARE(data.value<CustomQObject *>(), object);
++        QVERIFY(data.value<CustomQWidget*>() == 0);
++    }
++    {
+         CustomQObjectDerived *object = new CustomQObjectDerived(this);
+         QVariant data = QVariant::fromValue(object);

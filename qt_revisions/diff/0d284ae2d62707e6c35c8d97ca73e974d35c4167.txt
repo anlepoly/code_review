@@ -1,0 +1,493 @@
+diff --git a/src/qml/debugger/qdebugmessageservice.cpp b/src/qml/debugger/qdebugmessageservice.cpp
+index a41f95c..bcd7985 100644
+--- a/src/qml/debugger/qdebugmessageservice.cpp
++++ b/src/qml/debugger/qdebugmessageservice.cpp
+@@ -43,6 +43,7 @@
+ #include "qqmldebugservice_p_p.h"
+ 
+ #include <QDataStream>
++#include <QMutex>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -65,6 +66,7 @@ public:
+ 
+     QMessageHandler oldMsgHandler;
+     QQmlDebugService::State prevState;
++    QMutex initMutex;
+ };
+ 
+ QDebugMessageService::QDebugMessageService(QObject *parent) :
+@@ -73,6 +75,8 @@ QDebugMessageService::QDebugMessageService(QObject *parent) :
+ {
+     Q_D(QDebugMessageService);
+ 
++    // don't execute stateChanged() in parallel
++    QMutexLocker lock(&d->initMutex);
+     registerService();
+     if (state() == Enabled) {
+         d->oldMsgHandler = qInstallMessageHandler(DebugMessageHandler);
+@@ -108,6 +112,7 @@ void QDebugMessageService::sendDebugMessage(QtMsgType type,
+ void QDebugMessageService::stateChanged(State state)
+ {
+     Q_D(QDebugMessageService);
++    QMutexLocker lock(&d->initMutex);
+ 
+     if (state != Enabled && d->prevState == Enabled) {
+         QMessageHandler handler = qInstallMessageHandler(d->oldMsgHandler);
+@@ -117,7 +122,6 @@ void QDebugMessageService::stateChanged(State state)
+ 
+     } else if (state == Enabled && d->prevState != Enabled) {
+         d->oldMsgHandler = qInstallMessageHandler(DebugMessageHandler);
+-
+     }
+ 
+     d->prevState = state;
+diff --git a/src/qml/debugger/qqmldebugserver.cpp b/src/qml/debugger/qqmldebugserver.cpp
+index d49d04f..b247e43 100644
+--- a/src/qml/debugger/qqmldebugserver.cpp
++++ b/src/qml/debugger/qqmldebugserver.cpp
+@@ -99,6 +99,7 @@ public:
+     mutable QReadWriteLock pluginsLock;
+     QStringList clientPlugins;
+     bool gotHello;
++    bool blockingMode;
+ 
+     QMutex messageArrivedMutex;
+     QWaitCondition messageArrivedCondition;
+@@ -139,6 +140,7 @@ private:
+ QQmlDebugServerPrivate::QQmlDebugServerPrivate() :
+     connection(0),
+     gotHello(false),
++    blockingMode(false),
+     thread(0)
+ {
+     // used in _q_sendMessages
+@@ -244,6 +246,12 @@ bool QQmlDebugServer::hasDebuggingClient() const
+             && d->gotHello;
+ }
+ 
++bool QQmlDebugServer::blockingMode() const
++{
++    Q_D(const QQmlDebugServer);
++    return d->blockingMode;
++}
++
+ static QQmlDebugServer *qQmlDebugServer = 0;
+ 
+ 
+@@ -305,10 +313,12 @@ QQmlDebugServer *QQmlDebugServer::instance()
+                 thread->setPort(port, block, hostAddress);
+ 
+                 QQmlDebugServerPrivate *d = qQmlDebugServer->d_func();
++                d->blockingMode = block;
++
+                 QMutexLocker locker(&d->messageArrivedMutex);
+                 thread->start();
+ 
+-                if (block)
++                if (d->blockingMode)
+                     d->messageArrivedCondition.wait(&d->messageArrivedMutex);
+ 
+             } else {
+@@ -576,27 +586,6 @@ void QQmlDebugServer::sendMessages(QQmlDebugService *service,
+                               Q_ARG(QList<QByteArray>, prefixedMessages));
+ }
+ 
+-bool QQmlDebugServer::waitForMessage(QQmlDebugService *service)
+-{
+-    // to be executed in GUI thread
+-    Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
+-
+-    Q_D(QQmlDebugServer);
+-    QReadLocker lock(&d->pluginsLock);
+-
+-    if (!service
+-            || !d->plugins.contains(service->name()))
+-        return false;
+-
+-    d->messageArrivedMutex.lock();
+-    d->waitingForMessageNames << service->name();
+-    do {
+-        d->messageArrivedCondition.wait(&d->messageArrivedMutex);
+-    } while (d->waitingForMessageNames.contains(service->name()));
+-    d->messageArrivedMutex.unlock();
+-    return true;
+-}
+-
+ QT_END_NAMESPACE
+ 
+ #include "moc_qqmldebugserver_p.cpp"
+diff --git a/src/qml/debugger/qqmldebugserver_p.h b/src/qml/debugger/qqmldebugserver_p.h
+index 5de7e73..5e853da 100644
+--- a/src/qml/debugger/qqmldebugserver_p.h
++++ b/src/qml/debugger/qqmldebugserver_p.h
+@@ -76,6 +76,7 @@ public:
+     void setConnection(QQmlDebugServerConnection *connection);
+ 
+     bool hasDebuggingClient() const;
++    bool blockingMode() const;
+ 
+     QList<QQmlDebugService*> services() const;
+     QStringList serviceNames() const;
+@@ -86,7 +87,6 @@ public:
+ 
+     void receiveMessage(const QByteArray &message);
+ 
+-    bool waitForMessage(QQmlDebugService *service);
+     void sendMessages(QQmlDebugService *service, const QList<QByteArray> &messages);
+ 
+ private:
+diff --git a/src/qml/debugger/qqmldebugservice.cpp b/src/qml/debugger/qqmldebugservice.cpp
+index 4594849..1fe5aa3 100644
+--- a/src/qml/debugger/qqmldebugservice.cpp
++++ b/src/qml/debugger/qqmldebugservice.cpp
+@@ -213,6 +213,12 @@ bool QQmlDebugService::hasDebuggingClient()
+             && QQmlDebugServer::instance()->hasDebuggingClient();
+ }
+ 
++bool QQmlDebugService::blockingMode()
++{
++    return QQmlDebugServer::instance() != 0
++            && QQmlDebugServer::instance()->blockingMode();
++}
++
+ QString QQmlDebugService::objectToString(QObject *obj)
+ {
+     if(!obj)
+@@ -243,16 +249,6 @@ void QQmlDebugService::sendMessages(const QList<QByteArray> &messages)
+     d->server->sendMessages(this, messages);
+ }
+ 
+-bool QQmlDebugService::waitForMessage()
+-{
+-    Q_D(QQmlDebugService);
+-
+-    if (state() != Enabled)
+-        return false;
+-
+-    return d->server->waitForMessage(this);
+-}
+-
+ void QQmlDebugService::stateAboutToBeChanged(State)
+ {
+ }
+diff --git a/src/qml/debugger/qqmldebugservice_p.h b/src/qml/debugger/qqmldebugservice_p.h
+index f19b64f..abd9c1b 100644
+--- a/src/qml/debugger/qqmldebugservice_p.h
++++ b/src/qml/debugger/qqmldebugservice_p.h
+@@ -81,7 +81,6 @@ public:
+ 
+     void sendMessage(const QByteArray &);
+     void sendMessages(const QList<QByteArray> &);
+-    bool waitForMessage();
+ 
+     static int idForObject(QObject *);
+     static QObject *objectForId(int);
+@@ -90,6 +89,7 @@ public:
+ 
+     static bool isDebuggingEnabled();
+     static bool hasDebuggingClient();
++    static bool blockingMode();
+ 
+ protected:
+     QQmlDebugService(QQmlDebugServicePrivate &dd, const QString &name, float version, QObject *parent = 0);
+diff --git a/src/qml/debugger/qqmlprofilerservice.cpp b/src/qml/debugger/qqmlprofilerservice.cpp
+index 7109286..12db9e1 100644
+--- a/src/qml/debugger/qqmlprofilerservice.cpp
++++ b/src/qml/debugger/qqmlprofilerservice.cpp
+@@ -78,16 +78,17 @@ QByteArray QQmlProfilerData::toByteArray() const
+ 
+ QQmlProfilerService::QQmlProfilerService()
+     : QQmlDebugService(QStringLiteral("CanvasFrameRate"), 1),
+-      m_enabled(false), m_messageReceived(false)
++      m_enabled(false)
+ {
+     m_timer.start();
+ 
+-    if (registerService() == Enabled) {
+-        // wait for first message indicating whether to trace or not
+-        while (!m_messageReceived)
+-            waitForMessage();
++    // don't execute stateAboutToBeChanged(), messageReceived() in parallel
++    QMutexLocker lock(&m_initializeMutex);
+ 
+-        QUnifiedTimer::instance()->registerProfilerCallback( &animationFrame );
++    if (registerService() == Enabled) {
++        QUnifiedTimer::instance()->registerProfilerCallback(&animationFrame);
++        if (blockingMode())
++            m_initializeCondition.wait(&m_initializeMutex);
+     }
+ }
+ 
+@@ -248,7 +249,7 @@ void QQmlProfilerService::animationFrameImpl(qint64 delta)
+ */
+ void QQmlProfilerService::processMessage(const QQmlProfilerData &message)
+ {
+-    QMutexLocker locker(&m_mutex);
++    QMutexLocker locker(&m_dataMutex);
+     m_data.append(message);
+ }
+ 
+@@ -267,7 +268,7 @@ void QQmlProfilerService::setProfilingEnabled(bool enable)
+ */
+ void QQmlProfilerService::sendMessages()
+ {
+-    QMutexLocker locker(&m_mutex);
++    QMutexLocker locker(&m_dataMutex);
+     QList<QByteArray> messages;
+     for (int i = 0; i < m_data.count(); ++i)
+         messages << m_data.at(i).toByteArray();
+@@ -284,6 +285,8 @@ void QQmlProfilerService::sendMessages()
+ 
+ void QQmlProfilerService::stateAboutToBeChanged(QQmlDebugService::State newState)
+ {
++    QMutexLocker lock(&m_initializeMutex);
++
+     if (state() == newState)
+         return;
+ 
+@@ -292,24 +295,33 @@ void QQmlProfilerService::stateAboutToBeChanged(QQmlDebugService::State newState
+         stopProfilingImpl();
+         sendMessages();
+     }
++
++    if (state() != Enabled) {
++        // wake up constructor in blocking mode
++        // (we might got disabled before first message arrived)
++        m_initializeCondition.wakeAll();
++    }
+ }
+ 
+ void QQmlProfilerService::messageReceived(const QByteArray &message)
+ {
++    QMutexLocker lock(&m_initializeMutex);
++
+     QByteArray rwData = message;
+     QDataStream stream(&rwData, QIODevice::ReadOnly);
+ 
+     bool enabled;
+     stream >> enabled;
+ 
+-    m_messageReceived = true;
+-
+     if (enabled) {
+         startProfilingImpl();
+     } else {
+         if (stopProfilingImpl())
+             sendMessages();
+     }
++
++    // wake up constructor in blocking mode
++    m_initializeCondition.wakeAll();
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/debugger/qqmlprofilerservice_p.h b/src/qml/debugger/qqmlprofilerservice_p.h
+index 208fde5..eeaf871 100644
+--- a/src/qml/debugger/qqmlprofilerservice_p.h
++++ b/src/qml/debugger/qqmlprofilerservice_p.h
+@@ -61,6 +61,7 @@
+ #include <QtCore/qmutex.h>
+ #include <QtCore/qvector.h>
+ #include <QtCore/qstringbuilder.h>
++#include <QtCore/qwaitcondition.h>
+ 
+ 
+ QT_BEGIN_HEADER
+@@ -164,9 +165,10 @@ private:
+ private:
+     QElapsedTimer m_timer;
+     bool m_enabled;
+-    bool m_messageReceived;
+     QVector<QQmlProfilerData> m_data;
+-    QMutex m_mutex;
++    QMutex m_dataMutex;
++    QMutex m_initializeMutex;
++    QWaitCondition m_initializeCondition;
+ 
+     static QQmlProfilerService *instance;
+ 
+diff --git a/src/qml/debugger/qv8debugservice.cpp b/src/qml/debugger/qv8debugservice.cpp
+index f8831db..3ef1f32 100644
+--- a/src/qml/debugger/qv8debugservice.cpp
++++ b/src/qml/debugger/qv8debugservice.cpp
+@@ -48,6 +48,7 @@
+ #include <QtCore/QHash>
+ #include <QtCore/QFileInfo>
+ #include <QtCore/QMutex>
++#include <QtCore/QWaitCondition>
+ 
+ //V8 DEBUG SERVICE PROTOCOL
+ // <HEADER><COMMAND><DATA>
+@@ -106,8 +107,7 @@ class QV8DebugServicePrivate : public QQmlDebugServicePrivate
+ {
+ public:
+     QV8DebugServicePrivate()
+-        : connectReceived(false)
+-        , engine(0)
++        : engine(0)
+     {
+     }
+ 
+@@ -115,8 +115,8 @@ public:
+ 
+     static QByteArray packMessage(const QString &type, const QString &message = QString());
+ 
+-    bool connectReceived;
+     QMutex initializeMutex;
++    QWaitCondition initializeCondition;
+     QStringList breakOnSignals;
+     const QV8Engine *engine;
+ };
+@@ -127,16 +127,13 @@ QV8DebugService::QV8DebugService(QObject *parent)
+ {
+     Q_D(QV8DebugService);
+     v8ServiceInstancePtr = this;
+-    // wait for stateChanged() -> initialize()
+-    d->initializeMutex.lock();
++    // don't execute stateChanged, messageReceived in parallel
++    QMutexLocker lock(&d->initializeMutex);
++
+     if (registerService() == Enabled) {
+         init();
+-        // ,block mode, client attached
+-        while (!d->connectReceived) {
+-            waitForMessage();
+-        }
+-    } else {
+-        d->initializeMutex.unlock();
++        if (blockingMode())
++            d->initializeCondition.wait(&d->initializeMutex);
+     }
+ }
+ 
+@@ -189,11 +186,9 @@ void QV8DebugService::signalEmitted(const QString &signal)
+ // executed in the gui thread
+ void QV8DebugService::init()
+ {
+-    Q_D(QV8DebugService);
+     v8::Debug::SetMessageHandler2(DebugMessageHandler);
+     v8::Debug::SetDebugMessageDispatchHandler(DebugMessageDispatchHandler);
+     QV4Compiler::enableV4(false);
+-    d->initializeMutex.unlock();
+ }
+ 
+ // executed in the gui thread
+@@ -209,10 +204,16 @@ void QV8DebugService::scheduledDebugBreak(bool schedule)
+ void QV8DebugService::stateChanged(QQmlDebugService::State newState)
+ {
+     Q_D(QV8DebugService);
++    QMutexLocker lock(&d->initializeMutex);
++
+     if (newState == Enabled) {
+-        // execute in GUI thread
+-        d->initializeMutex.lock();
+-        QMetaObject::invokeMethod(this, "init", Qt::QueuedConnection);
++        // execute in GUI thread, bock to make sure messageReceived isn't called
++        // before it finished.
++        QMetaObject::invokeMethod(this, "init", Qt::BlockingQueuedConnection);
++    } else {
++        // wake up constructor in blocking mode
++        // (we might got disabled before first message arrived)
++        d->initializeCondition.wakeAll();
+     }
+ }
+ 
+@@ -220,6 +221,7 @@ void QV8DebugService::stateChanged(QQmlDebugService::State newState)
+ void QV8DebugService::messageReceived(const QByteArray &message)
+ {
+     Q_D(QV8DebugService);
++    QMutexLocker lock(&d->initializeMutex);
+ 
+     QDataStream ds(message);
+     QByteArray header;
+@@ -231,10 +233,9 @@ void QV8DebugService::messageReceived(const QByteArray &message)
+         ds >> command >> data;
+ 
+         if (command == V8_DEBUGGER_KEY_CONNECT) {
+-            QMutexLocker locker(&d->initializeMutex);
+-            d->connectReceived = true;
+             sendMessage(QV8DebugServicePrivate::packMessage(QLatin1String(V8_DEBUGGER_KEY_CONNECT)));
+-
++            // wake up constructor in blocking mode
++            d->initializeCondition.wakeAll();
+         } else if (command == V8_DEBUGGER_KEY_INTERRUPT) {
+             // break has to be executed in gui thread
+             QMetaObject::invokeMethod(this, "scheduledDebugBreak", Qt::QueuedConnection, Q_ARG(bool, true));
+@@ -260,7 +261,6 @@ void QV8DebugService::messageReceived(const QByteArray &message)
+             else
+                 d->breakOnSignals.removeOne(signalName);
+             sendMessage(QV8DebugServicePrivate::packMessage(QLatin1String(V8_DEBUGGER_KEY_BREAK_ON_SIGNAL)));
+-
+         }
+     }
+ }
+diff --git a/src/qml/debugger/qv8profilerservice.cpp b/src/qml/debugger/qv8profilerservice.cpp
+index 1cd7606..5cddea7 100644
+--- a/src/qml/debugger/qv8profilerservice.cpp
++++ b/src/qml/debugger/qv8profilerservice.cpp
+@@ -45,6 +45,8 @@
+ #include <private/qv8profiler_p.h>
+ 
+ #include <QtCore/QHash>
++#include <QtCore/QMutex>
++#include <QtCore/QWaitCondition>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -96,6 +98,8 @@ public:
+     QList<QV8ProfilerData> m_data;
+ 
+     bool initialized;
++    QMutex initializeMutex;
++    QWaitCondition initializeCondition;
+     QList<QString> m_ongoing;
+ };
+ 
+@@ -104,10 +108,12 @@ QV8ProfilerService::QV8ProfilerService(QObject *parent)
+ {
+     Q_D(QV8ProfilerService);
+ 
+-    if (registerService() == Enabled) {
+-        // ,block mode, client attached
+-        while (!d->initialized)
+-            waitForMessage();
++    QMutexLocker lock(&d->initializeMutex);
++
++    if (registerService() == Enabled
++            && QQmlDebugService::blockingMode()) {
++        // let's wait for first message ...
++        d->initializeCondition.wait(&d->initializeMutex);
+     }
+ }
+ 
+@@ -139,6 +145,10 @@ void QV8ProfilerService::stateAboutToBeChanged(QQmlDebugService::State newState)
+                                       Q_ARG(QString, title));
+         }
+         QMetaObject::invokeMethod(this, "sendProfilingData", Qt::BlockingQueuedConnection);
++    } else {
++        // wake up constructor in blocking mode
++        // (we might got disabled before first message arrived)
++        d->initializeCondition.wakeAll();
+     }
+ }
+ 
+@@ -152,6 +162,8 @@ void QV8ProfilerService::messageReceived(const QByteArray &message)
+     QByteArray title;
+     ds >> command >> option;
+ 
++    QMutexLocker lock(&d->initializeMutex);
++
+     if (command == "V8PROFILER") {
+         ds >>  title;
+         QString titleStr = QString::fromUtf8(title);
+@@ -172,6 +184,9 @@ void QV8ProfilerService::messageReceived(const QByteArray &message)
+         }
+     }
+ 
++    // wake up constructor in blocking mode
++    d->initializeCondition.wakeAll();
++
+     QQmlDebugService::messageReceived(message);
+ }

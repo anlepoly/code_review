@@ -1,0 +1,442 @@
+diff --git a/src/quick/items/qquicktext.cpp b/src/quick/items/qquicktext.cpp
+index e8eb555..fb90220 100644
+--- a/src/quick/items/qquicktext.cpp
++++ b/src/quick/items/qquicktext.cpp
+@@ -107,6 +107,7 @@ QQuickTextDocumentWithImageResources::QQuickTextDocumentWithImageResources(QQuic
+ : QTextDocument(parent), outstanding(0)
+ {
+     setUndoRedoEnabled(false);
++    documentLayout()->registerHandler(QTextFormat::ImageObject, this);
+ }
+ 
+ QQuickTextDocumentWithImageResources::~QQuickTextDocumentWithImageResources()
+@@ -121,27 +122,8 @@ QVariant QQuickTextDocumentWithImageResources::loadResource(int type, const QUrl
+     QUrl url = context->resolvedUrl(name);
+ 
+     if (type == QTextDocument::ImageResource) {
+-        QHash<QUrl, QDeclarativePixmap *>::Iterator iter = m_resources.find(url);
+-
+-        if (iter == m_resources.end()) {
+-            QDeclarativePixmap *p = new QDeclarativePixmap(context->engine(), url);
+-            iter = m_resources.insert(url, p);
+-
+-            if (p->isLoading()) {
+-                p->connectFinished(this, SLOT(requestFinished()));
+-                outstanding++;
+-            }
+-        }
+-
+-        QDeclarativePixmap *p = *iter;
+-        if (p->isReady()) {
+-            return p->image();
+-        } else if (p->isError()) {
+-            if (!errors.contains(url)) {
+-                errors.insert(url);
+-                qmlInfo(parent()) << p->error();
+-            }
+-        }
++        QDeclarativePixmap *p = loadPixmap(context, url);
++        return p->image();
+     }
+ 
+     return QTextDocument::loadResource(type,url); // The *resolved* URL
+@@ -152,9 +134,7 @@ void QQuickTextDocumentWithImageResources::requestFinished()
+     outstanding--;
+     if (outstanding == 0) {
+         markContentsDirty(0, characterCount());
+-
+-        if (QQuickText *item = qobject_cast<QQuickText *>(parent()))
+-            QQuickTextPrivate::get(item)->updateLayout();
++        emit imagesLoaded();
+     }
+ }
+ 
+@@ -165,6 +145,91 @@ void QQuickTextDocumentWithImageResources::clear()
+     QTextDocument::clear();
+ }
+ 
++
++QSizeF QQuickTextDocumentWithImageResources::intrinsicSize(
++        QTextDocument *, int, const QTextFormat &format)
++{
++    if (format.isImageFormat()) {
++        QTextImageFormat imageFormat = format.toImageFormat();
++
++        const bool hasWidth = imageFormat.hasProperty(QTextFormat::ImageWidth);
++        const int width = qRound(imageFormat.width());
++        const bool hasHeight = imageFormat.hasProperty(QTextFormat::ImageHeight);
++        const int height = qRound(imageFormat.height());
++
++        QSizeF size(width, height);
++        if (!hasWidth || !hasHeight) {
++            QDeclarativeContext *context = qmlContext(parent());
++            QUrl url = context->resolvedUrl(QUrl(imageFormat.name()));
++
++            QDeclarativePixmap *p = loadPixmap(context, url);
++            if (!p->isReady()) {
++                if (!hasWidth)
++                    size.setWidth(16);
++                if (!hasHeight)
++                    size.setHeight(16);
++                return size;
++            }
++            QSize implicitSize = p->implicitSize();
++
++            if (!hasWidth) {
++                if (!hasHeight)
++                    size.setWidth(implicitSize.width());
++                else
++                    size.setWidth(qRound(height * (implicitSize.width() / (qreal) implicitSize.height())));
++            }
++            if (!hasHeight) {
++                if (!hasWidth)
++                    size.setHeight(implicitSize.height());
++                else
++                    size.setHeight(qRound(width * (implicitSize.height() / (qreal) implicitSize.width())));
++            }
++        }
++        return size;
++    }
++    return QSizeF();
++}
++
++void QQuickTextDocumentWithImageResources::drawObject(
++        QPainter *, const QRectF &, QTextDocument *, int, const QTextFormat &)
++{
++}
++
++QImage QQuickTextDocumentWithImageResources::image(const QTextImageFormat &format)
++{
++    QDeclarativeContext *context = qmlContext(parent());
++    QUrl url = context->resolvedUrl(QUrl(format.name()));
++
++    QDeclarativePixmap *p = loadPixmap(context, url);
++    return p->image();
++}
++
++QDeclarativePixmap *QQuickTextDocumentWithImageResources::loadPixmap(
++        QDeclarativeContext *context, const QUrl &url)
++{
++
++    QHash<QUrl, QDeclarativePixmap *>::Iterator iter = m_resources.find(url);
++
++    if (iter == m_resources.end()) {
++        QDeclarativePixmap *p = new QDeclarativePixmap(context->engine(), url);
++        iter = m_resources.insert(url, p);
++
++        if (p->isLoading()) {
++            p->connectFinished(this, SLOT(requestFinished()));
++            outstanding++;
++        }
++    }
++
++    QDeclarativePixmap *p = *iter;
++    if (p->isError()) {
++        if (!errors.contains(url)) {
++            errors.insert(url);
++            qmlInfo(parent()) << p->error();
++        }
++    }
++    return p;
++}
++
+ void QQuickTextDocumentWithImageResources::clearResources()
+ {
+     foreach (QDeclarativePixmap *pixmap, m_resources)
+@@ -206,6 +271,12 @@ qreal QQuickTextPrivate::getImplicitWidth() const
+     return implicitWidth;
+ }
+ 
++void QQuickText::q_imagesLoaded()
++{
++    Q_D(QQuickText);
++    d->updateLayout();
++}
++
+ void QQuickTextPrivate::updateLayout()
+ {
+     Q_Q(QQuickText);
+@@ -830,6 +901,7 @@ void QQuickTextPrivate::ensureDoc()
+         Q_Q(QQuickText);
+         doc = new QQuickTextDocumentWithImageResources(q);
+         doc->setDocumentMargin(0);
++        FAST_CONNECT(doc, SIGNAL(imagesLoaded()), q, SLOT(q_imagesLoaded()));
+     }
+ }
+ 
+diff --git a/src/quick/items/qquicktext_p.h b/src/quick/items/qquicktext_p.h
+index 2292ea5..ad38953 100644
+--- a/src/quick/items/qquicktext_p.h
++++ b/src/quick/items/qquicktext_p.h
+@@ -203,6 +203,9 @@ protected:
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
+     virtual bool event(QEvent *);
+ 
++private Q_SLOTS:
++    void q_imagesLoaded();
++
+ private:
+     Q_DISABLE_COPY(QQuickText)
+     Q_DECLARE_PRIVATE(QQuickText)
+diff --git a/src/quick/items/qquicktext_p_p.h b/src/quick/items/qquicktext_p_p.h
+index fe25a02..cf95fc6 100644
+--- a/src/quick/items/qquicktext_p_p.h
++++ b/src/quick/items/qquicktext_p_p.h
+@@ -58,6 +58,7 @@
+ #include "qquickimplicitsizeitem_p_p.h"
+ 
+ #include <QtDeclarative/qdeclarative.h>
++#include <QtGui/qabstracttextdocumentlayout.h>
+ #include <QtGui/qtextlayout.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -167,9 +168,10 @@ public:
+ };
+ 
+ class QDeclarativePixmap;
+-class QQuickTextDocumentWithImageResources : public QTextDocument {
++class QQuickTextDocumentWithImageResources : public QTextDocument, public QTextObjectInterface
++{
+     Q_OBJECT
+-
++    Q_INTERFACES(QTextObjectInterface)
+ public:
+     QQuickTextDocumentWithImageResources(QQuickItem *parent);
+     virtual ~QQuickTextDocumentWithImageResources();
+@@ -181,9 +183,19 @@ public:
+ 
+     void clear();
+ 
++    QSizeF intrinsicSize(QTextDocument *doc, int posInDocument, const QTextFormat &format);
++    void drawObject(QPainter *p, const QRectF &rect, QTextDocument *doc, int posInDocument, const QTextFormat &format);
++
++    QImage image(const QTextImageFormat &format);
++
++Q_SIGNALS:
++    void imagesLoaded();
++
+ protected:
+     QVariant loadResource(int type, const QUrl &name);
+ 
++    QDeclarativePixmap *loadPixmap(QDeclarativeContext *context, const QUrl &name);
++
+ private slots:
+     void requestFinished();
+ 
+diff --git a/src/quick/items/qquicktextedit.cpp b/src/quick/items/qquicktextedit.cpp
+index f1dcada..0ecaf4c 100644
+--- a/src/quick/items/qquicktextedit.cpp
++++ b/src/quick/items/qquicktextedit.cpp
+@@ -1773,6 +1773,7 @@ void QQuickTextEditPrivate::init()
+ #endif
+     FAST_CONNECT(document, SIGNAL(undoAvailable(bool)), q, SIGNAL(canUndoChanged()));
+     FAST_CONNECT(document, SIGNAL(redoAvailable(bool)), q, SIGNAL(canRedoChanged()));
++    FAST_CONNECT(document, SIGNAL(imagesLoaded()), q, SLOT(updateSize()));
+ 
+     document->setDefaultFont(font);
+     document->setDocumentMargin(textMargin);
+diff --git a/src/quick/items/qquicktextedit_p.h b/src/quick/items/qquicktextedit_p.h
+index 508f564..8cdd984 100644
+--- a/src/quick/items/qquicktextedit_p.h
++++ b/src/quick/items/qquicktextedit_p.h
+@@ -214,6 +214,10 @@ public:
+     qreal paintedWidth() const;
+     qreal paintedHeight() const;
+ 
++    QUrl baseUrl() const;
++    void setBaseUrl(const QUrl &url);
++    void resetBaseUrl();
++
+     Q_INVOKABLE QRectF positionToRectangle(int) const;
+     Q_INVOKABLE int positionAt(int x, int y) const;
+     Q_INVOKABLE void moveCursorSelection(int pos);
+@@ -283,9 +287,9 @@ private Q_SLOTS:
+     void updateDocument();
+     void updateCursor();
+     void q_updateAlignment();
++    void updateSize();
+ 
+ private:
+-    void updateSize();
+     void updateTotalLines();
+     void updateImageCache(const QRectF &rect = QRectF());
+ 
+diff --git a/src/quick/items/qquicktextedit_p_p.h b/src/quick/items/qquicktextedit_p_p.h
+index bf7edf5..801bca0 100644
+--- a/src/quick/items/qquicktextedit_p_p.h
++++ b/src/quick/items/qquicktextedit_p_p.h
+@@ -82,6 +82,9 @@ public:
+     {
+     }
+ 
++    static QQuickTextEditPrivate *get(QQuickTextEdit *item) {
++        return static_cast<QQuickTextEditPrivate *>(QObjectPrivate::get(item)); }
++
+     void init();
+ 
+     void updateDefaultTextOption();
+diff --git a/src/quick/items/qquicktextnode.cpp b/src/quick/items/qquicktextnode.cpp
+index dedc456..804e83f 100644
+--- a/src/quick/items/qquicktextnode.cpp
++++ b/src/quick/items/qquicktextnode.cpp
+@@ -56,6 +56,7 @@
+ #include <qtexttable.h>
+ #include <qtextlist.h>
+ #include <private/qdeclarativestyledtext_p.h>
++#include <private/qquicktext_p_p.h>
+ #include <private/qfont_p.h>
+ #include <private/qfontengine_p.h>
+ #include <private/qrawfont_p.h>
+@@ -702,8 +703,15 @@ namespace {
+ 
+             if (format.objectType() == QTextFormat::ImageObject) {
+                 QTextImageFormat imageFormat = format.toImageFormat();
+-                QTextImageHandler *imageHandler = static_cast<QTextImageHandler *>(handler);
+-                image = imageHandler->image(textDocument, imageFormat);
++                if (QQuickTextDocumentWithImageResources *imageDoc = qobject_cast<QQuickTextDocumentWithImageResources *>(textDocument)) {
++                    image = imageDoc->image(imageFormat);
++
++                    if (image.isNull())
++                        return;
++                } else {
++                    QTextImageHandler *imageHandler = static_cast<QTextImageHandler *>(handler);
++                    image = imageHandler->image(textDocument, imageFormat);
++                }
+             }
+ 
+             if (image.isNull()) {
+diff --git a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+index 0e8eab1..fa9549a 100644
+--- a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
++++ b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+@@ -39,6 +39,7 @@
+ **
+ ****************************************************************************/
+ #include <qtest.h>
++#include <QtTest/QSignalSpy>
+ #include <QTextDocument>
+ #include <QtDeclarative/qdeclarativeengine.h>
+ #include <QtDeclarative/qdeclarativecomponent.h>
+diff --git a/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocal.qml b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocal.qml
+new file mode 100644
+index 0000000..150f7bd
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocal.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++TextEdit {
++    textFormat: TextEdit.RichText
++    text: "<img src='http/exists.png'>"
++}
+diff --git a/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocalError.qml b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocalError.qml
+new file mode 100644
+index 0000000..067b6d7
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesLocalError.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++TextEdit {
++    textFormat: TextEdit.RichText
++    text: "<img src='http/notexists.png'>"
++}
+diff --git a/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemote.qml b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemote.qml
+new file mode 100644
+index 0000000..a823882
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemote.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++TextEdit {
++    textFormat: TextEdit.RichText
++    text: "<img src='http://127.0.0.1:42332/exists.png'>"
++}
+diff --git a/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemoteError.qml b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemoteError.qml
+new file mode 100644
+index 0000000..c6172b6
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktextedit/data/embeddedImagesRemoteError.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++TextEdit {
++    textFormat: TextEdit.RichText
++    text: "<img src='http://127.0.0.1:42332/notexists.png'>"
++}
+diff --git a/tests/auto/qtquick2/qquicktextedit/data/http/exists.png b/tests/auto/qtquick2/qquicktextedit/data/http/exists.png
+new file mode 100644
+index 0000000..399bd0b
+Binary files /dev/null and b/tests/auto/qtquick2/qquicktextedit/data/http/exists.png differ
+diff --git a/tests/auto/qtquick2/qquicktextedit/tst_qquicktextedit.cpp b/tests/auto/qtquick2/qquicktextedit/tst_qquicktextedit.cpp
+index b35d955..272ec19 100644
+--- a/tests/auto/qtquick2/qquicktextedit/tst_qquicktextedit.cpp
++++ b/tests/auto/qtquick2/qquicktextedit/tst_qquicktextedit.cpp
+@@ -51,6 +51,7 @@
+ #include <QtGui/qguiapplication.h>
+ #include <private/qquicktextedit_p.h>
+ #include <private/qquicktextedit_p_p.h>
++#include <private/qquicktext_p_p.h>
+ #include <QFontMetrics>
+ #include <QtQuick/QQuickView>
+ #include <QDir>
+@@ -174,6 +175,9 @@ private slots:
+     void undo_keypressevents_data();
+     void undo_keypressevents();
+ 
++    void embeddedImages();
++    void embeddedImages_data();
++
+     void emptytags_QTBUG_22058();
+ 
+ private:
+@@ -3654,6 +3658,48 @@ void tst_qquicktextedit::undo_keypressevents()
+     QVERIFY(textEdit->text().isEmpty());
+ }
+ 
++void tst_qquicktextedit::embeddedImages_data()
++{
++    QTest::addColumn<QUrl>("qmlfile");
++    QTest::addColumn<QString>("error");
++    QTest::newRow("local") << testFileUrl("embeddedImagesLocal.qml") << "";
++    QTest::newRow("local-error") << testFileUrl("embeddedImagesLocalError.qml")
++        << testFileUrl("embeddedImagesLocalError.qml").toString()+":3:1: QML TextEdit: Cannot open: " + testFileUrl("http/notexists.png").toString();
++    QTest::newRow("remote") << testFileUrl("embeddedImagesRemote.qml") << "";
++    QTest::newRow("remote-error") << testFileUrl("embeddedImagesRemoteError.qml")
++        << testFileUrl("embeddedImagesRemoteError.qml").toString()+":3:1: QML TextEdit: Error downloading http://127.0.0.1:42332/notexists.png - server replied: Not found";
++}
++
++void tst_qquicktextedit::embeddedImages()
++{
++    QFETCH(QUrl, qmlfile);
++    QFETCH(QString, error);
++
++    TestHTTPServer server(42332);
++    server.serveDirectory(testFile("http"));
++
++    if (!error.isEmpty())
++        QTest::ignoreMessage(QtWarningMsg, error.toLatin1());
++
++    QDeclarativeComponent textComponent(&engine, qmlfile);
++    QQuickTextEdit *textObject = qobject_cast<QQuickTextEdit*>(textComponent.create());
++
++    QVERIFY(textObject != 0);
++    QTRY_COMPARE(QQuickTextEditPrivate::get(textObject)->document->resourcesLoading(), 0);
++
++    QPixmap pm(testFile("http/exists.png"));
++    if (error.isEmpty()) {
++        QCOMPARE(textObject->width(), double(pm.width()));
++        QCOMPARE(textObject->height(), double(pm.height()));
++    } else {
++        QVERIFY(16 != pm.width()); // check test is effective
++        QCOMPARE(textObject->width(), 16.0); // default size of QTextDocument broken image icon
++        QCOMPARE(textObject->height(), 16.0);
++    }
++
++    delete textObject;
++}
++
+ void tst_qquicktextedit::emptytags_QTBUG_22058()
+ {
+     QQuickView canvas(testFileUrl("qtbug-22058.qml"));

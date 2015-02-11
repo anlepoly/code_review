@@ -1,0 +1,263 @@
+diff --git a/src/network/kernel/qhostaddress.cpp b/src/network/kernel/qhostaddress.cpp
+index 9240434..009c8f2 100644
+--- a/src/network/kernel/qhostaddress.cpp
++++ b/src/network/kernel/qhostaddress.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include "qhostaddress.h"
+ #include "qhostaddress_p.h"
++#include "private/qipaddress_p.h"
+ #include "qdebug.h"
+ #if defined(Q_OS_WIN)
+ #include <winsock2.h>
+@@ -176,28 +177,7 @@ void QHostAddressPrivate::setAddress(const Q_IPV6ADDR &a_)
+     isParsed = true;
+ }
+ 
+-static bool parseIp4(const QString& address, quint32 *addr)
+-{
+-    QStringList ipv4 = address.split(QLatin1String("."));
+-    if (ipv4.count() != 4)
+-        return false;
+-
+-    quint32 ipv4Address = 0;
+-    for (int i = 0; i < 4; ++i) {
+-        bool ok = false;
+-        uint byteValue = ipv4.at(i).toUInt(&ok);
+-        if (!ok || byteValue > 255)
+-            return false;
+-
+-        ipv4Address <<= 8;
+-        ipv4Address += byteValue;
+-    }
+-
+-    *addr = ipv4Address;
+-    return true;
+-}
+-
+-static bool parseIp6(const QString &address, quint8 *addr, QString *scopeId)
++static bool parseIp6(const QString &address, QIPAddressUtils::IPv6Address &addr, QString *scopeId)
+ {
+     QString tmp = address;
+     int scopeIdPos = tmp.lastIndexOf(QLatin1Char('%'));
+@@ -207,77 +187,7 @@ static bool parseIp6(const QString &address, quint8 *addr, QString *scopeId)
+     } else {
+         scopeId->clear();
+     }
+-
+-    QStringList ipv6 = tmp.split(QLatin1String(":"));
+-    int count = ipv6.count();
+-    if (count < 3 || count > 8)
+-        return false;
+-
+-    int colonColon = tmp.count(QLatin1String("::"));
+-    if(count == 8 && colonColon > 1)
+-        return false;
+-
+-    // address can be compressed with a "::", but that
+-    // may only appear once (see RFC 1884)
+-    // the statement below means:
+-    // if(shortened notation is not used AND
+-    // ((pure IPv6 notation AND less than 8 parts) OR
+-    // ((mixed IPv4/6 notation AND less than 7 parts)))
+-    if(colonColon != 1 && count < (tmp.contains(QLatin1Char('.')) ? 7 : 8))
+-        return false;
+-
+-    int mc = 16;
+-    int fillCount = 9 - count;  // number of 0 words to fill in the middle
+-    for (int i = count - 1; i >= 0; --i) {
+-        if (mc <= 0)
+-            return false;
+-
+-        if (ipv6.at(i).isEmpty()) {
+-            if (i == count - 1) {
+-                // special case: ":" is last character
+-                if (!ipv6.at(i - 1).isEmpty())
+-                    return false;
+-                addr[--mc] = 0;
+-                addr[--mc] = 0;
+-            } else if (i == 0) {
+-                // special case: ":" is first character
+-                if (!ipv6.at(i + 1).isEmpty())
+-                    return false;
+-                addr[--mc] = 0;
+-                addr[--mc] = 0;
+-            } else {
+-                for (int j = 0; j < fillCount; ++j) {
+-                    if (mc <= 0)
+-                        return false;
+-                    addr[--mc] = 0;
+-                    addr[--mc] = 0;
+-                }
+-            }
+-        } else {
+-            bool ok = false;
+-            uint byteValue = ipv6.at(i).toUInt(&ok, 16);
+-            if (ok && byteValue <= 0xffff) {
+-                addr[--mc] = byteValue & 0xff;
+-                addr[--mc] = (byteValue >> 8) & 0xff;
+-            } else {
+-                if (i != count - 1)
+-                    return false;
+-
+-                // parse the ipv4 part of a mixed type
+-                quint32 maybeIp4;
+-                if (!parseIp4(ipv6.at(i), &maybeIp4))
+-                    return false;
+-
+-                addr[--mc] = maybeIp4 & 0xff;
+-                addr[--mc] = (maybeIp4 >> 8) & 0xff;
+-                addr[--mc] = (maybeIp4 >> 16) & 0xff;
+-                addr[--mc] = (maybeIp4 >> 24) & 0xff;
+-                --fillCount;
+-            }
+-        }
+-    }
+-
+-    return true;
++    return QIPAddressUtils::parseIp6(addr, tmp.constBegin(), tmp.constEnd());
+ }
+ 
+ bool QHostAddressPrivate::parse()
+@@ -285,6 +195,8 @@ bool QHostAddressPrivate::parse()
+     isParsed = true;
+     protocol = QAbstractSocket::UnknownNetworkLayerProtocol;
+     QString a = ipString.simplified();
++    if (a.isEmpty())
++        return false;
+ 
+     // All IPv6 addresses contain a ':', and may contain a '.'.
+     if (a.contains(QLatin1Char(':'))) {
+@@ -296,14 +208,11 @@ bool QHostAddressPrivate::parse()
+         }
+     }
+ 
+-    // All IPv4 addresses contain a '.'.
+-    if (a.contains(QLatin1Char('.'))) {
+-        quint32 maybeIp4 = 0;
+-        if (parseIp4(a, &maybeIp4)) {
+-            setAddress(maybeIp4);
+-            protocol = QAbstractSocket::IPv4Protocol;
+-            return true;
+-        }
++    quint32 maybeIp4 = 0;
++    if (QIPAddressUtils::parseIp4(maybeIp4, a.constBegin(), a.constEnd())) {
++        setAddress(maybeIp4);
++        protocol = QAbstractSocket::IPv4Protocol;
++        return true;
+     }
+ 
+     return false;
+@@ -766,42 +675,13 @@ QString QHostAddress::toString() const
+         || d->protocol == QAbstractSocket::AnyIPProtocol) {
+         quint32 i = toIPv4Address();
+         QString s;
+-        s.sprintf("%d.%d.%d.%d", (i>>24) & 0xff, (i>>16) & 0xff,
+-                (i >> 8) & 0xff, i & 0xff);
++        QIPAddressUtils::toString(s, i);
+         return s;
+     }
+ 
+     if (d->protocol == QAbstractSocket::IPv6Protocol) {
+-        quint16 ugle[8];
+-        for (int i = 0; i < 8; i++) {
+-            ugle[i] = (quint16(d->a6[2*i]) << 8) | quint16(d->a6[2*i+1]);
+-        }
+         QString s;
+-        QString temp;
+-        bool zeroDetected = false;
+-        bool zeroShortened = false;
+-        for (int i = 0; i < 8; i++) {
+-            if ((ugle[i] != 0) || zeroShortened) {
+-                temp.sprintf("%X", ugle[i]);
+-                s.append(temp);
+-                if (zeroDetected)
+-                    zeroShortened = true;
+-            } else {
+-                if (!zeroDetected) {
+-                    if (i<7 && (ugle[i+1] == 0)) {
+-                        s.append(QLatin1Char(':'));
+-                        zeroDetected = true;
+-                    } else {
+-                        temp.sprintf("%X", ugle[i]);
+-                        s.append(temp);
+-                        if (i<7)
+-                            s.append(QLatin1Char(':'));
+-                    }
+-                }
+-            }
+-            if (i<7 && ((ugle[i] != 0) || zeroShortened || (i==0 && zeroDetected)))
+-                s.append(QLatin1Char(':'));
+-        }
++        QIPAddressUtils::toString(s, d->a6.c);
+ 
+         if (!d->scopeId.isEmpty())
+             s.append(QLatin1Char('%') + d->scopeId);
+diff --git a/tests/auto/network/kernel/qhostaddress/tst_qhostaddress.cpp b/tests/auto/network/kernel/qhostaddress/tst_qhostaddress.cpp
+index d74e1b1..a0403e5 100644
+--- a/tests/auto/network/kernel/qhostaddress/tst_qhostaddress.cpp
++++ b/tests/auto/network/kernel/qhostaddress/tst_qhostaddress.cpp
+@@ -1,6 +1,7 @@
+ /****************************************************************************
+ **
+ ** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Copyright (C) 2012 Intel Corporation.
+ ** Contact: http://www.qt-project.org/
+ **
+ ** This file is part of the test suite of the Qt Toolkit.
+@@ -39,7 +40,6 @@
+ **
+ ****************************************************************************/
+ 
+-
+ #include <qcoreapplication.h>
+ #include <QtTest/QtTest>
+ #include <qhostaddress.h>
+@@ -165,24 +165,25 @@ void tst_QHostAddress::setAddress_QString_data()
+     QTest::newRow("ip4_03")  << QString(" 255.3.2.1") << true << QString("255.3.2.1") << 4;
+     QTest::newRow("ip4_04")  << QString("255.3.2.1\r ") << true << QString("255.3.2.1") << 4;
+     QTest::newRow("ip4_05")  << QString("0.0.0.0") << true << QString("0.0.0.0") << 4;
++    QTest::newRow("ip4_06")  << QString("123.0.0") << true << QString("123.0.0.0") << 4;
+ 
+     // for the format of IPv6 addresses see also RFC 5952
+-    QTest::newRow("ip6_00")  << QString("FEDC:BA98:7654:3210:FEDC:BA98:7654:3210") << true << QString("FEDC:BA98:7654:3210:FEDC:BA98:7654:3210") << 6;
+-    QTest::newRow("ip6_01")  << QString("1080:0000:0000:0000:0008:0800:200C:417A") << true << QString("1080::8:800:200C:417A") << 6;
+-    QTest::newRow("ip6_02")  << QString("1080:0:0:0:8:800:200C:417A") << true << QString("1080::8:800:200C:417A") << 6;
+-    QTest::newRow("ip6_03")  << QString("1080::8:800:200C:417A") << true << QString("1080::8:800:200C:417A") << 6;
+-    QTest::newRow("ip6_04")  << QString("FF01::43") << true << QString("FF01::43") << 6;
++    QTest::newRow("ip6_00")  << QString("FEDC:BA98:7654:3210:FEDC:BA98:7654:3210") << true << QString("fedc:ba98:7654:3210:fedc:ba98:7654:3210") << 6;
++    QTest::newRow("ip6_01")  << QString("1080:0000:0000:0000:0008:0800:200C:417A") << true << QString("1080::8:800:200c:417a") << 6;
++    QTest::newRow("ip6_02")  << QString("1080:0:0:0:8:800:200C:417A") << true << QString("1080::8:800:200c:417a") << 6;
++    QTest::newRow("ip6_03")  << QString("1080::8:800:200C:417A") << true << QString("1080::8:800:200c:417a") << 6;
++    QTest::newRow("ip6_04")  << QString("FF01::43") << true << QString("ff01::43") << 6;
+     QTest::newRow("ip6_05")  << QString("::1") << true << QString("::1") << 6;
+     QTest::newRow("ip6_06")  << QString("1::") << true << QString("1::") << 6;
+     QTest::newRow("ip6_07")  << QString("::") << true << QString("::") << 6;
+-    QTest::newRow("ip6_08")  << QString("0:0:0:0:0:0:13.1.68.3") << true << QString("::D01:4403") << 6;
+-    QTest::newRow("ip6_09")  << QString("::13.1.68.3") << true <<  QString("::D01:4403") << 6;
+-    QTest::newRow("ip6_10")  << QString("0:0:0:0:0:FFFF:129.144.52.38") << true << QString("::FFFF:8190:3426") << 6;
+-    QTest::newRow("ip6_11")  << QString("::FFFF:129.144.52.38") << true << QString("::FFFF:8190:3426") << 6;
+-    QTest::newRow("ip6_12")  << QString("1::FFFF:129.144.52.38") << true << QString("1::FFFF:8190:3426") << 6;
+-    QTest::newRow("ip6_13")  << QString("A:B::D:E") << true << QString("A:B::D:E") << 6;
+-    QTest::newRow("ip6_14")  << QString("1080:0:1:0:8:800:200C:417A") << true << QString("1080:0:1:0:8:800:200C:417A") << 6;
+-    QTest::newRow("ip6_15")  << QString("1080:0:1:0:8:800:200C:0") << true << QString("1080:0:1:0:8:800:200C:0") << 6;
++    QTest::newRow("ip6_08")  << QString("0:0:0:0:0:0:13.1.68.3") << true << QString("::13.1.68.3") << 6;
++    QTest::newRow("ip6_09")  << QString("::13.1.68.3") << true <<  QString("::13.1.68.3") << 6;
++    QTest::newRow("ip6_10")  << QString("0:0:0:0:0:FFFF:129.144.52.38") << true << QString("::ffff:129.144.52.38") << 6;
++    QTest::newRow("ip6_11")  << QString("::FFFF:129.144.52.38") << true << QString("::ffff:129.144.52.38") << 6;
++    QTest::newRow("ip6_12")  << QString("1::FFFF:129.144.52.38") << true << QString("1::ffff:8190:3426") << 6;
++    QTest::newRow("ip6_13")  << QString("A:B::D:E") << true << QString("a:b::d:e") << 6;
++    QTest::newRow("ip6_14")  << QString("1080:0:1:0:8:800:200C:417A") << true << QString("1080:0:1:0:8:800:200c:417a") << 6;
++    QTest::newRow("ip6_15")  << QString("1080:0:1:0:8:800:200C:0") << true << QString("1080:0:1:0:8:800:200c:0") << 6;
+     QTest::newRow("ip6_16")  << QString("1080:0:1:0:8:800:0:0") << true << QString("1080:0:1:0:8:800::") << 6;
+     QTest::newRow("ip6_17")  << QString("1080:0:0:0:8:800:0:0") << true << QString("1080::8:800:0:0") << 6;
+     QTest::newRow("ip6_18")  << QString("0:1:1:1:8:800:0:0") << true << QString("0:1:1:1:8:800::") << 6;
+@@ -196,7 +197,8 @@ void tst_QHostAddress::setAddress_QString_data()
+ 
+     QTest::newRow("error_ip4_00")  << QString("256.9.9.9") << false << QString() << 0;
+     QTest::newRow("error_ip4_01")  << QString("-1.9.9.9") << false << QString() << 0;
+-    QTest::newRow("error_ip4_02")  << QString("123.0.0") << false << QString() << 0;
++    //QTest::newRow("error_ip4_02")  << QString("123.0.0") << false << QString() << 0; // no longer invalid in Qt5
++    QTest::newRow("error_ip4_02")  << QString("123.0.0.") << false << QString() << 0;
+     QTest::newRow("error_ip4_03")  << QString("123.0.0.0.0") << false << QString() << 0;
+     QTest::newRow("error_ip4_04")  << QString("255.2 3.2.1") << false << QString() << 0;

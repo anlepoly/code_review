@@ -1,0 +1,408 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index d3ea3fb..617cf3e 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -451,7 +451,7 @@ QTestLib
+ 
+ QtSql
+ -----
+-QSqlTableModel/QSqlRelationalTableModel
++QSqlQueryModel/QSqlTableModel/QSqlRelationalTableModel
+ 
+ * The dataChanged() signal is now emitted for changes made to an inserted
+ record that has not yet been committed. Previously, dataChanged() was
+@@ -486,6 +486,10 @@ removed and only if there are no other changed rows.
+ QSqlTableModel::indexInQuery() as example of how to implement in a
+ subclass.
+ 
++* QSqlQueryMode::setQuery() emits fewer signals. The modelAboutToBeReset()
++and modelReset() signals suffice to inform views that they must reinterrogate
++the model.
++
+ * QSqlTableModel::selectRow(): This is a new method that refreshes a single
+ row in the model from the database.
+ 
+diff --git a/src/sql/models/qsqlquerymodel.cpp b/src/sql/models/qsqlquerymodel.cpp
+index 7b884ed..85869e4 100644
+--- a/src/sql/models/qsqlquerymodel.cpp
++++ b/src/sql/models/qsqlquerymodel.cpp
+@@ -78,9 +78,11 @@ void QSqlQueryModelPrivate::prefetch(int limit)
+         atEnd = true; // this is the end.
+     }
+     if (newBottom.row() >= 0 && newBottom.row() > bottom.row()) {
+-        q->beginInsertRows(QModelIndex(), bottom.row() + 1, newBottom.row());
++        if (!resetting)
++            q->beginInsertRows(QModelIndex(), bottom.row() + 1, newBottom.row());
+         bottom = newBottom;
+-        q->endInsertRows();
++        if (!resetting)
++            q->endInsertRows();
+     } else {
+         bottom = newBottom;
+     }
+@@ -208,6 +210,28 @@ bool QSqlQueryModel::canFetchMore(const QModelIndex &parent) const
+     return (!parent.isValid() && !d->atEnd);
+ }
+ 
++/*! \reimp
++ */
++void QSqlQueryModel::beginResetModel()
++{
++    Q_D(QSqlQueryModel);
++    if (!d->resetting) {
++        QAbstractTableModel::beginResetModel();
++        d->resetting = true;
++    }
++}
++
++/*! \reimp
++ */
++void QSqlQueryModel::endResetModel()
++{
++    Q_D(QSqlQueryModel);
++    if (d->resetting) {
++        d->resetting = false;
++        QAbstractTableModel::endResetModel();
++    }
++}
++
+ /*! \fn int QSqlQueryModel::rowCount(const QModelIndex &parent) const
+     \since 4.1
+ 
+@@ -317,60 +341,47 @@ void QSqlQueryModel::queryChange()
+ void QSqlQueryModel::setQuery(const QSqlQuery &query)
+ {
+     Q_D(QSqlQueryModel);
++    beginResetModel();
++
+     QSqlRecord newRec = query.record();
+     bool columnsChanged = (newRec != d->rec);
+-    bool hasQuerySize = query.driver()->hasFeature(QSqlDriver::QuerySize);
+-    bool hasNewData = (newRec != QSqlRecord()) || !query.lastError().isValid();
+ 
+     if (d->colOffsets.size() != newRec.count() || columnsChanged)
+         d->initColOffsets(newRec.count());
+ 
+-    bool mustClearModel = d->bottom.isValid();
+-    if (mustClearModel) {
+-        d->atEnd = true;
+-        beginRemoveRows(QModelIndex(), 0, qMax(d->bottom.row(), 0));
+-        d->bottom = QModelIndex();
+-    }
+-
++    d->bottom = QModelIndex();
+     d->error = QSqlError();
+     d->query = query;
+     d->rec = newRec;
++    d->atEnd = true;
+ 
+-    if (mustClearModel)
+-        endRemoveRows();
+-
+-    d->atEnd = false;
+-
+-    if (columnsChanged && hasNewData)
+-        reset();
++    if (query.isForwardOnly()) {
++        d->error = QSqlError(QLatin1String("Forward-only queries "
++                                           "cannot be used in a data model"),
++                             QString(), QSqlError::ConnectionError);
++        endResetModel();
++        return;
++    }
+ 
+-    if (!query.isActive() || query.isForwardOnly()) {
+-        d->atEnd = true;
+-        d->bottom = QModelIndex();
+-        if (query.isForwardOnly())
+-            d->error = QSqlError(QLatin1String("Forward-only queries "
+-                                               "cannot be used in a data model"),
+-                                 QString(), QSqlError::ConnectionError);
+-        else
+-            d->error = query.lastError();
++    if (!query.isActive()) {
++        d->error = query.lastError();
++        endResetModel();
+         return;
+     }
+-    QModelIndex newBottom;
+-    if (hasQuerySize && d->query.size() > 0) {
+-        newBottom = createIndex(d->query.size() - 1, d->rec.count() - 1);
+-        beginInsertRows(QModelIndex(), 0, qMax(0, newBottom.row()));
+-        d->bottom = createIndex(d->query.size() - 1, columnsChanged ? 0 : d->rec.count() - 1);
+-        d->atEnd = true;
+-        endInsertRows();
++
++    if (query.driver()->hasFeature(QSqlDriver::QuerySize) && d->query.size() > 0) {
++        d->bottom = createIndex(d->query.size() - 1, d->rec.count() - 1);
+     } else {
+-        newBottom = createIndex(-1, d->rec.count() - 1);
++        d->bottom = createIndex(-1, d->rec.count() - 1);
++        d->atEnd = false;
+     }
+-    d->bottom = newBottom;
+ 
+-    queryChange();
+ 
+     // fetchMore does the rowsInserted stuff for incremental models
+     fetchMore();
++
++    endResetModel();
++    queryChange();
+ }
+ 
+ /*! \overload
+diff --git a/src/sql/models/qsqlquerymodel.h b/src/sql/models/qsqlquerymodel.h
+index b5e1a7a..89b72c8 100644
+--- a/src/sql/models/qsqlquerymodel.h
++++ b/src/sql/models/qsqlquerymodel.h
+@@ -90,6 +90,8 @@ public:
+     bool canFetchMore(const QModelIndex &parent = QModelIndex()) const;
+ 
+ protected:
++    void beginResetModel();
++    void endResetModel();
+     virtual void queryChange();
+ 
+     virtual QModelIndex indexInQuery(const QModelIndex &item) const;
+diff --git a/src/sql/models/qsqlquerymodel_p.h b/src/sql/models/qsqlquerymodel_p.h
+index 6e0349f..3288d31 100644
+--- a/src/sql/models/qsqlquerymodel_p.h
++++ b/src/sql/models/qsqlquerymodel_p.h
+@@ -67,7 +67,7 @@ class QSqlQueryModelPrivate: public QAbstractItemModelPrivate
+ {
+     Q_DECLARE_PUBLIC(QSqlQueryModel)
+ public:
+-    QSqlQueryModelPrivate() : atEnd(false) {}
++    QSqlQueryModelPrivate() : atEnd(false), resetting(false) {}
+     ~QSqlQueryModelPrivate();
+     
+     void prefetch(int);
+@@ -80,6 +80,7 @@ public:
+     uint atEnd : 1;
+     QVector<QHash<int, QVariant> > headers;
+     QVarLengthArray<int, 56> colOffsets; // used to calculate indexInQuery of columns
++    bool resetting;
+ };
+ 
+ // helpers for building SQL expressions
+diff --git a/src/sql/models/qsqltablemodel.cpp b/src/sql/models/qsqltablemodel.cpp
+index f719897..40315da 100644
+--- a/src/sql/models/qsqltablemodel.cpp
++++ b/src/sql/models/qsqltablemodel.cpp
+@@ -364,18 +364,9 @@ bool QSqlTableModel::select()
+     if (query.isEmpty())
+         return false;
+ 
+-    QSqlTableModelPrivate::CacheMap::Iterator it = d->cache.end();
+-    while (it != d->cache.constBegin()) {
+-        --it;
+-        // rows must be accounted for
+-        if (it.value().insert()) {
+-            beginRemoveRows(QModelIndex(), it.key(), it.key());
+-            it = d->cache.erase(it);
+-            endRemoveRows();
+-        } else {
+-            it = d->cache.erase(it);
+-        }
+-    }
++    beginResetModel();
++
++    d->clearCache();
+ 
+     QSqlQuery qu(query, d->db);
+     setQuery(qu);
+@@ -383,8 +374,10 @@ bool QSqlTableModel::select()
+     if (!qu.isActive() || lastError().isValid()) {
+         // something went wrong - revert to non-select state
+         d->initRecordAndPrimaryIndex();
++        endResetModel();
+         return false;
+     }
++    endResetModel();
+     return true;
+ }
+ 
+diff --git a/tests/auto/sql/models/qsqlquerymodel/tst_qsqlquerymodel.cpp b/tests/auto/sql/models/qsqlquerymodel/tst_qsqlquerymodel.cpp
+index 33793c0..1c13196 100644
+--- a/tests/auto/sql/models/qsqlquerymodel/tst_qsqlquerymodel.cpp
++++ b/tests/auto/sql/models/qsqlquerymodel/tst_qsqlquerymodel.cpp
+@@ -478,22 +478,23 @@ void tst_QSqlQueryModel::fetchMore()
+     CHECK_DATABASE(db);
+ 
+     QSqlQueryModel model;
+-    QSignalSpy spy(&model, SIGNAL(rowsInserted(QModelIndex, int, int)));
++    QSignalSpy modelAboutToBeResetSpy(&model, SIGNAL(modelAboutToBeReset()));
++    QSignalSpy modelResetSpy(&model, SIGNAL(modelReset()));
+ 
+     model.setQuery(QSqlQuery("select * from " + qTableName("many", __FILE__), db));
+     int rowCount = model.rowCount();
+ 
+-    QCOMPARE(spy.value(0).value(1).toInt(), 0);
+-    QCOMPARE(spy.value(0).value(2).toInt(), rowCount - 1);
++    QCOMPARE(modelAboutToBeResetSpy.count(), 1);
++    QCOMPARE(modelResetSpy.count(), 1);
+ 
+     // If the driver doesn't return the query size fetchMore() causes the
+     // model to grow and new signals are emitted
++    QSignalSpy rowsInsertedSpy(&model, SIGNAL(rowsInserted(QModelIndex, int, int)));
+     if (!db.driver()->hasFeature(QSqlDriver::QuerySize)) {
+-        spy.clear();
+         model.fetchMore();
+         int newRowCount = model.rowCount();
+-        QCOMPARE(spy.value(0).value(1).toInt(), rowCount);
+-        QCOMPARE(spy.value(0).value(2).toInt(), newRowCount - 1);
++        QCOMPARE(rowsInsertedSpy.value(0).value(1).toInt(), rowCount);
++        QCOMPARE(rowsInsertedSpy.value(0).value(2).toInt(), newRowCount - 1);
+     }
+ }
+ 
+@@ -519,7 +520,8 @@ void tst_QSqlQueryModel::withSortFilterProxyModel()
+     QTableView view;
+     view.setModel(&proxy);
+ 
+-    QSignalSpy modelRowsRemovedSpy(&model, SIGNAL(rowsRemoved(const QModelIndex &, int, int)));
++    QSignalSpy modelAboutToBeResetSpy(&model, SIGNAL(modelAboutToBeReset()));
++    QSignalSpy modelResetSpy(&model, SIGNAL(modelReset()));
+     QSignalSpy modelRowsInsertedSpy(&model, SIGNAL(rowsInserted(const QModelIndex &, int, int)));
+     model.setQuery(QSqlQuery("SELECT * FROM " + qTableName("test3", __FILE__), db));
+     view.scrollToBottom();
+@@ -528,19 +530,14 @@ void tst_QSqlQueryModel::withSortFilterProxyModel()
+ 
+     QCOMPARE(proxy.rowCount(), 511);
+ 
+-    // The second call to setQuery() clears the model by removing it's rows.
+-    // Only 256 rows because that is what was cached.
+-    QCOMPARE(modelRowsRemovedSpy.count(), 1);
+-    QCOMPARE(modelRowsRemovedSpy.value(0).value(1).toInt(), 0);
+-    QCOMPARE(modelRowsRemovedSpy.value(0).value(2).toInt(), 255);
+-
+-    // The call to scrollToBottom() forces the model to fetch all rows,
+-    // which will be done in two steps.
+-    QCOMPARE(modelRowsInsertedSpy.count(), 2);
+-    QCOMPARE(modelRowsInsertedSpy.value(0).value(1).toInt(), 0);
+-    QCOMPARE(modelRowsInsertedSpy.value(0).value(2).toInt(), 255);
+-    QCOMPARE(modelRowsInsertedSpy.value(1).value(1).toInt(), 256);
+-    QCOMPARE(modelRowsInsertedSpy.value(1).value(2).toInt(), 510);
++    // setQuery() resets the model accompanied by begin and end signals
++    QCOMPARE(modelAboutToBeResetSpy.count(), 1);
++    QCOMPARE(modelResetSpy.count(), 1);
++
++    // The call to scrollToBottom() forces the model to fetch additional rows.
++    QCOMPARE(modelRowsInsertedSpy.count(), 1);
++    QCOMPARE(modelRowsInsertedSpy.value(0).value(1).toInt(), 256);
++    QCOMPARE(modelRowsInsertedSpy.value(0).value(2).toInt(), 510);
+ }
+ 
+ // For task 155402: When the model is already empty when setQuery() is called
+@@ -553,22 +550,19 @@ void tst_QSqlQueryModel::setQuerySignalEmission()
+     CHECK_DATABASE(db);
+ 
+     QSqlQueryModel model;
+-    QSignalSpy modelRowsAboutToBeRemovedSpy(&model, SIGNAL(rowsAboutToBeRemoved(const QModelIndex &, int, int)));
+-    QSignalSpy modelRowsRemovedSpy(&model, SIGNAL(rowsRemoved(const QModelIndex &, int, int)));
++    QSignalSpy modelAboutToBeResetSpy(&model, SIGNAL(modelAboutToBeReset()));
++    QSignalSpy modelResetSpy(&model, SIGNAL(modelReset()));
+ 
+-    // First select, the model was empty and no rows had to be removed!
++    // First select, the model was empty and no rows had to be removed, but model resets anyway.
+     model.setQuery(QSqlQuery("SELECT * FROM " + qTableName("test", __FILE__), db));
+-    QCOMPARE(modelRowsAboutToBeRemovedSpy.count(), 0);
+-    QCOMPARE(modelRowsRemovedSpy.count(), 0);
++    QCOMPARE(modelAboutToBeResetSpy.count(), 1);
++    QCOMPARE(modelResetSpy.count(), 1);
+ 
+     // Second select, the model wasn't empty and two rows had to be removed!
++    // setQuery() resets the model accompanied by begin and end signals
+     model.setQuery(QSqlQuery("SELECT * FROM " + qTableName("test", __FILE__), db));
+-    QCOMPARE(modelRowsAboutToBeRemovedSpy.count(), 1);
+-    QCOMPARE(modelRowsAboutToBeRemovedSpy.value(0).value(1).toInt(), 0);
+-    QCOMPARE(modelRowsAboutToBeRemovedSpy.value(0).value(2).toInt(), 1);
+-    QCOMPARE(modelRowsRemovedSpy.count(), 1);
+-    QCOMPARE(modelRowsRemovedSpy.value(0).value(1).toInt(), 0);
+-    QCOMPARE(modelRowsRemovedSpy.value(0).value(2).toInt(), 1);
++    QCOMPARE(modelAboutToBeResetSpy.count(), 2);
++    QCOMPARE(modelResetSpy.count(), 2);
+ }
+ 
+ // For task 170783: When the query's result set is empty no rows should be inserted,
+diff --git a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+index 2cea8b3..89085df 100644
+--- a/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
++++ b/tests/auto/sql/models/qsqltablemodel/tst_qsqltablemodel.cpp
+@@ -1338,39 +1338,13 @@ void tst_QSqlTableModel::setFilter()
+     QCOMPARE(model.rowCount(), 1);
+     QCOMPARE(model.data(model.index(0, 0)).toInt(), 1);
+ 
+-    QSignalSpy rowsRemovedSpy(&model, SIGNAL(rowsRemoved(QModelIndex,int,int)));
+-    QSignalSpy rowsAboutToBeRemovedSpy(&model,
+-            SIGNAL(rowsAboutToBeRemoved(QModelIndex,int,int)));
+-    QSignalSpy rowsInsertedSpy(&model, SIGNAL(rowsInserted(QModelIndex,int,int)));
+-    QSignalSpy rowsAboutToBeInsertedSpy(&model,
+-            SIGNAL(rowsAboutToBeInserted(QModelIndex,int,int)));
++    QSignalSpy modelAboutToBeResetSpy(&model, SIGNAL(modelAboutToBeReset()));
++    QSignalSpy modelResetSpy(&model, SIGNAL(modelReset()));
+     model.setFilter("id = 2");
+ 
+     // check the signals
+-    QCOMPARE(rowsAboutToBeRemovedSpy.count(), 1);
+-    QCOMPARE(rowsRemovedSpy.count(), 1);
+-    QCOMPARE(rowsAboutToBeInsertedSpy.count(), 1);
+-    QCOMPARE(rowsInsertedSpy.count(), 1);
+-    QList<QVariant> args = rowsAboutToBeRemovedSpy.takeFirst();
+-    QCOMPARE(args.count(), 3);
+-    QCOMPARE(qvariant_cast<QModelIndex>(args.at(0)), QModelIndex());
+-    QCOMPARE(args.at(1).toInt(), 0);
+-    QCOMPARE(args.at(2).toInt(), 0);
+-    args = rowsRemovedSpy.takeFirst();
+-    QCOMPARE(args.count(), 3);
+-    QCOMPARE(qvariant_cast<QModelIndex>(args.at(0)), QModelIndex());
+-    QCOMPARE(args.at(1).toInt(), 0);
+-    QCOMPARE(args.at(2).toInt(), 0);
+-    args = rowsInsertedSpy.takeFirst();
+-    QCOMPARE(args.count(), 3);
+-    QCOMPARE(qvariant_cast<QModelIndex>(args.at(0)), QModelIndex());
+-    QCOMPARE(args.at(1).toInt(), 0);
+-    QCOMPARE(args.at(2).toInt(), 0);
+-    args = rowsAboutToBeInsertedSpy.takeFirst();
+-    QCOMPARE(args.count(), 3);
+-    QCOMPARE(qvariant_cast<QModelIndex>(args.at(0)), QModelIndex());
+-    QCOMPARE(args.at(1).toInt(), 0);
+-    QCOMPARE(args.at(2).toInt(), 0);
++    QCOMPARE(modelAboutToBeResetSpy.count(), 1);
++    QCOMPARE(modelResetSpy.count(), 1);
+ 
+     QCOMPARE(model.rowCount(), 1);
+     QCOMPARE(model.data(model.index(0, 0)).toInt(), 2);
+@@ -1500,7 +1474,8 @@ void tst_QSqlTableModel::insertRecordsInLoop()
+     record.setValue(1, "Testman");
+     record.setValue(2, 1);
+ 
+-    QSignalSpy spyRowsRemoved(&model, SIGNAL(rowsRemoved(const QModelIndex &, int, int)));
++    QSignalSpy modelAboutToBeResetSpy(&model, SIGNAL(modelAboutToBeReset()));
++    QSignalSpy modelResetSpy(&model, SIGNAL(modelReset()));
+     QSignalSpy spyRowsInserted(&model, SIGNAL(rowsInserted(const QModelIndex &, int, int)));
+     for (int i = 0; i < 10; i++) {
+         QVERIFY(model.insertRecord(model.rowCount(), record));
+@@ -1509,18 +1484,9 @@ void tst_QSqlTableModel::insertRecordsInLoop()
+     }
+     model.submitAll(); // submitAll() calls select() which clears and repopulates the table
+ 
+-    int firstRowIndex = 0, lastRowIndex = 12;
+-    QCOMPARE(spyRowsRemoved.count(), 11);
+-    // QSqlTableModel emits 10 signals for its 10 inserted rows
+-    QCOMPARE(spyRowsRemoved.at(0).at(1).toInt(), lastRowIndex);
+-    QCOMPARE(spyRowsRemoved.at(9).at(1).toInt(), firstRowIndex + 3);
+-    // QSqlQueryModel emits 1 signal for its 3 rows
+-    QCOMPARE(spyRowsRemoved.at(10).at(1).toInt(), firstRowIndex);
+-    QCOMPARE(spyRowsRemoved.at(10).at(2).toInt(), firstRowIndex + 2);
+-
+-    QCOMPARE(spyRowsInserted.at(10).at(1).toInt(), firstRowIndex);
+-    QCOMPARE(spyRowsInserted.at(10).at(2).toInt(), lastRowIndex);
+-    QCOMPARE(spyRowsInserted.count(), 11);
++    // model emits reset signals
++    QCOMPARE(modelAboutToBeResetSpy.count(), 1);
++    QCOMPARE(modelResetSpy.count(), 1);
+ 
+     QCOMPARE(model.rowCount(), 13);
+     QCOMPARE(model.columnCount(), 3);

@@ -1,0 +1,245 @@
+diff --git a/src/qml/debugger/qqmldebugstatesdelegate_p.h b/src/qml/debugger/qqmldebugstatesdelegate_p.h
+index 6e3cc97..6d4ac10 100644
+--- a/src/qml/debugger/qqmldebugstatesdelegate_p.h
++++ b/src/qml/debugger/qqmldebugstatesdelegate_p.h
+@@ -54,6 +54,8 @@
+ //
+ 
+ #include <QtQml/qtqmlglobal.h>
++#include <QtCore/QList>
++#include <QtCore/QPointer>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -74,7 +76,8 @@ protected:
+ public:
+     virtual ~QQmlDebugStatesDelegate() {}
+ 
+-    virtual void buildStatesList(QQmlContext *ctxt, bool cleanList) = 0;
++    virtual void buildStatesList(bool cleanList,
++                                 const QList<QPointer<QObject> > &instances) = 0;
+     virtual void updateBinding(QQmlContext *context,
+                                const QQmlProperty &property,
+                                const QVariant &expression, bool isLiteralValue,
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 892098b..7f9e38b 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -297,7 +297,9 @@ void QQmlEngineDebugService::prepareDeferredObjects(QObject *obj)
+ 
+ }
+ 
+-void QQmlEngineDebugService::buildObjectList(QDataStream &message, QQmlContext *ctxt)
++void QQmlEngineDebugService::buildObjectList(QDataStream &message,
++                                             QQmlContext *ctxt,
++                                             const QList<QPointer<QObject> > &instances)
+ {
+     QQmlContextData *p = QQmlContextData::get(ctxt);
+ 
+@@ -318,29 +320,30 @@ void QQmlEngineDebugService::buildObjectList(QDataStream &message, QQmlContext *
+ 
+     child = p->childContexts;
+     while (child) {
+-        buildObjectList(message, child->asQQmlContext());
++        buildObjectList(message, child->asQQmlContext(), instances);
+         child = child->nextChild;
+     }
+ 
+-    // Clean deleted objects
+-    QQmlContextPrivate *ctxtPriv = QQmlContextPrivate::get(ctxt);
+-    for (int ii = 0; ii < ctxtPriv->instances.count(); ++ii) {
+-        if (!ctxtPriv->instances.at(ii)) {
+-            ctxtPriv->instances.removeAt(ii);
+-            --ii;
+-        }
++    count = 0;
++    for (int ii = 0; ii < instances.count(); ++ii) {
++        QQmlData *data = QQmlData::get(instances.at(ii));
++        if (data->context == p)
++            count ++;
+     }
++    message << count;
+ 
+-    message << ctxtPriv->instances.count();
+-    for (int ii = 0; ii < ctxtPriv->instances.count(); ++ii) {
+-        message << objectData(ctxtPriv->instances.at(ii));
++    for (int ii = 0; ii < instances.count(); ++ii) {
++        QQmlData *data = QQmlData::get(instances.at(ii));
++        if (data->context == p)
++            message << objectData(instances.at(ii));
+     }
+ }
+ 
+-void QQmlEngineDebugService::buildStatesList(QQmlContext *ctxt, bool cleanList)
++void QQmlEngineDebugService::buildStatesList(bool cleanList,
++                                             const QList<QPointer<QObject> > &instances)
+ {
+     if (m_statesDelegate)
+-        m_statesDelegate->buildStatesList(ctxt, cleanList);
++        m_statesDelegate->buildStatesList(cleanList, instances);
+ }
+ 
+ QQmlEngineDebugService::QQmlObjectData
+@@ -427,8 +430,17 @@ void QQmlEngineDebugService::processMessage(const QByteArray &message)
+         rs << QByteArray("LIST_OBJECTS_R") << queryId;
+ 
+         if (engine) {
+-            buildObjectList(rs, engine->rootContext());
+-            buildStatesList(engine->rootContext(), true);
++            QQmlContext *rootContext = engine->rootContext();
++            // Clean deleted objects
++            QQmlContextPrivate *ctxtPriv = QQmlContextPrivate::get(rootContext);
++            for (int ii = 0; ii < ctxtPriv->instances.count(); ++ii) {
++                if (!ctxtPriv->instances.at(ii)) {
++                    ctxtPriv->instances.removeAt(ii);
++                    --ii;
++                }
++            }
++            buildObjectList(rs, rootContext, ctxtPriv->instances);
++            buildStatesList(true, ctxtPriv->instances);
+         }
+ 
+         sendMessage(reply);
+diff --git a/src/qml/debugger/qqmlenginedebugservice_p.h b/src/qml/debugger/qqmlenginedebugservice_p.h
+index 1a92801..f41063d 100644
+--- a/src/qml/debugger/qqmlenginedebugservice_p.h
++++ b/src/qml/debugger/qqmlenginedebugservice_p.h
+@@ -57,6 +57,7 @@
+ 
+ #include <QtCore/qurl.h>
+ #include <QtCore/qvariant.h>
++#include <QtCore/QPointer>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -111,9 +112,10 @@ private Q_SLOTS:
+ 
+ private:
+     void prepareDeferredObjects(QObject *);
+-    void buildObjectList(QDataStream &, QQmlContext *);
++    void buildObjectList(QDataStream &, QQmlContext *,
++                         const QList<QPointer<QObject> > &instances);
+     void buildObjectDump(QDataStream &, QObject *, bool, bool);
+-    void buildStatesList(QQmlContext *, bool);
++    void buildStatesList(bool cleanList, const QList<QPointer<QObject> > &instances);
+     QQmlObjectData objectData(QObject *);
+     QQmlObjectProperty propertyData(QObject *, int);
+     QVariant valueContents(const QVariant &defaultValue) const;
+diff --git a/src/quick/qtquick2.cpp b/src/quick/qtquick2.cpp
+index 32a9d38..a97dade 100644
+--- a/src/quick/qtquick2.cpp
++++ b/src/quick/qtquick2.cpp
+@@ -63,7 +63,7 @@ class QQmlQtQuick2DebugStatesDelegate : public QQmlDebugStatesDelegate
+ public:
+     QQmlQtQuick2DebugStatesDelegate();
+     virtual ~QQmlQtQuick2DebugStatesDelegate();
+-    virtual void buildStatesList(QQmlContext *ctxt, bool cleanList);
++    virtual void buildStatesList(bool cleanList, const QList<QPointer<QObject> > &instances);
+     virtual void updateBinding(QQmlContext *context,
+                                const QQmlProperty &property,
+                                const QVariant &expression, bool isLiteralValue,
+@@ -90,20 +90,15 @@ QQmlQtQuick2DebugStatesDelegate::~QQmlQtQuick2DebugStatesDelegate()
+ {
+ }
+ 
+-void QQmlQtQuick2DebugStatesDelegate::buildStatesList(QQmlContext *ctxt, bool cleanList)
++void QQmlQtQuick2DebugStatesDelegate::buildStatesList(bool cleanList,
++                                                      const QList<QPointer<QObject> > &instances)
+ {
+     if (cleanList)
+         m_allStates.clear();
+ 
+-    QQmlContextPrivate *ctxtPriv = QQmlContextPrivate::get(ctxt);
+-    for (int ii = 0; ii < ctxtPriv->instances.count(); ++ii) {
+-        buildStatesList(ctxtPriv->instances.at(ii));
+-    }
+-
+-    QQmlContextData *child = QQmlContextData::get(ctxt)->childContexts;
+-    while (child) {
+-        buildStatesList(child->asQQmlContext());
+-        child = child->nextChild;
++    //only root context has all instances
++    for (int ii = 0; ii < instances.count(); ++ii) {
++        buildStatesList(instances.at(ii));
+     }
+ }
+ 
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+index 9756313..e409f3c 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+@@ -137,11 +137,15 @@ QQmlDebugObjectReference tst_QQmlEngineDebugService::findRootObject(int context,
+     QQmlDebugRootContextQuery *q_context = m_dbg->queryRootContexts(q_engines->engines()[0].debugId(), this);
+     waitForQuery(q_context);
+ 
+-    if (q_context->rootContext().objects().count() == 0)
++    if (q_context->rootContext().contexts().count() == 0 ||
++            q_context->rootContext().contexts().last().objects().count() == 0)
+         return QQmlDebugObjectReference();
++
++    //Contexts are in a stack
++    int count = q_context->rootContext().contexts().count();
+     QQmlDebugObjectQuery *q_obj = recursive ?
+-                m_dbg->queryObjectRecursive(q_context->rootContext().objects()[context], this) :
+-                m_dbg->queryObject(q_context->rootContext().objects()[context], this);
++                m_dbg->queryObjectRecursive(q_context->rootContext().contexts()[count - context - 1].objects()[0], this) :
++                m_dbg->queryObject(q_context->rootContext().contexts()[count - context - 1].objects()[0], this);
+     waitForQuery(q_obj);
+ 
+     QQmlDebugObjectReference result = q_obj->object();
+@@ -493,8 +497,9 @@ void tst_QQmlEngineDebugService::watch_object()
+     QQmlDebugRootContextQuery *q_context = m_dbg->queryRootContexts(q_engines->engines()[0].debugId(), this);
+     waitForQuery(q_context);
+ 
+-    QVERIFY(q_context->rootContext().objects().count() > 0);
+-    QQmlDebugObjectQuery *q_obj = m_dbg->queryObject(q_context->rootContext().objects()[0], this);
++    QVERIFY(q_context->rootContext().contexts().count());
++    QVERIFY(q_context->rootContext().contexts().last().objects().count() > 0);
++    QQmlDebugObjectQuery *q_obj = m_dbg->queryObject(q_context->rootContext().contexts().last().objects()[0], this);
+     waitForQuery(q_obj);
+ 
+     QQmlDebugObjectReference obj = q_obj->object();
+@@ -705,12 +710,9 @@ void tst_QQmlEngineDebugService::queryRootContexts()
+     QCOMPARE(context.debugId(), QQmlDebugService::idForObject(actualContext));
+     QCOMPARE(context.name(), actualContext->objectName());
+ 
+-    QCOMPARE(context.objects().count(), 4); // 4 qml component objects created for context in main()
+-
+     // root context query sends only root object data - it doesn't fill in
+     // the children or property info
+-    QCOMPARE(context.objects()[0].properties().count(), 0);
+-    QCOMPARE(context.objects()[0].children().count(), 0);
++    QCOMPARE(context.objects().count(), 0);
+ 
+     QCOMPARE(context.contexts().count(), 5);
+     QVERIFY(context.contexts()[0].debugId() >= 0);
+@@ -734,7 +736,7 @@ void tst_QQmlEngineDebugService::queryObject()
+ 
+     QQmlDebugRootContextQuery *q_context = m_dbg->queryRootContexts(q_engines->engines()[0].debugId(), this);
+     waitForQuery(q_context);
+-    QQmlDebugObjectReference rootObject = q_context->rootContext().objects()[0];
++    QQmlDebugObjectReference rootObject = q_context->rootContext().contexts().last().objects()[0];
+ 
+     QQmlDebugObjectQuery *q_obj = 0;
+ 
+@@ -815,7 +817,7 @@ void tst_QQmlEngineDebugService::queryExpressionResult()
+ 
+     QQmlDebugRootContextQuery *q_context = m_dbg->queryRootContexts(q_engines->engines()[0].debugId(), this);
+     waitForQuery(q_context);
+-    int objectId = q_context->rootContext().objects()[0].debugId();
++    int objectId = q_context->rootContext().contexts().last().objects()[0].debugId();
+ 
+     QQmlDebugExpressionQuery *q_expr;
+ 
+@@ -1164,8 +1166,9 @@ void tst_QQmlEngineDebugService::queryObjectTree()
+     QQmlDebugRootContextQuery *q_context = m_dbg->queryRootContexts(q_engines->engines()[0].debugId(), this);
+     waitForQuery(q_context);
+ 
+-    QVERIFY(q_context->rootContext().objects().count() > sourceIndex);
+-    QQmlDebugObjectReference rootObject = q_context->rootContext().objects()[sourceIndex];
++    QVERIFY(q_context->rootContext().contexts().count() >= sourceIndex);
++    int count = q_context->rootContext().contexts().count();
++    QQmlDebugObjectReference rootObject = q_context->rootContext().contexts()[count - sourceIndex - 1].objects()[0];
+ 
+     QQmlDebugObjectQuery *q_obj = m_dbg->queryObjectRecursive(rootObject, this);
+     waitForQuery(q_obj);

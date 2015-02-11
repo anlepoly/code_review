@@ -1,0 +1,188 @@
+diff --git a/src/quick/items/qquickcanvas.cpp b/src/quick/items/qquickcanvas.cpp
+index d9476fe..ad2f016 100644
+--- a/src/quick/items/qquickcanvas.cpp
++++ b/src/quick/items/qquickcanvas.cpp
+@@ -264,12 +264,18 @@ void QQuickCanvasPrivate::syncSceneGraph()
+ void QQuickCanvasPrivate::renderSceneGraph(const QSize &size)
+ {
+     Q_Q(QQuickCanvas);
++    emit q->beforeRendering();
++    int fboId = 0;
+     renderer->setDeviceRect(QRect(QPoint(0, 0), size));
+-    renderer->setViewportRect(QRect(QPoint(0, 0), renderTarget ? renderTarget->size() : size));
++    if (renderTargetId) {
++        fboId = renderTargetId;
++        renderer->setViewportRect(QRect(QPoint(0, 0), renderTargetSize));
++    } else {
++        renderer->setViewportRect(QRect(QPoint(0, 0), size));
++    }
+     renderer->setProjectionMatrixToDeviceRect();
+ 
+-    emit q->beforeRendering();
+-    context->renderNextFrame(renderer, renderTarget);
++    context->renderNextFrame(renderer, fboId);
+     emit q->afterRendering();
+ }
+ 
+@@ -285,6 +291,7 @@ QQuickCanvasPrivate::QQuickCanvasPrivate()
+     , clearColor(Qt::white)
+     , clearBeforeRendering(true)
+     , renderTarget(0)
++    , renderTargetId(0)
+     , incubationController(0)
+ {
+ }
+@@ -1818,8 +1825,53 @@ void QQuickCanvas::setRenderTarget(QOpenGLFramebufferObject *fbo)
+     }
+ 
+     d->renderTarget = fbo;
++    if (fbo) {
++        d->renderTargetId = fbo->handle();
++        d->renderTargetSize = fbo->size();
++    } else {
++        d->renderTargetId = 0;
++        d->renderTargetSize = QSize();
++    }
++}
++
++/*!
++    \overload
++ */
++void QQuickCanvas::setRenderTarget(uint fboId, const QSize &size)
++{
++    Q_D(QQuickCanvas);
++    if (d->context && d->context && QThread::currentThread() != d->context->thread()) {
++        qWarning("QQuickCanvas::setRenderThread: Cannot set render target from outside the rendering thread");
++        return;
++    }
++
++    d->renderTargetId = fboId;
++    d->renderTargetSize = size;
++
++    // Unset any previously set instance...
++    d->renderTarget = 0;
++}
++
++
++/*!
++    Returns the FBO id of the render target when set; otherwise returns 0.
++ */
++uint QQuickCanvas::renderTargetId() const
++{
++    Q_D(const QQuickCanvas);
++    return d->renderTargetId;
+ }
+ 
++/*!
++    Returns the size of the currently set render target; otherwise returns an enpty size.
++ */
++QSize QQuickCanvas::renderTargetSize() const
++{
++    Q_D(const QQuickCanvas);
++    return d->renderTargetSize;
++}
++
++
+ 
+ 
+ /*!
+diff --git a/src/quick/items/qquickcanvas.h b/src/quick/items/qquickcanvas.h
+index 496c9d0..335cbf7 100644
+--- a/src/quick/items/qquickcanvas.h
++++ b/src/quick/items/qquickcanvas.h
+@@ -96,6 +96,10 @@ public:
+     void setRenderTarget(QOpenGLFramebufferObject *fbo);
+     QOpenGLFramebufferObject *renderTarget() const;
+ 
++    void setRenderTarget(uint fboId, const QSize &size);
++    uint renderTargetId() const;
++    QSize renderTargetSize() const;
++
+     QDeclarativeIncubationController *incubationController() const;
+ 
+     virtual QAccessibleInterface *accessibleRoot() const;
+diff --git a/src/quick/items/qquickcanvas_p.h b/src/quick/items/qquickcanvas_p.h
+index 45b87c6..e6b9f7d 100644
+--- a/src/quick/items/qquickcanvas_p.h
++++ b/src/quick/items/qquickcanvas_p.h
+@@ -182,6 +182,8 @@ public:
+     uint clearBeforeRendering : 1;
+ 
+     QOpenGLFramebufferObject *renderTarget;
++    uint renderTargetId;
++    QSize renderTargetSize;
+ 
+     QHash<int, QQuickItem *> itemForTouchPointId;
+ 
+diff --git a/src/quick/scenegraph/coreapi/qsgrenderer.cpp b/src/quick/scenegraph/coreapi/qsgrenderer.cpp
+index 56693ad..6a894ee 100644
+--- a/src/quick/scenegraph/coreapi/qsgrenderer.cpp
++++ b/src/quick/scenegraph/coreapi/qsgrenderer.cpp
+@@ -93,6 +93,17 @@ void QSGBindableFbo::bind() const
+     m_fbo->bind();
+ }
+ 
++QSGBindableFboId::QSGBindableFboId(GLuint id)
++    : m_id(id)
++{
++}
++
++
++void QSGBindableFboId::bind() const
++{
++    QOpenGLContext::currentContext()->functions()->glBindFramebuffer(GL_FRAMEBUFFER, m_id);
++}
++
+ /*!
+     \class QSGRenderer
+     \brief The renderer class is the abstract baseclass use for rendering the
+diff --git a/src/quick/scenegraph/coreapi/qsgrenderer_p.h b/src/quick/scenegraph/coreapi/qsgrenderer_p.h
+index 7b7ba07..ff4196c 100644
+--- a/src/quick/scenegraph/coreapi/qsgrenderer_p.h
++++ b/src/quick/scenegraph/coreapi/qsgrenderer_p.h
+@@ -199,6 +199,15 @@ private:
+     QOpenGLFramebufferObject *m_fbo;
+ };
+ 
++class QSGBindableFboId : public QSGBindable
++{
++public:
++    QSGBindableFboId(GLuint);
++    virtual void bind() const;
++private:
++    GLuint m_id;
++};
++
+ 
+ 
+ QSGMaterialShader::RenderState QSGRenderer::state(QSGMaterialShader::RenderState::DirtyStates dirty) const
+diff --git a/src/quick/scenegraph/qsgcontext.cpp b/src/quick/scenegraph/qsgcontext.cpp
+index 14a8547..1f26e57 100644
+--- a/src/quick/scenegraph/qsgcontext.cpp
++++ b/src/quick/scenegraph/qsgcontext.cpp
+@@ -221,10 +221,10 @@ bool QSGContext::isReady() const
+ }
+ 
+ 
+-void QSGContext::renderNextFrame(QSGRenderer *renderer, QOpenGLFramebufferObject *fbo)
++void QSGContext::renderNextFrame(QSGRenderer *renderer, GLuint fboId)
+ {
+-    if (fbo) {
+-        QSGBindableFbo bindable(fbo);
++    if (fboId) {
++        QSGBindableFboId bindable(fboId);
+         renderer->renderScene(bindable);
+     } else {
+         renderer->renderScene();
+diff --git a/src/quick/scenegraph/qsgcontext_p.h b/src/quick/scenegraph/qsgcontext_p.h
+index eda1ab6..84c293c 100644
+--- a/src/quick/scenegraph/qsgcontext_p.h
++++ b/src/quick/scenegraph/qsgcontext_p.h
+@@ -92,7 +92,7 @@ public:
+ 
+     QSGMaterialShader *prepareMaterial(QSGMaterial *material);
+ 
+-    virtual void renderNextFrame(QSGRenderer *renderer, QOpenGLFramebufferObject *fbo = 0);
++    virtual void renderNextFrame(QSGRenderer *renderer, GLuint fboId);
+ 
+     virtual QSGDistanceFieldGlyphCache *createDistanceFieldGlyphCache(const QRawFont &font);

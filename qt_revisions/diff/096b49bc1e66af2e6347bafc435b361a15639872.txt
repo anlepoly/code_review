@@ -1,0 +1,603 @@
+diff --git a/src/corelib/io/io.pri b/src/corelib/io/io.pri
+index 1d31e5d..e8a41b2 100644
+--- a/src/corelib/io/io.pri
++++ b/src/corelib/io/io.pri
+@@ -87,7 +87,11 @@ win32 {
+     wince* {
+         SOURCES += io/qprocess_wince.cpp
+     } else {
+-        SOURCES += io/qprocess_win.cpp
++        HEADERS += \
++            io/qwinoverlappedionotifier_p.h
++        SOURCES += \
++            io/qprocess_win.cpp \
++            io/qwinoverlappedionotifier.cpp
+     }
+ } else:unix|integrity {
+         SOURCES += \
+diff --git a/src/corelib/io/qwinoverlappedionotifier.cpp b/src/corelib/io/qwinoverlappedionotifier.cpp
+new file mode 100644
+index 0000000..b040de3
+--- /dev/null
++++ b/src/corelib/io/qwinoverlappedionotifier.cpp
+@@ -0,0 +1,228 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** All rights reserved.
++** Contact: Nokia Corporation (qt-info@nokia.com)
++**
++** This file is part of the QtCore module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qwinoverlappedionotifier_p.h"
++#include <qdebug.h>
++#include <qmutex.h>
++#include <qpointer.h>
++#include <qset.h>
++#include <qthread.h>
++
++QT_BEGIN_NAMESPACE
++
++/*!
++    \class QWinOverlappedIoNotifier
++    \brief The QWinOverlappedIoNotifier class provides support for overlapped I/O notifications on Windows.
++    \since 5.0
++    \internal
++
++    The QWinOverlappedIoNotifier class makes it possible to use efficient
++    overlapped (asynchronous) I/O notifications on Windows by using an
++    I/O completion port.
++
++    Once you have obtained a file handle, you can use setHandle() to get
++    notifications for I/O operations. Whenever an I/O operation completes,
++    the notified() signal is emitted which will pass the number of transferred
++    bytes and the operation's error code to the receiver.
++
++    Every handle that supports overlapped I/O can be used by
++    QWinOverlappedIoNotifier. That includes file handles, TCP sockets
++    and named pipes.
++
++    Note that you must not use ReadFileEx() and WriteFileEx() together
++    with QWinOverlappedIoNotifier. They are not supported as they use a
++    different I/O notification mechanism.
++
++    The hEvent member in the OVERLAPPED structure passed to ReadFile()
++    or WriteFile() is ignored and can be used for other purposes.
++
++    \warning This class is only available on Windows.
++*/
++
++class QWinIoCompletionPort : protected QThread
++{
++public:
++    QWinIoCompletionPort()
++        : hPort(INVALID_HANDLE_VALUE)
++    {
++        setObjectName(QLatin1String("I/O completion port thread"));
++        HANDLE hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, NULL, 0);
++        if (!hIOCP) {
++            qErrnoWarning("CreateIoCompletionPort failed.");
++            return;
++        }
++        hPort = hIOCP;
++    }
++
++    ~QWinIoCompletionPort()
++    {
++        PostQueuedCompletionStatus(hPort, 0, NULL, NULL);
++        QThread::wait();
++        CloseHandle(hPort);
++    }
++
++    void registerNotifier(QWinOverlappedIoNotifier *notifier)
++    {
++        HANDLE hIOCP = CreateIoCompletionPort(notifier->hHandle, hPort, reinterpret_cast<ULONG_PTR>(notifier), 0);
++        if (!hIOCP) {
++            qErrnoWarning("Can't associate file handle %x with I/O completion port.", notifier->hHandle);
++            return;
++        }
++        mutex.lock();
++        notifiers += notifier;
++        mutex.unlock();
++        if (!QThread::isRunning())
++            QThread::start();
++    }
++
++    void unregisterNotifier(QWinOverlappedIoNotifier *notifier)
++    {
++        mutex.lock();
++        notifiers.remove(notifier);
++        mutex.unlock();
++    }
++
++protected:
++    void run()
++    {
++        DWORD dwBytesRead;
++        ULONG_PTR pulCompletionKey;
++        OVERLAPPED *overlapped;
++
++        forever {
++            BOOL success = GetQueuedCompletionStatus(hPort,
++                                                     &dwBytesRead,
++                                                     &pulCompletionKey,
++                                                     &overlapped,
++                                                     INFINITE);
++
++            DWORD errorCode = success ? ERROR_SUCCESS : GetLastError();
++            if (!success && !overlapped) {
++                qErrnoWarning(errorCode, "GetQueuedCompletionStatus failed.");
++                return;
++            }
++
++            if (success && !(dwBytesRead || pulCompletionKey || overlapped)) {
++                // We've posted null values via PostQueuedCompletionStatus to end this thread.
++                return;
++            }
++
++            QWinOverlappedIoNotifier *notifier = reinterpret_cast<QWinOverlappedIoNotifier *>(pulCompletionKey);
++            mutex.lock();
++            if (notifiers.contains(notifier))
++                notifier->notify(dwBytesRead, errorCode);
++            mutex.unlock();
++        }
++    }
++
++private:
++    HANDLE hPort;
++    QSet<QWinOverlappedIoNotifier *> notifiers;
++    QMutex mutex;
++};
++
++Q_GLOBAL_STATIC(QWinIoCompletionPort, iocp)
++
++QWinOverlappedIoNotifier::QWinOverlappedIoNotifier(QObject *parent)
++    : QObject(parent),
++      hHandle(INVALID_HANDLE_VALUE),
++      lastNumberOfBytes(0),
++      lastErrorCode(ERROR_SUCCESS)
++{
++    hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
++    connect(this, &QWinOverlappedIoNotifier::_q_notify,
++            this, &QWinOverlappedIoNotifier::_q_notified, Qt::QueuedConnection);
++}
++
++QWinOverlappedIoNotifier::~QWinOverlappedIoNotifier()
++{
++    setEnabled(false);
++    CloseHandle(hEvent);
++}
++
++void QWinOverlappedIoNotifier::setHandle(HANDLE h)
++{
++    hHandle = h;
++}
++
++void QWinOverlappedIoNotifier::setEnabled(bool enabled)
++{
++    if (enabled)
++        iocp()->registerNotifier(this);
++    else
++        iocp()->unregisterNotifier(this);
++}
++
++bool QWinOverlappedIoNotifier::waitForNotified(int msecs)
++{
++    DWORD result = WaitForSingleObject(hEvent, msecs == -1 ? INFINITE : DWORD(msecs));
++    switch (result) {
++    case WAIT_OBJECT_0:
++        _q_notified();
++        return true;
++    case WAIT_TIMEOUT:
++        return false;
++    }
++
++    qErrnoWarning("QWinOverlappedIoNotifier::waitForNotified: WaitForSingleObject failed.");
++    return false;
++}
++
++/*!
++  * Note: This function runs in the I/O completion port thread.
++  */
++void QWinOverlappedIoNotifier::notify(DWORD numberOfBytes, DWORD errorCode)
++{
++    lastNumberOfBytes = numberOfBytes;
++    lastErrorCode = errorCode;
++    SetEvent(hEvent);
++    emit _q_notify();
++}
++
++void QWinOverlappedIoNotifier::_q_notified()
++{
++    if (WaitForSingleObject(hEvent, 0) == WAIT_OBJECT_0) {
++        ResetEvent(hEvent);
++        emit notified(lastNumberOfBytes, lastErrorCode);
++    }
++}
++
++QT_END_NAMESPACE
+diff --git a/src/corelib/io/qwinoverlappedionotifier_p.h b/src/corelib/io/qwinoverlappedionotifier_p.h
+new file mode 100644
+index 0000000..2924c21
+--- /dev/null
++++ b/src/corelib/io/qwinoverlappedionotifier_p.h
+@@ -0,0 +1,101 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** All rights reserved.
++** Contact: Nokia Corporation (qt-info@nokia.com)
++**
++** This file is part of the QtCore module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QWINOVERLAPPEDIONOTIFIER_P_H
++#define QWINOVERLAPPEDIONOTIFIER_P_H
++
++//
++//  W A R N I N G
++//  -------------
++//
++// This file is not part of the Qt API.  It exists purely as an
++// implementation detail.  This header file may change from version to
++// version without notice, or even be removed.
++//
++// We mean it.
++//
++
++#include <qobject.h>
++#include <qt_windows.h>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Core)
++
++class Q_CORE_EXPORT QWinOverlappedIoNotifier : public QObject
++{
++    Q_OBJECT
++public:
++    QWinOverlappedIoNotifier(QObject *parent = 0);
++    ~QWinOverlappedIoNotifier();
++
++    void setHandle(HANDLE h);
++    HANDLE handle() const { return hHandle; }
++
++    void setEnabled(bool enabled);
++    bool waitForNotified(int msecs);
++
++Q_SIGNALS:
++    void notified(DWORD numberOfBytes, DWORD errorCode);
++    void _q_notify();
++
++private Q_SLOTS:
++    void _q_notified();
++
++private:
++    void notify(DWORD numberOfBytes, DWORD errorCode);
++
++private:
++    HANDLE hHandle;
++    HANDLE hEvent;
++    DWORD lastNumberOfBytes;
++    DWORD lastErrorCode;
++
++    friend class QWinIoCompletionPort;
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif // QWINOVERLAPPEDIONOTIFIER_P_H
+diff --git a/tests/auto/corelib/io/io.pro b/tests/auto/corelib/io/io.pro
+index ae0b496..095aa7a 100644
+--- a/tests/auto/corelib/io/io.pro
++++ b/tests/auto/corelib/io/io.pro
+@@ -22,6 +22,12 @@ SUBDIRS=\
+     qtemporaryfile \
+     qtextstream \
+     qurl \
++    qwinoverlappedionotifier \
++
++!win32|wince* {
++    SUBDIRS -=\
++        qwinoverlappedionotifier
++}
+ 
+ !contains(QT_CONFIG, private_tests): SUBDIRS -= \
+     qfileinfo
+diff --git a/tests/auto/corelib/io/qwinoverlappedionotifier/qwinoverlappedionotifier.pro b/tests/auto/corelib/io/qwinoverlappedionotifier/qwinoverlappedionotifier.pro
+new file mode 100644
+index 0000000..0b5bf9f
+--- /dev/null
++++ b/tests/auto/corelib/io/qwinoverlappedionotifier/qwinoverlappedionotifier.pro
+@@ -0,0 +1,4 @@
++CONFIG += testcase parallel_test
++TARGET = tst_qwinoverlappedionotifier
++QT = core-private testlib
++SOURCES = tst_qwinoverlappedionotifier.cpp
+diff --git a/tests/auto/corelib/io/qwinoverlappedionotifier/tst_qwinoverlappedionotifier.cpp b/tests/auto/corelib/io/qwinoverlappedionotifier/tst_qwinoverlappedionotifier.cpp
+new file mode 100644
+index 0000000..965ace4
+--- /dev/null
++++ b/tests/auto/corelib/io/qwinoverlappedionotifier/tst_qwinoverlappedionotifier.cpp
+@@ -0,0 +1,212 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** All rights reserved.
++** Contact: Nokia Corporation (qt-info@nokia.com)
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <QtTest/QtTest>
++#include <private/qwinoverlappedionotifier_p.h>
++#include <qbytearray.h>
++
++class tst_QWinOverlappedIoNotifier : public QObject
++{
++    Q_OBJECT
++
++private slots:
++    void initTestCase();
++    void readFile_data();
++    void readFile();
++    void waitForNotified_data();
++    void waitForNotified();
++    void brokenPipe();
++
++private:
++    QFileInfo sourceFileInfo;
++    DWORD notifiedBytesRead;
++    DWORD notifiedErrorCode;
++};
++
++class NotifierSink : public QObject
++{
++    Q_OBJECT
++public:
++    NotifierSink(QWinOverlappedIoNotifier *notifier)
++        : QObject(notifier),
++          notifications(0),
++          notifiedBytesRead(0),
++          notifiedErrorCode(ERROR_SUCCESS)
++    {
++        connect(notifier, &QWinOverlappedIoNotifier::notified, this, &NotifierSink::notified);
++    }
++
++protected slots:
++    void notified(DWORD bytesRead, DWORD errorCode)
++    {
++        notifications++;
++        notifiedBytesRead = bytesRead;
++        notifiedErrorCode = errorCode;
++        emit notificationReceived();
++    }
++
++signals:
++    void notificationReceived();
++
++public:
++    int notifications;
++    DWORD notifiedBytesRead;
++    DWORD notifiedErrorCode;
++};
++
++void tst_QWinOverlappedIoNotifier::initTestCase()
++{
++    sourceFileInfo.setFile(QFINDTESTDATA("tst_qwinoverlappedionotifier.cpp"));
++    QVERIFY2(sourceFileInfo.exists(), "File tst_qwinoverlappedionotifier.cpp not found.");
++}
++
++void tst_QWinOverlappedIoNotifier::readFile_data()
++{
++    QTest::addColumn<QString>("fileName");
++    QTest::addColumn<int>("readBufferSize");
++    QTest::addColumn<DWORD>("expectedBytesRead");
++
++    QString sourceFileName = QDir::toNativeSeparators(sourceFileInfo.absoluteFilePath());
++    int sourceFileSize = sourceFileInfo.size();
++
++    QTest::newRow("read file, less than available")
++        << sourceFileName << sourceFileSize / 2 << DWORD(sourceFileSize / 2);
++    QTest::newRow("read file, more than available")
++        << sourceFileName << sourceFileSize * 2 << DWORD(sourceFileSize);
++}
++
++void tst_QWinOverlappedIoNotifier::readFile()
++{
++    QFETCH(QString, fileName);
++    QFETCH(int, readBufferSize);
++    QFETCH(DWORD, expectedBytesRead);
++
++    QWinOverlappedIoNotifier notifier;
++    NotifierSink sink(&notifier);
++    connect(&sink, &NotifierSink::notificationReceived, &QTestEventLoop::instance(), &QTestEventLoop::exitLoop);
++
++    HANDLE hFile = CreateFile(reinterpret_cast<const wchar_t*>(fileName.utf16()),
++                              GENERIC_READ, FILE_SHARE_READ,
++                              NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
++    notifier.setHandle(hFile);
++    notifier.setEnabled(true);
++
++    OVERLAPPED overlapped = {0};
++    QByteArray buffer(readBufferSize, 0);
++    BOOL readSuccess = ReadFile(hFile, buffer.data(), buffer.size(), NULL, &overlapped);
++    QVERIFY(readSuccess || GetLastError() == ERROR_IO_PENDING);
++
++    QTestEventLoop::instance().enterLoop(3);
++    CloseHandle(hFile);
++    QCOMPARE(sink.notifications, 1);
++    QCOMPARE(sink.notifiedBytesRead, expectedBytesRead);
++    QCOMPARE(sink.notifiedErrorCode, DWORD(ERROR_SUCCESS));
++}
++
++void tst_QWinOverlappedIoNotifier::waitForNotified_data()
++{
++    readFile_data();
++}
++
++void tst_QWinOverlappedIoNotifier::waitForNotified()
++{
++    QFETCH(QString, fileName);
++    QFETCH(int, readBufferSize);
++    QFETCH(DWORD, expectedBytesRead);
++
++    QWinOverlappedIoNotifier notifier;
++    NotifierSink sink(&notifier);
++    HANDLE hFile = CreateFile(reinterpret_cast<const wchar_t*>(fileName.utf16()),
++                              GENERIC_READ, FILE_SHARE_READ,
++                              NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
++    QCOMPARE(notifier.waitForNotified(0), false);
++    notifier.setHandle(hFile);
++    notifier.setEnabled(true);
++    QCOMPARE(notifier.waitForNotified(100), false);
++
++    OVERLAPPED overlapped = {0};
++    QByteArray buffer(readBufferSize, 0);
++    BOOL readSuccess = ReadFile(hFile, buffer.data(), buffer.size(), NULL, &overlapped);
++    QVERIFY(readSuccess || GetLastError() == ERROR_IO_PENDING);
++
++    QCOMPARE(notifier.waitForNotified(3000), true);
++    CloseHandle(hFile);
++    QCOMPARE(sink.notifications, 1);
++    QCOMPARE(sink.notifiedBytesRead, expectedBytesRead);
++    QCOMPARE(sink.notifiedErrorCode, DWORD(ERROR_SUCCESS));
++    QCOMPARE(notifier.waitForNotified(100), false);
++}
++
++void tst_QWinOverlappedIoNotifier::brokenPipe()
++{
++    QWinOverlappedIoNotifier notifier;
++    NotifierSink sink(&notifier);
++    connect(&sink, &NotifierSink::notificationReceived, &QTestEventLoop::instance(), &QTestEventLoop::exitLoop);
++
++    wchar_t pipeName[] = L"\\\\.\\pipe\\tst_QWinOverlappedIoNotifier_brokenPipe";
++    HANDLE hPipe = CreateNamedPipe(pipeName,
++                                   PIPE_ACCESS_DUPLEX,
++                                   PIPE_TYPE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
++                                   1, 0, 0, 0, NULL);
++    QVERIFY(hPipe != INVALID_HANDLE_VALUE);
++    HANDLE hReadEnd = CreateFile(pipeName, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0);
++    QVERIFY(hReadEnd != INVALID_HANDLE_VALUE);
++    notifier.setHandle(hReadEnd);
++    notifier.setEnabled(true);
++
++    OVERLAPPED overlapped = {0};
++    QByteArray buffer(1024, 0);
++    BOOL readSuccess = ReadFile(hReadEnd, buffer.data(), buffer.size(), NULL, &overlapped);
++    QVERIFY(readSuccess || GetLastError() == ERROR_IO_PENDING);
++
++    // close the write end of the pipe
++    CloseHandle(hPipe);
++
++    QTestEventLoop::instance().enterLoop(3);
++    CloseHandle(hReadEnd);
++    QCOMPARE(sink.notifications, 1);
++    QCOMPARE(sink.notifiedBytesRead, DWORD(0));
++    QCOMPARE(sink.notifiedErrorCode, DWORD(ERROR_BROKEN_PIPE));
++}
++
++QTEST_MAIN(tst_QWinOverlappedIoNotifier)
++
++#include "tst_qwinoverlappedionotifier.moc"

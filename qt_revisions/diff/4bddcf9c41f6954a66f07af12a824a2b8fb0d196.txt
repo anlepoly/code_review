@@ -1,0 +1,382 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoabackingstore.h b/src/plugins/platforms/cocoa/qcocoabackingstore.h
+index 9f9159a..0e19981 100644
+--- a/src/plugins/platforms/cocoa/qcocoabackingstore.h
++++ b/src/plugins/platforms/cocoa/qcocoabackingstore.h
+@@ -61,9 +61,12 @@ public:
+     void flush(QWindow *widget, const QRegion &region, const QPoint &offset);
+     void resize (const QSize &size, const QRegion &);
+     bool scroll(const QRegion &area, int dx, int dy);
++    CGImageRef getBackingStoreCGImage();
+ 
+ private:
+-    QImage *m_image;
++    QImage m_qImage;
++    CGImageRef m_cgImage;
++    QSize m_requestedSize;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoabackingstore.mm b/src/plugins/platforms/cocoa/qcocoabackingstore.mm
+index 8a20ed8..7bd7e4c 100644
+--- a/src/plugins/platforms/cocoa/qcocoabackingstore.mm
++++ b/src/plugins/platforms/cocoa/qcocoabackingstore.mm
+@@ -40,54 +40,51 @@
+ ****************************************************************************/
+ 
+ #include "qcocoabackingstore.h"
+-#include "qcocoaautoreleasepool.h"
+-
+-#include <QtCore/qdebug.h>
+ #include <QtGui/QPainter>
++#include "qcocoahelpers.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ QCocoaBackingStore::QCocoaBackingStore(QWindow *window)
+     : QPlatformBackingStore(window)
++    , m_cgImage(0)
+ {
+-    m_image = new QImage(window->geometry().size(),QImage::Format_ARGB32_Premultiplied);
+ }
+ 
+ QCocoaBackingStore::~QCocoaBackingStore()
+ {
+-    delete m_image;
++    CGImageRelease(m_cgImage);
++    m_cgImage = 0;
+ }
+ 
+ QPaintDevice *QCocoaBackingStore::paintDevice()
+ {
+-    return m_image;
++    if (m_qImage.size() != m_requestedSize) {
++        CGImageRelease(m_cgImage);
++        m_cgImage = 0;
++        m_qImage = QImage(m_requestedSize, QImage::Format_ARGB32_Premultiplied);
++    }
++    return &m_qImage;
+ }
+ 
+-void QCocoaBackingStore::flush(QWindow *widget, const QRegion &region, const QPoint &offset)
++void QCocoaBackingStore::flush(QWindow *win, const QRegion &region, const QPoint &offset)
+ {
+-    Q_UNUSED(widget);
+-    Q_UNUSED(offset);
+-    QCocoaAutoReleasePool pool;
+-
+-    QRect geo = region.boundingRect();
+-    NSRect rect = NSMakeRect(geo.x(), geo.y(), geo.width(), geo.height());
+-    QCocoaWindow *cocoaWindow = static_cast<QCocoaWindow *>(window()->handle());
+-    if (cocoaWindow) {
+-        // setImage call is needed here to make the displayRect call
+-        // have effect - even if the image has not changed.
+-        [cocoaWindow->m_contentView setImage:m_image];
+-        [cocoaWindow->m_contentView displayRect:rect];
+-   }
++    // A flush means that qImage has changed. Since CGImages are seen as
++    // immutable, CoreImage fails to pick up this change for m_cgImage
++    // (since it usually cached), so we must recreate it. We await doing this
++    // until one of the views needs it, since, together with calling
++    // "setNeedsDisplayInRect" instead of "displayRect" we will, in most
++    // cases, get away with doing this once for every repaint. Also note that
++    // m_cgImage is only a reference to the data inside m_qImage, it is not a copy.
++    CGImageRelease(m_cgImage);
++    m_cgImage = 0;
++    if (QCocoaWindow *cocoaWindow = static_cast<QCocoaWindow *>(win->handle()))
++        [cocoaWindow->m_contentView flushBackingStore:this region:region offset:offset];
+ }
+ 
+ void QCocoaBackingStore::resize(const QSize &size, const QRegion &)
+ {
+-    delete m_image;
+-    m_image = new QImage(size, QImage::Format_ARGB32_Premultiplied);
+-
+-    QCocoaWindow *cocoaWindow = static_cast<QCocoaWindow *>(window()->handle());
+-    if (cocoaWindow)
+-        [static_cast<QNSView *>(cocoaWindow->m_contentView) setImage:m_image];
++    m_requestedSize = size;
+ }
+ 
+ bool QCocoaBackingStore::scroll(const QRegion &area, int dx, int dy)
+@@ -97,9 +94,20 @@ bool QCocoaBackingStore::scroll(const QRegion &area, int dx, int dy)
+     const QVector<QRect> qrects = area.rects();
+     for (int i = 0; i < qrects.count(); ++i) {
+         const QRect &qrect = qrects.at(i);
+-        qt_scrollRectInImage(*m_image, qrect, qpoint);
++        qt_scrollRectInImage(m_qImage, qrect, qpoint);
+     }
+     return true;
+ }
+ 
++CGImageRef QCocoaBackingStore::getBackingStoreCGImage()
++{
++    if (!m_cgImage)
++        m_cgImage = qt_mac_toCGImage(m_qImage, false, 0);
++
++    // Warning: do not retain/release/cache the returned image from
++    // outside the backingstore since it shares data with a QImage and
++    // needs special memory considerations.
++    return m_cgImage;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoahelpers.h b/src/plugins/platforms/cocoa/qcocoahelpers.h
+index de98d52..b022273 100644
+--- a/src/plugins/platforms/cocoa/qcocoahelpers.h
++++ b/src/plugins/platforms/cocoa/qcocoahelpers.h
+@@ -159,6 +159,7 @@ public:
+ };
+ 
+ CGContextRef qt_mac_cg_context(const QPaintDevice *pdev);
++CGImageRef qt_mac_toCGImage(const QImage &qImage, bool isMask, uchar **dataCopy);
+ 
+ QT_END_NAMESPACE
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoahelpers.mm b/src/plugins/platforms/cocoa/qcocoahelpers.mm
+index 0a8da0a..008d9da 100644
+--- a/src/plugins/platforms/cocoa/qcocoahelpers.mm
++++ b/src/plugins/platforms/cocoa/qcocoahelpers.mm
+@@ -751,4 +751,60 @@ CGContextRef qt_mac_cg_context(const QPaintDevice *pdev)
+     return 0;
+ }
+ 
++CGImageRef qt_mac_toCGImage(const QImage &qImage, bool isMask, uchar **dataCopy)
++{
++    int width = qImage.width();
++    int height = qImage.height();
++
++    if (width <= 0 || height <= 0) {
++        qWarning() << Q_FUNC_INFO <<
++            "setting invalid size" << width << "x" << height << "for qnsview image";
++        return 0;
++    }
++
++    const uchar *imageData = qImage.bits();
++    if (dataCopy) {
++        delete[] *dataCopy;
++        *dataCopy = new uchar[qImage.byteCount()];
++        memcpy(*dataCopy, imageData, qImage.byteCount());
++    }
++    int bitDepth = qImage.depth();
++    int colorBufferSize = 8;
++    int bytesPrLine = qImage.bytesPerLine();
++
++    CGDataProviderRef cgDataProviderRef = CGDataProviderCreateWithData(
++                NULL,
++                dataCopy ? *dataCopy : imageData,
++                qImage.byteCount(),
++                NULL);
++
++    CGImageRef cgImage = 0;
++    if (isMask) {
++        cgImage = CGImageMaskCreate(width,
++                                    height,
++                                    colorBufferSize,
++                                    bitDepth,
++                                    bytesPrLine,
++                                    cgDataProviderRef,
++                                    NULL,
++                                    false);
++    } else {
++        CGColorSpaceRef cgColourSpaceRef = CGColorSpaceCreateDeviceRGB();
++        cgImage = CGImageCreate(width,
++                                height,
++                                colorBufferSize,
++                                bitDepth,
++                                bytesPrLine,
++                                cgColourSpaceRef,
++                                kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
++                                cgDataProviderRef,
++                                NULL,
++                                false,
++                                kCGRenderingIntentDefault);
++        CGColorSpaceRelease(cgColourSpaceRef);
++    }
++    CGDataProviderRelease(cgDataProviderRef);
++    return cgImage;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qnsview.h b/src/plugins/platforms/cocoa/qnsview.h
+index 246d311..1ee3697 100644
+--- a/src/plugins/platforms/cocoa/qnsview.h
++++ b/src/plugins/platforms/cocoa/qnsview.h
+@@ -50,10 +50,12 @@
+ 
+ QT_BEGIN_NAMESPACE
+ class QCocoaWindow;
++class QCocoaBackingStore;
+ QT_END_NAMESPACE
+ 
+ @interface QNSView : NSView <NSTextInputClient> {
+-    CGImageRef m_cgImage;
++    QCocoaBackingStore* m_backingStore;
++    QPoint m_backingStoreOffset;
+     CGImageRef m_maskImage;
+     uchar *m_maskData;
+     QWindow *m_window;
+@@ -69,7 +71,7 @@ QT_END_NAMESPACE
+ - (id)init;
+ - (id)initWithQWindow:(QWindow *)window platformWindow:(QCocoaWindow *) platformWindow;
+ 
+-- (void)setImage:(QImage *)image;
++- (void)flushBackingStore:(QCocoaBackingStore *)backingStore region:(const QRegion &)region offset:(QPoint)offset;
+ - (void)setMaskRegion:(const QRegion *)region;
+ - (void)drawRect:(NSRect)dirtyRect;
+ - (void)updateGeometry;
+diff --git a/src/plugins/platforms/cocoa/qnsview.mm b/src/plugins/platforms/cocoa/qnsview.mm
+index 4fb0993..8e18ca3 100644
+--- a/src/plugins/platforms/cocoa/qnsview.mm
++++ b/src/plugins/platforms/cocoa/qnsview.mm
+@@ -55,6 +55,7 @@
+ #include <QtGui/QTextFormat>
+ #include <QtCore/QDebug>
+ #include <private/qguiapplication_p.h>
++#include "qcocoabackingstore.h"
+ 
+ #ifdef QT_COCOA_ENABLE_ACCESSIBILITY_INSPECTOR
+ #include <accessibilityinspector.h>
+@@ -74,7 +75,7 @@ static QTouchDevice *touchDevice = 0;
+ {
+     self = [super initWithFrame : NSMakeRect(0,0, 300,300)];
+     if (self) {
+-        m_cgImage = 0;
++        m_backingStore = 0;
+         m_maskImage = 0;
+         m_maskData = 0;
+         m_window = 0;
+@@ -93,8 +94,6 @@ static QTouchDevice *touchDevice = 0;
+ 
+ - (void)dealloc
+ {
+-    CGImageRelease(m_cgImage);
+-    m_cgImage = 0;
+     CGImageRelease(m_maskImage);
+     m_maskImage = 0;
+     delete[] m_maskData;
+@@ -211,66 +210,12 @@ static QTouchDevice *touchDevice = 0;
+     }
+ }
+ 
+-static CGImageRef qt_mac_toCGImage(QImage *qImage, bool isMask, uchar **dataCopy)
++- (void) flushBackingStore:(QCocoaBackingStore *)backingStore region:(const QRegion &)region offset:(QPoint)offset
+ {
+-    int width = qImage->width();
+-    int height = qImage->height();
+-
+-    if (width <= 0 || height <= 0) {
+-        qWarning() << Q_FUNC_INFO <<
+-            "setting invalid size" << width << "x" << height << "for qnsview image";
+-        return 0;
+-    }
+-
+-    const uchar *imageData = qImage->bits();
+-    if (dataCopy) {
+-        delete[] *dataCopy;
+-        *dataCopy = new uchar[qImage->byteCount()];
+-        memcpy(*dataCopy, imageData, qImage->byteCount());
+-    }
+-    int bitDepth = qImage->depth();
+-    int colorBufferSize = 8;
+-    int bytesPrLine = qImage->bytesPerLine();
+-
+-    CGDataProviderRef cgDataProviderRef = CGDataProviderCreateWithData(
+-                NULL,
+-                dataCopy ? *dataCopy : imageData,
+-                qImage->byteCount(),
+-                NULL);
+-
+-    CGImageRef cgImage = 0;
+-    if (isMask) {
+-        cgImage = CGImageMaskCreate(width,
+-                                    height,
+-                                    colorBufferSize,
+-                                    bitDepth,
+-                                    bytesPrLine,
+-                                    cgDataProviderRef,
+-                                    NULL,
+-                                    false);
+-    } else {
+-        CGColorSpaceRef cgColourSpaceRef = CGColorSpaceCreateDeviceRGB();
+-        cgImage = CGImageCreate(width,
+-                                height,
+-                                colorBufferSize,
+-                                bitDepth,
+-                                bytesPrLine,
+-                                cgColourSpaceRef,
+-                                kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+-                                cgDataProviderRef,
+-                                NULL,
+-                                false,
+-                                kCGRenderingIntentDefault);
+-        CGColorSpaceRelease(cgColourSpaceRef);
+-    }
+-    CGDataProviderRelease(cgDataProviderRef);
+-    return cgImage;
+-}
+-
+-- (void) setImage:(QImage *)image
+-{
+-    CGImageRelease(m_cgImage);
+-    m_cgImage = qt_mac_toCGImage(image, false, 0);
++    m_backingStore = backingStore;
++    m_backingStoreOffset = offset;
++    QRect br = region.boundingRect();
++    [self setNeedsDisplayInRect:NSMakeRect(br.x(), br.y(), br.width(), br.height())];
+ }
+ 
+ - (void) setMaskRegion:(const QRegion *)region
+@@ -291,36 +236,45 @@ static CGImageRef qt_mac_toCGImage(QImage *qImage, bool isMask, uchar **dataCopy
+     p.end();
+ 
+     maskImage = maskImage.convertToFormat(QImage::Format_Indexed8);
+-    m_maskImage = qt_mac_toCGImage(&maskImage, true, &m_maskData);
++    m_maskImage = qt_mac_toCGImage(maskImage, true, &m_maskData);
+ }
+ 
+ - (void) drawRect:(NSRect)dirtyRect
+ {
+-    if (!m_cgImage)
++    if (!m_backingStore)
+         return;
+ 
+     CGRect dirtyCGRect = NSRectToCGRect(dirtyRect);
+-
+     NSGraphicsContext *nsGraphicsContext = [NSGraphicsContext currentContext];
+     CGContextRef cgContext = (CGContextRef) [nsGraphicsContext graphicsPort];
+ 
+-    CGContextSaveGState( cgContext );
++    // Translate coordiate system from CoreGraphics (bottom-left) to NSView (top-left):
++    CGContextSaveGState(cgContext);
+     int dy = dirtyCGRect.origin.y + CGRectGetMaxY(dirtyCGRect);
+     CGContextTranslateCTM(cgContext, 0, dy);
+     CGContextScaleCTM(cgContext, 1, -1);
+ 
++    // If a mask is set, modify the sub image accordingly:
+     CGImageRef subMask = 0;
+     if (m_maskImage) {
+         subMask = CGImageCreateWithImageInRect(m_maskImage, dirtyCGRect);
+         CGContextClipToMask(cgContext, dirtyCGRect, subMask);
+     }
+ 
+-    CGImageRef subImage = CGImageCreateWithImageInRect(m_cgImage, dirtyCGRect);
+-    CGContextDrawImage(cgContext,dirtyCGRect,subImage);
+-
++    // Clip out and draw the correct sub image from the (shared) backingstore:
++    CGRect backingStoreRect = CGRectMake(
++        dirtyRect.origin.x + m_backingStoreOffset.x(),
++        dirtyRect.origin.y + m_backingStoreOffset.y(),
++        dirtyRect.size.width,
++        dirtyRect.size.height
++    );
++    CGImageRef bsCGImage = m_backingStore->getBackingStoreCGImage();
++    CGImageRef cleanImg = CGImageCreateWithImageInRect(bsCGImage, backingStoreRect);
++    CGContextDrawImage(cgContext, dirtyCGRect, cleanImg);
++
++    // Clean-up:
+     CGContextRestoreGState(cgContext);
+-
+-    CGImageRelease(subImage);
++    CGImageRelease(cleanImg);
+     CGImageRelease(subMask);
+ }

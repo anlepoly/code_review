@@ -1,0 +1,262 @@
+diff --git a/configure b/configure
+index f9e0864..0c621fe 100755
+--- a/configure
++++ b/configure
+@@ -2243,7 +2243,6 @@ if [ "$OPT_SHADOW" = "yes" ]; then
+     mkdir -p "$outpath/mkspecs"
+     rm -rf "$outpath"/mkspecs/*
+     ln -s "$relpath"/mkspecs/* "$outpath/mkspecs"
+-    rm -f "$outpath/mkspecs/default"
+ 
+     ShadowMkspecs()
+     {
+@@ -3527,6 +3526,9 @@ esac
+ #-------------------------------------------------------------------------------
+ [ -d "$outpath/src/corelib/global" ] || mkdir -p "$outpath/src/corelib/global"
+ 
++shortxspec=`echo $XQMAKESPEC | sed "s,^${relpath}/mkspecs/,,"`
++shortspec=`echo $QMAKESPEC | sed "s,^${relpath}/mkspecs/,,"`
++
+ cat > "$outpath/src/corelib/global/qconfig.cpp.new" <<EOF
+ /* License Info */
+ static const char qt_configure_licensee_str          [256 + 12] = "qt_lcnsuser=$Licensee";
+@@ -3553,6 +3555,8 @@ static const char qt_configure_prefix_path_strs[][256 + 12] = {
+     "qt_hpfxpath=$QT_HOST_PREFIX",
+     "qt_hbinpath=$QT_HOST_BINS",
+     "qt_hdatpath=$QT_HOST_DATA",
++    "qt_targspec=$shortxspec",
++    "qt_hostspec=$shortspec",
+ #endif
+ };
+ static const char qt_configure_settings_path_str[256 + 12] = "qt_stngpath=$QT_INSTALL_SETTINGS";
+@@ -3616,10 +3620,6 @@ setBootstrapVariable()
+ if true; then ###[ '!' -f "$outpath/bin/qmake" ];
+     echo "Creating qmake. Please wait..."
+ 
+-    #mkspecs/default is used as a (gasp!) default mkspec so QMAKESPEC needn't be set once configured
+-    rm -rf mkspecs/default mkspecs/default-host
+-    ln -s `echo $XQMAKESPEC | sed "s,^${relpath}/mkspecs/,,"` mkspecs/default
+-    ln -s `echo $QMAKESPEC | sed "s,^${relpath}/mkspecs/,,"` mkspecs/default-host
+     mkdir -p "$outpath/qmake" || exit
+     # fix makefiles
+     for mkfile in GNUmakefile Makefile; do
+diff --git a/qmake/library/qmakeevaluator.cpp b/qmake/library/qmakeevaluator.cpp
+index f4125ec..e861c8d 100644
+--- a/qmake/library/qmakeevaluator.cpp
++++ b/qmake/library/qmakeevaluator.cpp
+@@ -1127,20 +1127,23 @@ bool QMakeEvaluator::loadSpecInternal()
+         evalError(fL1S("Could not read qmake configuration file %1.").arg(spec));
+         return false;
+     }
+-#ifdef Q_OS_UNIX
++#ifndef QT_BUILD_QMAKE
++    // Legacy support for Qt4 default specs
++#  ifdef Q_OS_UNIX
+     if (m_qmakespec.endsWith(QLatin1String("/default-host"))
+         || m_qmakespec.endsWith(QLatin1String("/default"))) {
+         QString rspec = QFileInfo(m_qmakespec).readLink();
+         if (!rspec.isEmpty())
+             m_qmakespec = QDir::cleanPath(QDir(m_qmakespec).absoluteFilePath(rspec));
+     }
+-#else
++#  else
+     // We can't resolve symlinks as they do on Unix, so configure.exe puts
+     // the source of the qmake.conf at the end of the default/qmake.conf in
+     // the QMAKESPEC_ORIGINAL variable.
+     const ProString &orig_spec = first(ProKey("QMAKESPEC_ORIGINAL"));
+     if (!orig_spec.isEmpty())
+         m_qmakespec = orig_spec.toQString();
++#  endif
+ #endif
+     valuesRef(ProKey("QMAKESPEC")) << ProString(m_qmakespec);
+     m_qmakespecName = IoUtils::fileName(m_qmakespec).toString();
+@@ -1188,7 +1191,12 @@ bool QMakeEvaluator::loadSpec()
+ 
+     updateMkspecPaths();
+     if (qmakespec.isEmpty())
+-        qmakespec = m_hostBuild ? QLatin1String("default-host") : QLatin1String("default");
++        qmakespec = propertyValue(ProKey(m_hostBuild ? "QMAKE_SPEC" : "QMAKE_XSPEC")).toQString();
++#ifndef QT_BUILD_QMAKE
++    // Legacy support for Qt4 qmake in Qt Creator, etc.
++    if (qmakespec.isEmpty())
++        qmakespec = QLatin1String("default-host") : QLatin1String("default");
++#endif
+     if (IoUtils::isRelativePath(qmakespec)) {
+         foreach (const QString &root, m_mkspecPaths) {
+             QString mkspec = root + QLatin1Char('/') + qmakespec;
+diff --git a/qmake/property.cpp b/qmake/property.cpp
+index d9056cd..f1e9ba6 100644
+--- a/qmake/property.cpp
++++ b/qmake/property.cpp
+@@ -71,6 +71,8 @@ static const struct {
+     { "QT_HOST_PREFIX", QLibraryInfo::HostPrefixPath, true },
+     { "QT_HOST_DATA", QLibraryInfo::HostDataPath, true },
+     { "QT_HOST_BINS", QLibraryInfo::HostBinariesPath, true },
++    { "QMAKE_SPEC", QLibraryInfo::HostSpecPath, true },
++    { "QMAKE_XSPEC", QLibraryInfo::TargetSpecPath, true },
+ };
+ 
+ QMakeProperty::QMakeProperty() : settings(0)
+diff --git a/qtbase.pro b/qtbase.pro
+index 59814d7..e66d9fb 100644
+--- a/qtbase.pro
++++ b/qtbase.pro
+@@ -87,16 +87,6 @@ mkspecs.files = \
+     $$OUT_PWD/mkspecs/qconfig.pri $$OUT_PWD/mkspecs/qmodule.pri $$OUT_PWD/mkspecs/qdevice.pri \
+     $$files($$PWD/mkspecs/*)   # $$OUT_PWD contains only symlinks under Unix
+ mkspecs.files -= $$PWD/mkspecs/modules
+-!equals(OUT_PWD, $$PWD) {
+-    # When shadow building, the default mkspecs only exist in the build tree.
+-    mkspecs.files += $$OUT_PWD/mkspecs/default-host $$OUT_PWD/mkspecs/default
+-}
+-!equals(QMAKE_HOST.os, Linux):!equals(QMAKE_HOST.os, Windows) {
+-    # MacOS' (and maybe other Unixes') cp command is too daft to honor -f when copying symlinks.
+-    mkspecs_pre.commands = rm -f $$[QT_HOST_DATA]/mkspecs/default-host $$[QT_HOST_DATA]/mkspecs/default
+-    QMAKE_EXTRA_TARGETS += mkspecs_pre
+-    mkspecs.depends += mkspecs_pre
+-}
+ INSTALLS += mkspecs
+ 
+ global_docs.files = $$PWD/doc/global
+diff --git a/src/corelib/global/qlibraryinfo.cpp b/src/corelib/global/qlibraryinfo.cpp
+index ccf0718..ffdf8d0 100644
+--- a/src/corelib/global/qlibraryinfo.cpp
++++ b/src/corelib/global/qlibraryinfo.cpp
+@@ -276,6 +276,8 @@ static const struct {
+     { "HostPrefix", "" },
+     { "HostBinaries", "bin" },
+     { "HostData", "." },
++    { "TargetSpec", "" },
++    { "HostSpec", "" },
+ #endif
+ };
+ 
+@@ -378,6 +380,12 @@ QLibraryInfo::rawLocation(LibraryLocation loc, PathGroup group)
+ #endif // QT_NO_SETTINGS
+     }
+ 
++#ifdef QT_BOOTSTRAPPED
++    // The specs need to be returned verbatim.
++    if (loc == TargetSpecPath || loc == HostSpecPath)
++        return ret;
++#endif
++
+     if (!ret.isEmpty() && QDir::isRelativePath(ret)) {
+         QString baseDir;
+ #ifdef QT_BOOTSTRAPPED
+diff --git a/src/corelib/global/qlibraryinfo.h b/src/corelib/global/qlibraryinfo.h
+index 1d9b809..93b0c81 100644
+--- a/src/corelib/global/qlibraryinfo.h
++++ b/src/corelib/global/qlibraryinfo.h
+@@ -81,7 +81,9 @@ public:
+         HostPrefixPath,
+         HostBinariesPath,
+         HostDataPath,
+-        LastHostPath = HostDataPath,
++        TargetSpecPath,
++        HostSpecPath,
++        LastHostPath = HostSpecPath,
+ #endif
+         SettingsPath = 100
+     };
+diff --git a/tools/configure/configureapp.cpp b/tools/configure/configureapp.cpp
+index 472563a..f26a07a 100644
+--- a/tools/configure/configureapp.cpp
++++ b/tools/configure/configureapp.cpp
+@@ -3074,37 +3074,6 @@ QString Configure::addDefine(QString def)
+ }
+ 
+ #if !defined(EVAL)
+-bool Configure::copySpec(const char *name, const char *pfx, const QString &spec)
+-{
+-    // "Link" configured mkspec to default directory, but remove the old one first, if there is any
+-    QString defSpec = buildPath + "/mkspecs/" + name;
+-    QFileInfo defSpecInfo(defSpec);
+-    if (defSpecInfo.exists()) {
+-        if (!Environment::rmdir(defSpec)) {
+-            cout << "Couldn't update default " << pfx << "mkspec! Are files in " << qPrintable(defSpec) << " read-only?" << endl;
+-            dictionary["DONE"] = "error";
+-            return false;
+-        }
+-    }
+-
+-    QDir::current().mkpath(defSpec);
+-    QFile qfile(defSpec + "/qmake.conf");
+-    if (qfile.open(QFile::WriteOnly | QFile::Text)) {
+-        QTextStream fileStream;
+-        fileStream.setDevice(&qfile);
+-        QString srcSpec = buildPath + "/mkspecs/" + spec; // We copied it to the build dir
+-        fileStream << "QMAKESPEC_ORIGINAL = " << formatPath(srcSpec) << endl;
+-        fileStream << "include($$QMAKESPEC_ORIGINAL/qmake.conf)" << endl;
+-        qfile.close();
+-    }
+-    if (qfile.error() != QFile::NoError) {
+-        cout << "Couldn't update default " << pfx << "mkspec: " << qPrintable(qfile.errorString()) << endl;
+-        dictionary["DONE"] = "error";
+-        return false;
+-    }
+-    return true;
+-}
+-
+ void Configure::generateConfigfiles()
+ {
+     QDir(buildPath).mkpath("src/corelib/global");
+@@ -3510,6 +3479,11 @@ void Configure::generateHeaders()
+     }
+ }
+ 
++static QString stripPrefix(const QString &str, const QString &pfx)
++{
++    return str.startsWith(pfx) ? str.mid(pfx.length()) : str;
++}
++
+ void Configure::generateQConfigCpp()
+ {
+     // if QT_INSTALL_* have not been specified on commandline, define them now from QT_INSTALL_PREFIX
+@@ -3553,6 +3527,10 @@ void Configure::generateQConfigCpp()
+     QDir(buildPath).mkpath("src/corelib/global");
+     const QString outName(buildPath + "/src/corelib/global/qconfig.cpp");
+ 
++    QString specPfx = dictionary["QT_HOST_DATA"] + "/mkspecs/";
++    QString hostSpec = stripPrefix(dictionary["QMAKESPEC"], specPfx);
++    QString targSpec = dictionary.contains("XQMAKESPEC") ? stripPrefix(dictionary["XQMAKESPEC"], specPfx) : hostSpec;
++
+     QTemporaryFile tmpFile;
+     if (tmpFile.open()) {
+         QTextStream tmpStream(&tmpFile);
+@@ -3580,6 +3558,8 @@ void Configure::generateQConfigCpp()
+                   << "    \"qt_hpfxpath=" << formatPath(dictionary["QT_HOST_PREFIX"]) << "\"," << endl
+                   << "    \"qt_hbinpath=" << formatPath(dictionary["QT_HOST_BINS"]) << "\"," << endl
+                   << "    \"qt_hdatpath=" << formatPath(dictionary["QT_HOST_DATA"]) << "\"," << endl
++                  << "    \"qt_targspec=" << targSpec << "\"," << endl
++                  << "    \"qt_hostspec=" << hostSpec << "\"," << endl
+                   << "#endif" << endl
+                   << "};" << endl;
+ 
+@@ -3692,14 +3672,6 @@ void Configure::buildQmake()
+         confFile.close();
+     }
+ 
+-    //create default mkspecs
+-    QString spec = dictionary.contains("XQMAKESPEC") ? dictionary["XQMAKESPEC"] : dictionary["QMAKESPEC"];
+-    if (!copySpec("default", "", spec)
+-        || !copySpec("default-host", "host ", dictionary["QMAKESPEC"])) {
+-        cout << "Error installing default mkspecs" << endl << endl;
+-        exit(EXIT_FAILURE);
+-    }
+-
+ }
+ #endif
+ 
+diff --git a/tools/configure/configureapp.h b/tools/configure/configureapp.h
+index 16d0a11..bfec520 100644
+--- a/tools/configure/configureapp.h
++++ b/tools/configure/configureapp.h
+@@ -79,7 +79,6 @@ public:
+     void generateMakefiles();
+     void appendMakeItem(int inList, const QString &item);
+ #if !defined(EVAL)
+-    bool copySpec(const char *name, const char *pfx, const QString &spec);
+     void generateConfigfiles();
+     void detectArch();
+     void generateQConfigPri();

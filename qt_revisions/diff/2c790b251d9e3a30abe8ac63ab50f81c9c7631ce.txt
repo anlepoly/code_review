@@ -1,0 +1,366 @@
+diff --git a/src/network/socket/qnativesocketengine_p.h b/src/network/socket/qnativesocketengine_p.h
+index 67e7038..90c3fbe 100644
+--- a/src/network/socket/qnativesocketengine_p.h
++++ b/src/network/socket/qnativesocketengine_p.h
+@@ -244,7 +244,7 @@ public:
+     int option(QNativeSocketEngine::SocketOption option) const;
+     bool setOption(QNativeSocketEngine::SocketOption option, int value);
+ 
+-    bool createNewSocket(QAbstractSocket::SocketType type, QAbstractSocket::NetworkLayerProtocol protocol);
++    bool createNewSocket(QAbstractSocket::SocketType type, QAbstractSocket::NetworkLayerProtocol &protocol);
+ 
+     bool nativeConnect(const QHostAddress &address, quint16 port);
+     bool nativeBind(const QHostAddress &address, quint16 port);
+diff --git a/src/network/socket/qnativesocketengine_unix.cpp b/src/network/socket/qnativesocketengine_unix.cpp
+index f5f9bba..a01186a 100644
+--- a/src/network/socket/qnativesocketengine_unix.cpp
++++ b/src/network/socket/qnativesocketengine_unix.cpp
+@@ -159,12 +159,17 @@ static inline void qt_socket_getPortAndAddress(const qt_sockaddr *s, quint16 *po
+     and \a socketProtocol.  Returns -1 on failure.
+ */
+ bool QNativeSocketEnginePrivate::createNewSocket(QAbstractSocket::SocketType socketType,
+-                                         QAbstractSocket::NetworkLayerProtocol socketProtocol)
++                                         QAbstractSocket::NetworkLayerProtocol &socketProtocol)
+ {
+     int protocol = (socketProtocol == QAbstractSocket::IPv6Protocol || socketProtocol == QAbstractSocket::AnyIPProtocol) ? AF_INET6 : AF_INET;
+     int type = (socketType == QAbstractSocket::UdpSocket) ? SOCK_DGRAM : SOCK_STREAM;
+ 
+ 	int socket = qt_safe_socket(protocol, type, 0);
++    if (socket <= 0 && socketProtocol == QAbstractSocket::AnyIPProtocol && errno == EAFNOSUPPORT) {
++        protocol = AF_INET;
++        socket = qt_safe_socket(protocol, type, 0);
++        socketProtocol = QAbstractSocket::IPv4Protocol;
++    }
+ 
+     if (socket <= 0) {
+         switch (errno) {
+@@ -527,6 +532,15 @@ bool QNativeSocketEnginePrivate::nativeBind(const QHostAddress &address, quint16
+         }
+ 
+     int bindResult = QT_SOCKET_BIND(socketDescriptor, sockAddrPtr, sockAddrSize);
++    if (bindResult < 0 && errno == EAFNOSUPPORT && address.protocol() == QAbstractSocket::AnyIPProtocol) {
++        memset(&sockAddrIPv4, 0, sizeof(sockAddrIPv4));
++        sockAddrIPv4.sin_family = AF_INET;
++        sockAddrIPv4.sin_port = htons(port);
++        sockAddrIPv4.sin_addr.s_addr = htonl(address.toIPv4Address());
++        sockAddrSize = sizeof(sockAddrIPv4);
++        sockAddrPtr = (struct sockaddr *) &sockAddrIPv4;
++        bindResult = QT_SOCKET_BIND(socketDescriptor, sockAddrPtr, sockAddrSize);
++    }
+ 
+     if (bindResult < 0) {
+         switch(errno) {
+diff --git a/src/network/socket/qnativesocketengine_win.cpp b/src/network/socket/qnativesocketengine_win.cpp
+index db6ace1..bc26a7f 100644
+--- a/src/network/socket/qnativesocketengine_win.cpp
++++ b/src/network/socket/qnativesocketengine_win.cpp
+@@ -294,7 +294,7 @@ QWindowsSockInit::~QWindowsSockInit()
+ #  define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR,12)
+ #endif
+ 
+-bool QNativeSocketEnginePrivate::createNewSocket(QAbstractSocket::SocketType socketType, QAbstractSocket::NetworkLayerProtocol socketProtocol)
++bool QNativeSocketEnginePrivate::createNewSocket(QAbstractSocket::SocketType socketType, QAbstractSocket::NetworkLayerProtocol &socketProtocol)
+ {
+ 
+     //### no ip6 support on winsocket 1.1 but we will try not to use this !!!!!!!!!!!!1
+diff --git a/src/network/socket/qtcpserver.cpp b/src/network/socket/qtcpserver.cpp
+index 9cca943..4d8aad0 100644
+--- a/src/network/socket/qtcpserver.cpp
++++ b/src/network/socket/qtcpserver.cpp
+@@ -267,11 +267,12 @@ bool QTcpServer::listen(const QHostAddress &address, quint16 port)
+     }
+ 
+     QAbstractSocket::NetworkLayerProtocol proto = address.protocol();
++    QHostAddress addr = address;
+ 
+ #ifdef QT_NO_NETWORKPROXY
+     static const QNetworkProxy &proxy = *(QNetworkProxy *)0;
+ #else
+-    QNetworkProxy proxy = d->resolveProxy(address, port);
++    QNetworkProxy proxy = d->resolveProxy(addr, port);
+ #endif
+ 
+     delete d->socketEngine;
+@@ -290,6 +291,9 @@ bool QTcpServer::listen(const QHostAddress &address, quint16 port)
+         d->serverSocketErrorString = d->socketEngine->errorString();
+         return false;
+     }
++    proto = d->socketEngine->protocol();
++    if (addr.protocol() == QAbstractSocket::AnyIPProtocol && proto == QAbstractSocket::IPv4Protocol)
++        addr = QHostAddress::AnyIPv4;
+ 
+ #if defined(Q_OS_UNIX)
+     // Under Unix, we want to be able to bind to the port, even if a socket on
+@@ -303,7 +307,7 @@ bool QTcpServer::listen(const QHostAddress &address, quint16 port)
+     d->socketEngine->setOption(QAbstractSocketEngine::AddressReusable, 1);
+ #endif
+ 
+-    if (!d->socketEngine->bind(address, port)) {
++    if (!d->socketEngine->bind(addr, port)) {
+         d->serverSocketError = d->socketEngine->error();
+         d->serverSocketErrorString = d->socketEngine->errorString();
+         return false;
+diff --git a/tests/auto/network-settings.h b/tests/auto/network-settings.h
+index 4c36e2d..72ff9bb 100644
+--- a/tests/auto/network-settings.h
++++ b/tests/auto/network-settings.h
+@@ -44,6 +44,12 @@
+ #include <QtNetwork/QHostInfo>
+ #endif
+ 
++#ifdef Q_OS_UNIX
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#endif
++
+ class QtNetworkSettings
+ {
+ public:
+@@ -112,6 +118,27 @@ public:
+         return false;
+     }
+ 
++    static bool hasIPv6()
++    {
++#ifdef Q_OS_UNIX
++        int s = ::socket(AF_INET6, SOCK_DGRAM, 0);
++        if (s == -1)
++            return false;
++        else {
++            struct sockaddr_in6 addr;
++            memset(&addr, 0, sizeof(addr));
++            addr.sin6_family = AF_INET6;
++            memcpy(&addr.sin6_addr, &in6addr_loopback, sizeof(in6_addr));
++            if (-1 == ::bind(s, (sockaddr*)&addr, sizeof(addr))) {
++                ::close(s);
++                return false;
++            }
++        }
++#endif
++        return true;
++    }
++
++
+ #ifdef QT_NETWORK_LIB
+     static bool verifyTestNetworkSettings()
+     {
+diff --git a/tests/auto/network/access/qnetworkreply/test/test.pro b/tests/auto/network/access/qnetworkreply/test/test.pro
+index f267b09..faa584c 100644
+--- a/tests/auto/network/access/qnetworkreply/test/test.pro
++++ b/tests/auto/network/access/qnetworkreply/test/test.pro
+@@ -8,7 +8,6 @@ contains(QT_CONFIG,xcb): CONFIG+=insignificant_test  # unstable, QTBUG-21102
+ QT = core-private network-private testlib
+ RESOURCES += ../qnetworkreply.qrc
+ 
+-contains(QT_CONFIG,ipv6ifname): DEFINES += HAVE_IPV6
+ TESTDATA += ../empty ../rfc3252.txt ../resource ../bigfile ../*.jpg ../certs \
+             ../index.html ../smb-file.txt
+ 
+diff --git a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+index e338640..2c02df0 100644
+--- a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
++++ b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+@@ -2501,9 +2501,8 @@ void tst_QNetworkReply::connectToIPv6Address()
+     QFETCH(QByteArray, dataToSend);
+     QFETCH(QByteArray, hostfield);
+ 
+-#if !defined(HAVE_IPV6) && defined(Q_OS_UNIX)
+-    QSKIP("system doesn't support ipv6!");
+-#endif
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
+ 
+     QByteArray httpResponse = QByteArray("HTTP/1.0 200 OK\r\nContent-Length: ");
+     httpResponse += QByteArray::number(dataToSend.size());
+diff --git a/tests/auto/network/socket/platformsocketengine/tst_platformsocketengine.cpp b/tests/auto/network/socket/platformsocketengine/tst_platformsocketengine.cpp
+index ffcc9cf..aa59c08 100644
+--- a/tests/auto/network/socket/platformsocketengine/tst_platformsocketengine.cpp
++++ b/tests/auto/network/socket/platformsocketengine/tst_platformsocketengine.cpp
+@@ -572,14 +572,16 @@ void tst_PlatformSocketEngine::bind()
+     QVERIFY(!binder3.bind(QHostAddress::AnyIPv4, 31180));
+     QVERIFY(binder3.error() == QAbstractSocket::AddressInUseError);
+ 
+-    PLATFORMSOCKETENGINE binder4;
+-    QVERIFY(binder4.initialize(QAbstractSocket::TcpSocket, QAbstractSocket::IPv6Protocol));
+-    QVERIFY(binder4.bind(QHostAddress::AnyIPv6, 31180));
+-
+-    PLATFORMSOCKETENGINE binder5;
+-    QVERIFY(binder5.initialize(QAbstractSocket::TcpSocket, QAbstractSocket::IPv6Protocol));
+-    QVERIFY(!binder5.bind(QHostAddress::AnyIPv6, 31180));
+-    QVERIFY(binder5.error() == QAbstractSocket::AddressInUseError);
++    if (QtNetworkSettings::hasIPv6()) {
++        PLATFORMSOCKETENGINE binder4;
++        QVERIFY(binder4.initialize(QAbstractSocket::TcpSocket, QAbstractSocket::IPv6Protocol));
++        QVERIFY(binder4.bind(QHostAddress::AnyIPv6, 31180));
++
++        PLATFORMSOCKETENGINE binder5;
++        QVERIFY(binder5.initialize(QAbstractSocket::TcpSocket, QAbstractSocket::IPv6Protocol));
++        QVERIFY(!binder5.bind(QHostAddress::AnyIPv6, 31180));
++        QVERIFY(binder5.error() == QAbstractSocket::AddressInUseError);
++    }
+ 
+     PLATFORMSOCKETENGINE binder6;
+     QVERIFY(binder6.initialize(QAbstractSocket::TcpSocket, QAbstractSocket::AnyIPProtocol));
+diff --git a/tests/auto/network/socket/qtcpserver/tst_qtcpserver.cpp b/tests/auto/network/socket/qtcpserver/tst_qtcpserver.cpp
+index f730f67..1d9ba55 100644
+--- a/tests/auto/network/socket/qtcpserver/tst_qtcpserver.cpp
++++ b/tests/auto/network/socket/qtcpserver/tst_qtcpserver.cpp
+@@ -255,6 +255,8 @@ void tst_QTcpServer::clientServerLoop()
+ //----------------------------------------------------------------------------------
+ void tst_QTcpServer::ipv6Server()
+ {
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
+     //### need to enter the event loop for the server to get the connection ?? ( windows)
+     QTcpServer server;
+     if (!server.listen(QHostAddress::LocalHostIPv6, 8944)) {
+@@ -295,6 +297,8 @@ void tst_QTcpServer::dualStack()
+     QFETCH_GLOBAL(bool, setProxy);
+     if (setProxy)
+         QSKIP("test server proxy doesn't support ipv6");
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
+     QFETCH(QHostAddress, bindAddress);
+     QFETCH(bool, v4ok);
+     QFETCH(bool, v6ok);
+@@ -328,6 +332,9 @@ void tst_QTcpServer::ipv6ServerMapped()
+     QVERIFY(server.waitForNewConnection(5000));
+     delete server.nextPendingConnection();
+ 
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
++
+     // let's try the mapped one in the nice format
+     QTcpSocket client2;
+     client2.connectToHost("::ffff:127.0.0.1", server.serverPort());
+@@ -814,9 +821,13 @@ void tst_QTcpServer::serverAddress_data()
+         QTest::newRow("Any") << QHostAddress(QHostAddress::Any) << QHostAddress(QHostAddress::AnyIPv4); //windows XP doesn't support dual stack sockets
+     else
+ #endif
+-    QTest::newRow("Any") << QHostAddress(QHostAddress::Any) << QHostAddress(QHostAddress::Any);
++    if (QtNetworkSettings::hasIPv6())
++        QTest::newRow("Any") << QHostAddress(QHostAddress::Any) << QHostAddress(QHostAddress::Any);
++    else
++        QTest::newRow("Any") << QHostAddress(QHostAddress::Any) << QHostAddress(QHostAddress::AnyIPv4);
+     QTest::newRow("AnyIPv4") << QHostAddress(QHostAddress::AnyIPv4) << QHostAddress(QHostAddress::AnyIPv4);
+-    QTest::newRow("AnyIPv6") << QHostAddress(QHostAddress::AnyIPv6) << QHostAddress(QHostAddress::AnyIPv6);
++    if (QtNetworkSettings::hasIPv6())
++        QTest::newRow("AnyIPv6") << QHostAddress(QHostAddress::AnyIPv6) << QHostAddress(QHostAddress::AnyIPv6);
+     foreach (const QHostAddress& addr, QNetworkInterface::allAddresses()) {
+         if (addr.isInSubnet(QHostAddress::parseSubnet("fe80::/10"))
+             || addr.isInSubnet(QHostAddress::parseSubnet("169.254/16")))
+@@ -850,6 +861,7 @@ void tst_QTcpServer::qtbug6305()
+         return;
+ 
+     QFETCH(QHostAddress, listenAddress);
++
+     QTcpServer server;
+     QVERIFY2(server.listen(listenAddress), qPrintable(server.errorString()));
+ 
+diff --git a/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp b/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
+index 1196825..edf3744 100644
+--- a/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
++++ b/tests/auto/network/socket/qudpsocket/tst_qudpsocket.cpp
+@@ -450,10 +450,6 @@ void tst_QUdpSocket::dualStack()
+     QByteArray v4Data("v4");
+     QVERIFY(v4Sock.bind(QHostAddress(QHostAddress::AnyIPv4), 0));
+ 
+-    QUdpSocket v6Sock;
+-    QByteArray v6Data("v6");
+-    QVERIFY(v6Sock.bind(QHostAddress(QHostAddress::AnyIPv6), 0));
+-
+     QHostAddress from;
+     quint16 port;
+     QByteArray buffer;
+@@ -466,14 +462,29 @@ void tst_QUdpSocket::dualStack()
+     buffer.resize(size);
+     QCOMPARE(buffer, v4Data);
+ 
+-    //test v6 -> dual
+-    QCOMPARE((int)v6Sock.writeDatagram(v6Data.constData(), v6Data.length(), QHostAddress(QHostAddress::LocalHostIPv6), dualSock.localPort()), v6Data.length());
+-    QVERIFY(dualSock.waitForReadyRead(5000));
+-    buffer.reserve(100);
+-    size = dualSock.readDatagram(buffer.data(), 100, &from, &port);
+-    QCOMPARE((int)size, v6Data.length());
+-    buffer.resize(size);
+-    QCOMPARE(buffer, v6Data);
++    if (QtNetworkSettings::hasIPv6()) {
++        QUdpSocket v6Sock;
++        QByteArray v6Data("v6");
++        QVERIFY(v6Sock.bind(QHostAddress(QHostAddress::AnyIPv6), 0));
++
++        //test v6 -> dual
++        QCOMPARE((int)v6Sock.writeDatagram(v6Data.constData(), v6Data.length(), QHostAddress(QHostAddress::LocalHostIPv6), dualSock.localPort()), v6Data.length());
++        QVERIFY(dualSock.waitForReadyRead(5000));
++        buffer.reserve(100);
++        size = dualSock.readDatagram(buffer.data(), 100, &from, &port);
++        QCOMPARE((int)size, v6Data.length());
++        buffer.resize(size);
++        QCOMPARE(buffer, v6Data);
++
++        //test dual -> v6
++        QCOMPARE((int)dualSock.writeDatagram(dualData.constData(), dualData.length(), QHostAddress(QHostAddress::LocalHostIPv6), v6Sock.localPort()), dualData.length());
++        QVERIFY(v6Sock.waitForReadyRead(5000));
++        buffer.reserve(100);
++        size = v6Sock.readDatagram(buffer.data(), 100, &from, &port);
++        QCOMPARE((int)size, dualData.length());
++        buffer.resize(size);
++        QCOMPARE(buffer, dualData);
++    }
+ 
+     //test dual -> v4
+     QCOMPARE((int)dualSock.writeDatagram(dualData.constData(), dualData.length(), QHostAddress(QHostAddress::LocalHost), v4Sock.localPort()), dualData.length());
+@@ -483,16 +494,6 @@ void tst_QUdpSocket::dualStack()
+     QCOMPARE((int)size, dualData.length());
+     buffer.resize(size);
+     QCOMPARE(buffer, dualData);
+-
+-    //test dual -> v6
+-    QCOMPARE((int)dualSock.writeDatagram(dualData.constData(), dualData.length(), QHostAddress(QHostAddress::LocalHostIPv6), v6Sock.localPort()), dualData.length());
+-    QVERIFY(v6Sock.waitForReadyRead(5000));
+-    buffer.reserve(100);
+-    size = v6Sock.readDatagram(buffer.data(), 100, &from, &port);
+-    QCOMPARE((int)size, dualData.length());
+-    buffer.resize(size);
+-    QCOMPARE(buffer, dualData);
+-
+ }
+ 
+ void tst_QUdpSocket::dualStackAutoBinding()
+@@ -500,6 +501,8 @@ void tst_QUdpSocket::dualStackAutoBinding()
+     QFETCH_GLOBAL(bool, setProxy);
+     if (setProxy)
+         QSKIP("test server SOCKS proxy doesn't support IPv6");
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
+     QUdpSocket v4Sock;
+     QVERIFY(v4Sock.bind(QHostAddress(QHostAddress::AnyIPv4), 0));
+ 
+@@ -560,6 +563,8 @@ void tst_QUdpSocket::dualStackNoIPv4onV6only()
+     QFETCH_GLOBAL(bool, setProxy);
+     if (setProxy)
+         QSKIP("test server SOCKS proxy doesn't support IPv6");
++    if (!QtNetworkSettings::hasIPv6())
++        QSKIP("system doesn't support ipv6!");
+     QUdpSocket v4Sock;
+     QVERIFY(v4Sock.bind(QHostAddress(QHostAddress::AnyIPv4), 0));
+     QByteArray v4Data("v4");
+@@ -1145,6 +1150,8 @@ void tst_QUdpSocket::multicastLeaveAfterClose()
+     QFETCH(QHostAddress, groupAddress);
+     if (setProxy)
+         QSKIP("UDP Multicast does not work with proxies");
++    if (groupAddress.protocol() == QAbstractSocket::IPv6Protocol)
++        QSKIP("system doesn't support ipv6!");
+ 
+     QUdpSocket udpSocket;
+ #ifdef FORCE_SESSION
+@@ -1228,6 +1235,8 @@ void tst_QUdpSocket::multicast()
+     QFETCH(bool, bindResult);
+     QFETCH(QHostAddress, groupAddress);
+     QFETCH(bool, joinResult);
++    if (groupAddress.protocol() == QAbstractSocket::IPv6Protocol)
++        QSKIP("system doesn't support ipv6!");
+     if (setProxy) {
+         // UDP multicast does not work with proxies
+         if (

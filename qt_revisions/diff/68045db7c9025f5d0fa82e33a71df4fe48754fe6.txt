@@ -1,0 +1,263 @@
+diff --git a/doc/src/qtsensorgestures-plugins.qdoc b/doc/src/qtsensorgestures-plugins.qdoc
+index adf4e0d..6cbe706 100644
+--- a/doc/src/qtsensorgestures-plugins.qdoc
++++ b/doc/src/qtsensorgestures-plugins.qdoc
+@@ -79,7 +79,7 @@ For QtSensorGestures plugin:
+         \row
+             \o QtSensors.cover
+             \o cover
+-            \o Hand covers up phone display for one second, when it's face up, using the Proximity sensor.
++            \o Hand covers up phone display for one second, when it's face up, using the IR Proximity sensor.
+             \o \image sensorgesture-cover.png
+         \row
+             \o QtSensors.doubletap
+@@ -89,7 +89,8 @@ For QtSensorGestures plugin:
+         \row
+             \o QtSensors.hover
+             \o hover
+-            \o Hand hovers over the phone for more than 1 second, then is removed when face up, using the Light sensor.
++            \o Hand hovers about 5 cm above the phone for more than 1 second, then is removed when face up,
++               using the IR Proximity sensor.
+             \o \image sensorgesture-hover.png
+         \row
+             \o QtSensors.pickup
+diff --git a/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.cpp b/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.cpp
+index 82a849e..0f488cc 100644
+--- a/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.cpp
++++ b/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.cpp
+@@ -41,11 +41,13 @@
+ 
+ 
+ #include "qcoversensorgesturerecognizer.h"
++#include <math.h>
++
+ QT_BEGIN_NAMESPACE
+ 
+ QCoverSensorGestureRecognizer::QCoverSensorGestureRecognizer(QObject *parent) :
+     QSensorGestureRecognizer(parent),
+-    lastProx(0)
++    detecting(0), lastProx(0)
+ {
+ }
+ 
+@@ -55,7 +57,7 @@ QCoverSensorGestureRecognizer::~QCoverSensorGestureRecognizer()
+ 
+ void QCoverSensorGestureRecognizer::create()
+ {
+-    proximity = new QProximitySensor(this);
++    proximity = new QIRProximitySensor(this);
+     proximity->connectToBackend();
+ 
+     orientation = new QOrientationSensor(this);
+@@ -77,6 +79,7 @@ bool QCoverSensorGestureRecognizer::start()
+     connect(proximity,SIGNAL(readingChanged()),this,SLOT(proximityChanged()));
+     proximity->start();
+     orientation->start();
++    lastProx = proximity->reading()->reflectance();
+     return proximity->isActive();
+ }
+ 
+@@ -95,22 +98,38 @@ bool QCoverSensorGestureRecognizer::isActive()
+ 
+ void QCoverSensorGestureRecognizer::proximityChanged()
+ {// look at case of face up->face down->face up.
+-    if ((orientation->reading()->orientation() ==  QOrientationReading::FaceUp)
+-            && proximity->reading()->close())
+-        timer->start();
+-    else if (proximity->reading()->close())
+-        timer->stop();
++
++    qreal refl = proximity->reading()->reflectance();
++    qreal difference =  lastProx - refl;
++
++    if (fabs(difference) < .15) {
++        return;
++    }
++
++    if (orientation->reading()->orientation() ==  QOrientationReading::FaceUp
++            && refl > .55) {
++        if (!timer->isActive()) {
++            timer->start();
++            detecting = true;
++        }
++    }
++    if (refl < .55) {
++        if (timer->isActive()) {
++            timer->stop();
++            detecting = false;
++        }
++    }
++    lastProx = refl;
+ }
+ 
+ void QCoverSensorGestureRecognizer::timeout()
+ {
+-
+-    if ((orientation->reading()->orientation() ==  QOrientationReading::FaceUp)
+-            && proximity->reading()->close()) {
++    if (detecting && orientation->reading()->orientation() == QOrientationReading::FaceUp
++            && proximity->reading()->reflectance() > 0.55) {
+         Q_EMIT cover();
+         Q_EMIT detected("cover");
++        detecting = false;
+     }
+-    lastProx = proximity->reading()->close();
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.h b/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.h
+index a08833f..c6dddf6 100644
+--- a/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.h
++++ b/src/plugins/sensorgestures/qtsensors/qcoversensorgesturerecognizer.h
+@@ -46,6 +46,7 @@
+ #include <QtSensors/QSensor>
+ #include <QProximitySensor>
+ #include <QtSensors/QOrientationSensor>
++#include <QIRProximitySensor>
+ 
+ #include <qsensorgesturerecognizer.h>
+ #include <QTimer>
+@@ -74,11 +75,12 @@ private slots:
+ 
+ 
+ private:
+-    QProximitySensor *proximity;
++    QIRProximitySensor *proximity;
+     QOrientationSensor *orientation;
+ 
+     QTimer *timer;
+-    bool lastProx;
++    bool detecting;
++    qreal lastProx;
+ 
+ };
+ QT_END_NAMESPACE
+diff --git a/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.cpp b/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.cpp
+index 4717c7d..a441cda 100644
+--- a/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.cpp
++++ b/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.cpp
+@@ -41,6 +41,8 @@
+ 
+ 
+ #include "qhoversensorgesturerecognizer.h"
++#include <math.h>
++
+ QT_BEGIN_NAMESPACE
+ 
+ QHoverSensorGestureRecognizer::QHoverSensorGestureRecognizer(QObject *parent) :
+@@ -55,9 +57,6 @@ QHoverSensorGestureRecognizer::~QHoverSensorGestureRecognizer()
+ 
+ void QHoverSensorGestureRecognizer::create()
+ {
+-    proximity = new QProximitySensor(this);
+-    proximity->connectToBackend();
+-
+     irProx = new QIRProximitySensor(this);
+     irProx->connectToBackend();
+ 
+@@ -80,14 +79,12 @@ QString QHoverSensorGestureRecognizer::id() const
+ bool QHoverSensorGestureRecognizer::start()
+ {
+     connect(irProx,SIGNAL(readingChanged()), this,SLOT(proxyChanged()));
+-    proximity->start();
+     irProx->start();
+     return irProx->isActive();
+ }
+ 
+ bool QHoverSensorGestureRecognizer::stop()
+ {
+-    proximity->stop();
+     irProx->stop();
+     disconnect(irProx,SIGNAL(readingChanged()),this,SLOT(proxyChanged()));
+     return irProx->isActive();
+@@ -100,28 +97,31 @@ bool QHoverSensorGestureRecognizer::isActive()
+ 
+ void QHoverSensorGestureRecognizer::proxyChanged()
+ {
+-    if (proximity->reading()->close()) {
++    qreal refl = irProx->reading()->reflectance();
++
++    if (refl > .51) {
+         hoverOk = false;
+         detecting = false;
+         return;
+     }
+ 
+-    int refl = irProx->reading()->reflectance() * 100;
+-
+-    if (!detecting && (refl > 20 && refl < 35)) {
++    if (!detecting && (refl > .40 && refl < .50)) {
+         detecting = true;
+         timer->start();
+         timer2->start();
++        detectedHigh = refl;
+ 
+     } else if (hoverOk && detecting
+-               && refl == 0) {
++               && refl < .33
++               && detectedHigh
++               ) {
+         // went light again after 1 seconds
+             Q_EMIT hover();
+             Q_EMIT detected("hover");
+             hoverOk = false;
+             detecting = false;
+     }
+-    if (refl == 0)
++    if (refl > .60)
+         detecting = false;
+ }
+ 
+@@ -130,9 +130,9 @@ void QHoverSensorGestureRecognizer::timeout()
+     hoverOk = true;
+ }
+ 
+-
+ void QHoverSensorGestureRecognizer::timeout2()
+ {
+     detecting = false;
+ }
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.h b/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.h
+index d8bf96b..0efdf02 100644
+--- a/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.h
++++ b/src/plugins/sensorgestures/qtsensors/qhoversensorgesturerecognizer.h
+@@ -49,6 +49,7 @@
+ #include <QProximitySensor>
+ #include <QIRProximitySensor>
+ 
++
+ QT_BEGIN_NAMESPACE
+ 
+ class QHoverSensorGestureRecognizer : public QSensorGestureRecognizer
+@@ -73,7 +74,6 @@ private slots:
+     void timeout();
+     void timeout2();
+ private:
+-    QProximitySensor *proximity;
+     QIRProximitySensor *irProx;
+ 
+     QTimer *timer;
+@@ -83,7 +83,7 @@ private:
+     bool detecting;
+ 
+     qreal detectedHigh;
+-
++    qreal lastProx;
+ };
+ QT_END_NAMESPACE
+ #endif // QHOVERSENSORGESTURERECOGNIZER_H
+diff --git a/src/sensors/gestures/qsensorgesturemanagerprivate.cpp b/src/sensors/gestures/qsensorgesturemanagerprivate.cpp
+index c693f9d..3108bab 100644
+--- a/src/sensors/gestures/qsensorgesturemanagerprivate.cpp
++++ b/src/sensors/gestures/qsensorgesturemanagerprivate.cpp
+@@ -59,8 +59,8 @@ QSensorGestureManagerPrivate::QSensorGestureManagerPrivate(QObject *parent) :
+ 
+ QSensorGestureManagerPrivate::~QSensorGestureManagerPrivate()
+ {
+-    qDeleteAll(registeredSensorGestures);
+-    delete loader;
++//    qDeleteAll(registeredSensorGestures);
++//    delete loader;
+ }

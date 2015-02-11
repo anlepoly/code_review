@@ -1,0 +1,1151 @@
+diff --git a/src/multimedia/audio/audio.pri b/src/multimedia/audio/audio.pri
+index 8c8daa5..a1cfa0b 100644
+--- a/src/multimedia/audio/audio.pri
++++ b/src/multimedia/audio/audio.pri
+@@ -2,6 +2,7 @@ INCLUDEPATH += audio
+ 
+ PUBLIC_HEADERS += \
+            audio/qaudio.h \
++           audio/qaudiobuffer.h \
+            audio/qaudioformat.h \
+            audio/qaudioinput.h \
+            audio/qaudiooutput.h \
+@@ -12,6 +13,7 @@ PUBLIC_HEADERS += \
+            audio/qsound.h
+ 
+ PRIVATE_HEADERS += \
++           audio/qaudiobuffer_p.h \
+            audio/qaudiodevicefactory_p.h \
+            audio/qaudiopluginloader_p.h \
+            audio/qwavedecoder_p.h \
+@@ -30,7 +32,8 @@ SOURCES += \
+            audio/qsoundeffect.cpp \
+            audio/qwavedecoder_p.cpp \
+            audio/qsamplecache_p.cpp \
+-           audio/qsound.cpp
++           audio/qsound.cpp \
++           audio/qaudiobuffer.cpp
+ 
+ mac {
+     PRIVATE_HEADERS +=  audio/qaudioinput_mac_p.h \
+diff --git a/src/multimedia/audio/qaudiobuffer.cpp b/src/multimedia/audio/qaudiobuffer.cpp
+new file mode 100644
+index 0000000..7fa37f8
+--- /dev/null
++++ b/src/multimedia/audio/qaudiobuffer.cpp
+@@ -0,0 +1,440 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qaudiobuffer.h"
++#include "qaudiobuffer_p.h"
++
++#include <QObject>
++#include <QDebug>
++
++QT_BEGIN_NAMESPACE
++
++namespace
++{
++    class QAudioBufferPrivateRegisterMetaTypes
++    {
++    public:
++        QAudioBufferPrivateRegisterMetaTypes()
++        {
++            qRegisterMetaType<QAudioBuffer>();
++        }
++    } _registerMetaTypes;
++}
++
++
++class QAudioBufferPrivate : public QSharedData
++{
++public:
++    QAudioBufferPrivate(QAbstractAudioBuffer *provider)
++        : mProvider(provider)
++        , mCount(1)
++    {
++    }
++
++    ~QAudioBufferPrivate()
++    {
++        if (mProvider)
++            mProvider->release();
++    }
++
++    void ref()
++    {
++        mCount.ref();
++    }
++
++    void deref()
++    {
++        if (!mCount.deref())
++            delete this;
++    }
++
++    QAudioBufferPrivate *clone();
++
++    static QAudioBufferPrivate *acquire(QAudioBufferPrivate *other)
++    {
++        if (!other)
++            return 0;
++
++        // Ref the other (if there are extant data() pointers, they will
++        // also point here - it's a feature, not a bug, like QByteArray)
++        other->ref();
++        return other;
++    }
++
++    QAbstractAudioBuffer *mProvider;
++    QAtomicInt mCount;
++};
++
++// Private class to go in .cpp file
++class QMemoryAudioBufferProvider : public QAbstractAudioBuffer {
++public:
++    QMemoryAudioBufferProvider(const void *data, int sampleCount, const QAudioFormat &format, qint64 startTime)
++        : mStartTime(startTime)
++        , mSampleCount(sampleCount)
++        , mFormat(format)
++    {
++        int numBytes = (sampleCount * format.channelCount() * format.sampleSize()) / 8;
++        if (numBytes > 0) {
++            mBuffer = malloc(numBytes);
++            if (!mBuffer) {
++                // OOM, if that's likely
++                mStartTime = -1;
++                mSampleCount = 0;
++                mFormat = QAudioFormat();
++            } else {
++                // Allocated, see if we have data to copy
++                if (data) {
++                    memcpy(mBuffer, data, numBytes);
++                } else {
++                    // We have to fill with the zero value..
++                    switch (format.sampleType()) {
++                        case QAudioFormat::SignedInt:
++                            // Signed int means 0x80, 0x8000 is zero
++                            // XXX this is not right for > 8 bits(0x8080 vs 0x8000)
++                            memset(mBuffer, 0x80, numBytes);
++                            break;
++                        default:
++                            memset(mBuffer, 0x0, numBytes);
++                    }
++                }
++            }
++        } else
++            mBuffer = 0;
++    }
++
++    ~QMemoryAudioBufferProvider()
++    {
++        if (mBuffer)
++            free(mBuffer);
++    }
++
++    void release() {delete this;}
++    QAudioFormat format() const {return mFormat;}
++    qint64 startTime() const {return mStartTime;}
++    int sampleCount() const {return mSampleCount;}
++
++    void *constData() const {return mBuffer;}
++
++    void *writableData() {return mBuffer;}
++    QAbstractAudioBuffer *clone() const
++    {
++        return new QMemoryAudioBufferProvider(mBuffer, mSampleCount, mFormat, mStartTime);
++    }
++
++    void *mBuffer;
++    qint64 mStartTime;
++    int mSampleCount;
++    QAudioFormat mFormat;
++};
++
++QAudioBufferPrivate *QAudioBufferPrivate::clone()
++{
++    // We want to create a single bufferprivate with a
++    // single qaab
++    // This should only be called when the count is > 1
++    Q_ASSERT(mCount.load() > 1);
++
++    if (mProvider) {
++        QAbstractAudioBuffer *abuf = mProvider->clone();
++
++        if (!abuf) {
++            abuf = new QMemoryAudioBufferProvider(mProvider->constData(), mProvider->sampleCount(), mProvider->format(), mProvider->startTime());
++        }
++
++        if (abuf) {
++            return new QAudioBufferPrivate(abuf);
++        }
++    }
++
++    return 0;
++}
++
++/*!
++    \class QAbstractAudioBuffer
++    \internal
++*/
++
++/*!
++    \class QAudioBuffer
++    \brief A class that represents a collection of audio samples.
++    \inmodule QtMultimedia
++    \ingroup multimedia
++    \ingroup multimedia_audio
++
++    The QAudioBuffer class represents a collection of audio samples,
++    with a specific format and sample rate.
++*/
++// ^ Mostly useful with probe or decoder
++
++/*!
++    Create a new, empty, invalid buffer.
++ */
++QAudioBuffer::QAudioBuffer()
++    : d(0)
++{
++}
++
++/*!
++    \internal
++    Create a new audio buffer from the supplied \a provider.  This
++    constructor is typically only used when handling certain hardware
++    or media framework specific buffers, and generally isn't useful
++    in application code.
++ */
++QAudioBuffer::QAudioBuffer(QAbstractAudioBuffer *provider)
++    : d(new QAudioBufferPrivate(provider))
++{
++}
++/*!
++    Creates a new audio buffer from \a other.  Generally
++    this will have copy-on-write semantics - a copy will
++    only be made when it has to be.
++ */
++QAudioBuffer::QAudioBuffer(const QAudioBuffer &other)
++{
++    d = QAudioBufferPrivate::acquire(other.d);
++}
++
++/*!
++    Creates a new audio buffer from the supplied \a data, in the
++    given \a format.  The format will determine how the number
++    and sizes of the samples are interpreted from the \a data.
++
++    If the supplied \a data is not an integer multiple of the
++    calculated sample size, the excess data will not be used.
++
++    This audio buffer will copy the contents of \a data.
++ */
++QAudioBuffer::QAudioBuffer(const QByteArray &data, const QAudioFormat &format)
++{
++    int sampleSize = (format.sampleSize() * format.channelCount()) / 8;
++    int sampleCount = data.size() / sampleSize; // truncate
++    d = new QAudioBufferPrivate(new QMemoryAudioBufferProvider(data.constData(), sampleCount, format, -1));
++}
++
++/*!
++    Creates a new audio buffer with space for \a numSamples samples of
++    the given \a format.  The samples will be initialized to the default
++    for the format.
++ */
++QAudioBuffer::QAudioBuffer(int numSamples, const QAudioFormat &format)
++    : d(new QAudioBufferPrivate(new QMemoryAudioBufferProvider(0, numSamples, format, -1)))
++{
++}
++
++/*!
++    Assigns the \a other buffer to this.
++ */
++QAudioBuffer &QAudioBuffer::operator =(const QAudioBuffer &other)
++{
++    if (this->d != other.d) {
++        d = QAudioBufferPrivate::acquire(other.d);
++    }
++    return *this;
++}
++
++/*!
++    Destroys this audio buffer.
++ */
++QAudioBuffer::~QAudioBuffer()
++{
++    if (d)
++        d->deref();
++}
++
++/*!
++    Returns true if this is a valid buffer.  A valid buffer
++    has more than zero samples in it and a valid format.
++ */
++bool QAudioBuffer::isValid() const
++{
++    if (!d || !d->mProvider)
++        return false;
++    return d->mProvider->format().isValid() && (d->mProvider->sampleCount() > 0);
++}
++
++/*!
++    Returns the \l {QAudioFormat}{format} of this buffer.
++
++    Several properties of this format influence how
++    the \l duration() or \l byteCount() are calculated
++    from the \l sampleCount().
++ */
++QAudioFormat QAudioBuffer::format() const
++{
++    if (!isValid())
++        return QAudioFormat();
++    return d->mProvider->format();
++}
++
++/*!
++    Returns the number of samples in this buffer.
++
++    If the format of this buffer has multiple channels,
++    then this count includes all channels.  This means
++    that a stereo buffer with 1000 samples in total will
++    have 500 left samples and 500 right samples (interleaved),
++    and this function will return 1000.
++ */
++int QAudioBuffer::sampleCount() const
++{
++    if (!isValid())
++        return 0;
++    return d->mProvider->sampleCount();
++}
++
++/*!
++    Returns the size of this buffer, in bytes.
++ */
++int QAudioBuffer::byteCount() const
++{
++    const QAudioFormat f(format());
++    return (f.channelCount() * f.sampleSize() * sampleCount()) / 8; // sampleSize is in bits
++}
++
++/*!
++    Returns the duration of audio in this buffer, in microseconds.
++
++    This depends on the /l format(), and the \l sampleCount().
++*/
++qint64 QAudioBuffer::duration() const
++{
++    int divisor = format().sampleRate() * format().channelCount();
++    if (divisor > 0)
++        return (sampleCount() * 1000000LL) / divisor;
++    else
++        return 0;
++}
++
++/*!
++    Returns the time in a stream that this buffer starts at (in microseconds).
++
++    If this buffer is not part of a stream, this will return -1.
++ */
++qint64 QAudioBuffer::startTime() const
++{
++    if (!isValid())
++        return -1;
++    return d->mProvider->startTime();
++}
++
++/*!
++    Returns a pointer to this buffer's data.  You can only read it.
++
++    This method is preferred over the const version of \l data() to
++    prevent unnecessary copying.
++ */
++const void* QAudioBuffer::constData() const
++{
++    if (!isValid())
++        return 0;
++    return d->mProvider->constData();
++}
++
++/*!
++    Returns a pointer to this buffer's data.  You can only read it.
++
++    You should use the \l constData() function rather than this
++    to prevent accidental deep copying.
++ */
++const void* QAudioBuffer::data() const
++{
++    if (!isValid())
++        return 0;
++    return d->mProvider->constData();
++}
++
++/*!
++    Returns a pointer to this buffer's data.  You can modify the
++    data through the returned pointer.
++
++    Since QAudioBuffers can share the actual sample data, calling
++    this function will result in a deep copy being made if there
++    are any other buffers using the sample.  You should avoid calling
++    this unless you really need to modify the data.
++
++    This pointer will remain valid until the underlying storage is
++    detached.  In particular, if you obtain a pointer, and then
++    copy this audio buffer, changing data through this pointer may
++    change both buffer instances.  Calling \l data() on either instance
++    will again cause a deep copy to be made, which may invalidate
++    the pointers returned from this function previously.
++ */
++void *QAudioBuffer::data()
++{
++    if (!isValid())
++        return 0;
++
++    if (d->mCount.load() != 1) {
++        // Can't share a writable buffer
++        // so we need to detach
++        QAudioBufferPrivate *newd = d->clone();
++
++        // This shouldn't happen
++        if (!newd)
++            return 0;
++
++        d->deref();
++        d = newd;
++    }
++
++    // We're (now) the only user of this qaab, so
++    // see if it's writable directly
++    void *buffer = d->mProvider->writableData();
++    if (buffer) {
++        return buffer;
++    }
++
++    // Wasn't writable, so turn it into a memory provider
++    QAbstractAudioBuffer *memBuffer = new QMemoryAudioBufferProvider(constData(), sampleCount(), format(), startTime());
++
++    if (memBuffer) {
++        d->mProvider->release();
++        d->mCount.store(1);
++        d->mProvider = memBuffer;
++
++        return memBuffer->writableData();
++    }
++
++    return 0;
++}
++
++QT_END_NAMESPACE
+diff --git a/src/multimedia/audio/qaudiobuffer.h b/src/multimedia/audio/qaudiobuffer.h
+new file mode 100644
+index 0000000..bd95f9d
+--- /dev/null
++++ b/src/multimedia/audio/qaudiobuffer.h
+@@ -0,0 +1,158 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QAUDIOBUFFER_H
++#define QAUDIOBUFFER_H
++
++#include <QSharedDataPointer>
++
++#include <qtmultimediadefs.h>
++#include <qtmedianamespace.h>
++
++#include <qaudio.h>
++#include <qaudioformat.h>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Multimedia)
++
++class QAbstractAudioBuffer;
++class QAudioBufferPrivate;
++class Q_MULTIMEDIA_EXPORT QAudioBuffer
++{
++public:
++    QAudioBuffer();
++    QAudioBuffer(QAbstractAudioBuffer *provider);
++    QAudioBuffer(const QAudioBuffer &other);
++    QAudioBuffer(const QByteArray &data, const QAudioFormat &format);
++    QAudioBuffer(int numSamples, const QAudioFormat &format); // Initialized to empty
++
++    QAudioBuffer& operator=(const QAudioBuffer &other);
++
++    ~QAudioBuffer();
++
++    bool isValid() const;
++
++    QAudioFormat format() const;
++
++    int sampleCount() const;
++    int byteCount() const;
++
++    qint64 duration() const;
++    qint64 startTime() const;
++
++    // Data modification
++    // void clear();
++    // Other ideas
++    // operator *=
++    // operator += (need to be careful about different formats)
++
++    // Data access
++    const void* constData() const; // Does not detach, preferred
++    const void* data() const; // Does not detach
++    void *data(); // detaches
++
++    // Structures for easier access to stereo data
++    template <typename T> struct StereoSampleDefault { enum { Default = 0 }; };
++
++    template <typename T> struct StereoSample {
++
++        StereoSample()
++            : left(T(StereoSampleDefault<T>::Default))
++            , right(T(StereoSampleDefault<T>::Default))
++        {
++        }
++
++        StereoSample(T leftSample, T rightSample)
++            : left(leftSample)
++            , right(rightSample)
++        {
++        }
++
++        StereoSample& operator=(const StereoSample &other)
++        {
++            // Two straight assigns is probably
++            // cheaper than a conditional check on
++            // self assignment
++            left = other.left;
++            right = other.right;
++            return *this;
++        }
++
++        T left;
++        T right;
++
++        T average() const {return (left + right) / 2;}
++        void clear() {left = right = T(StereoSampleDefault<T>::Default);}
++    };
++
++    typedef StereoSample<unsigned char> S8U;
++    typedef StereoSample<signed char> S8S;
++    typedef StereoSample<unsigned short> S16U;
++    typedef StereoSample<signed short> S16S;
++    typedef StereoSample<float> S32F;
++
++    template <typename T> const T* constData() const {
++        return static_cast<const T*>(constData());
++    }
++    template <typename T> const T* data() const {
++        return static_cast<const T*>(data());
++    }
++    template <typename T> T* data() {
++        return static_cast<T*>(data());
++    }
++private:
++    QAudioBufferPrivate *d;
++};
++
++template <> struct QAudioBuffer::StereoSampleDefault<unsigned char> { enum { Default = 128 }; };
++template <> struct QAudioBuffer::StereoSampleDefault<unsigned short> { enum { Default = 32768 }; };
++
++
++QT_END_NAMESPACE
++
++Q_DECLARE_METATYPE(QAudioBuffer)
++
++QT_END_HEADER
++
++#endif // QAUDIOBUFFER_H
+diff --git a/src/multimedia/audio/qaudiobuffer_p.h b/src/multimedia/audio/qaudiobuffer_p.h
+new file mode 100644
+index 0000000..af81b7c
+--- /dev/null
++++ b/src/multimedia/audio/qaudiobuffer_p.h
+@@ -0,0 +1,90 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QAUDIOBUFFER_P_H
++#define QAUDIOBUFFER_P_H
++
++#include <qtmultimediadefs.h>
++#include <qtmedianamespace.h>
++
++#include "qaudioformat.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Multimedia)
++
++class Q_MULTIMEDIA_EXPORT QAbstractAudioBuffer {
++public:
++    virtual ~QAbstractAudioBuffer() {}
++
++    // Lifetime management
++    virtual void release() = 0;
++
++    // Format related
++    virtual QAudioFormat format() const = 0;
++    virtual qint64 startTime() const = 0;
++    virtual int sampleCount() const = 0;
++
++    // R/O Data
++    virtual void *constData() const = 0;
++
++    // For writable data we do this:
++    // If we only have one reference to the provider,
++    // call writableData().  If that does not return 0,
++    // then we're finished.  If it does return 0, then we call
++    // writableClone() to get a new buffer and then release
++    // the old clone if that succeeds.  If it fails, we create
++    // a memory clone from the constData and release the old buffer.
++    // If writableClone() succeeds, we then call writableData() on it
++    // and that should be good.
++
++    virtual void *writableData() = 0;
++    virtual QAbstractAudioBuffer *clone() const = 0;
++};
++
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif // QAUDIOBUFFER_P_H
+diff --git a/tests/auto/unit/multimedia.pro b/tests/auto/unit/multimedia.pro
+index 1fe7e7c..a662d44 100644
+--- a/tests/auto/unit/multimedia.pro
++++ b/tests/auto/unit/multimedia.pro
+@@ -29,6 +29,7 @@ SUBDIRS += \
+     qvideoframe \
+     qvideosurfaceformat \
+     qwavedecoder \
++    qaudiobuffer
+ 
+ # Tests depending on private interfaces should only be built if
+ # these interfaces are exported.
+@@ -36,3 +37,4 @@ contains (QT_CONFIG, private_tests) {
+     SUBDIRS += \
+         qdeclarativeaudio
+ }
++
+diff --git a/tests/auto/unit/qaudiobuffer/qaudiobuffer.pro b/tests/auto/unit/qaudiobuffer/qaudiobuffer.pro
+new file mode 100644
+index 0000000..cbbaefe
+--- /dev/null
++++ b/tests/auto/unit/qaudiobuffer/qaudiobuffer.pro
+@@ -0,0 +1,17 @@
++#-------------------------------------------------
++#
++# Project created by QtCreator 2012-02-02T23:40:38
++#
++#-------------------------------------------------
++
++QT       += multimedia testlib
++QT       -= gui
++
++TARGET = tst_qaudiobuffer
++CONFIG   += console
++CONFIG   -= app_bundle
++
++TEMPLATE = app
++
++SOURCES += tst_qaudiobuffer.cpp
++DEFINES += SRCDIR=\\\"$$PWD/\\\"
+diff --git a/tests/auto/unit/qaudiobuffer/tst_qaudiobuffer.cpp b/tests/auto/unit/qaudiobuffer/tst_qaudiobuffer.cpp
+new file mode 100644
+index 0000000..7339cc7
+--- /dev/null
++++ b/tests/auto/unit/qaudiobuffer/tst_qaudiobuffer.cpp
+@@ -0,0 +1,369 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <QtCore/QString>
++#include <QtTest/QtTest>
++
++#include <qaudiobuffer.h>
++
++class tst_QAudioBuffer : public QObject
++{
++    Q_OBJECT
++
++public:
++    tst_QAudioBuffer();
++    ~tst_QAudioBuffer();
++
++private Q_SLOTS:
++    void ctors();
++    void assign();
++    void constData() const;
++    void data_const() const;
++    void data();
++    void durations();
++    void durations_data();
++    void stereoSample();
++
++private:
++    QAudioFormat mFormat;
++    QAudioBuffer *mNull;
++    QAudioBuffer *mEmpty;
++    QAudioBuffer *mFromArray;
++};
++
++tst_QAudioBuffer::tst_QAudioBuffer()
++{
++    // Initialize some common buffers
++    mFormat.setChannelCount(2);
++    mFormat.setSampleSize(16);
++    mFormat.setSampleType(QAudioFormat::UnSignedInt);
++    mFormat.setSampleRate(10000);
++    mFormat.setCodec("audio/x-pcm"); // XXX this is not a good fit?
++
++    QByteArray b(4000, 0x80);
++    mNull = new QAudioBuffer;
++    mEmpty = new QAudioBuffer(1000, mFormat);
++    mFromArray = new QAudioBuffer(b, mFormat);
++}
++
++
++tst_QAudioBuffer::~tst_QAudioBuffer()
++{
++    delete mNull;
++    delete mEmpty;
++    delete mFromArray;
++}
++
++void tst_QAudioBuffer::ctors()
++{
++    // Null buffer
++    QVERIFY(!mNull->isValid());
++    QVERIFY(mNull->constData() == 0);
++    QVERIFY(mNull->data() == 0);
++    QVERIFY(((const QAudioBuffer*)mNull)->data() == 0);
++    QCOMPARE(mNull->duration(), 0LL);
++    QCOMPARE(mNull->byteCount(), 0);
++    QCOMPARE(mNull->sampleCount(), 0);
++    QCOMPARE(mNull->startTime(), -1LL);
++
++    // Empty buffer
++    QVERIFY(mEmpty->isValid());
++    QVERIFY(mEmpty->constData() != 0);
++    QVERIFY(mEmpty->data() != 0);
++    QVERIFY(((const QAudioBuffer*)mEmpty)->data() != 0);
++    QCOMPARE(mEmpty->duration(), 50000LL);
++    QCOMPARE(mEmpty->byteCount(), 4000);
++    QCOMPARE(mEmpty->sampleCount(), 1000);
++    QCOMPARE(mEmpty->startTime(), -1LL);
++
++    // bytearray buffer
++    QVERIFY(mFromArray->isValid());
++    QVERIFY(mFromArray->constData() != 0);
++    QVERIFY(mFromArray->data() != 0);
++    QVERIFY(((const QAudioBuffer*)mFromArray)->data() != 0);
++    QCOMPARE(mFromArray->duration(), 50000LL); // 4000 bytes
++    QCOMPARE(mFromArray->byteCount(), 4000);
++    QCOMPARE(mFromArray->sampleCount(), 1000);
++    QCOMPARE(mFromArray->startTime(), -1LL);
++}
++
++void tst_QAudioBuffer::assign()
++{
++    // Needs strong behaviour definition
++}
++
++void tst_QAudioBuffer::constData() const
++{
++    const void *data = mEmpty->constData();
++    QVERIFY(data != 0);
++
++    const unsigned int *idata = reinterpret_cast<const unsigned int*>(data);
++    QCOMPARE(*idata, 0U);
++
++    const QAudioBuffer::S8U *sdata = mEmpty->constData<QAudioBuffer::S8U>();
++    QVERIFY(sdata);
++    QCOMPARE(sdata->left, (unsigned char)0);
++    QCOMPARE(sdata->right, (unsigned char)0);
++
++    // The bytearray one should be 0x80
++    data = mFromArray->constData();
++    QVERIFY(data != 0);
++
++    idata = reinterpret_cast<const unsigned int *>(data);
++    QEXPECT_FAIL("", "Unsigned 16bits are cleared to 0x8080 currently", Continue);
++    QCOMPARE(*idata, 0x80008000);
++
++    sdata = mFromArray->constData<QAudioBuffer::S8U>();
++    QCOMPARE(sdata->left, (unsigned char)0x80);
++    QCOMPARE(sdata->right, (unsigned char)0x80);
++}
++
++void tst_QAudioBuffer::data_const() const
++{
++    const void *data = ((const QAudioBuffer*)mEmpty)->data();
++    QVERIFY(data != 0);
++
++    const unsigned int *idata = reinterpret_cast<const unsigned int*>(data);
++    QCOMPARE(*idata, 0U);
++
++    const QAudioBuffer::S8U *sdata = ((const QAudioBuffer*)mEmpty)->constData<QAudioBuffer::S8U>();
++    QVERIFY(sdata);
++    QCOMPARE(sdata->left, (unsigned char)0);
++    QCOMPARE(sdata->right, (unsigned char)0);
++
++    // The bytearray one should be 0x80
++    data = ((const QAudioBuffer*)mFromArray)->data();
++    QVERIFY(data != 0);
++
++    idata = reinterpret_cast<const unsigned int *>(data);
++    QEXPECT_FAIL("", "Unsigned 16bits are cleared to 0x8080 currently", Continue);
++    QCOMPARE(*idata, 0x80008000);
++
++    sdata = ((const QAudioBuffer*)mFromArray)->constData<QAudioBuffer::S8U>();
++    QCOMPARE(sdata->left, (unsigned char)0x80);
++    QCOMPARE(sdata->right, (unsigned char)0x80);
++}
++
++void tst_QAudioBuffer::data()
++{
++    void *data = mEmpty->data();
++    QVERIFY(data != 0);
++
++    unsigned int *idata = reinterpret_cast<unsigned int*>(data);
++    QCOMPARE(*idata, 0U);
++
++    QAudioBuffer::S8U *sdata = mEmpty->data<QAudioBuffer::S8U>();
++    QVERIFY(sdata);
++    QCOMPARE(sdata->left, (unsigned char)0);
++    QCOMPARE(sdata->right, (unsigned char)0);
++
++    // The bytearray one should be 0x80
++    data = mFromArray->data();
++    QVERIFY(data != 0);
++
++    idata = reinterpret_cast<unsigned int *>(data);
++    QEXPECT_FAIL("", "Unsigned 16bits are cleared to 0x8080 currently", Continue);
++    QCOMPARE(*idata, 0x80008000);
++
++    sdata = mFromArray->data<QAudioBuffer::S8U>();
++    QCOMPARE(sdata->left, (unsigned char)0x80);
++    QCOMPARE(sdata->right, (unsigned char)0x80);
++}
++
++void tst_QAudioBuffer::durations()
++{
++    QFETCH(int, channelCount);
++    QFETCH(int, sampleSize);
++    QFETCH(int, sampleCount);
++    QFETCH(QAudioFormat::SampleType, sampleType);
++    QFETCH(int, sampleRate);
++    QFETCH(qint64, duration);
++    QFETCH(int, byteCount);
++
++    QAudioFormat f;
++    f.setChannelCount(channelCount);
++    f.setSampleType(sampleType);
++    f.setSampleSize(sampleSize);
++    f.setSampleRate(sampleRate);
++    f.setCodec("audio/x-pcm"); // XXX this is not a good fit?
++
++    QAudioBuffer b(sampleCount, f);
++
++    QCOMPARE(b.sampleCount(), sampleCount);
++    QCOMPARE(b.duration(), duration);
++    QCOMPARE(b.byteCount(), byteCount);
++}
++
++void tst_QAudioBuffer::durations_data()
++{
++    QTest::addColumn<int>("channelCount");
++    QTest::addColumn<int>("sampleSize");
++    QTest::addColumn<int>("sampleCount");
++    QTest::addColumn<QAudioFormat::SampleType>("sampleType");
++    QTest::addColumn<int>("sampleRate");
++    QTest::addColumn<qint64>("duration");
++    QTest::addColumn<int>("byteCount");
++    QTest::newRow("M8_1000_8K") << 1 << 8 << 1000 << QAudioFormat::UnSignedInt << 8000 << 125000LL << 1000;
++    QTest::newRow("M8_2000_8K") << 1 << 8 << 2000 << QAudioFormat::UnSignedInt << 8000 << 250000LL << 2000;
++    QTest::newRow("M8_1000_4K") << 1 << 8 << 1000 << QAudioFormat::UnSignedInt << 4000 << 250000LL << 1000;
++
++    QTest::newRow("S8_1000_8K") << 2 << 8 << 1000 << QAudioFormat::UnSignedInt << 8000 << 62500LL << 2000;
++
++    QTest::newRow("SF_1000_8K") << 2 << 32 << 1000 << QAudioFormat::Float << 8000 << 62500LL << 8000;
++
++    QTest::newRow("4x128_1000_16K") << 4 << 128 << 1000 << QAudioFormat::SignedInt << 16000 << 15625LL << 64000;
++}
++
++void tst_QAudioBuffer::stereoSample()
++{
++    // Uninitialized (should default to zero level for type)
++    QAudioBuffer::S8U s8u;
++    QAudioBuffer::S8S s8s;
++    QAudioBuffer::S16U s16u;
++    QAudioBuffer::S16S s16s;
++    QAudioBuffer::S32F s32f;
++
++    QCOMPARE(s8u.left, (unsigned char) 0x80);
++    QCOMPARE(s8u.right, (unsigned char) 0x80);
++    QCOMPARE(s8u.average(), (unsigned char) 0x80);
++
++    QCOMPARE(s8s.left, (signed char) 0x00);
++    QCOMPARE(s8s.right, (signed char) 0x00);
++    QCOMPARE(s8s.average(), (signed char) 0x0);
++
++    QCOMPARE(s16u.left, (unsigned short) 0x8000);
++    QCOMPARE(s16u.right, (unsigned short) 0x8000);
++    QCOMPARE(s16u.average(), (unsigned short) 0x8000);
++
++    QCOMPARE(s16s.left, (signed short) 0x0);
++    QCOMPARE(s16s.right, (signed short) 0x0);
++    QCOMPARE(s16s.average(), (signed short) 0x0);
++
++    QCOMPARE(s32f.left, 0.0f);
++    QCOMPARE(s32f.right, 0.0f);
++    QCOMPARE(s32f.average(), 0.0f);
++
++    // Initialized
++    QAudioBuffer::S8U s8u2(34, 145);
++    QAudioBuffer::S8S s8s2(23, -89);
++    QAudioBuffer::S16U s16u2(500, 45000);
++    QAudioBuffer::S16S s16s2(-10000, 346);
++    QAudioBuffer::S32F s32f2(500.7f, -123.1f);
++
++    QCOMPARE(s8u2.left, (unsigned char) 34);
++    QCOMPARE(s8u2.right, (unsigned char) 145);
++    QCOMPARE(s8u2.average(), (unsigned char) 89);
++
++    QCOMPARE(s8s2.left, (signed char) 23);
++    QCOMPARE(s8s2.right,(signed char) -89);
++    QCOMPARE(s8s2.average(), (signed char) -33);
++
++    QCOMPARE(s16u2.left, (unsigned short) 500);
++    QCOMPARE(s16u2.right, (unsigned short) 45000);
++    QCOMPARE(s16u2.average(), (unsigned short) 22750);
++
++    QCOMPARE(s16s2.left, (signed short) -10000);
++    QCOMPARE(s16s2.right, (signed short) 346);
++    QCOMPARE(s16s2.average(), (signed short) (-5000 + 173));
++
++    QCOMPARE(s32f2.left, 500.7f);
++    QCOMPARE(s32f2.right, -123.1f);
++    QCOMPARE(s32f2.average(), (500.7f - 123.1f)/2);
++
++    // Assigned
++    s8u = s8u2;
++    s8s = s8s2;
++    s16u = s16u2;
++    s16s = s16s2;
++    s32f = s32f2;
++
++    QCOMPARE(s8u.left, (unsigned char) 34);
++    QCOMPARE(s8u.right, (unsigned char) 145);
++    QCOMPARE(s8u.average(), (unsigned char) 89);
++
++    QCOMPARE(s8s.left, (signed char) 23);
++    QCOMPARE(s8s.right, (signed char) -89);
++    QCOMPARE(s8s.average(), (signed char) -33);
++
++    QCOMPARE(s16u.left, (unsigned short) 500);
++    QCOMPARE(s16u.right, (unsigned short) 45000);
++    QCOMPARE(s16u.average(), (unsigned short) 22750);
++
++    QCOMPARE(s16s.left, (signed short) -10000);
++    QCOMPARE(s16s.right, (signed short) 346);
++    QCOMPARE(s16s.average(), (signed short) (-5000 + 173));
++
++    QCOMPARE(s32f.left, 500.7f);
++    QCOMPARE(s32f.right, -123.1f);
++    QCOMPARE(s32f.average(), (500.7f - 123.1f)/2);
++
++    // Cleared
++    s8u.clear();
++    s8s.clear();
++    s16u.clear();
++    s16s.clear();
++    s32f.clear();
++
++    QCOMPARE(s8u.left, (unsigned char) 0x80);
++    QCOMPARE(s8u.right, (unsigned char) 0x80);
++    QCOMPARE(s8u.average(), (unsigned char) 0x80);
++
++    QCOMPARE(s8s.left, (signed char) 0x00);
++    QCOMPARE(s8s.right, (signed char) 0x00);
++    QCOMPARE(s8s.average(), (signed char) 0x0);
++
++    QCOMPARE(s16u.left, (unsigned short) 0x8000);
++    QCOMPARE(s16u.right, (unsigned short) 0x8000);
++    QCOMPARE(s16u.average(), (unsigned short) 0x8000);
++
++    QCOMPARE(s16s.left, (signed short) 0x0);
++    QCOMPARE(s16s.right, (signed short) 0x0);
++    QCOMPARE(s16s.average(), (signed short) 0x0);
++
++    QCOMPARE(s32f.left, 0.0f);
++    QCOMPARE(s32f.right, 0.0f);
++    QCOMPARE(s32f.average(), 0.0f);
++}
++
++
++QTEST_APPLESS_MAIN(tst_QAudioBuffer);
++
++#include "tst_qaudiobuffer.moc"

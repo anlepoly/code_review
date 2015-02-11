@@ -1,0 +1,197 @@
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index 768e80f..5473290 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -63,10 +63,15 @@
+ 
+ #include <QStack>
+ #include <QStringList>
++#include <QThreadStorage>
+ #include <QtCore/qdebug.h>
+ #include <qqmlinfo.h>
+ #include "qqmlmemoryprofiler_p.h"
+ 
++namespace {
++    QThreadStorage<int> creationDepth;
++}
++
+ QT_BEGIN_NAMESPACE
+ 
+ class QQmlComponentExtension : public QV8Engine::Deletable
+@@ -772,7 +777,8 @@ QObject *QQmlComponent::create(QQmlContext *context)
+         context = d->engine->rootContext();
+ 
+     QObject *rv = beginCreate(context);
+-    completeCreate();
++    if (rv)
++        completeCreate();
+     return rv;
+ }
+ 
+@@ -840,6 +846,16 @@ QQmlComponentPrivate::beginCreate(QQmlContextData *context)
+         return 0;
+     }
+ 
++    // Do not create infinite recursion in object creation
++    static const int maxCreationDepth = 10;
++    if (++creationDepth.localData() >= maxCreationDepth) {
++        qWarning("QQmlComponent: Component creation is recursing - aborting");
++        --creationDepth.localData();
++        return 0;
++    }
++    Q_ASSERT(creationDepth.localData() >= 1);
++    depthIncreased = true;
++
+     QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(engine);
+ 
+     if (enginePriv->inProgressCreations == 0) {
+@@ -864,6 +880,10 @@ QQmlComponentPrivate::beginCreate(QQmlContextData *context)
+         ddata->indestructible = true;
+         ddata->explicitIndestructibleSet = true;
+         ddata->rootObjectInCreation = false;
++    } else {
++        Q_ASSERT(creationDepth.localData() >= 1);
++        --creationDepth.localData();
++        depthIncreased = false;
+     }
+ 
+     if (enginePriv->isDebugging && rv) {
+@@ -936,6 +956,12 @@ void QQmlComponentPrivate::completeCreate()
+         delete profiler;
+         profiler = 0;
+     }
++
++    if (depthIncreased) {
++        Q_ASSERT(creationDepth.localData() >= 1);
++        --creationDepth.localData();
++        depthIncreased = false;
++    }
+ }
+ 
+ QQmlComponentAttached::QQmlComponentAttached(QObject *parent)
+diff --git a/src/qml/qml/qqmlcomponent_p.h b/src/qml/qml/qqmlcomponent_p.h
+index 9e220b5..f5589b9 100644
+--- a/src/qml/qml/qqmlcomponent_p.h
++++ b/src/qml/qml/qqmlcomponent_p.h
+@@ -84,7 +84,8 @@ class Q_QML_PRIVATE_EXPORT QQmlComponentPrivate : public QObjectPrivate, public
+     Q_DECLARE_PUBLIC(QQmlComponent)
+         
+ public:
+-    QQmlComponentPrivate() : typeData(0), progress(0.), start(-1), cc(0), engine(0), creationContext(0), profiler(0) {}
++    QQmlComponentPrivate()
++        : typeData(0), progress(0.), start(-1), cc(0), engine(0), creationContext(0), profiler(0), depthIncreased(false) {}
+ 
+     void loadUrl(const QUrl &newUrl, QQmlComponent::CompilationMode mode = QQmlComponent::PreferSynchronous);
+ 
+@@ -120,6 +121,7 @@ public:
+     QQmlEngine *engine;
+     QQmlGuardedContextData creationContext;
+     QQmlObjectCreatingProfiler *profiler;
++    bool depthIncreased;
+ 
+     void clear();
+ 
+diff --git a/tests/auto/qml/qqmlcomponent/data/RecursiveComponent.qml b/tests/auto/qml/qqmlcomponent/data/RecursiveComponent.qml
+new file mode 100644
+index 0000000..eec17a7
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/RecursiveComponent.qml
+@@ -0,0 +1,10 @@
++import QtQuick 2.0
++
++Item {
++    id: inner
++    property Item innermost: null
++
++    Component.onCompleted: {
++        innermost = Qt.createComponent("./RecursiveComponent.qml").createObject();
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/data/recursion.qml b/tests/auto/qml/qqmlcomponent/data/recursion.qml
+new file mode 100644
+index 0000000..d7f9471
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/recursion.qml
+@@ -0,0 +1,12 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    property RecursiveComponent myInner: RecursiveComponent {}
++    property bool success: false
++
++    Component.onCompleted: {
++        success = (myInner.innermost != null)
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/data/recursionContinuation.qml b/tests/auto/qml/qqmlcomponent/data/recursionContinuation.qml
+new file mode 100644
+index 0000000..a10afd3
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/recursionContinuation.qml
+@@ -0,0 +1,16 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    property bool success: false
++
++    Component.onCompleted: {
++        for (var i = 0; i < 10; ++i) {
++            Qt.createComponent("RecursiveComponent.qml").createObject(root)
++        }
++
++        var o = Qt.createComponent("TestComponent.qml").createObject(root)
++        root.success = (o != null)
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+index be38829..3a3952d 100644
+--- a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
++++ b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+@@ -114,6 +114,8 @@ private slots:
+     void componentUrlCanonicalization();
+     void onDestructionLookup();
+     void onDestructionCount();
++    void recursion();
++    void recursionContinuation();
+ 
+ private:
+     QQmlEngine engine;
+@@ -410,6 +412,34 @@ void tst_qqmlcomponent::onDestructionCount()
+     QCOMPARE(warnings.count(), 0);
+ }
+ 
++void tst_qqmlcomponent::recursion()
++{
++    QQmlEngine engine;
++    QQmlComponent component(&engine, testFileUrl("recursion.qml"));
++
++    QTest::ignoreMessage(QtWarningMsg, QLatin1String("QQmlComponent: Component creation is recursing - aborting").data());
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++
++    // Sub-object creation does not succeed
++    QCOMPARE(object->property("success").toBool(), false);
++}
++
++void tst_qqmlcomponent::recursionContinuation()
++{
++    QQmlEngine engine;
++    QQmlComponent component(&engine, testFileUrl("recursionContinuation.qml"));
++
++    for (int i = 0; i < 10; ++i)
++        QTest::ignoreMessage(QtWarningMsg, QLatin1String("QQmlComponent: Component creation is recursing - aborting").data());
++
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++
++    // Eventual sub-object creation succeeds
++    QVERIFY(object->property("success").toBool());
++}
++
+ QTEST_MAIN(tst_qqmlcomponent)
+ 
+ #include "tst_qqmlcomponent.moc"

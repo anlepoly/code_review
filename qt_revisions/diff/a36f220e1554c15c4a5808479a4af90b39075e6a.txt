@@ -1,0 +1,695 @@
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 5bb993f..b41fb28 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -47,12 +47,18 @@
+ #include "qv4compiler_p_p.h"
+ 
+ #include <private/qqmlglobal_p.h>
++
++#include <private/qv8_p.h>
++#include <private/qjsconverter_p.h>
++#include <private/qjsconverter_impl_p.h>
++
+ #include <private/qqmlaccessors_p.h>
+ #include <private/qqmlprofilerservice_p.h>
+ #include <private/qqmlmetatype_p.h>
+ #include <private/qqmltrace_p.h>
+ #include <private/qqmlstringconverters_p.h>
+ #include <private/qqmlproperty_p.h>
++#include <private/qqmlvmemetaobject_p.h>
+ 
+ #include <QtQml/qqmlinfo.h>
+ #include <QtCore/qnumeric.h>
+@@ -91,12 +97,15 @@ struct Register {
+     inline bool getbool() const { return boolValue; }
+     inline bool &getboolref() { return boolValue; }
+ 
+-    inline QVariant *getvariantptr() { return (QVariant *)typeDataPtr(); }
+-    inline QString *getstringptr() { return (QString *)typeDataPtr(); }
+-    inline QUrl *geturlptr() { return (QUrl *)typeDataPtr(); }
+-    inline const QVariant *getvariantptr() const { return (QVariant *)typeDataPtr(); }
+-    inline const QString *getstringptr() const { return (QString *)typeDataPtr(); }
+-    inline const QUrl *geturlptr() const { return (QUrl *)typeDataPtr(); }
++    inline QVariant *getvariantptr() { return reinterpret_cast<QVariant *>(typeDataPtr()); }
++    inline QString *getstringptr() { return reinterpret_cast<QString *>(typeDataPtr()); }
++    inline QUrl *geturlptr() { return reinterpret_cast<QUrl *>(typeDataPtr()); }
++    inline v8::Handle<v8::Value> *gethandleptr() { return reinterpret_cast<v8::Handle<v8::Value> *>(typeDataPtr()); }
++
++    inline const QVariant *getvariantptr() const { return reinterpret_cast<const QVariant *>(typeDataPtr()); }
++    inline const QString *getstringptr() const { return reinterpret_cast<const QString *>(typeDataPtr()); }
++    inline const QUrl *geturlptr() const { return reinterpret_cast<const QUrl *>(typeDataPtr()); }
++    inline const v8::Handle<v8::Value> *gethandleptr() const { return reinterpret_cast<const v8::Handle<v8::Value> *>(typeDataPtr()); }
+ 
+     size_t dataSize() { return sizeof(data); }
+     inline void *typeDataPtr() { return (void *)&data; }
+@@ -124,6 +133,7 @@ struct Register {
+     inline void cleanupUrl();
+     inline void cleanupColor();
+     inline void cleanupVariant();
++    inline void cleanupHandle();
+ 
+     inline void copy(const Register &other);
+     inline void init(Type type);
+@@ -137,6 +147,24 @@ struct Register {
+             qWarning("Register leaked of type %d", dataType);
+     }
+ #endif
++
++    template <typename T>
++    inline static void copyConstructPointee(T *p, const T *other)
++    {
++        new (p) T(*other);
++    }
++
++    template <typename T>
++    inline static void defaultConstructPointee(T *p)
++    {
++        new (p) T();
++    }
++
++    template <typename T>
++    inline static void destroyPointee(T *p)
++    {
++        p->~T();
++    }
+ };
+ 
+ void Register::cleanup()
+@@ -150,6 +178,8 @@ void Register::cleanup()
+             QQml_valueTypeProvider()->destroyValueType(QMetaType::QColor, typeDataPtr(), dataSize());
+         } else if (dataType == QVariantType) {
+             getvariantptr()->~QVariant();
++        } else if (dataType == qMetaTypeId<v8::Handle<v8::Value> >()) {
++            destroyPointee(gethandleptr());
+         }
+     }
+     setUndefined();
+@@ -179,6 +209,12 @@ void Register::cleanupVariant()
+     setUndefined();
+ }
+ 
++void Register::cleanupHandle()
++{
++    destroyPointee(gethandleptr());
++    setUndefined();
++}
++
+ void Register::copy(const Register &other)
+ {
+     *this = other;
+@@ -191,6 +227,8 @@ void Register::copy(const Register &other)
+             QQml_valueTypeProvider()->copyValueType(QMetaType::QColor, other.typeDataPtr(), typeDataPtr(), dataSize());
+         else if (other.dataType == QVariantType)
+             new (getvariantptr()) QVariant(*other.getvariantptr());
++        else if (other.dataType == qMetaTypeId<v8::Handle<v8::Value> >())
++            copyConstructPointee(gethandleptr(), other.gethandleptr());
+     } 
+ }
+ 
+@@ -206,6 +244,8 @@ void Register::init(Type type)
+             QQml_valueTypeProvider()->initValueType(QMetaType::QColor, typeDataPtr(), dataSize());
+         else if (dataType == QVariantType)
+             new (getvariantptr()) QVariant();
++        else if (dataType == qMetaTypeId<v8::Handle<v8::Value> >())
++            defaultConstructPointee(gethandleptr());
+     }
+ }
+ 
+@@ -356,7 +396,18 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+ 
+         vt->write(binding->target, binding->property & 0xFFFF, flags);
+     } else {
+-        run(binding->index, binding->executedBlocks, context, binding, binding->scope, binding->target, flags);
++        QQmlData *data = QQmlData::get(binding->target);
++        QQmlPropertyData *propertyData = (data && data->propertyCache ? data->propertyCache->property(binding->property) : 0);
++
++        if (propertyData && propertyData->isVMEProperty()) {
++            // We will allocate a V8 handle in this conversion/store
++            v8::HandleScope handle_scope;
++            v8::Context::Scope context_scope(QQmlEnginePrivate::get(context->engine)->v8engine()->context());
++
++            run(binding->index, binding->executedBlocks, context, binding, binding->scope, binding->target, flags);
++        } else {
++            run(binding->index, binding->executedBlocks, context, binding, binding->scope, binding->target, flags);
++        }
+     }
+     binding->updating = false;
+ }
+@@ -453,10 +504,14 @@ static void testBindingResult(const QString &binding, int line, int column,
+     QByteArray qtscriptResult;
+     QByteArray v4Result;
+ 
++    const int handleType = qMetaTypeId<v8::Handle<v8::Value> >();
++
+     if (expression.hasError()) {
+         iserror = true;
+         qtscriptResult = "exception";
+-    } else if ((value.userType() != resultType) && (resultType != QMetaType::QVariant)) {
++    } else if ((value.userType() != resultType) &&
++               (resultType != QMetaType::QVariant) &&
++               (resultType != handleType)) {
+         // Override the QMetaType conversions to make them more JS friendly.
+         if (value.userType() == QMetaType::Double && (resultType == QMetaType::QString ||
+                                                         resultType == QMetaType::QUrl)) {
+@@ -515,6 +570,9 @@ static void testBindingResult(const QString &binding, int line, int column,
+         default:
+             if (resultType == QQmlMetaType::QQuickAnchorLineMetaTypeId()) {
+                 v4value = QVariant(QQmlMetaType::QQuickAnchorLineMetaTypeId(), result.typeDataPtr());
++            } else if (resultType == handleType) {
++                QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
++                v4value = ep->v8engine()->toVariant(*result.gethandleptr(), resultType);
+             } else {
+                 iserror = true;
+                 v4Result = "Unknown V4 type";
+@@ -647,6 +705,11 @@ inline quint32 QV4Bindings::toUint32(double n)
+     MARK_REGISTER(reg); \
+ }
+ 
++#define V8HANDLE_REGISTER(reg) { \
++    registers[(reg)].settype(V8HandleType); \
++    MARK_REGISTER(reg); \
++}
++
+ #ifdef QML_THREADED_INTERPRETER
+ void **QV4Bindings::getDecodeInstrTable()
+ {
+@@ -901,6 +964,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertBoolToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertBoolToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.gethandleptr()) v8::Handle<v8::Value>(v8::Boolean::New(src.getbool()));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertBoolToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertIntToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -945,6 +1021,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertIntToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertIntToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.gethandleptr()) v8::Handle<v8::Value>(v8::Integer::New(src.getint()));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertIntToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertNumberToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -990,6 +1079,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertNumberToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertNumberToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            new (output.gethandleptr()) v8::Handle<v8::Value>(v8::Number::New(src.getnumber()));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertNumberToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertStringToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1109,6 +1211,24 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertStringToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertStringToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            const QString tmp(*src.getstringptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupString();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            new (output.gethandleptr()) v8::Handle<v8::Value>(QJSConverter::toString(tmp));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertStringToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertUrlToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1165,6 +1285,25 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertUrlToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertUrlToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        // ### NaN
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            const QUrl tmp(*src.geturlptr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupUrl();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++            new (output.gethandleptr()) v8::Handle<v8::Value>(QJSConverter::toString(tmp.toString()));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertUrlToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertColorToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1212,6 +1351,28 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertColorToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertColorToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        // ### NaN
++        if (src.isUndefined()) {
++            output.setUndefined();
++        } else {
++            const QVariant tmp(QMetaType::QColor, src.typeDataPtr());
++            if (instr->unaryop.src == instr->unaryop.output) {
++                output.cleanupColor();
++                MARK_CLEAN_REGISTER(instr->unaryop.output);
++            }
++
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
++            QQmlValueType *vt = ep->valueTypes[QMetaType::QColor];
++            new (output.gethandleptr()) v8::Handle<v8::Value>(ep->v8engine()->valueTypeWrapper()->newValueType(tmp, vt));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertColorToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertObjectToBool, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1238,6 +1399,21 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertObjectToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertObjectToVar, unaryop)
++    {
++        const Register &src = registers[instr->unaryop.src];
++        Register &output = registers[instr->unaryop.output];
++        // ### NaN
++        if (src.isUndefined())
++            output.setUndefined();
++        else {
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
++            new (output.gethandleptr()) v8::Handle<v8::Value>(ep->v8engine()->newQObject(src.getQObject()));
++            V8HANDLE_REGISTER(instr->unaryop.output);
++        }
++    }
++    QML_V4_END_INSTR(ConvertObjectToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ConvertNullToObject, unaryop)
+     {
+         Register &output = registers[instr->unaryop.output];
+@@ -1253,6 +1429,14 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     }
+     QML_V4_END_INSTR(ConvertNullToVariant, unaryop)
+ 
++    QML_V4_BEGIN_INSTR(ConvertNullToVar, unaryop)
++    {
++        Register &output = registers[instr->unaryop.output];
++        new (output.gethandleptr()) v8::Handle<v8::Value>(v8::Null());
++        V8HANDLE_REGISTER(instr->unaryop.output);
++    }
++    QML_V4_END_INSTR(ConvertNullToVar, unaryop)
++
+     QML_V4_BEGIN_INSTR(ResolveUrl, unaryop)
+     {
+         const Register &src = registers[instr->unaryop.src];
+@@ -1757,10 +1941,16 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+             data.setfloat(v);
+         }
+ 
+-        int status = -1;
+-        void *argv[] = { data.typeDataPtr(), 0, &status, &storeFlags };
+-        QMetaObject::metacall(output, QMetaObject::WriteProperty,
+-                              instr->store.index, argv);
++        if (data.gettype() == V8HandleType) {
++            // This property must be a VME var property
++            QQmlVMEMetaObject *vmemo = static_cast<QQmlVMEMetaObject *>(const_cast<QMetaObject *>(output->metaObject()));
++            vmemo->setVMEProperty(instr->store.index, *data.gethandleptr());
++        } else {
++            int status = -1;
++            void *argv[] = { data.typeDataPtr(), 0, &status, &storeFlags };
++            QMetaObject::metacall(output, QMetaObject::WriteProperty,
++                                  instr->store.index, argv);
++        }
+ 
+         goto programExit;
+     }
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index e03270c..dc7759d 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -970,6 +970,7 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+             case IR::BoolType:
+             case IR::StringType:
+             case IR::VariantType:
++            case IR::VarType:
+                 // nothing to do. V4 will generate optimized
+                 // url-to-xxx conversions.
+                 break;
+@@ -1086,6 +1087,20 @@ void QV4CompilerPrivate::visitMove(IR::Move *s)
+                 default: break;
+                 } // switch
+             }
++        } else if (targetTy == IR::VarType) {
++            if (s->isMoveForReturn) {
++                switch (sourceTy) {
++                case IR::BoolType: opcode = V4Instr::ConvertBoolToVar; break;
++                case IR::IntType:  opcode = V4Instr::ConvertIntToVar; break;
++                case IR::NumberType: opcode = V4Instr::ConvertNumberToVar; break;
++                case IR::UrlType: opcode = V4Instr::ConvertUrlToVar; break;
++                case IR::ColorType: opcode = V4Instr::ConvertColorToVar; break;
++                case IR::StringType: opcode = V4Instr::ConvertStringToVar; break;
++                case IR::ObjectType: opcode = V4Instr::ConvertObjectToVar; break;
++                case IR::NullType: opcode = V4Instr::ConvertNullToVar; break;
++                default: break;
++                } // switch
++            }
+         }
+         if (opcode != V4Instr::Noop) {
+             V4Instr conv;
+@@ -1162,6 +1177,9 @@ void QV4CompilerPrivate::visitRet(IR::Ret *s)
+         case IR::VariantType:
+             test.regType = QMetaType::QVariant;
+             break;
++        case IR::VarType:
++            test.regType = qMetaTypeId<v8::Handle<v8::Value> >();
++            break;
+         case IR::BoolType:
+             test.regType = QMetaType::Bool;
+             break;
+diff --git a/src/qml/qml/v4/qv4compiler_p.h b/src/qml/qml/v4/qv4compiler_p.h
+index a93248a..cf0d519 100644
+--- a/src/qml/qml/v4/qv4compiler_p.h
++++ b/src/qml/qml/v4/qv4compiler_p.h
+@@ -57,6 +57,10 @@
+ #include <private/qqmlbinding_p.h>
+ #include <private/qqmlcompiler_p.h>
+ 
++#include <private/qv8_p.h>
++
++Q_DECLARE_METATYPE(v8::Handle<v8::Value>)
++
+ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+diff --git a/src/qml/qml/v4/qv4instruction.cpp b/src/qml/qml/v4/qv4instruction.cpp
+index c202979..f5e59eb 100644
+--- a/src/qml/qml/v4/qv4instruction.cpp
++++ b/src/qml/qml/v4/qv4instruction.cpp
+@@ -147,6 +147,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertBoolToVariant:
+         INSTR_DUMP << "\t" << "ConvertBoolToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertBoolToVar:
++        INSTR_DUMP << "\t" << "ConvertBoolToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertIntToBool:
+         INSTR_DUMP << "\t" << "ConvertIntToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+@@ -159,6 +162,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertIntToVariant:
+         INSTR_DUMP << "\t" << "ConvertIntToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertIntToVar:
++        INSTR_DUMP << "\t" << "ConvertIntToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertNumberToBool:
+         INSTR_DUMP << "\t" << "ConvertNumberToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+@@ -171,6 +177,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertNumberToVariant:
+         INSTR_DUMP << "\t" << "ConvertNumberToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertNumberToVar:
++        INSTR_DUMP << "\t" << "ConvertNumberToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertStringToBool:
+         INSTR_DUMP << "\t" << "ConvertStringToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+@@ -189,6 +198,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertStringToVariant:
+         INSTR_DUMP << "\t" << "ConvertStringToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertStringToVar:
++        INSTR_DUMP << "\t" << "ConvertStringToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertUrlToBool:
+         INSTR_DUMP << "\t" << "ConvertUrlToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+@@ -198,6 +210,9 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertUrlToVariant:
+         INSTR_DUMP << "\t" << "ConvertUrlToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertUrlToVar:
++        INSTR_DUMP << "\t" << "ConvertUrlToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertColorToBool:
+         INSTR_DUMP << "\t" << "ConvertColorToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+@@ -207,18 +222,27 @@ void Bytecode::dump(const V4Instr *i, int address) const
+     case V4Instr::ConvertColorToVariant:
+         INSTR_DUMP << "\t" << "ConvertColorToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertColorToVar:
++        INSTR_DUMP << "\t" << "ConvertColorToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertObjectToBool:
+         INSTR_DUMP << "\t" << "ConvertObjectToBool" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+     case V4Instr::ConvertObjectToVariant:
+         INSTR_DUMP << "\t" << "ConvertObjectToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertObjectToVar:
++        INSTR_DUMP << "\t" << "ConvertObjectToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ConvertNullToObject:
+         INSTR_DUMP << "\t" << "ConvertNullToObject" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+     case V4Instr::ConvertNullToVariant:
+         INSTR_DUMP << "\t" << "ConvertNullToVariant" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
++    case V4Instr::ConvertNullToVar:
++        INSTR_DUMP << "\t" << "ConvertNullToVar" << "\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
++        break;
+     case V4Instr::ResolveUrl:
+         INSTR_DUMP << "\t" << "ResolveUrl" << "\t\t" << "Input_Reg(" << i->unaryop.src << ") -> Output_Reg(" << i->unaryop.output << ")";
+         break;
+diff --git a/src/qml/qml/v4/qv4instruction_p.h b/src/qml/qml/v4/qv4instruction_p.h
+index 6eb9efa..c9e244e 100644
+--- a/src/qml/qml/v4/qv4instruction_p.h
++++ b/src/qml/qml/v4/qv4instruction_p.h
+@@ -84,30 +84,38 @@ QT_BEGIN_NAMESPACE
+     F(ConvertBoolToNumber, unaryop) \
+     F(ConvertBoolToString, unaryop) \
+     F(ConvertBoolToVariant, unaryop) \
++    F(ConvertBoolToVar, unaryop) \
+     F(ConvertIntToBool, unaryop) \
+     F(ConvertIntToNumber, unaryop) \
+     F(ConvertIntToString, unaryop) \
+     F(ConvertIntToVariant, unaryop) \
++    F(ConvertIntToVar, unaryop) \
+     F(ConvertNumberToBool, unaryop) \
+     F(ConvertNumberToInt, unaryop) \
+     F(ConvertNumberToString, unaryop) \
+     F(ConvertNumberToVariant, unaryop) \
++    F(ConvertNumberToVar, unaryop) \
+     F(ConvertStringToBool, unaryop) \
+     F(ConvertStringToInt, unaryop) \
+     F(ConvertStringToNumber, unaryop) \
+     F(ConvertStringToUrl, unaryop) \
+     F(ConvertStringToColor, unaryop) \
+     F(ConvertStringToVariant, unaryop) \
++    F(ConvertStringToVar, unaryop) \
+     F(ConvertUrlToBool, unaryop) \
+     F(ConvertUrlToString, unaryop) \
+     F(ConvertUrlToVariant, unaryop) \
++    F(ConvertUrlToVar, unaryop) \
+     F(ConvertColorToBool, unaryop) \
+     F(ConvertColorToString, unaryop) \
+     F(ConvertColorToVariant, unaryop) \
++    F(ConvertColorToVar, unaryop) \
+     F(ConvertObjectToBool, unaryop) \
+     F(ConvertObjectToVariant, unaryop) \
++    F(ConvertObjectToVar, unaryop) \
+     F(ConvertNullToObject, unaryop) \
+     F(ConvertNullToVariant, unaryop) \
++    F(ConvertNullToVar, unaryop) \
+     F(ResolveUrl, unaryop) \
+     F(MathSinNumber, unaryop) \
+     F(MathCosNumber, unaryop) \
+diff --git a/src/qml/qml/v4/qv4program_p.h b/src/qml/qml/v4/qv4program_p.h
+index c1dc392..9ac02f1 100644
+--- a/src/qml/qml/v4/qv4program_p.h
++++ b/src/qml/qml/v4/qv4program_p.h
+@@ -97,7 +97,8 @@ enum QQmlRegisterType {
+     QStringType = FirstCleanupType,
+     QUrlType,
+     QVariantType,
+-    QColorType
++    QColorType,
++    V8HandleType
+ };
+ 
+ const char *QV4Program::data() const 
+diff --git a/tests/auto/qml/v4/data/varHandling.qml b/tests/auto/qml/v4/data/varHandling.qml
+new file mode 100644
+index 0000000..c19e6a2
+--- /dev/null
++++ b/tests/auto/qml/v4/data/varHandling.qml
+@@ -0,0 +1,67 @@
++import QtQuick 2.0
++
++QtObject {
++    property bool pBool: true
++    property int pInt: 666
++    property real pReal: 3.1415927
++    property string pString: 'foo'
++    property url pUrl: 'http://tools.ietf.org/html/rfc3986#section-1.1.2'
++    property color pColor: Qt.rgba(1, 0, 0, 0.5)
++    property QtObject pObject: QtObject { property string foo: 'bar' }
++
++    // Test assignment to var
++    property var pBoolVar: pBool
++    property var pIntVar: pInt
++    property var pRealVar: pReal
++    property var pStringVar: pString
++    property var pUrlVar: pUrl
++    property var pColorVar: pColor
++    property var pObjectVar: pObject
++    property var pNullVar: null
++    property var pVarVar: pUrlVar
++
++    // Test equivalence
++    property bool boolConversionSuccess: (pBoolVar == true)
++    property bool intConversionSuccess: (pIntVar == 666)
++    property bool realConversionSuccess: (pRealVar == 3.1415927)
++    property bool stringConversionSuccess: (pStringVar == 'foo')
++
++    property url comparisonUrl: 'http://tools.ietf.org/html/rfc3986#section-1.1.2'
++    property bool urlConversionSuccess: (pUrlVar == comparisonUrl)
++
++    property color comparisonColor: Qt.rgba(1, 0, 0, 0.5)
++    property bool colorConversionSuccess: (pColorVar == comparisonColor)
++
++    property bool objectConversionSuccess: (pObjectVar == pObject)
++    property bool nullConversionSuccess: (pNullVar == null)
++
++    property bool varConversionSuccess: (pVarVar == comparisonUrl)
++
++    // Operations are not handled by V4 - they should pass through correctly
++    property var pVarNot: !pBoolVar
++    property var pVarComplement: ~pIntVar
++    property var pVarEqual: (pBoolVar == pBoolVar)
++    property var pVarLiteralEqual: (pBoolVar == true)
++    property var pVarUnequal: (pUrlVar == pColorVar)
++    property var pVarComparison: (pIntVar <= pIntVar)
++    property var pVarShift: (pIntVar >> 1)
++
++    Component.onCompleted: {
++        if (!boolConversionSuccess) console.warn('QV4: bool conversion failed');
++        if (!intConversionSuccess) console.warn('QV4: int conversion failed');
++        if (!realConversionSuccess) console.warn('QV4: real conversion failed');
++        if (!stringConversionSuccess) console.warn('QV4: string conversion failed');
++        if (!urlConversionSuccess) console.warn('QV4: url conversion failed');
++        if (!colorConversionSuccess) console.warn('QV4: color conversion failed');
++        if (!objectConversionSuccess) console.warn('QV4: object conversion failed');
++        if (!nullConversionSuccess) console.warn('QV4: null conversion failed');
++        if (!varConversionSuccess) console.warn('QV4: var conversion failed');
++        if (pVarNot != false) console.warn('QV4: var negation impeded');
++        if (pVarComplement != ~666) console.warn('QV4: var complement impeded');
++        if (pVarEqual != true) console.warn('QV4: var equality impeded');
++        if (pVarLiteralEqual != true) console.warn('QV4: var/literal equality impeded');
++        if (pVarUnequal != false) console.warn('QV4: var unequality impeded');
++        if (pVarComparison != true) console.warn('QV4: var comparison impeded');
++        if (pVarShift != 333) console.warn('QV4: var shift impeded');
++    }
++}
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index 99a4405..57dec5a 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -151,6 +151,7 @@ void tst_v4::qtscript_data()
+     QTest::newRow("conversion from url") << "conversions.7.qml"; // QTBUG-24706
+     QTest::newRow("conversion from vec3") << "conversions.8.qml";
+     QTest::newRow("variantHandling") << "variantHandling.qml";
++    QTest::newRow("varHandling") << "varHandling.qml";
+ }
+ 
+ void tst_v4::unnecessaryReeval()
+@@ -858,30 +859,38 @@ void tst_v4::debuggingDumpInstructions()
+     expectedPreAddress << "\t\tConvertBoolToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertBoolToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertBoolToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertIntToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertIntToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToInt\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNumberToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertNumberToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToInt\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToNumber\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToUrl\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToColor\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertStringToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertStringToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertUrlToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertUrlToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToString\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertColorToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertColorToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertObjectToBool\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertObjectToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertObjectToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNullToObject\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tConvertNullToVariant\tInput_Reg(0) -> Output_Reg(0)";
++    expectedPreAddress << "\t\tConvertNullToVar\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tResolveUrl\t\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tMathSinNumber\t\tInput_Reg(0) -> Output_Reg(0)";
+     expectedPreAddress << "\t\tMathCosNumber\t\tInput_Reg(0) -> Output_Reg(0)";

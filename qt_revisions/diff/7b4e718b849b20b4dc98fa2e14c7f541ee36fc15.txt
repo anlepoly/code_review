@@ -1,0 +1,682 @@
+diff --git a/src/platformsupport/udev/qudevhelper_p.h b/src/platformsupport/udev/qudevhelper_p.h
+index e6046ca..3895da8 100644
+--- a/src/platformsupport/udev/qudevhelper_p.h
++++ b/src/platformsupport/udev/qudevhelper_p.h
+@@ -43,6 +43,7 @@
+ #define QUDEVHELPER_P_H
+ 
+ #include <QString>
++#include <QObject>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+diff --git a/src/platformsupport/udev/qudevicehelper.cpp b/src/platformsupport/udev/qudevicehelper.cpp
+new file mode 100644
+index 0000000..bf3ce67
+--- /dev/null
++++ b/src/platformsupport/udev/qudevicehelper.cpp
+@@ -0,0 +1,235 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qudevicehelper_p.h"
++
++#include <QStringList>
++#include <QCoreApplication>
++#include <QObject>
++#include <QHash>
++#include <QSocketNotifier>
++
++#include <linux/input.h>
++
++//#define QT_QPA_UDEVICE_HELPER_DEBUG
++
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++#include <QtDebug>
++#endif
++
++QT_BEGIN_NAMESPACE
++
++QUDeviceHelper *QUDeviceHelper::createUDeviceHelper(QUDeviceTypes types, QObject *parent)
++{
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++    qWarning() << "Try to create new UDeviceHelper";
++#endif
++
++    QUDeviceHelper *helper = 0;
++    struct udev *udev;
++
++    udev = udev_new();
++    if (udev) {
++        helper = new QUDeviceHelper(types, udev, parent);
++    } else {
++        qWarning("Failed to get udev library context.");
++    }
++
++    return helper;
++}
++
++QUDeviceHelper::QUDeviceHelper(QUDeviceTypes types, struct udev *udev, QObject *parent) :
++    QObject(parent),
++    m_udev(udev), m_types(types), m_udevMonitor(0), m_udevMonitorFileDescriptor(-1), m_udevSocketNotifier(0)
++{
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++    qWarning() << "New UDeviceHelper created for type" << types;
++#endif
++
++    if (!m_udev)
++        return;
++
++    m_udevMonitor = udev_monitor_new_from_netlink(m_udev, "udev");
++    if (!m_udevMonitor) {
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++        qWarning("Unable to create an Udev monitor. No devices can be detected.");
++#endif
++        return;
++    }
++
++    udev_monitor_filter_add_match_subsystem_devtype(m_udevMonitor, "input", 0);
++    udev_monitor_enable_receiving(m_udevMonitor);
++    m_udevMonitorFileDescriptor = udev_monitor_get_fd(m_udevMonitor);
++
++    m_udevSocketNotifier = new QSocketNotifier(m_udevMonitorFileDescriptor, QSocketNotifier::Read, this);
++    connect(m_udevSocketNotifier, SIGNAL(activated(int)), this, SLOT(handleUDevNotification()));
++}
++
++QUDeviceHelper::~QUDeviceHelper()
++{
++    if (m_udevMonitor)
++        udev_monitor_unref(m_udevMonitor);
++
++    if (m_udev)
++        udev_unref(m_udev);
++}
++
++QStringList QUDeviceHelper::scanConnectedDevices()
++{
++    QStringList devices;
++
++    if (!m_udev)
++        return devices;
++
++    udev_enumerate *ue = udev_enumerate_new(m_udev);
++    udev_enumerate_add_match_subsystem(ue, "input");
++
++    if (m_types & UDev_Mouse)
++        udev_enumerate_add_match_property(ue, "ID_INPUT_MOUSE", "1");
++    if (m_types & UDev_Touchpad)
++        udev_enumerate_add_match_property(ue, "ID_INPUT_TOUCHPAD", "1");
++    if (m_types & UDev_Touchscreen)
++        udev_enumerate_add_match_property(ue, "ID_INPUT_TOUCHSCREEN", "1");
++    if (m_types & UDev_Keyboard)
++        udev_enumerate_add_match_property(ue, "ID_INPUT_KEYBOARD", "1");
++
++    if (udev_enumerate_scan_devices(ue) != 0) {
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++        qWarning() << "UDeviceHelper scan connected devices for enumeration failed";
++#endif
++        return devices;
++    }
++
++    udev_list_entry *entry;
++    udev_list_entry_foreach (entry, udev_enumerate_get_list_entry(ue)) {
++        const char *syspath = udev_list_entry_get_name(entry);
++        udev_device *udevice = udev_device_new_from_syspath(m_udev, syspath);
++        QString candidate = QString::fromUtf8(udev_device_get_devnode(udevice));
++        if (candidate.startsWith(QLatin1String("/dev/input/event")))
++            devices << candidate;
++
++        udev_device_unref(udevice);
++    }
++    udev_enumerate_unref(ue);
++
++#ifdef QT_QPA_UDEVICE_HELPER_DEBUG
++    qWarning() << "UDeviceHelper found matching devices" << devices;
++#endif
++
++    return devices;
++}
++
++void QUDeviceHelper::handleUDevNotification()
++{
++    if (!m_udevMonitor)
++        return;
++
++    struct udev_device *dev;
++    QString devNode;
++    QUDeviceTypes types = QFlag(UDev_Unknown);
++
++    dev = udev_monitor_receive_device(m_udevMonitor);
++    if (!dev)
++        goto cleanup;
++
++    const char *action;
++    action = udev_device_get_action(dev);
++    if (!action)
++        goto cleanup;
++
++    const char *str;
++    str = udev_device_get_devnode(dev);
++    if (!str)
++        goto cleanup;
++
++    devNode = QString::fromUtf8(str);
++    if (!devNode.startsWith(QLatin1String("/dev/input/event")))
++        goto cleanup;
++
++    // does not increase the refcount
++    dev = udev_device_get_parent_with_subsystem_devtype(dev, "input", 0);
++    if (!dev)
++        goto cleanup;
++
++    types = checkDeviceType(dev);
++
++    if (types && (qstrcmp(action, "add") == 0))
++        emit deviceDetected(devNode, types);
++
++    if (types && (qstrcmp(action, "remove") == 0))
++        emit deviceRemoved(devNode, types);
++
++cleanup:
++    udev_device_unref(dev);
++}
++
++QUDeviceHelper::QUDeviceTypes QUDeviceHelper::checkDeviceType(udev_device *dev)
++{
++    QUDeviceTypes types = QFlag(UDev_Unknown);
++
++    if ((m_types & UDev_Keyboard) && (qstrcmp(udev_device_get_property_value(dev, "ID_INPUT_KEYBOARD"), "1") == 0 )) {
++        const char *capabilities_key = udev_device_get_sysattr_value(dev, "capabilities/key");
++        QStringList val = QString::fromUtf8(capabilities_key).split(QString::fromUtf8(" "), QString::SkipEmptyParts);
++        if (!val.isEmpty()) {
++            bool ok;
++            unsigned long long keys = val.last().toULongLong(&ok, 16);
++            if (ok) {
++                // Tests if the letter Q is valid for the device.  We may want to alter this test, but it seems mostly reliable.
++                bool test = (keys >> KEY_Q) & 1;
++                if (test)
++                    types |= UDev_Keyboard;
++            }
++        }
++    }
++
++    if ((m_types & UDev_Mouse) && (qstrcmp(udev_device_get_property_value(dev, "ID_INPUT_MOUSE"), "1") == 0))
++        types |= UDev_Mouse;
++
++    if ((m_types & UDev_Touchpad) && (qstrcmp(udev_device_get_property_value(dev, "ID_INPUT_TOUCHPAD"), "1") == 0))
++        types |= UDev_Touchpad;
++
++    if ((m_types & UDev_Touchscreen) && (qstrcmp(udev_device_get_property_value(dev, "ID_INPUT_TOUCHSCREEN"), "1") == 0))
++        types |= UDev_Touchscreen;
++
++    return types;
++}
++
++QT_END_NAMESPACE
+diff --git a/src/platformsupport/udev/qudevicehelper_p.h b/src/platformsupport/udev/qudevicehelper_p.h
+new file mode 100644
+index 0000000..b7544fa
+--- /dev/null
++++ b/src/platformsupport/udev/qudevicehelper_p.h
+@@ -0,0 +1,98 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QUDEVICEHELPER_H
++#define QUDEVICEHELPER_H
++
++#include <QObject>
++#include <QSocketNotifier>
++
++#include <libudev.h>
++
++QT_BEGIN_NAMESPACE
++
++class QUDeviceHelper : public QObject
++{
++    Q_OBJECT
++    Q_ENUMS(QUDeviceType)
++
++public:
++    enum QUDeviceType {
++        UDev_Unknown = 0x00,
++        UDev_Mouse = 0x01,
++        UDev_Touchpad = 0x02,
++        UDev_Touchscreen = 0x04,
++        UDev_Keyboard = 0x08
++    };
++    Q_DECLARE_FLAGS(QUDeviceTypes, QUDeviceType)
++
++    static QUDeviceHelper *createUDeviceHelper(QUDeviceTypes type, QObject *parent);
++    ~QUDeviceHelper();
++
++    QStringList scanConnectedDevices();
++
++signals:
++    void deviceDetected(const QString &deviceNode, QUDeviceTypes types);
++    void deviceRemoved(const QString &deviceNode, QUDeviceTypes types);
++
++private slots:
++    void handleUDevNotification();
++
++private:
++    QUDeviceHelper(QUDeviceTypes types, struct udev *udev, QObject *parent = 0);
++
++    void startWatching();
++    void stopWatching();
++
++    QUDeviceTypes checkDeviceType(struct udev_device *dev);
++
++    struct udev *m_udev;
++    QUDeviceTypes m_types;
++    struct udev_monitor *m_udevMonitor;
++    int m_udevMonitorFileDescriptor;
++    QSocketNotifier *m_udevSocketNotifier;
++};
++
++Q_DECLARE_OPERATORS_FOR_FLAGS(QUDeviceHelper::QUDeviceTypes)
++
++QT_END_NAMESPACE
++
++#endif // QUDEVICEHELPER_H
+diff --git a/src/platformsupport/udev/udev.pri b/src/platformsupport/udev/udev.pri
+index ac3f7df..48ad9d3 100644
+--- a/src/platformsupport/udev/udev.pri
++++ b/src/platformsupport/udev/udev.pri
+@@ -1,5 +1,5 @@
+ contains(QT_CONFIG, libudev) {
+-    HEADERS += $$PWD/qudevhelper_p.h
+-    SOURCES += $$PWD/qudevhelper.cpp
++    HEADERS += $$PWD/qudevhelper_p.h $$PWD/qudevicehelper_p.h
++    SOURCES += $$PWD/qudevhelper.cpp $$PWD/qudevicehelper.cpp
+     LIBS += -ludev
+ }
+diff --git a/src/plugins/generic/evdevkeyboard/evdevkeyboard.pro b/src/plugins/generic/evdevkeyboard/evdevkeyboard.pro
+index 47608b7..82edf17 100644
+--- a/src/plugins/generic/evdevkeyboard/evdevkeyboard.pro
++++ b/src/plugins/generic/evdevkeyboard/evdevkeyboard.pro
+@@ -10,7 +10,7 @@ HEADERS = \
+     qevdevkeyboardhandler.h \
+     qevdevkeyboardmanager.h
+ 
+-QT += core-private
++QT += core-private platformsupport-private
+ 
+ LIBS += -ludev
+ 
+diff --git a/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.cpp b/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.cpp
+index cb23d3a..0938fdc 100644
+--- a/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.cpp
++++ b/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.cpp
+@@ -42,28 +42,27 @@
+ #include "qevdevkeyboardmanager.h"
+ 
+ #include <QStringList>
+-#include <QDebug>
+ #include <QCoreApplication>
+ 
+-#include <linux/input.h>
+-#include <linux/kd.h>
+-
+ //#define QT_QPA_KEYMAP_DEBUG
+ 
++#ifdef QT_QPA_KEYMAP_DEBUG
++#include <QDebug>
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ QEvdevKeyboardManager::QEvdevKeyboardManager(const QString &key, const QString &specification)
+-    : m_udev(0), m_udevMonitor(0), m_udevMonitorFileDescriptor(-1), m_udevSocketNotifier(0)
+ {
+     Q_UNUSED(key);
+ 
+-    bool useUDev = false;
++    bool useUDev = true;
+     QStringList args = specification.split(QLatin1Char(':'));
+     QStringList devices;
+ 
+     foreach (const QString &arg, args) {
+-        if (arg.startsWith("udev") && !arg.contains("no")) {
+-            useUDev = true;
++        if (arg.startsWith("udev") && arg.contains("no")) {
++            useUDev = false;
+         } else if (arg.startsWith("/dev/")) {
+             // if device is specified try to use it
+             devices.append(arg);
+@@ -71,182 +70,69 @@ QEvdevKeyboardManager::QEvdevKeyboardManager(const QString &key, const QString &
+         }
+     }
+ 
++    // build new specification without /dev/ elements
+     m_spec = args.join(":");
+ 
+     // add all keyboards for devices specified in the argument list
+     foreach (const QString &device, devices)
+         addKeyboard(device);
+ 
+-    // no udev and no devices specified, try a fallback
+-    if (!useUDev && devices.isEmpty()) {
+-        addKeyboard();
+-        return;
+-    }
++    if (useUDev) {
++#ifdef QT_QPA_KEYMAP_DEBUG
++        qWarning() << "Use UDev for device discovery";
++#endif
++
++        m_udeviceHelper = QUDeviceHelper::createUDeviceHelper(QUDeviceHelper::UDev_Keyboard, this);
++        if (m_udeviceHelper) {
++            // scan and add already connected keyboards
++            QStringList devices = m_udeviceHelper->scanConnectedDevices();
++            foreach (QString device, devices) {
++                addKeyboard(device);
++            }
+ 
+-    m_udev = udev_new();
+-    if (!m_udev) {
+-        qWarning() << "Failed to read udev configuration. Try to open a keyboard without it";
+-        addKeyboard();
+-    } else {
+-        // Look for already attached devices:
+-        parseConnectedDevices();
+-        // Watch for device add/remove
+-        startWatching();
++            connect(m_udeviceHelper, SIGNAL(deviceDetected(QString,QUDeviceTypes)), this, SLOT(addKeyboard(QString)));
++            connect(m_udeviceHelper, SIGNAL(deviceRemoved(QString,QUDeviceTypes)), this, SLOT(removeKeyboard(QString)));
++        }
+     }
+ }
+ 
+ QEvdevKeyboardManager::~QEvdevKeyboardManager()
+ {
+-    // cleanup udev related resources
+-    stopWatching();
+-    if (m_udev)
+-        udev_unref(m_udev);
+-
+-    // cleanup all resources of connected keyboards
+     qDeleteAll(m_keyboards);
+     m_keyboards.clear();
+ }
+ 
+-void QEvdevKeyboardManager::addKeyboard(const QString &devnode)
++void QEvdevKeyboardManager::addKeyboard(const QString &deviceNode)
+ {
++#ifdef QT_QPA_KEYMAP_DEBUG
++    qWarning() << "Adding keyboard at" << deviceNode;
++#endif
++
+     QString specification = m_spec;
+-    QString deviceString = devnode;
+ 
+-    if (!deviceString.isEmpty()) {
++    if (!deviceNode.isEmpty()) {
+         specification.append(":");
+-        specification.append(deviceString);
+-    } else {
+-        deviceString = "default";
++        specification.append(deviceNode);
+     }
+ 
+-#ifdef QT_QPA_KEYMAP_DEBUG
+-    qWarning() << "Adding keyboard at" << deviceString;
+-#endif
+-
+     QEvdevKeyboardHandler *keyboard;
+     keyboard = QEvdevKeyboardHandler::createLinuxInputKeyboardHandler("EvdevKeyboard", specification);
+     if (keyboard)
+-        m_keyboards.insert(deviceString, keyboard);
++        m_keyboards.insert(deviceNode, keyboard);
+     else
+-        qWarning() << "Failed to open keyboard";
++        qWarning("Failed to open keyboard");
+ }
+ 
+-void QEvdevKeyboardManager::removeKeyboard(const QString &devnode)
++void QEvdevKeyboardManager::removeKeyboard(const QString &deviceNode)
+ {
+-    if (m_keyboards.contains(devnode)) {
++    if (m_keyboards.contains(deviceNode)) {
+ #ifdef QT_QPA_KEYMAP_DEBUG
+-    qWarning() << "Removing keyboard at" << devnode;
++        qWarning() << "Removing keyboard at" << deviceNode;
+ #endif
+-        QEvdevKeyboardHandler *keyboard = m_keyboards.value(devnode);
+-        m_keyboards.remove(devnode);
++        QEvdevKeyboardHandler *keyboard = m_keyboards.value(deviceNode);
++        m_keyboards.remove(deviceNode);
+         delete keyboard;
+     }
+ }
+ 
+-void QEvdevKeyboardManager::startWatching()
+-{
+-    m_udevMonitor = udev_monitor_new_from_netlink(m_udev, "udev");
+-    if (!m_udevMonitor) {
+-#ifdef QT_QPA_KEYMAP_DEBUG
+-        qWarning("Unable to create an Udev monitor. No devices can be detected.");
+-#endif
+-        return;
+-    }
+-
+-    udev_monitor_filter_add_match_subsystem_devtype(m_udevMonitor, "input", NULL);
+-    udev_monitor_enable_receiving(m_udevMonitor);
+-    m_udevMonitorFileDescriptor = udev_monitor_get_fd(m_udevMonitor);
+-
+-    m_udevSocketNotifier = new QSocketNotifier(m_udevMonitorFileDescriptor, QSocketNotifier::Read, this);
+-    connect(m_udevSocketNotifier, SIGNAL(activated(int)), this, SLOT(deviceDetected()));
+-}
+-
+-void QEvdevKeyboardManager::stopWatching()
+-{
+-    if (m_udevSocketNotifier)
+-        delete m_udevSocketNotifier;
+-
+-    if (m_udevMonitor)
+-        udev_monitor_unref(m_udevMonitor);
+-
+-    m_udevSocketNotifier = 0;
+-    m_udevMonitor = 0;
+-    m_udevMonitorFileDescriptor = 0;
+-}
+-
+-void QEvdevKeyboardManager::deviceDetected()
+-{
+-    if (!m_udevMonitor)
+-        return;
+-
+-    struct udev_device *dev;
+-    dev = udev_monitor_receive_device(m_udevMonitor);
+-    if (!dev)
+-        return;
+-
+-    if (qstrcmp(udev_device_get_action(dev), "add") == 0) {
+-        checkDevice(dev);
+-    } else {
+-        // We can't determine what the device was, so we handle false positives outside of this class
+-        QString str = udev_device_get_devnode(dev);
+-        if (!str.isEmpty())
+-            removeKeyboard(str);
+-    }
+-
+-    udev_device_unref(dev);
+-}
+-
+-void QEvdevKeyboardManager::parseConnectedDevices()
+-{
+-    struct udev_enumerate *enumerate;
+-    struct udev_list_entry *devices;
+-    struct udev_list_entry *dev_list_entry;
+-    struct udev_device *dev;
+-    const char *str;
+-
+-    enumerate = udev_enumerate_new(m_udev);
+-    udev_enumerate_add_match_subsystem(enumerate, "input");
+-    udev_enumerate_scan_devices(enumerate);
+-    devices = udev_enumerate_get_list_entry(enumerate);
+-
+-    udev_list_entry_foreach(dev_list_entry, devices) {
+-        str = udev_list_entry_get_name(dev_list_entry);
+-        dev = udev_device_new_from_syspath(m_udev, str);
+-        checkDevice(dev);
+-    }
+-
+-    udev_enumerate_unref(enumerate);
+-}
+-
+-void QEvdevKeyboardManager::checkDevice(udev_device *dev)
+-{
+-    const char *str;
+-    QString devnode;
+-
+-    str = udev_device_get_devnode(dev);
+-    if (!str)
+-        return;
+-
+-    devnode = str;
+-
+-    dev = udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
+-    if (!dev)
+-        return;
+-
+-    str = udev_device_get_sysattr_value(dev, "capabilities/key");
+-    QStringList val = QString(str).split(' ', QString::SkipEmptyParts);
+-
+-    bool ok;
+-    unsigned long long keys = val.last().toULongLong(&ok, 16);
+-    if (!ok)
+-        return;
+-
+-    // Tests if the letter Q is valid for the device.  We may want to alter this test, but it seems mostly reliable.
+-    bool test = (keys >> KEY_Q) & 1;
+-    if (test) {
+-        addKeyboard(devnode);
+-        return;
+-    }
+-}
+-
+ QT_END_NAMESPACE
+diff --git a/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.h b/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.h
+index 3caed6f..c776af2 100644
+--- a/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.h
++++ b/src/plugins/generic/evdevkeyboard/qevdevkeyboardmanager.h
+@@ -44,12 +44,12 @@
+ 
+ #include "qevdevkeyboardhandler.h"
+ 
++#include <QtPlatformSupport/private/qudevicehelper_p.h>
++
+ #include <QObject>
+ #include <QHash>
+ #include <QSocketNotifier>
+ 
+-#include <libudev.h>
+-
+ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+@@ -62,24 +62,13 @@ public:
+     ~QEvdevKeyboardManager();
+ 
+ private slots:
+-    void deviceDetected();
++    void addKeyboard(const QString &deviceNode = QString());
++    void removeKeyboard(const QString &deviceNode);
+ 
+ private:
+-    void startWatching();
+-    void stopWatching();
+-    void parseConnectedDevices();
+-    void checkDevice(struct udev_device *dev);
+-
+-    void addKeyboard(const QString &devnode = QString());
+-    void removeKeyboard(const QString &devnode);
+-
+     QString m_spec;
+     QHash<QString,QEvdevKeyboardHandler*> m_keyboards;
+-
+-    struct udev *m_udev;
+-    struct udev_monitor *m_udevMonitor;
+-    int m_udevMonitorFileDescriptor;
+-    QSocketNotifier *m_udevSocketNotifier;
++    QUDeviceHelper *m_udeviceHelper;
+ };
+ 
+ QT_END_HEADER

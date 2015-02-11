@@ -1,0 +1,216 @@
+diff --git a/src/3rdparty/javascriptcore/JavaScriptCore/runtime/Collector.cpp b/src/3rdparty/javascriptcore/JavaScriptCore/runtime/Collector.cpp
+index 36269ff..d5adbd7 100644
+--- a/src/3rdparty/javascriptcore/JavaScriptCore/runtime/Collector.cpp
++++ b/src/3rdparty/javascriptcore/JavaScriptCore/runtime/Collector.cpp
+@@ -1151,11 +1151,6 @@ void Heap::markRoots()
+     // Mark explicitly registered roots.
+     markProtectedObjects(markStack);
+ 
+-#if QT_BUILD_SCRIPT_LIB
+-    if (m_globalData->clientData)
+-        m_globalData->clientData->mark(markStack);
+-#endif
+-
+     // Mark misc. other roots.
+     if (m_markListSet && m_markListSet->size())
+         MarkedArgumentBuffer::markLists(markStack, *m_markListSet);
+@@ -1167,6 +1162,11 @@ void Heap::markRoots()
+     if (m_globalData->firstStringifierToMark)
+         JSONObject::markStringifiers(markStack, m_globalData->firstStringifierToMark);
+ 
++#if QT_BUILD_SCRIPT_LIB
++    if (m_globalData->clientData)
++        m_globalData->clientData->mark(markStack);
++#endif
++
+     markStack.drain();
+     markStack.compact();
+ 
+diff --git a/src/script/api/qscriptengine.cpp b/src/script/api/qscriptengine.cpp
+index 8b3b844..3b1cb9d 100644
+--- a/src/script/api/qscriptengine.cpp
++++ b/src/script/api/qscriptengine.cpp
+@@ -1253,6 +1253,9 @@ void QScriptEnginePrivate::setContextFlags(JSC::ExecState *exec, uint flags)
+ }
+ 
+ 
++// This function is called by JSC after all objects reachable by JSC itself
++// have been processed (see JSC::Heap::markRoots()).
++// Here we should mark additional objects managed by QtScript.
+ void QScriptEnginePrivate::mark(JSC::MarkStack& markStack)
+ {
+     Q_Q(QScriptEngine);
+diff --git a/src/script/bridge/qscriptqobject.cpp b/src/script/bridge/qscriptqobject.cpp
+index 2bc2547..15288a7 100644
+--- a/src/script/bridge/qscriptqobject.cpp
++++ b/src/script/bridge/qscriptqobject.cpp
+@@ -97,7 +97,7 @@ struct QObjectConnection
+                 QObjectDelegate *inst = static_cast<QObjectDelegate*>(delegate);
+                 if ((inst->ownership() == QScriptEngine::ScriptOwnership)
+                     || ((inst->ownership() == QScriptEngine::AutoOwnership)
+-                        && inst->value() && !inst->value()->parent())) {
++                        && !inst->hasParent())) {
+                     senderWrapper = JSC::JSValue();
+                 } else {
+                     markStack.append(senderWrapper);
+@@ -2199,6 +2199,10 @@ QObjectData::~QObjectData()
+     }
+ }
+ 
++// This function assumes all objects reachable elsewhere in the JS environment
++// (stack, heap) have been marked already (see QScriptEnginePrivate::mark()).
++// This determines whether any of QtScript's internal QObject wrappers are only
++// weakly referenced and can be discarded.
+ void QObjectData::mark(JSC::MarkStack& markStack)
+ {
+     if (connectionManager)
+@@ -2207,10 +2211,14 @@ void QObjectData::mark(JSC::MarkStack& markStack)
+         QList<QScript::QObjectWrapperInfo>::iterator it;
+         for (it = wrappers.begin(); it != wrappers.end(); ) {
+             const QScript::QObjectWrapperInfo &info = *it;
+-            // ### don't mark if there are no other references.
+-            // we need something like isMarked()
+-            markStack.append(info.object);
+-            ++it;
++            if (JSC::Heap::isCellMarked(info.object)) {
++                ++it;
++            } else if (info.isCollectableWhenWeaklyReferenced()) {
++                it = wrappers.erase(it);
++            } else {
++                markStack.append(info.object);
++                ++it;
++            }
+         }
+     }
+ }
+diff --git a/src/script/bridge/qscriptqobject_p.h b/src/script/bridge/qscriptqobject_p.h
+index 837368e..c6ebc8a 100644
+--- a/src/script/bridge/qscriptqobject_p.h
++++ b/src/script/bridge/qscriptqobject_p.h
+@@ -95,6 +95,7 @@ public:
+ 
+     inline QObject *value() const { return data->value; }
+     inline void setValue(QObject* value) { data->value = value; }
++    inline bool hasParent() const { return data->value && data->value->parent(); }
+ 
+     inline QScriptEngine::ValueOwnership ownership() const
+         { return data->ownership; }
+@@ -138,6 +139,25 @@ struct QObjectWrapperInfo
+     QScriptObject *object;
+     QScriptEngine::ValueOwnership ownership;
+     QScriptEngine::QObjectWrapOptions options;
++
++    // Returns true if this wrapper can be garbage-collected when there are no
++    // other references to it in the JS environment (weak reference), otherwise
++    // returns false (should not be collected).
++    bool isCollectableWhenWeaklyReferenced() const
++    {
++        switch (ownership) {
++        case QScriptEngine::ScriptOwnership:
++            return true;
++        case QScriptEngine::AutoOwnership: {
++            QScriptObjectDelegate *delegate = object->delegate();
++            Q_ASSERT(delegate && (delegate->type() == QScriptObjectDelegate::QtObject));
++            return !static_cast<QObjectDelegate *>(delegate)->hasParent();
++        }
++        default:
++            break;
++        }
++        return false;
++    }
+ };
+ 
+ class QObjectData // : public QObjectUserData
+diff --git a/tests/auto/qscriptengine/tst_qscriptengine.cpp b/tests/auto/qscriptengine/tst_qscriptengine.cpp
+index 23ab8ef..b1b416c 100644
+--- a/tests/auto/qscriptengine/tst_qscriptengine.cpp
++++ b/tests/auto/qscriptengine/tst_qscriptengine.cpp
+@@ -248,6 +248,8 @@ private slots:
+     void dateConversionJSQt();
+     void dateConversionQtJS();
+     void stringListFromArrayWithEmptyElement();
++    void collectQObjectWithCachedWrapper_data();
++    void collectQObjectWithCachedWrapper();
+ };
+ 
+ tst_QScriptEngine::tst_QScriptEngine()
+@@ -6142,5 +6144,79 @@ void tst_QScriptEngine::stringListFromArrayWithEmptyElement()
+              QStringList() << "" << "hello");
+ }
+ 
++// QTBUG-21993
++void tst_QScriptEngine::collectQObjectWithCachedWrapper_data()
++{
++    QTest::addColumn<QString>("program");
++    QTest::addColumn<QString>("ownership");
++    QTest::addColumn<bool>("giveParent");
++    QTest::addColumn<bool>("shouldBeCollected");
++
++    QString prog1 = QString::fromLatin1("newQObject(ownership, parent)");
++    QTest::newRow("unassigned,cpp,no-parent") << prog1 << "cpp" << false << false;
++    QTest::newRow("unassigned,cpp,parent") << prog1 << "cpp" << true << false;
++    QTest::newRow("unassigned,auto,no-parent") << prog1 << "auto" << false << true;
++    QTest::newRow("unassigned,auto,parent") << prog1 << "auto" << true << false;
++    QTest::newRow("unassigned,script,no-parent") << prog1 << "script" << false << true;
++    QTest::newRow("unassigned,script,parent") << prog1 << "script" << true << true;
++
++    QString prog2 = QString::fromLatin1("myObject = { foo: newQObject(ownership, parent) }; myObject.foo");
++    QTest::newRow("global-property-property,cpp,no-parent") << prog2 << "cpp" << false << false;
++    QTest::newRow("global-property-property,cpp,parent") << prog2 << "cpp" << true << false;
++    QTest::newRow("global-property-property,auto,no-parent") << prog2 << "auto" << false << false;
++    QTest::newRow("global-property-property,auto,parent") << prog2 << "auto" << true << false;
++    QTest::newRow("global-property-property,script,no-parent") << prog2 << "script" << false << false;
++    QTest::newRow("global-property-property,script,parent") << prog2 << "script" << true << false;
++
++}
++
++void tst_QScriptEngine::collectQObjectWithCachedWrapper()
++{
++    struct Functions {
++        static QScriptValue newQObject(QScriptContext *ctx, QScriptEngine *eng)
++        {
++            QString ownershipString = ctx->argument(0).toString();
++            QScriptEngine::ValueOwnership ownership;
++            if (ownershipString == "cpp")
++                ownership = QScriptEngine::QtOwnership;
++            else if (ownershipString == "auto")
++                ownership = QScriptEngine::AutoOwnership;
++            else if (ownershipString == "script")
++                ownership = QScriptEngine::ScriptOwnership;
++            else
++                return ctx->throwError("Ownership specifier 'cpp', 'auto' or 'script' expected");
++
++            QObject *parent = ctx->argument(1).toQObject();
++            return eng->newQObject(new QObject(parent), ownership,
++                                   QScriptEngine::PreferExistingWrapperObject);
++        }
++    };
++
++    QFETCH(QString, program);
++    QFETCH(QString, ownership);
++    QFETCH(bool, giveParent);
++    QFETCH(bool, shouldBeCollected);
++
++    QScriptEngine eng;
++    eng.globalObject().setProperty("ownership", ownership);
++    eng.globalObject().setProperty("newQObject",
++                                   eng.newFunction(Functions::newQObject));
++
++    QObject parent;
++    eng.globalObject().setProperty("parent",
++                                   giveParent ? eng.newQObject(&parent)
++                                              : QScriptValue(QScriptValue::NullValue));
++
++    QPointer<QObject> ptr = eng.evaluate(program).toQObject();
++    QVERIFY(ptr != 0);
++    QVERIFY(ptr->parent() == (giveParent ? &parent : 0));
++
++    collectGarbage_helper(eng);
++
++    if (ptr && shouldBeCollected)
++        QEXPECT_FAIL("", "Test can fail because the garbage collector is conservative", Continue);
++    QCOMPARE(ptr == 0, shouldBeCollected);
++}
++
+ QTEST_MAIN(tst_QScriptEngine)
+ #include "tst_qscriptengine.moc"

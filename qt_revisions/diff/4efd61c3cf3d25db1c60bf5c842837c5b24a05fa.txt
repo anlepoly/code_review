@@ -1,0 +1,315 @@
+diff --git a/src/plugins/platforms/qnx/qqnxeventthread.cpp b/src/plugins/platforms/qnx/qqnxeventthread.cpp
+index 1e08dbc..768d508 100644
+--- a/src/plugins/platforms/qnx/qqnxeventthread.cpp
++++ b/src/plugins/platforms/qnx/qqnxeventthread.cpp
+@@ -49,9 +49,11 @@
+ 
+ #include <cctype>
+ 
+-QQnxEventThread::QQnxEventThread(screen_context_t context)
++QQnxEventThread::QQnxEventThread(screen_context_t context,
++                                 QQnxScreenEventHandler *screenEventHandler)
+     : QThread(),
+       m_screenContext(context),
++      m_screenEventHandler(screenEventHandler),
+       m_quit(false)
+ {
+ }
+@@ -69,7 +71,6 @@ void QQnxEventThread::injectKeyboardEvent(int flags, int sym, int mod, int scan,
+ 
+ void QQnxEventThread::run()
+ {
+-    QQnxScreenEventHandler eventHandler;
+     screen_event_t event;
+ 
+     // create screen event
+@@ -106,7 +107,7 @@ void QQnxEventThread::run()
+     #endif
+             m_quit = true;
+         } else {
+-            eventHandler.handleEvent(event, qnxType);
++            m_screenEventHandler->handleEvent(event, qnxType);
+         }
+     }
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxeventthread.h b/src/plugins/platforms/qnx/qqnxeventthread.h
+index 0bb26c3..aa6186a 100644
+--- a/src/plugins/platforms/qnx/qqnxeventthread.h
++++ b/src/plugins/platforms/qnx/qqnxeventthread.h
+@@ -48,10 +48,12 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class QQnxScreenEventHandler;
++
+ class QQnxEventThread : public QThread
+ {
+ public:
+-    explicit QQnxEventThread(screen_context_t context);
++    QQnxEventThread(screen_context_t context, QQnxScreenEventHandler *screenEventHandler);
+     virtual ~QQnxEventThread();
+ 
+     static void injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap);
+@@ -63,6 +65,7 @@ private:
+     void shutdown();
+ 
+     screen_context_t m_screenContext;
++    QQnxScreenEventHandler *m_screenEventHandler;
+     bool m_quit;
+ };
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.cpp b/src/plugins/platforms/qnx/qqnxintegration.cpp
+index 43f474a..40e2998 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.cpp
++++ b/src/plugins/platforms/qnx/qqnxintegration.cpp
+@@ -46,6 +46,7 @@
+ #include "qqnxnavigatoreventhandler.h"
+ #include "qqnxrasterbackingstore.h"
+ #include "qqnxscreen.h"
++#include "qqnxscreeneventhandler.h"
+ #include "qqnxwindow.h"
+ #include "qqnxvirtualkeyboard.h"
+ #include "qqnxclipboard.h"
+@@ -85,6 +86,7 @@ QQnxIntegration::QQnxIntegration()
+     , m_paintUsingOpenGL(false)
+     , m_eventDispatcher(createUnixEventDispatcher())
+     , m_services(0)
++    , m_screenEventHandler(new QQnxScreenEventHandler())
+ #ifndef QT_NO_CLIPBOARD
+     , m_clipboard(0)
+ #endif
+@@ -106,7 +108,7 @@ QQnxIntegration::QQnxIntegration()
+     QQnxGLContext::initialize();
+ 
+     // Create/start event thread
+-    m_eventThread = new QQnxEventThread(m_screenContext);
++    m_eventThread = new QQnxEventThread(m_screenContext, m_screenEventHandler);
+     m_eventThread->start();
+ 
+     // Create/start navigator event handler
+@@ -145,6 +147,8 @@ QQnxIntegration::~QQnxIntegration()
+     qDebug() << "QQnx: platform plugin shutdown begin";
+ #endif
+ 
++    delete m_screenEventHandler;
++
+     // Destroy input context
+     delete m_inputContext;
+ 
+@@ -342,6 +346,11 @@ void QQnxIntegration::createDisplays()
+         QQnxScreen *screen = new QQnxScreen(m_screenContext, displays[i], i==0);
+         m_screens.append(screen);
+         screenAdded(screen);
++
++        QObject::connect(m_screenEventHandler, SIGNAL(newWindowCreated(void *)),
++                         screen, SLOT(newWindowCreated(void *)));
++        QObject::connect(m_screenEventHandler, SIGNAL(windowClosed(void *)),
++                         screen, SLOT(windowClosed(void *)));
+     }
+ }
+ 
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.h b/src/plugins/platforms/qnx/qqnxintegration.h
+index ef654bf..5a5e2c6 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.h
++++ b/src/plugins/platforms/qnx/qqnxintegration.h
+@@ -57,6 +57,7 @@ class QQnxAbstractVirtualKeyboard;
+ class QQnxWindow;
+ class QQnxServices;
+ class QQnxScreen;
++class QQnxScreenEventHandler;
+ 
+ #ifndef QT_NO_CLIPBOARD
+ class QQnxClipboard;
+@@ -115,6 +116,7 @@ private:
+     QAbstractEventDispatcher *m_eventDispatcher;
+     QQnxServices *m_services;
+     QList<QQnxScreen*> m_screens;
++    QQnxScreenEventHandler *m_screenEventHandler;
+ #ifndef QT_NO_CLIPBOARD
+     mutable QQnxClipboard* m_clipboard;
+ #endif
+diff --git a/src/plugins/platforms/qnx/qqnxscreen.cpp b/src/plugins/platforms/qnx/qqnxscreen.cpp
+index c9ac003..183878b 100644
+--- a/src/plugins/platforms/qnx/qqnxscreen.cpp
++++ b/src/plugins/platforms/qnx/qqnxscreen.cpp
+@@ -42,6 +42,7 @@
+ #include "qqnxscreen.h"
+ #include "qqnxwindow.h"
+ 
++#include <QtCore/QThread>
+ #ifdef QQNXSCREEN_DEBUG
+ #    include <QtCore/QDebug>
+ #endif
+@@ -260,6 +261,13 @@ void QQnxScreen::updateHierarchy()
+     for (it = m_childWindows.constBegin(); it != m_childWindows.constEnd(); ++it)
+         (*it)->updateZorder(topZorder);
+ 
++    topZorder++;
++    Q_FOREACH (screen_window_t overlay, m_overlays) {
++        if (screen_set_window_property_iv(overlay, SCREEN_PROPERTY_ZORDER, &topZorder) != 0)
++            qWarning("QQnxScreen: failed to update z order for overlay, errno=%d", errno);
++        topZorder++;
++    }
++
+     // After a hierarchy update, we need to force a flush on all screens.
+     // Right now, all screens share a context.
+     screen_flush_context( m_screenContext, 0 );
+@@ -291,5 +299,44 @@ void QQnxScreen::keyboardHeightChanged(int height)
+     QWindowSystemInterface::handleScreenAvailableGeometryChange(screen(), availableGeometry());
+ }
+ 
++void QQnxScreen::addOverlayWindow(screen_window_t window)
++{
++    m_overlays.append(window);
++    updateHierarchy();
++}
++
++void QQnxScreen::removeOverlayWindow(screen_window_t window)
++{
++    const int numOverlaysRemoved = m_overlays.removeAll(window);
++    if (numOverlaysRemoved > 0)
++        updateHierarchy();
++}
++
++void QQnxScreen::newWindowCreated(void *window)
++{
++    Q_ASSERT(thread() == QThread::currentThread());
++    const screen_window_t windowHandle = reinterpret_cast<screen_window_t>(window);
++    screen_display_t display = NULL;
++    if (screen_get_window_property_pv(windowHandle, SCREEN_PROPERTY_DISPLAY, (void**)&display) != 0) {
++        qWarning("QQnx: Failed to get screen for window, errno=%d", errno);
++        return;
++    }
++
++    if (display == nativeDisplay()) {
++        // A window was created on this screen. If we don't know about this window yet, it means
++        // it was not created by Qt, but by some foreign library like the multimedia renderer, which
++        // creates an overlay window when playing a video.
++        // Treat all foreign windows as overlays here.
++        if (!findWindow(windowHandle))
++            addOverlayWindow(windowHandle);
++    }
++}
++
++void QQnxScreen::windowClosed(void *window)
++{
++    Q_ASSERT(thread() == QThread::currentThread());
++    const screen_window_t windowHandle = reinterpret_cast<screen_window_t>(window);
++    removeOverlayWindow(windowHandle);
++}
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxscreen.h b/src/plugins/platforms/qnx/qqnxscreen.h
+index a39689d..fb05dfd 100644
+--- a/src/plugins/platforms/qnx/qqnxscreen.h
++++ b/src/plugins/platforms/qnx/qqnxscreen.h
+@@ -91,10 +91,17 @@ public:
+ 
+     QSharedPointer<QQnxRootWindow> rootWindow() const { return m_rootWindow; }
+ 
++public Q_SLOTS:
++    void newWindowCreated(void *window);
++    void windowClosed(void *window);
++
+ private Q_SLOTS:
+     void keyboardHeightChanged(int height);
+ 
+ private:
++    void addOverlayWindow(screen_window_t window);
++    void removeOverlayWindow(screen_window_t window);
++
+     screen_context_t m_screenContext;
+     screen_display_t m_display;
+     QSharedPointer<QQnxRootWindow> m_rootWindow;
+@@ -111,6 +118,7 @@ private:
+     QPlatformOpenGLContext *m_platformContext;
+ 
+     QList<QQnxWindow *> m_childWindows;
++    QList<screen_window_t> m_overlays;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp b/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
+index 46780b6..9640c65 100644
+--- a/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
++++ b/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
+@@ -106,6 +106,10 @@ bool QQnxScreenEventHandler::handleEvent(screen_event_t event, int qnxType)
+         handlePointerEvent(event);
+         break;
+ 
++    case SCREEN_EVENT_CREATE:
++        handleCreateEvent(event);
++        break;
++
+     case SCREEN_EVENT_CLOSE:
+         handleCloseEvent(event);
+         break;
+@@ -456,19 +460,28 @@ void QQnxScreenEventHandler::handleTouchEvent(screen_event_t event, int qnxType)
+ 
+ void QQnxScreenEventHandler::handleCloseEvent(screen_event_t event)
+ {
+-    // Query the window that was closed
+-    void *handle;
+-    int result = screen_get_event_property_pv(event, SCREEN_PROPERTY_WINDOW, &handle);
+-    if (result != 0) {
+-        qFatal("QQNX: failed to query event window, errno=%d", errno);
+-    }
+-    screen_window_t qnxWindow = static_cast<screen_window_t>(handle);
++    screen_window_t window = 0;
++    if (screen_get_event_property_pv(event, SCREEN_PROPERTY_WINDOW, (void**)&window) != 0)
++        qFatal("QQnx: failed to query window property, errno=%d", errno);
++
++    Q_EMIT windowClosed(window);
+ 
+     // Map window handle to top-level QWindow
+-    QWindow *w = QQnxIntegration::window(qnxWindow);
++    QWindow *w = QQnxIntegration::window(window);
+     if (w != 0) {
+         QWindowSystemInterface::handleCloseEvent(w);
+     }
+ }
+ 
++void QQnxScreenEventHandler::handleCreateEvent(screen_event_t event)
++{
++    screen_window_t window = 0;
++    if (screen_get_event_property_pv(event, SCREEN_PROPERTY_WINDOW, (void**)&window) != 0)
++        qFatal("QQnx: failed to query window property, errno=%d", errno);
++
++    Q_EMIT newWindowCreated(window);
++}
++
++#include "moc_qqnxscreeneventhandler.cpp"
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventhandler.h b/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
+index 3653517..06cc7a0 100644
+--- a/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
++++ b/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
+@@ -48,8 +48,9 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QQnxScreenEventHandler
++class QQnxScreenEventHandler : public QObject
+ {
++    Q_OBJECT
+ public:
+     QQnxScreenEventHandler();
+ 
+@@ -58,11 +59,16 @@ public:
+ 
+     static void injectKeyboardEvent(int flags, int sym, int mod, int scan, int cap);
+ 
++Q_SIGNALS:
++    void newWindowCreated(void *window);
++    void windowClosed(void *window);
++
+ private:
+     void handleKeyboardEvent(screen_event_t event);
+     void handlePointerEvent(screen_event_t event);
+     void handleTouchEvent(screen_event_t event, int qnxType);
+     void handleCloseEvent(screen_event_t event);
++    void handleCreateEvent(screen_event_t event);
+ 
+ private:
+     enum {

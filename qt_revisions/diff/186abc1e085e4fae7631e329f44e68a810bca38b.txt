@@ -1,0 +1,233 @@
+diff --git a/src/qml/qml/qqmlbinding.cpp b/src/qml/qml/qqmlbinding.cpp
+index d2a02dc..45c2273 100644
+--- a/src/qml/qml/qqmlbinding.cpp
++++ b/src/qml/qml/qqmlbinding.cpp
+@@ -186,6 +186,10 @@ void QQmlBinding::update(QQmlPropertyPrivate::WriteFlags flags)
+     if (!enabledFlag() || !context() || !context()->isValid())
+         return;
+ 
++    // Check that the target has not been deleted
++    if (QQmlData::wasDeleted(object()))
++        return;
++
+     QQmlTrace trace("General Binding Update");
+     trace.addDetail("URL", m_url);
+     trace.addDetail("Line", m_lineNumber);
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index e97bbb1..4849db0 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -195,6 +195,10 @@ public:
+     QHash<int, QObject *> *attachedProperties() const;
+ 
+     static inline bool wasDeleted(QObject *);
++
++    static void markAsDeleted(QObject *);
++    static inline void setQueuedForDeletion(QObject *);
++
+ private:
+     // For objectNameNotifier and attachedProperties
+     mutable QQmlDataExtended *extendedData;
+@@ -205,7 +209,7 @@ bool QQmlData::wasDeleted(QObject *object)
+     if (!object)
+         return true;
+ 
+-    QObjectPrivate *priv = QObjectPrivate::get(const_cast<QObject *>(object));
++    QObjectPrivate *priv = QObjectPrivate::get(object);
+     if (priv->wasDeleted)
+         return true;
+ 
+@@ -213,6 +217,17 @@ bool QQmlData::wasDeleted(QObject *object)
+            static_cast<QQmlData *>(priv->declarativeData)->isQueuedForDeletion;
+ }
+ 
++void QQmlData::setQueuedForDeletion(QObject *object)
++{
++    if (object) {
++        if (QObjectPrivate *priv = QObjectPrivate::get(object)) {
++            if (!priv->wasDeleted && priv->declarativeData) {
++                static_cast<QQmlData *>(priv->declarativeData)->isQueuedForDeletion = true;
++            }
++        }
++    }
++}
++
+ QQmlNotifierEndpoint *QQmlData::notify(int index)
+ {
+     Q_ASSERT(index <= 0xFFFF);
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 2717ed3..91c86a2 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -422,6 +422,10 @@ void QQmlPrivate::qdeclarativeelement_destructor(QObject *o)
+             d->context->destroy();
+             d->context = 0;
+         }
++
++        // Mark this object as in the process of deletion to
++        // prevent it resolving in bindings
++        QQmlData::markAsDeleted(o);
+     }
+ }
+ 
+@@ -468,6 +472,16 @@ int QQmlData::endpointCount(int index)
+     return count;
+ }
+ 
++void QQmlData::markAsDeleted(QObject *o)
++{
++    QQmlData::setQueuedForDeletion(o);
++
++    QObjectPrivate *p = QObjectPrivate::get(o);
++    for (QList<QObject *>::iterator it = p->children.begin(), end = p->children.end(); it != end; ++it) {
++        QQmlData::markAsDeleted(*it);
++    }
++}
++
+ void QQmlEnginePrivate::init()
+ {
+     Q_Q(QQmlEngine);
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index b41fb28..dbbaa23 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -358,6 +358,10 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+     if (!context || !context->isValid()) 
+         return;
+ 
++    // Check that the target has not been deleted
++    if (QQmlData::wasDeleted(binding->target))
++        return;
++
+     QQmlTrace trace("V4 Binding Update");
+     trace.addDetail("URL", context->url);
+     trace.addDetail("Line", binding->line);
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index 65c395e..7cb14fb 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -106,6 +106,14 @@ void QV8Bindings::Binding::update(QQmlPropertyPrivate::WriteFlags flags)
+     if (!enabledFlag())
+         return;
+ 
++    QQmlContextData *context = parent->context();
++    if (!context || !context->isValid())
++        return;
++
++    // Check that the target has not been deleted
++    if (QQmlData::wasDeleted(object()))
++        return;
++
+     QQmlTrace trace("V8 Binding Update");
+     trace.addDetail("URL", parent->url());
+     trace.addDetail("Line", instruction->line);
+@@ -113,12 +121,9 @@ void QV8Bindings::Binding::update(QQmlPropertyPrivate::WriteFlags flags)
+ 
+     QQmlBindingProfiler prof(parent->urlString(), instruction->line, instruction->column);
+ 
+-    QQmlContextData *context = parent->context();
+-    if (!context || !context->isValid())
+-        return;
+-
+     if (!updatingFlag()) {
+         setUpdatingFlag(true);
++
+         QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
+ 
+         bool isUndefined = false;
+diff --git a/tests/auto/qml/qqmlecmascript/data/ContainerComponent.qml b/tests/auto/qml/qqmlecmascript/data/ContainerComponent.qml
+new file mode 100644
+index 0000000..459c82a
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/ContainerComponent.qml
+@@ -0,0 +1,4 @@
++import QtQuick 2.0
++
++Item {
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/ContentComponent.qml b/tests/auto/qml/qqmlecmascript/data/ContentComponent.qml
+new file mode 100644
+index 0000000..7710624
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/ContentComponent.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++
++Item {
++    property bool validParentChildCount: parent && (parent.children.length > 0)
++
++    onValidParentChildCountChanged: {
++        if (!validParentChildCount) console.warn('WARNING: Invalid parent child count')
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/bindingSuppression.qml b/tests/auto/qml/qqmlecmascript/data/bindingSuppression.qml
+new file mode 100644
+index 0000000..2d3bfa1
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/bindingSuppression.qml
+@@ -0,0 +1,17 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    Component.onCompleted: {
++        var container = containerComponent.createObject(root)
++        contentComponent.createObject(container)
++        container.destroy();
++
++        pendingEvents.process()
++    }
++
++    property Component containerComponent: ContainerComponent {}
++    property Component contentComponent: ContentComponent {}
++}
++
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 11819c5..781d594 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -258,6 +258,7 @@ private slots:
+     void replaceBinding();
+     void deleteRootObjectInCreation();
+     void onDestruction();
++    void bindingSuppression();
+ 
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+@@ -6658,6 +6659,35 @@ void tst_qqmlecmascript::onDestruction()
+     }
+ }
+ 
++struct EventProcessor : public QObject
++{
++    Q_OBJECT
++public:
++    Q_INVOKABLE void process()
++    {
++        QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++        QCoreApplication::processEvents();
++    }
++};
++
++void tst_qqmlecmascript::bindingSuppression()
++{
++    QQmlEngine engine;
++    EventProcessor processor;
++    engine.rootContext()->setContextProperty("pendingEvents", &processor);
++
++    transientErrorsMsgCount = 0;
++    QtMsgHandler old = qInstallMsgHandler(transientErrorsMsgHandler);
++
++    QQmlComponent c(&engine, testFileUrl("bindingSuppression.qml"));
++    QObject *obj = c.create();
++    QVERIFY(obj != 0);
++    delete obj;
++
++    qInstallMsgHandler(old);
++    QCOMPARE(transientErrorsMsgCount, 0);
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

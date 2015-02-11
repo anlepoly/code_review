@@ -1,0 +1,309 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.h b/src/plugins/platforms/cocoa/qcocoawindow.h
+index debc8c4..32d9044 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.h
++++ b/src/plugins/platforms/cocoa/qcocoawindow.h
+@@ -55,12 +55,14 @@ class QT_PREPEND_NAMESPACE(QCocoaWindow);
+     @public QCocoaWindow *m_cocoaPlatformWindow;
+ }
+ 
++- (void)clearPlatformWindow;
+ - (BOOL)canBecomeKeyWindow;
+ @end
+ 
+ @interface QNSPanel : NSPanel {
+     @public QT_PREPEND_NAMESPACE(QCocoaWindow) *m_cocoaPlatformWindow;
+ }
++- (void)clearPlatformWindow;
+ - (BOOL)canBecomeKeyWindow;
+ @end
+ 
+@@ -105,6 +107,7 @@ public:
+     void setOpacity(qreal level);
+     bool setKeyboardGrabEnabled(bool grab);
+     bool setMouseGrabEnabled(bool grab);
++    QMargins frameMargins() const;
+ 
+     WId winId() const;
+     void setParent(const QPlatformWindow *window);
+@@ -122,6 +125,10 @@ public:
+ 
+     bool setWindowModified(bool modified) Q_DECL_OVERRIDE;
+ 
++    void setFrameStrutEventsEnabled(bool enabled);
++    bool frameStrutEventsEnabled() const
++        { return m_frameStrutEventsEnabled; }
++
+     void setMenubar(QCocoaMenuBar *mb);
+     QCocoaMenuBar *menubar() const;
+ protected:
+@@ -152,6 +159,7 @@ public: // for QNSView
+     QCocoaMenuBar *m_menubar;
+ 
+     bool m_hasModalSession;
++    bool m_frameStrutEventsEnabled;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.mm b/src/plugins/platforms/cocoa/qcocoawindow.mm
+index 971bc3c..96a27c2 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.mm
++++ b/src/plugins/platforms/cocoa/qcocoawindow.mm
+@@ -47,7 +47,7 @@
+ #include "qnsview.h"
+ #include <QtCore/private/qcore_mac_p.h>
+ #include <qwindow.h>
+-#include <QtGui/qwindowsysteminterface.h>
++#include <QtGui/QWindowSystemInterface>
+ #include <qpa/qplatformscreen.h>
+ 
+ #include <Cocoa/Cocoa.h>
+@@ -55,6 +55,45 @@
+ 
+ #include <QDebug>
+ 
++static bool isMouseEvent(NSEvent *ev)
++{
++    switch ([ev type]) {
++    case NSLeftMouseDown:
++    case NSLeftMouseUp:
++    case NSRightMouseDown:
++    case NSRightMouseUp:
++    case NSMouseMoved:
++    case NSLeftMouseDragged:
++    case NSRightMouseDragged:
++        return true;
++    default:
++        return false;
++    }
++}
++
++@interface NSWindow (CocoaWindowCategory)
++- (void) clearPlatformWindow;
++- (NSRect) legacyConvertRectFromScreen:(NSRect) rect;
++@end
++
++@implementation NSWindow (CocoaWindowCategory)
++- (void) clearPlatformWindow
++{
++}
++
++- (NSRect) legacyConvertRectFromScreen:(NSRect) rect
++{
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7
++    if (QSysInfo::QSysInfo::MacintoshVersion >= QSysInfo::MV_10_7) {
++        return [self convertRectFromScreen: rect];
++    }
++#endif
++    NSRect r = rect;
++    r.origin = [self convertScreenToBase:rect.origin];
++    return r;
++}
++@end
++
+ @implementation QNSWindow
+ 
+ - (BOOL)canBecomeKeyWindow
+@@ -77,6 +116,30 @@
+     return canBecomeMain;
+ }
+ 
++- (void) sendEvent: (NSEvent*) theEvent
++{
++    [super sendEvent: theEvent];
++
++    if (!m_cocoaPlatformWindow)
++        return;
++
++    if (m_cocoaPlatformWindow->frameStrutEventsEnabled() && isMouseEvent(theEvent)) {
++        NSPoint loc = [theEvent locationInWindow];
++        NSRect windowFrame = [self legacyConvertRectFromScreen:[self frame]];
++        NSRect contentFrame = [[self contentView] frame];
++        if (NSMouseInRect(loc, windowFrame, NO) &&
++            !NSMouseInRect(loc, contentFrame, NO))
++        {
++            QNSView *contentView = (QNSView *) m_cocoaPlatformWindow->contentView();
++            [contentView handleFrameStrutMouseEvent: theEvent];
++        }
++    }
++}
++
++- (void)clearPlatformWindow
++{
++    m_cocoaPlatformWindow = 0;
++}
+ 
+ @end
+ 
+@@ -92,6 +155,31 @@
+     return YES;
+ }
+ 
++- (void) sendEvent: (NSEvent*) theEvent
++{
++    [super sendEvent: theEvent];
++
++    if (!m_cocoaPlatformWindow)
++        return;
++
++    if (m_cocoaPlatformWindow->frameStrutEventsEnabled() && isMouseEvent(theEvent)) {
++        NSPoint loc = [theEvent locationInWindow];
++        NSRect windowFrame = [self legacyConvertRectFromScreen:[self frame]];
++        NSRect contentFrame = [[self contentView] frame];
++        if (NSMouseInRect(loc, windowFrame, NO) &&
++            !NSMouseInRect(loc, contentFrame, NO))
++        {
++            QNSView *contentView = (QNSView *) m_cocoaPlatformWindow->contentView();
++            [contentView handleFrameStrutMouseEvent: theEvent];
++        }
++    }
++}
++
++- (void)clearPlatformWindow
++{
++    m_cocoaPlatformWindow = 0;
++}
++
+ @end
+ 
+ QCocoaWindow::QCocoaWindow(QWindow *tlw)
+@@ -102,6 +190,7 @@ QCocoaWindow::QCocoaWindow(QWindow *tlw)
+     , m_glContext(0)
+     , m_menubar(0)
+     , m_hasModalSession(false)
++    , m_frameStrutEventsEnabled(false)
+ {
+ #ifdef QT_COCOA_ENABLE_WINDOW_DEBUG
+     qDebug() << "QCocoaWindow::QCocoaWindow" << this;
+@@ -118,6 +207,10 @@ QCocoaWindow::QCocoaWindow(QWindow *tlw)
+ 
+ QCocoaWindow::~QCocoaWindow()
+ {
++#ifdef QT_COCOA_ENABLE_WINDOW_DEBUG
++    qDebug() << "QCocoaWindow::~QCocoaWindow" << this;
++#endif
++
+     clearNSWindow(m_nsWindow);
+     [m_contentView release];
+     [m_nsWindow release];
+@@ -542,6 +635,7 @@ void QCocoaWindow::setNSWindow(NSWindow *window)
+ void QCocoaWindow::clearNSWindow(NSWindow *window)
+ {
+     [window setDelegate:nil];
++    [window clearPlatformWindow];
+     [[NSNotificationCenter defaultCenter] removeObserver:m_contentView];
+ }
+ 
+@@ -616,3 +710,19 @@ QCocoaMenuBar *QCocoaWindow::menubar() const
+ {
+     return m_menubar;
+ }
++
++QMargins QCocoaWindow::frameMargins() const
++{
++    NSRect frameW = [m_nsWindow frame];
++    NSRect frameC = [m_nsWindow contentRectForFrameRect:frameW];
++
++    return QMargins(frameW.origin.x - frameC.origin.x,
++        (frameW.origin.y + frameW.size.height) - (frameC.origin.y + frameC.size.height),
++        (frameW.origin.x + frameW.size.width) - (frameC.origin.x + frameC.size.width),
++        frameC.origin.y - frameW.origin.y);
++}
++
++void QCocoaWindow::setFrameStrutEventsEnabled(bool enabled)
++{
++    m_frameStrutEventsEnabled = enabled;
++}
+diff --git a/src/plugins/platforms/cocoa/qnsview.h b/src/plugins/platforms/cocoa/qnsview.h
+index 2e8d9ce..b7218a4 100644
+--- a/src/plugins/platforms/cocoa/qnsview.h
++++ b/src/plugins/platforms/cocoa/qnsview.h
+@@ -88,6 +88,7 @@ QT_END_NAMESPACE
+ - (void)otherMouseDown:(NSEvent *)theEvent;
+ - (void)otherMouseDragged:(NSEvent *)theEvent;
+ - (void)otherMouseUp:(NSEvent *)theEvent;
++- (void)handleFrameStrutMouseEvent:(NSEvent *)theEvent;
+ 
+ - (int) convertKeyCode : (QChar)keyCode;
+ - (Qt::KeyboardModifiers) convertKeyModifiers : (ulong)modifierFlags;
+diff --git a/src/plugins/platforms/cocoa/qnsview.mm b/src/plugins/platforms/cocoa/qnsview.mm
+index 6c83e42..aeecefa 100644
+--- a/src/plugins/platforms/cocoa/qnsview.mm
++++ b/src/plugins/platforms/cocoa/qnsview.mm
+@@ -310,6 +310,39 @@ static QTouchDevice *touchDevice = 0;
+     QWindowSystemInterface::handleMouseEvent(m_window, timestamp, qtWindowPoint, qtScreenPoint, m_buttons);
+ }
+ 
++- (void)handleFrameStrutMouseEvent:(NSEvent *)theEvent
++{
++    // get m_buttons in sync
++    NSEventType ty = [theEvent type];
++    switch (ty) {
++    case NSLeftMouseDown:
++        m_buttons |= Qt::LeftButton;
++        break;
++    case NSLeftMouseUp:
++         m_buttons &= QFlag(~int(Qt::LeftButton));
++         break;
++    case NSRightMouseDown:
++        m_buttons |= Qt::RightButton;
++        break;
++    case NSRightMouseUp:
++        m_buttons &= QFlag(~int(Qt::RightButton));
++        break;
++    default:
++        break;
++    }
++
++    NSWindow *window = [self window];
++    int windowHeight = [window frame].size.height;
++    NSPoint windowPoint = [theEvent locationInWindow];
++    NSPoint nsViewPoint = [self convertPoint: windowPoint fromView: nil];
++    QPoint qtWindowPoint = QPoint(windowPoint.x, windowHeight - windowPoint.y);
++    NSPoint screenPoint = [window convertBaseToScreen : windowPoint];
++    QPoint qtScreenPoint = QPoint(screenPoint.x, qt_mac_flipYCoordinate(screenPoint.y));
++
++    ulong timestamp = [theEvent timestamp] * 1000;
++    QWindowSystemInterface::handleFrameStrutMouseEvent(m_window, timestamp, qtWindowPoint, qtScreenPoint, m_buttons);
++}
++
+ - (void)mouseDown:(NSEvent *)theEvent
+ {
+     if (m_platformWindow->m_activePopupWindow) {
+diff --git a/src/widgets/styles/qmacstyle_mac.mm b/src/widgets/styles/qmacstyle_mac.mm
+index fecc4f2b..ced29c8 100644
+--- a/src/widgets/styles/qmacstyle_mac.mm
++++ b/src/widgets/styles/qmacstyle_mac.mm
+@@ -2584,7 +2584,7 @@ int QMacStyle::pixelMetric(PixelMetric metric, const QStyleOption *opt, const QW
+         ret = 1;
+         break;
+     case PM_DockWidgetFrameWidth:
+-        ret = 2;
++        ret = 0;
+         break;
+     case PM_DockWidgetTitleMargin:
+         ret = 0;
+diff --git a/src/widgets/widgets/qdockwidget.cpp b/src/widgets/widgets/qdockwidget.cpp
+index 4a1ce17..bbea8d3 100644
+--- a/src/widgets/widgets/qdockwidget.cpp
++++ b/src/widgets/widgets/qdockwidget.cpp
+@@ -943,18 +943,11 @@ void QDockWidgetPrivate::nonClientAreaMouseEvent(QMouseEvent *event)
+         case QEvent::NonClientAreaMouseMove:
+             if (state == 0 || !state->dragging)
+                 break;
++
++#ifndef Q_OS_MAC
+             if (state->nca) {
+                 endDrag();
+             }
+-#ifdef Q_OS_MAC
+-            else { // workaround for lack of mouse-grab on Mac
+-                QMainWindowLayout *layout = qt_mainwindow_layout(qobject_cast<QMainWindow *>(q->parentWidget()));
+-                Q_ASSERT(layout != 0);
+-
+-                q->move(event->globalPos() - state->pressPos);
+-                if (!state->ctrlDrag)
+-                    layout->hover(state->widgetItem, event->globalPos());
+-            }
+ #endif
+             break;
+         case QEvent::NonClientAreaMouseButtonRelease:

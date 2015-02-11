@@ -1,0 +1,138 @@
+diff --git a/src/declarative/qml/qdeclarativevme.cpp b/src/declarative/qml/qdeclarativevme.cpp
+index c008e2a..a37964a 100644
+--- a/src/declarative/qml/qdeclarativevme.cpp
++++ b/src/declarative/qml/qdeclarativevme.cpp
+@@ -826,9 +826,11 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+                 CTXT->v8bindings->configBinding(instr.value, target, scope, 
+                                                 instr.property, instr.line,
+                                                 instr.column);
+-            bindValues.push(binding);
+-            binding->m_mePtr = &bindValues.top();
+-            binding->addToObject(target, QDeclarativePropertyPrivate::bindingIndex(instr.property));
++            if (binding) {
++                bindValues.push(binding);
++                binding->m_mePtr = &bindValues.top();
++                binding->addToObject(target, QDeclarativePropertyPrivate::bindingIndex(instr.property));
++            }
+         QML_END_INSTR(StoreV8Binding)
+ 
+         QML_BEGIN_INSTR(StoreValueSource)
+diff --git a/src/declarative/qml/v8/qv8bindings.cpp b/src/declarative/qml/v8/qv8bindings.cpp
+index 84ed892..b21ddf5 100644
+--- a/src/declarative/qml/v8/qv8bindings.cpp
++++ b/src/declarative/qml/v8/qv8bindings.cpp
+@@ -167,18 +167,41 @@ QV8Bindings::QV8Bindings(const QString &program, int index, int line,
+         v8::HandleScope handle_scope;
+         v8::Context::Scope scope(engine->context());
+ 
+-        v8::Local<v8::Script> script = engine->qmlModeCompile(program, compiled->name, line);
+-        v8::Local<v8::Value> result = script->Run(engine->contextWrapper()->sharedContext());
++        v8::Local<v8::Script> script;
++        bool compileFailed = false;
++        {
++            v8::TryCatch try_catch;
++            script = engine->qmlModeCompile(program, compiled->name, line);
++            if (try_catch.HasCaught()) {
++                // The binding was not compiled.  There are some exceptional cases which the
++                // expression rewriter does not rewrite properly (e.g., \r-terminated lines
++                // are not rewritten correctly but this bug is demed out-of-scope to fix for
++                // performance reasons; see QTBUG-24064).
++                compileFailed = true;
++                QDeclarativeError error;
++                error.setDescription(QString(QLatin1String("Exception occurred during compilation of binding at line: %1")).arg(line));
++                v8::Local<v8::Message> message = try_catch.Message();
++                if (!message.IsEmpty())
++                    QDeclarativeExpressionPrivate::exceptionToError(message, error);
++                QDeclarativeEnginePrivate::get(engine->engine())->warning(error);
++                compiled->v8bindings[index] = qPersistentNew(v8::Array::New());
++            }
++        }
+ 
+-        if (result->IsArray()) 
+-            compiled->v8bindings[index] = qPersistentNew(v8::Local<v8::Array>::Cast(result));
++        if (!compileFailed) {
++            v8::Local<v8::Value> result = script->Run(engine->contextWrapper()->sharedContext());
++            if (result->IsArray()) {
++                compiled->v8bindings[index] = qPersistentNew(v8::Local<v8::Array>::Cast(result));
++            }
++        }
+     }
+ 
+     url = compiled->url;
+     functions = qPersistentNew(compiled->v8bindings[index]);
+     bindingsCount = functions->Length();
+-    bindings = new QV8Bindings::Binding[bindingsCount];
+-    
++    if (bindingsCount)
++        bindings = new QV8Bindings::Binding[bindingsCount];
++
+     setContext(context);
+ }
+ 
+@@ -195,6 +218,9 @@ QDeclarativeAbstractBinding *QV8Bindings::configBinding(int index, QObject *targ
+                                                         const QDeclarativePropertyData &p,
+                                                         int line, int column)
+ {
++    if (bindingsCount <= index) // initialization failed.
++        return 0;
++
+     QV8Bindings::Binding *rv = bindings + index;
+ 
+     rv->line = line;
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/data/v8bindingException.qml b/tests/auto/declarative/qdeclarativeecmascript/data/v8bindingException.qml
+new file mode 100644
+index 0000000..ff203e2
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativeecmascript/data/v8bindingException.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++
++// This test uses a multi-line string which has \r-terminated
++// string fragments.  The expression rewriter deliberately doesn't
++// handle \r-terminated string fragments (see QTBUG-24064) and thus
++// this test ensures that we don't crash when we encounter a
++// non-compilable binding such as this one.
++
++Item {
++    id: root
++
++    Component {
++        id: comp
++        Text {
++            property var value: ","
++            text: 'multi            line ' + value + 'str            ings'
++        }
++    }
++
++    Component.onCompleted: comp.createObject(root, { "value": undefined })
++}
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+index 219eac6..1c42d9d 100644
+--- a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
++++ b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+@@ -113,6 +113,7 @@ private slots:
+     void exceptionClearsOnReeval();
+     void exceptionSlotProducesWarning();
+     void exceptionBindingProducesWarning();
++    void compileInvalidBinding();
+     void transientErrors();
+     void shutdownErrors();
+     void compositePropertyType();
+@@ -1562,6 +1563,17 @@ void tst_qdeclarativeecmascript::exceptionBindingProducesWarning()
+     delete object;
+ }
+ 
++void tst_qdeclarativeecmascript::compileInvalidBinding()
++{
++    // QTBUG-23387: ensure that invalid bindings don't cause a crash.
++    QDeclarativeComponent component(&engine, testFileUrl("v8bindingException.qml"));
++    QString warning = component.url().toString() + ":16: SyntaxError: Unexpected token ILLEGAL";
++    QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    delete object;
++}
++
+ static int transientErrorsMsgCount = 0;
+ static void transientErrorsMsgHandler(QtMsgType, const char *)
+ {

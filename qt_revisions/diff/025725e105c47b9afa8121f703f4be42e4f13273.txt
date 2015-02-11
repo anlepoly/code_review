@@ -1,0 +1,2047 @@
+diff --git a/scripts/lib/perl5/QtQA/QMake/Project.pm b/scripts/lib/perl5/QtQA/QMake/Project.pm
+new file mode 100644
+index 0000000..bfc49b2
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/Project.pm
+@@ -0,0 +1,957 @@
++#############################################################################
++##
++## Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++## Contact: http://www.qt-project.org/
++##
++## This file is part of the Quality Assurance module of the Qt Toolkit.
++##
++## $QT_BEGIN_LICENSE:LGPL$
++## GNU Lesser General Public License Usage
++## This file may be used under the terms of the GNU Lesser General Public
++## License version 2.1 as published by the Free Software Foundation and
++## appearing in the file LICENSE.LGPL included in the packaging of this
++## file. Please review the following information to ensure the GNU Lesser
++## General Public License version 2.1 requirements will be met:
++## http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++##
++## In addition, as a special exception, Nokia gives you certain additional
++## rights. These rights are described in the Nokia Qt LGPL Exception
++## version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++##
++## GNU General Public License Usage
++## Alternatively, this file may be used under the terms of the GNU General
++## Public License version 3.0 as published by the Free Software Foundation
++## and appearing in the file LICENSE.GPL included in the packaging of this
++## file. Please review the following information to ensure the GNU General
++## Public License version 3.0 requirements will be met:
++## http://www.gnu.org/copyleft/gpl.html.
++##
++## Other Usage
++## Alternatively, this file may be used in accordance with the terms and
++## conditions contained in a signed written agreement between you and Nokia.
++##
++##
++##
++##
++##
++##
++## $QT_END_LICENSE$
++##
++#############################################################################
++
++package QtQA::QMake::Project;
++use strict;
++use warnings;
++
++use Carp;
++use English qw(-no_match_vars);
++use File::chdir;
++use File::Basename;
++use File::Temp;
++use Getopt::Long qw(GetOptions);
++use IO::File;
++use Readonly;
++use ReleaseAction qw(on_release);
++use List::MoreUtils qw(apply);
++use Text::ParseWords;
++
++use QtQA::QMake::Project::LazyValue;
++
++Readonly my $WINDOWS => ($OSNAME =~ m{win32}i);
++
++# Magic string denoting we've deliberately exited qmake early
++Readonly my $MAGIC_QMAKE_EXIT_STRING => __PACKAGE__.':EXITING';
++
++sub new
++{
++    my ($class, $makefile) = @_;
++
++    my $self = bless {
++        _die_on_error => 1, # whether to die when an error occurs
++        _qmake_count => 0,  # number of times qmake has been run (for testing)
++    }, $class;
++
++    if ($makefile) {
++        $self->set_makefile( $makefile );
++    }
++
++    $self->set_make( $self->_default_make( ) );
++
++    return $self;
++}
++
++sub set_makefile
++{
++    my ($self, $makefile) = @_;
++
++    $self->{ _makefile } = $makefile;
++
++    # Makefile changed, so everything needs to be resolved again.
++    $self->{ _resolved } = {};
++
++    return;
++}
++
++sub makefile
++{
++    my ($self) = @_;
++    return $self->{ _makefile };
++}
++
++sub set_make
++{
++    my ($self, $make) = @_;
++
++    $self->{ _make } = $make;
++
++    return;
++}
++
++sub make
++{
++    my ($self) = @_;
++
++    return $self->{ _make };
++}
++
++# Returns a reasonable default make command based on the platform.
++sub _default_make
++{
++    my ($self) = @_;
++
++    if ($WINDOWS) {
++        return 'nmake';
++    }
++
++    return 'make';
++}
++
++sub die_on_error
++{
++    my ($self) = @_;
++
++    return $self->{ _die_on_error };
++}
++
++sub set_die_on_error
++{
++    my ($self, $value) = @_;
++
++    $self->{ _die_on_error } = $value;
++    return;
++}
++
++sub _prepare_variable
++{
++    my ($self, @variable) = @_;
++
++    foreach my $variable (@variable) {
++        $self->{ _to_resolve }{ variable }{ $variable } = 1;
++    }
++
++    return;
++}
++
++sub _prepare_test
++{
++    my ($self, @test) = @_;
++
++    foreach my $test (@test) {
++        $self->{ _to_resolve }{ test }{ $test } = 1;
++    }
++
++    return;
++}
++
++sub _qx_or_croak
++{
++    my ($self, $cmd) = @_;
++
++    my $output = qx($cmd);
++    if ($? != 0) {
++        # If $output contains this magic, we deliberately exited, and the status can
++        # be ignored.
++        if ($output !~ m/\Q$MAGIC_QMAKE_EXIT_STRING\E/) {
++            croak __PACKAGE__.": command `$cmd' exited with status $?, output follows:\n$output\n";
++        }
++        return $output;
++    }
++
++    return $output;
++}
++
++# Returns a copy of %ENV with any make-related environment variables removed.
++sub _make_cleaned_env
++{
++    my ($self) = @_;
++
++    my %out = %ENV;
++
++    delete @out{qw(
++        MAKEFLAGS
++        MAKELEVEL
++        MFLAGS
++    )};
++
++    return %out;
++}
++
++# Returns the qmake command (as a single string) used to generate the given makefile.
++# Croaks on error.
++sub _discover_qmake_command
++{
++    my ($self, %args) = @_;
++
++    my $make = $self->make( );
++    my $makefile = $args{ makefile };
++
++    # Make sure we do not accidentally inherit any environment from
++    # some calling make (e.g. if we are invoked via `make check')
++    local %ENV = $self->_make_cleaned_env( );
++
++    my $cmd = qq{"$make" -f "$makefile" -n qmake 2>&1};
++    my $output = $self->_qx_or_croak( $cmd );
++    my @lines = reverse split( /\n/, $output );
++
++    my $out;
++    while (my $line = shift @lines) {
++        $line or next;
++        # last line should be the qmake command
++        if ($line =~ m{qmake}i) {
++            $out = $line;
++            chomp $out;
++            last;
++        }
++    }
++
++    if (!$out) {
++        croak __PACKAGE__.": could not figure out qmake command used to generate $makefile\n"
++             ."Output from command ($cmd):\n$output\n";
++    }
++
++    return $out;
++}
++
++# Given a qmake $command line (single string containing both command and args),
++# parses it and returns a hashref with the following:
++#
++#   qmake        => path to the qmake binary
++#   makefile     => path to the makefile
++#   projectfiles => arrayref, paths to the project (.pro) file(s)
++#   args         => arrayref, all args not covered by any of the above
++#
++sub _parse_qmake_command
++{
++    my ($self, $command) = @_;
++
++    my $qmake;
++    my $makefile;
++    my @projectfiles;
++    my @args;
++
++    # Getopt callbacks to accept a known qmake option onto @args
++    my $sub_accept_option_with_value = sub {
++        # Getopt already removes the -, we need to put it back
++        my ($option, $value) = @_;
++        push @args, "-$option", "$value";
++    };
++    my $sub_accept_option_without_value = sub {
++        my ($option) = @_;
++        push @args, "-$option";
++    };
++
++    # Getopt callback to accept an unknown qmake argument.
++    # This includes determining whether the argument should be handled as a
++    # .pro file; the logic for this must match qmake's own logic in option.cpp.
++    my $sub_accept_nonoption = sub {
++        my ($arg) = @_;
++
++        if ($arg =~ m{=}) {
++            # Arg containing '=' => it is a user variable assignment.
++            # Nothing special to be done.
++            push @args, $arg;
++        }
++        elsif ($arg =~ m{^-}) {
++            # Arg starts with '-' => it is probably a qmake argument we haven't
++            # handled.  For example, a new qmake argument added after this
++            # script was created.  In this case, our code needs to be updated
++            # to handle it safely, so we'll warn about it, then keep going.
++            warn __PACKAGE__ . ": in ($command), the meaning of $arg is unknown.\n";
++            push @args, $arg;
++        }
++        else {
++            # Otherwise, it is a .pro file.
++            push @projectfiles, $arg;
++        }
++    };
++
++    Getopt::Long::Configure( 'permute', 'pass_through' );
++
++    {
++        local @ARGV = $self->_split_command_to_words( $command );
++
++        # The first element is the qmake binary itself
++        $qmake = shift @ARGV;
++
++        GetOptions(
++            # All of these options are directly accepted into @args with no
++            # special behavior
++            map( { $_ => $sub_accept_option_without_value } qw(
++                project
++                makefile
++                Wnone
++                Wall
++                Wparser
++                Wlogic
++                Wdeprecated
++                d
++                help
++                v
++                after
++                norecursive
++                recursive
++                nocache
++                nodepend
++                nomoc
++                nopwd
++            )),
++            map( { $_ => $sub_accept_option_with_value } qw(
++                unset=s
++                query=s
++                cache=s
++                spec=s
++                t=s
++                tp=s
++            )),
++
++            # "-o <Makefile>" tells us which makefile to use
++            'o=s' => sub { (undef, $makefile) = @_ },
++
++            # anything else should be either a variable assignment or
++            # a .pro file, pass it to our function for handling these
++            '<>'  => $sub_accept_nonoption,
++        ) || croak __PACKAGE__.": command ($command) could not be parsed";
++    }
++
++    return {
++        qmake => $qmake,
++        makefile => $makefile,
++        projectfiles => \@projectfiles,
++        args => \@args,
++    };
++}
++
++# Given a single string representing a qmake command, split it into
++# a list of arguments as qmake's own main() would receive
++sub _split_command_to_words
++{
++    my ($self, $cmd) = @_;
++
++    if ($WINDOWS) {
++        # In theory, we should be using CommandLineToArgvW here.
++        # But do we really need to?  It seems quite annoying to use that
++        # from within perl (e.g. requires Inline::C or Win32::API).
++        #
++        # From reading the qmake sources, where the "qmake:" target is
++        # written, it appears that the command-line is simple enough that
++        # this will never actually matter.  Basically, the only special
++        # construct is if a path contains spaces, in which case double
++        # quotes are used around that path.
++        #
++        # Therefore, the Windows command-line handling is compatible
++        # with the Unix command-line handling, except that \ does not
++        # have a special meaning (so we have to escape it to keep them
++        # as-is).
++        $cmd =~ s{\\}{\\\\}g;
++    }
++
++    return Text::ParseWords::shellwords( $cmd );
++}
++
++sub _resolve
++{
++    my ($self) = @_;
++
++    eval {
++        $self->_resolve_impl( );
++    };
++    if ($@) {
++        my $error = $@;
++        # Make sure the error visibly comes from us
++        my $pkg = __PACKAGE__;
++        if ($error !~ m{^\Q$pkg\E: }) {
++            $error = "$pkg: $error";
++        }
++
++        if ($self->{ _die_on_error }) {
++            croak $error;
++        }
++        carp $error;
++    }
++
++    return;
++}
++
++sub _resolve_impl
++{
++    my ($self) = @_;
++
++    my $makefile = $self->makefile( ) || croak __PACKAGE__.': no makefile set';
++    local $CWD = dirname( $makefile );
++    $makefile = basename( $makefile );
++
++    my $to_resolve = delete $self->{ _to_resolve };
++    if (!$to_resolve) {
++        return $self->{ _resolved };
++    }
++
++    my $original_qmake_command = $self->_discover_qmake_command( makefile => $makefile );
++    my $parsed_qmake_command = $self->_parse_qmake_command( $original_qmake_command );
++
++    # We must have exactly one makefile and one .pro file to proceed
++    my $croak_command_error = sub {
++        croak __PACKAGE__.": in ($original_qmake_command), @_";
++    };
++
++    my $parsed_makefile = $parsed_qmake_command->{ makefile }
++        || $croak_command_error->( 'the output makefile could not be determined' );
++    my @projectfiles = @{$parsed_qmake_command->{ projectfiles }};
++    if (@projectfiles == 0) {
++        $croak_command_error->( 'the input .pro file could not be determined' );
++    }
++    if (@projectfiles > 1) {
++        $croak_command_error->( 'this is an unusual, unsupported qmake command' );
++    }
++    my ($projectfile) = @projectfiles;
++
++    # We're ready to run our qmake.
++    #
++    # We need to rewrite the input, and we don't care about the output, so we use
++    # temporary files for both of these.
++    #
++    # Note that the temporary files must be in the same directory as the real input/output
++    # files, because this significantly affects the behavior of qmake (e.g. values of $$PWD,
++    # $$_PRO_FILE_PWD_)
++    my $pkg_safe = __PACKAGE__;
++    $pkg_safe =~ s{[^a-zA-Z0-9]}{_}g;
++
++    my $temp_makefile = File::Temp->new(
++        TEMPLATE => "${pkg_safe}_Makefile.XXXXXX",
++        DIR => dirname( $parsed_makefile ),
++        UNLINK => 1,
++    );
++    # qmake may silently create various other makefiles behind our back (e.g. Debug, Release
++    # makefiles), so we have to arrange to delete those too.
++    my $delete_other_makefiles = $self->_delete_files_on_destroy( "$temp_makefile.*" );
++
++    my $temp_projectfile = File::Temp->new(
++        TEMPLATE => "${pkg_safe}_XXXXXX",
++        SUFFIX => '.pro',
++        DIR => dirname( $projectfile ),
++        UNLINK => 1,
++    );
++
++    my $temp_qmakefeatures_dir = File::Temp->newdir(
++        "${pkg_safe}_XXXXXX",
++        TMPDIR => 1,
++        CLEANUP => 1,
++    );
++
++    local $ENV{ QMAKEFEATURES } = "$temp_qmakefeatures_dir"
++        . ($ENV{ QMAKEFEATURES }
++          ? ':'.$ENV{ QMAKEFEATURES }
++          : '')
++    ;
++
++    $self->_write_modified_pro_prf(
++        input_filename => $projectfile,
++        output_pro => $temp_projectfile,
++        output_qmakefeatures => $temp_qmakefeatures_dir,
++        to_resolve => $to_resolve,
++    );
++
++    # Special case: default value of TARGET is defined by the .pro file name.
++    # We changed the .pro file name, but we can keep the old target by
++    # passing it on the command-line.
++    my $initial_target = fileparse( $projectfile, qr{\..+\z} );
++
++    # If it has a space, it needs to be double-quoted (i.e. quoted in shell,
++    # and also quoted in qmake)
++    if ($initial_target =~ m{ }) {
++        $initial_target = qq{"$initial_target"};
++    }
++
++    my $qmake_command = $self->_shquote(
++        $parsed_qmake_command->{ qmake },
++        '-o',
++        $temp_makefile,
++        "TARGET=$initial_target",
++        $temp_projectfile,
++        @{$parsed_qmake_command->{ args }},
++    );
++    my $qmake_output = $self->_qx_or_croak( "$qmake_command 2>&1" );
++
++    # _parse_qmake_output merges with current _resolved
++    $self->_parse_qmake_output( $qmake_output );
++
++    ++$self->{ _qmake_count };
++
++    return $self->{ _resolved };
++}
++
++# Returns a handle which, when it goes out of scope, will delete
++# all the files matching $glob.
++sub _delete_files_on_destroy
++{
++    my ($self, $glob) = @_;
++
++    return on_release {
++        my @files = glob( $glob );
++        return unless @files;
++
++        if (unlink( @files ) != @files) {
++            warn __PACKAGE__.': failed to remove some of ('
++                .join(', ', @files)
++                ."): $!";
++        }
++    };
++}
++
++sub _write_modified_pro_prf
++{
++    my ($self, %args) = @_;
++
++    my $input_filename = $args{ input_filename };
++    my $output_pro = $args{ output_pro };
++    my $output_qmakefeatures = $args{ output_qmakefeatures };
++    my $to_resolve = $args{ to_resolve };
++    my $pkg = __PACKAGE__;
++
++    my $prf_basename = '_qtqa_qmake_project_magic';
++    my $prf_name = "$output_qmakefeatures/$prf_basename.prf";
++
++    my $input_fh = IO::File->new( $input_filename, '<' )
++        || croak "$pkg: open $input_filename for read: $!";
++    my $prf_fh = IO::File->new( $prf_name, '>' )
++        || croak "$pkg: open $prf_name for write: $!";
++
++    # Copy the input .pro file unmodified ...
++    while (my $line = <$input_fh>) {
++        $output_pro->print( $line );
++    }
++
++    # Then arrange our .prf to be loaded.
++    # CONFIG are loaded from right-to-left, so we put ourself at
++    # the beginning to be loaded last.
++    $output_pro->printflush( qq|\n\nCONFIG=$prf_basename \$\$CONFIG\n| );
++
++    # And write all code to resolve the desired values to our prf.
++    # Set PWD back to the value from the .pro file, to hide that we're
++    # in a temporary .prf
++    $prf_fh->print( qq|PWD="\$\$_PRO_FILE_PWD_"\n| );
++    $prf_fh->print( qq|message("${pkg}::BEGIN")\n| );
++
++    # The name of a qmake variable which we can safely use without fear of colliding
++    # with any real qmake variables.
++    my $x = $pkg;
++    $x =~ s{[^a-zA-Z0-9]}{_}g;
++
++    # For each variable we've been asked to resolve, make qmake output lines like:
++    #
++    #   QtQA::QMake::Project::variable:CONFIG:val1
++    #   QtQA::QMake::Project::variable:CONFIG:val2
++    #   ...etc
++    #
++    # Most qmake variables are lists; in fact, all "normal" qmake variables
++    # are lists, but a few special substitutions (e.g. _PRO_FILE_PWD_) use
++    # special code.  We always try with "for" first to get proper lists,
++    # then fall back to a plain message otherwise.
++    #
++    foreach my $v (keys %{ $to_resolve->{ variable } || {} }) {
++        $prf_fh->print( <<"END_QMAKE" );
++
++unset(found_$x)
++for($x,$v) {
++    message("${pkg}::variable:$v:\$\$$x")               # normal variable (list)
++    found_$x=1
++}
++isEmpty(found_$x):message("${pkg}::variable:$v:\$\$$v") # special variable
++
++END_QMAKE
++
++    }
++
++    # For each test we've been asked to resolve, make qmake output lines like:
++    #
++    #   QtQA::QMake::Project::test:EXPR1:1
++    #   QtQA::QMake::Project::test:EXPR2:0
++    #   ...etc
++    #
++    foreach my $test (keys %{ $to_resolve->{ test } || {} }) {
++        $prf_fh->print(
++            qq|$x=0\n$test:$x=1\nmessage("${pkg}::test:$test:\$\$$x")\n|
++        );
++    }
++
++    $prf_fh->printflush( qq|\nunset($x)\nmessage("${pkg}::END")\n| );
++
++    # We've output everything we need.
++    # Kill qmake, to avoid wasting time creating the Makefile.
++    # In a basic benchmark (on Linux), this seems to save ~10-15% of runtime.
++    $prf_fh->printflush( qq|error($MAGIC_QMAKE_EXIT_STRING)\n| );
++
++    return;
++}
++
++sub _parse_qmake_output
++{
++    my ($self, $output) = @_;
++
++    my $pkg = quotemeta( __PACKAGE__ );
++    my $resolved = {
++        variable => {},
++        test => {},
++    };
++
++    my @lines = split( /\n/, $output );
++    my $parsing = 0;
++    foreach my $line (@lines) {
++        # We only parse between our BEGIN and END blocks, just in case something
++        # somewhere else is outputting lines which could confuse us.
++        if ($line =~ m/\b${pkg}::BEGIN/) {
++            $parsing = 1;
++        }
++        elsif ($line =~ m/\b${pkg}::END/) {
++            $parsing = 0;
++            last;
++        }
++        next unless $parsing;
++
++        if ($line =~ m/\b${pkg}::variable:([^:]+):(.+)\z/) {
++            push @{ $resolved->{ variable }{ $1 } }, $2;
++        }
++        elsif ($line =~ m/\b${pkg}::test:([^:]+):(.+)\z/) {
++            $resolved->{ test }{ $1 } = $2;
++        }
++    }
++
++    # Now merge what we resolved this time with what we resolved previously
++    my %resolved_variable = %{ $resolved->{ variable } };
++    my %resolved_test = %{ $resolved->{ test } };
++    $self->{ _resolved }{ variable } = {(
++        %{ $self->{ _resolved }{ variable } || {} },
++        %resolved_variable,
++    )};
++    $self->{ _resolved }{ test } = {(
++        %{ $self->{ _resolved }{ test } || {} },
++        %resolved_test,
++    )};
++
++    return;
++}
++
++# Given an arguments list, returns a single string representing that command in a shell.
++# This is far from complete, it only needs to work for all the qmake commands we're likely
++# to run, in sh and cmd.
++sub _shquote
++{
++    my ($self, @command) = @_;
++
++    # [ q{"Hello", world!}, q{nice day today} ] => q{"\"Hello\", world!" "nice day today"}
++
++    @command = apply { s{"}{\\"}g } @command;
++    @command = map { qq{"$_"} } @command;
++
++    return join(' ', @command);
++}
++
++sub values  ## no critic (Subroutines::ProhibitBuiltinHomonyms)
++            #  Yes, there is a builtin values(), but we are trying to follow the
++            #  API of the QMakeProject class in qmake/project.cpp, and this should
++            #  be harmless if always invoked using $object-> syntax.
++{
++    my ($self, $key) = @_;
++
++    $self->_prepare_variable( $key );
++
++    return $self->_lazy_value( project => $self, key => $key, type => 'variable' );
++}
++
++sub test
++{
++    my ($self, $key) = @_;
++
++    $self->_prepare_test( $key );
++
++    return $self->_lazy_value( project => $self, key => $key, type => 'test' );
++}
++
++sub _lazy_value
++{
++    my ($self, %args) = @_;
++
++    my $lazy = QtQA::QMake::Project::LazyValue->new( %args );
++
++    # FIXME: some way of also delaying on `wantarray' would be nice, but it
++    # currently doesn't seem feasible.  Note that returning a tied array
++    # doesn't work as expected (the entire tied array is expanded out into
++    # the caller when the function returns).
++    return wantarray ? $lazy->_resolved( ) : $lazy;
++}
++
++1;
++
++=head1 NAME
++
++QtQA::QMake::Project - perl interface to qmake .pro file(s)
++
++=head1 SYNOPSIS
++
++  use QtQA::QMake::Project;
++
++  # Load a project from a qmake-generated Makefile
++  my $prj = QtQA::QMake::Project->new( 'Makefile' );
++
++  # Perform arbitrary tests; may be anything usable from a qmake scope
++  my $testcase = $prj->test( 'testcase' );
++  my $insignificant = $prj->test( 'insignificant_test' );
++
++  # Retrieve arbitrary values (scalars or lists)
++  my $target = $prj->values( 'TARGET' );
++
++  return unless $testcase;
++
++  my $status = system( $target, '-silent' );
++  return unless $status;
++  if ($insignificant) {
++      warn "Test $target failed; ignoring, since it is insignificant";
++      return;
++  }
++  die "Test $target failed with exit status $status";
++
++Given a qmake-generated Makefile, provides an API for accessing any
++qmake variables or tests (scopes).
++
++=head1 DESCRIPTION
++
++For projects using qmake, .pro files are a convenient place to include
++all sorts of metadata.  However, making that metadata robustly readable
++by tools other than qmake has been rather challenging.  Typically the data
++is only able to flow in one direction: if some tool outside of the build
++system wants to access build system metadata, then qmake or some .prf
++files must be modified to explicitly export that data.  General programmatic
++access has not been possible.
++
++This module aims to solve this problem, allowing robust and correct reading
++of metadata from qmake project files without requiring any changes to qmake.
++
++=head2 HOW IT WORKS
++
++The qmake language is undefined, and there is no library form of qmake.
++This means that only qmake (the binary) can parse qmake (the language).
++Therefore, this module does not actually parse any qmake .pro files itself.
++qmake does all the parsing.
++
++Values are resolved roughly using a process like the following:
++
++=over
++
++=item *
++
++The given makefile is used to determine the correct qmake command,
++arguments and .pro file for this test.
++
++=item *
++
++A temporary .pro file is created containing the content of the real .pro
++file, as well as some additional code which outputs all of the requested
++variables / tests.
++
++=item *
++
++qmake is run over the temporary .pro file.  The Makefile generated by
++this qmake run is discarded.  The standard output of qmake is parsed to
++determine the values of the evaluated variables/tests.
++
++=back
++
++At a glance, it may seem odd that this package operates on Makefiles
++(qmake's output) rather than .pro files (qmake's input).  In fact, there
++is a good reason for this.
++
++Various context affects the behavior of qmake, including the directory
++containing the .pro file, the directory containing the Makefile, the
++arguments passed by the user, the presence of a .qmake.cache file, etc.
++The Makefile encapsulates all of this context.
++
++=head2 DELAYED EVALUATION
++
++Running qmake can be relatively slow (e.g. a few seconds for a cold
++run), and therefore the amount of qmake runs should be minimized.
++This is accomplished by delayed evaluation.
++
++Essentially, repeated calls to the B<test> or B<values> functions
++may not result in any qmake runs, until one of the values returned
++by these functions is actually used.  This is accomplished by
++returning blessed values with overloaded conversions.
++
++For example, consider this code:
++
++  my $project = QtQA::QMake::Project->new( 'Makefile' );
++  my $target = $project->values( 'TARGET' );
++  my $target_path = $project->values( 'target.path' );
++
++  say "$target will be installed to $target_path";  # QMAKE EXECUTED HERE!
++
++There is a single qmake execution, occurring only when the values
++are used by the caller.
++
++This means that writing the code a bit differently potentially would
++have much worse performance:
++
++  #### BAD EXAMPLE ####
++  my $project = QtQA::QMake::Project->new( 'Makefile' );
++
++  my $target = $project->values( 'TARGET' );
++  say "Processing $target";                            # QMAKE EXECUTED HERE!
++
++  my $target_path = $project->values( 'target.path' );
++  say "  -> will be installed to $target_path";        # QMAKE EXECUTED HERE!
++
++Therefore it is good to keep the delayed evaluation in mind, to avoid writing
++poorly performing code.
++
++As a caveat to all of the above, a list evaluation is never delayed. This is
++because the size of the list must always be known when a list is returned.
++
++  my $project = QtQA::QMake::Project->new( 'Makefile' );
++  my $target = $project->values( 'TARGET' );
++  my @config = $project->values( 'CONFIG' ); # QMAKE EXECUTED HERE!
++
++  say "configuration of $target: ".join(' ', @CONFIG);
++
++=head2 ERROR HANDLING
++
++By default, all errors are considered fatal, and raised as exceptions.
++This includes errors encountered during delayed evaluation.
++
++Errors can be made into non-fatal warnings by calling C<set_die_on_error( 0 )>.
++
++All exceptions and warnings match the pattern C<qr/^QtQA::QMake::Project:/>.
++
++=head2 FUNCTIONS
++
++The following functions are provided:
++
++=over
++
++=item B<new>()
++
++=item B<new>( MAKEFILE )
++
++Returns a new B<QtQA::QMake::Project> representing the qmake project for
++the given MAKEFILE.  If MAKEFILE is not provided, a makefile must be set
++via B<set_makefile> before attempting to retrieve any values from the project.
++
++=item B<test>( EXPRESSION )
++
++Returns a true value if the given qmake EXPRESSION evaluated to true,
++a false value otherwise.
++
++EXPRESSION must be a valid qmake "test" expression, as in the following
++construct:
++
++  EXPRESSION:message("The expression is true!")
++
++Compound expressions are fine.  For example:
++
++  if ($project->test( 'testcase:CONFIG(debug, debug|release)' )) {
++    say "Found testcase in debug mode.  Running test in debugger.";
++    ...
++  }
++
++The actual evaluation of the expression might be delayed until the returned
++value is used in a boolean context.  See L<DELAYED EVALUATION> for more
++details.
++
++=item B<values>( VARIABLE )
++
++Returns the value(s) of the given qmake VARIABLE.
++
++VARIABLE may be any valid qmake variable name, without any leading $$.
++
++Note that (almost) all qmake variables are inherently lists.  A variable
++with a single value, such as TARGET, is a list with one element.  A variable
++such as CONFIG contains many elements.
++
++In scalar context, this function will return only the variable's first value.
++In list context, it will return all values.
++
++Example:
++
++  my $target = $project->values( 'TARGET' );
++  my @testdata = $project->values( 'TESTDATA' );
++
++  if (@testdata) {
++    say "Deploying testdata for $target";
++    ...
++  }
++
++In scalar context, the actual evaluation of the variable might be delayed
++until the returned value is used in a string, integer or boolean context.
++See L<DELAYED EVALUATION> for more details.  In list context, evaluation is
++never delayed, due to implementation difficulties.
++
++=item B<makefile>()
++
++=item B<set_makefile>( MAKEFILE )
++
++Get or set the makefile referred to by this project.
++Note that changing the makefile invalidates any values resolved via the
++old makefile.
++
++=item B<make>()
++
++=item B<set_make>( MAKE )
++
++Get or set the "make" binary (with no arguments) to be used for parsing
++the makefile.  It should rarely be required to use these functions, as
++there is a reasonable default.
++
++=item B<die_on_error>()
++
++=item B<set_die_on_error>( BOOL )
++
++Get or set whether to raise exceptions when an error occurs.
++By default, exceptions are raised.
++
++Calling C<set_die_on_error( 0 )> will cause errors to be reported as
++warnings only.  When errors occur, undefined values will be returned
++by C<test> and C<values>.
++
++=back
++
++=head1 CAVEATS
++
++Write permissions are required to both the directory containing the .pro
++file and the directory containing the Makefile.
++
++The module tries to ensure that all evaluations are performed after
++qmake has processed default_post.prf and CONFIG - so, for example, if a
++.pro file contains CONFIG+=debug, QMAKE_CXXFLAGS would contain (e.g.) -g,
++as expected.  However, certain strange code could break this (such as
++some .prf files loaded via CONFIG themselves re-ordering the CONFIG
++variable).
++
++It is possible to use this module to run arbitrary qmake code.  It goes
++without saying that users are discouraged from abusing this :)
++
++Various exotic constructs may cause this code to fail; for example, .pro
++files with side effects.  The rule of thumb is: if C<make qmake> works for
++your project, then this package should also work.
++
++This module is (somewhat obviously) using qmake in a way it was not
++designed to be used.  Although it appears to work well in practice, it's
++fair to call this module one a big hack.
++
++=cut
+diff --git a/scripts/lib/perl5/QtQA/QMake/Project/LazyValue.pm b/scripts/lib/perl5/QtQA/QMake/Project/LazyValue.pm
+new file mode 100644
+index 0000000..aefd767
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/Project/LazyValue.pm
+@@ -0,0 +1,121 @@
++#############################################################################
++##
++## Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++## Contact: http://www.qt-project.org/
++##
++## This file is part of the Quality Assurance module of the Qt Toolkit.
++##
++## $QT_BEGIN_LICENSE:LGPL$
++## GNU Lesser General Public License Usage
++## This file may be used under the terms of the GNU Lesser General Public
++## License version 2.1 as published by the Free Software Foundation and
++## appearing in the file LICENSE.LGPL included in the packaging of this
++## file. Please review the following information to ensure the GNU Lesser
++## General Public License version 2.1 requirements will be met:
++## http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++##
++## In addition, as a special exception, Nokia gives you certain additional
++## rights. These rights are described in the Nokia Qt LGPL Exception
++## version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++##
++## GNU General Public License Usage
++## Alternatively, this file may be used under the terms of the GNU General
++## Public License version 3.0 as published by the Free Software Foundation
++## and appearing in the file LICENSE.GPL included in the packaging of this
++## file. Please review the following information to ensure the GNU General
++## Public License version 3.0 requirements will be met:
++## http://www.gnu.org/copyleft/gpl.html.
++##
++## Other Usage
++## Alternatively, this file may be used in accordance with the terms and
++## conditions contained in a signed written agreement between you and Nokia.
++##
++##
++##
++##
++##
++##
++## $QT_END_LICENSE$
++##
++#############################################################################
++
++package QtQA::QMake::Project::LazyValue;
++use strict;
++use warnings;
++
++our @CARP_NOT = qw( QtQA::QMake::Project );
++
++use overload
++    q{""} => \&_resolved,
++    q{0+} => \&_resolved,
++    q{bool} => \&_resolved,
++    q{cmp} => \&_cmp,
++    q{<=>} => \&_num_cmp,
++;
++
++sub new
++{
++    my ($class, %args) = @_;
++
++    return bless \%args, $class;
++}
++
++sub _resolved
++{
++    my ($self) = @_;
++
++    my $resolved;
++    if (exists $self->{ _resolved }) {
++        $resolved = $self->{ _resolved };
++    } else {
++        $self->{ project }->_resolve( );
++        $resolved = $self->{ project }{ _resolved }{ $self->{ type } }{ $self->{ key } };
++        $self->{ _resolved } = $resolved;
++    }
++
++    # Variables are typically arrayrefs, though they may have only 1 value.
++    # Tests are typically plain scalars, no dereferencing required.
++    #
++    # However, we actually do not rely on the above; we support both cases (arrayref
++    # or scalar) without checking what type we expect.
++    #
++    if (defined($resolved) && ref($resolved) eq 'ARRAY') {
++        return wantarray ? @{ $resolved } : $resolved->[0];
++    }
++
++    # If there was an error, and we wantarray, make sure we return ()
++    # rather than (undef)
++    if (wantarray && !defined($resolved)) {
++        return ();
++    }
++
++    return $resolved;
++}
++
++sub _cmp
++{
++    my ($self, $other) = @_;
++
++    return "$self" cmp "$other";
++}
++
++sub _num_cmp
++{
++    my ($self, $other) = @_;
++
++    return 0+$self <=> 0+$other;
++}
++
++1;
++
++=head1 NAME
++
++QtQA::QMake::Project::LazyValue - evaluate qmake values on-demand
++                                  (implementation detail)
++
++=head1 DESCRIPTION
++
++This package implements the lazy evaluation of values from a qmake project.
++It is an implementation detail; callers do not use this class directly.
++
++=cut
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t b/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t
+new file mode 100644
+index 0000000..df001fd
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/01-QtQA-QMake-Project.t
+@@ -0,0 +1,405 @@
++#!/usr/bin/env perl
++use strict;
++use warnings;
++
++=head1 NAME
++
++01-QtQA-QMake-Project.t - test for QtQA::QMake::Project
++
++=cut
++
++use FindBin;
++use lib "$FindBin::Bin/../../..";
++
++use QtQA::QMake::Project;
++
++use English qw(-no_match_vars);
++use File::Spec::Functions;
++use File::chdir;
++use Readonly;
++use Test::Exception;
++use Test::More;
++use Test::Warn;
++
++Readonly my $TESTDATA => catfile( $FindBin::Bin, 'test_projects' );
++Readonly my $QT_VERSION => 5;
++Readonly my $QMAKE => find_qmake( );
++Readonly my $ERROR_RE => qr/^QtQA::QMake::Project:/;
++
++sub run_qmake
++{
++    my ($args) = @_;
++    if (!$args) {
++        $args = "";
++    }
++    my $out = qx( $QMAKE $args 2>&1 );
++    is( $?, 0, 'qmake ok' ) || diag( $out );
++    ok( -f( 'Makefile' ), 'makefile was created' );
++    return;
++}
++
++# Basic test of a typical application .pro file
++sub test_typical
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/01-typical";
++    local $CWD = $dir;
++
++    run_qmake( );
++
++    if ($proj) {
++        $proj->set_makefile( 'Makefile' );
++    } else {
++        $proj = QtQA::QMake::Project->new( 'Makefile' );
++    }
++
++    my $initial_count = $proj->{ _qmake_count };
++    is( $proj->values( 'TARGET' ), 'myapp' );
++    is( $proj->values( 'SOURCES' ), 'main.cpp' );
++    is( canonpath($proj->values( 'PWD' )), canonpath($dir) );
++    is( $proj->{ _qmake_count } - $initial_count, 3 );
++
++    return;
++}
++
++# Test that the default set TARGET still remains (even though we
++# used our own, differently-named .pro file)
++sub test_default_target
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/02-default-target";
++    local $CWD = $dir;
++
++    run_qmake( );
++
++    # Check that we don't get messed up by any of make's environment
++    # variables, which might be set if we are e.g. running via `make check'
++    local $ENV{ MAKEFLAGS } = '-w -j3 -k';
++    local $ENV{ MFLAGS } = $ENV{ MAKEFLAGS };
++    local $ENV{ MAKELEVEL } = 1;
++
++    if ($proj) {
++        $proj->set_makefile( 'Makefile' );
++    } else {
++        $proj = QtQA::QMake::Project->new( 'Makefile' );
++    }
++
++    my $initial_count = $proj->{ _qmake_count };
++    is( $proj->values( 'TARGET' ), '02-default-target' );
++    is( $proj->{ _qmake_count } - $initial_count, 1 );
++
++    return;
++}
++
++# Test retrieving list values
++sub test_list
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/03-list";
++
++    # Test being in a directory other than the project directory
++    {
++        local $CWD = $dir;
++        run_qmake( );
++    }
++
++    if ($proj) {
++        $proj->set_makefile( "$dir/Makefile" );
++    } else {
++        $proj = QtQA::QMake::Project->new( "$dir/Makefile" );
++    }
++
++    # Order of QT is undefined
++    my %expected_qt = map { $_ => 1 } qw(core gui network xmlpatterns);
++
++    my $initial_count = $proj->{ _qmake_count };
++    ok( $expected_qt{ $proj->values( 'QT' ) } );
++    is_deeply( [ sort $proj->values( 'QT' ) ], [ sort keys %expected_qt ] );
++    is( $proj->{ _qmake_count } - $initial_count, 2 );
++
++    return;
++}
++
++# Test some delayed evaluation
++sub test_delayed
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/03-list";
++    local $CWD = $dir;
++
++    # Basic sanity check when qmake has extra args.
++    run_qmake( '-spec default -nocache' );
++
++    if ($proj) {
++        $proj->set_makefile( 'Makefile' );
++    } else {
++        $proj = QtQA::QMake::Project->new( 'Makefile' );
++    }
++
++    my $initial_count = $proj->{ _qmake_count };
++
++    my $pro_file_pwd = $proj->values( '_PRO_FILE_PWD_' );
++    my $uses_gui = $proj->test( 'contains(QT,gui)' );
++
++    # Shouldn't have run qmake yet ...
++    is( $proj->{ _qmake_count } - $initial_count, 0 );
++
++    is( canonpath( $pro_file_pwd ), canonpath( $dir ) );
++    is( $uses_gui, 1 );
++
++    # Should have run just once due to the above
++    is( $proj->{ _qmake_count } - $initial_count, 1 );
++
++    my @qt = $proj->values( 'QT' );
++
++    # And again, due to list
++    is( $proj->{ _qmake_count } - $initial_count, 2 );
++
++    # Order of QT is undefined
++    is_deeply( [sort @qt], [ sort qw(core gui network xmlpatterns) ] );
++
++    return;
++}
++
++# Test order of evaluation compared to default_post, CONFIG, etc.
++sub test_ordering
++{
++    my ($proj) = @_;
++
++    my $dir = "$TESTDATA/06-ordering";
++    local $CWD = $dir;
++
++    run_qmake( );
++
++    if ($proj) {
++        $proj->set_makefile( 'Makefile' );
++    } else {
++        $proj = QtQA::QMake::Project->new( 'Makefile' );
++    }
++
++    my @DEFINES = $proj->values( 'DEFINES' );
++
++    # If we correctly evaluate after default_post.prf and all CONFIG are
++    # processed, then our setting of QT_NAMESPACE in our .pro file has
++    # been transformed into a DEFINE.  Otherwise, it hasn't.
++    is( grep( { $_ =~ qr/QT_NAMESPACE=QtQA_QMake_Project/ } @DEFINES ), 1 )
++        || diag "DEFINES: @DEFINES";
++
++    return;
++}
++
++# Test what happens when an error occurs somewhere
++sub test_error
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/04-error";
++    local $CWD = $dir;
++
++    run_qmake( );
++
++    # qmake worked the first time, but this environment
++    # variable will force an error when we try to parse it.
++    local $ENV{ FORCE_QMAKE_ERROR } = 'fake error';
++
++    if ($proj) {
++        $proj->set_makefile( 'Makefile' );
++    } else {
++        $proj = QtQA::QMake::Project->new( 'Makefile' );
++    }
++
++    my $uses_gui = $proj->test( 'contains(QT,gui)' );
++    throws_ok( sub { $uses_gui = "$uses_gui" }, $ERROR_RE );
++
++    # If we set_die_on_error 0, this should become a warning.
++    my $qt = $proj->values( 'QT' );
++    $proj->set_die_on_error( 0 );
++
++    warnings_like { "$qt" } [ $ERROR_RE, qr{Use of uninitialized value} ];
++
++    my @qt;
++    warning_like { @qt = $proj->values( 'QT' ) } $ERROR_RE;
++    is( scalar(@qt), 0 );
++
++    # Test that turning errors back on really works
++    $proj->set_die_on_error( 1 );
++
++    throws_ok( sub { diag( 'unix: '.$proj->test( 'unix' ) ) }, $ERROR_RE );
++
++    return;
++}
++
++# Test spaces in path and value
++sub test_spaces
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/05 space in path";
++
++    local $CWD = $dir;
++    run_qmake( );
++
++    if ($proj) {
++        $proj->set_makefile( "$dir/Makefile" );
++    } else {
++        $proj = QtQA::QMake::Project->new( "$dir/Makefile" );
++    }
++
++    my $initial_count = $proj->{ _qmake_count };
++    is( $proj->values( 'TEMPLATE' ), 'app' );
++    is( $proj->values( 'TARGET' ), '05 space in path' );
++    is( canonpath( $proj->values( 'PWD' ) ), canonpath( $dir ) );
++    is( canonpath( $proj->values( 'OUT_PWD' ) ), canonpath( $dir ) );
++    is_deeply(
++        [ $proj->values( 'SOURCES' ) ],
++        [ 'main.cpp', 'space in source.cpp' ],
++    );
++    is( $proj->{ _qmake_count } - $initial_count, 5 );
++
++    return;
++}
++
++# Test a few really basic error conditions, e.g. make itself can't work
++sub test_make_error
++{
++    my ($proj) = @_;
++    my $dir = "$TESTDATA/01-typical";
++    local $CWD = $dir;
++
++    run_qmake( );
++
++    if ($proj) {
++        $proj->set_makefile( undef );
++    } else {
++        $proj = QtQA::QMake::Project->new( );
++    }
++
++    my $sub = sub{ my @qt = $proj->values( 'QT' ) };
++    my $original_make = $proj->make( );
++
++    # fail: no makefile set
++    throws_ok(
++        sub { $sub->() },   # weird syntax is necessary to satisfy prototype
++        qr{$ERROR_RE no makefile set}
++    );
++
++    # fail: invalid makefile directory
++    $proj->set_makefile( '/some/directory/does/not/exist' );
++    throws_ok(
++        sub { $sub->() },
++        qr{$ERROR_RE.*No such file or directory}
++    );
++
++    # fail: invalid makefile
++    $proj->set_makefile( "$dir/Makefile.does-not-exist" );
++    throws_ok(
++        sub { $sub->() },
++        $ERROR_RE,  # generic error because make output is platform-specific
++    );
++
++    # fail: bogus make command
++    $proj->set_makefile( "$dir/Makefile" );
++    $proj->set_make( 'not-a-real-make-command' );
++    throws_ok(
++        sub { $sub->() },
++        qr{$ERROR_RE .*not-a-real-make-command}
++    );
++    $proj->set_make( $original_make );
++
++    # Now do it all again with warnings instead
++    $proj->set_die_on_error( 0 );
++
++    # warn: no makefile set
++    $proj->set_makefile( undef );
++    warning_like(
++        sub { $sub->() },
++        qr{$ERROR_RE no makefile set}
++    );
++
++    # warn: invalid makefile directory
++    $proj->set_makefile( '/some/directory/does/not/exist' );
++    warning_like(
++        sub { $sub->() },
++        qr{$ERROR_RE.*No such file or directory}
++    );
++
++    # warn: invalid makefile
++    $proj->set_makefile( "$dir/Makefile.does-not-exist" );
++    warning_like(
++        sub { $sub->() },
++        $ERROR_RE,  # generic error because make output is platform-specific
++    );
++
++    # warn: bogus make command
++    $proj->set_makefile( "$dir/Makefile" );
++    $proj->set_make( 'not-a-real-make-command' );
++    warning_like(
++        sub { $sub->() },
++        qr{$ERROR_RE .*not-a-real-make-command}
++    );
++    $proj->set_make( $original_make );
++
++    return;
++}
++
++sub run_test
++{
++    unless (ok( $QMAKE, 'found qmake' )) {
++        diag(
++            'This test requires a working qmake from Qt >= 5.0. This may come either from a '
++           .'qtbase directory at the same level as the qtqa directory, or from PATH.  I could '
++           .'not find either of these.'
++        );
++        return;
++    }
++
++    test_typical;
++    test_default_target;
++    test_list;
++    test_delayed;
++    test_spaces;
++    test_ordering;
++    test_error;
++    test_make_error;
++
++    # Now do them all again using a single object
++    my $proj = QtQA::QMake::Project->new( );
++    test_typical( $proj );
++    test_default_target( $proj );
++    test_list( $proj );
++    test_delayed( $proj );
++    test_spaces( $proj );
++    test_ordering( $proj );
++    test_error( $proj );
++    test_make_error( $proj );
++
++    return;
++}
++
++sub find_qmake
++{
++    # Try to find the "right" qmake - not particularly easy.
++    my $repo_base = catfile( $FindBin::Bin, qw(.. .. .. .. .. ..) );
++    my $qmake = canonpath catfile( $repo_base, qw(.. qtbase bin qmake) );
++    if ($OSNAME =~ m{win32}i) {
++        $qmake .= '.exe';
++    }
++
++    if (-f $qmake) {
++        diag "Using qmake from sibling qtbase: $qmake";
++        return $qmake;
++    }
++
++    # OK, then just try to use qmake from PATH
++    my $output = qx(qmake -v 2>&1);
++    if ($? == 0 && $output =~ m{Using Qt version $QT_VERSION}) {
++        diag "Using qmake from PATH";
++        return 'qmake';
++    }
++
++    return;
++}
++
++if (!caller) {
++    run_test;
++    done_testing;
++}
++1;
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/99-dump-qmake-project-info.t b/scripts/lib/perl5/QtQA/QMake/t/99-dump-qmake-project-info.t
+new file mode 100644
+index 0000000..26735e2
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/99-dump-qmake-project-info.t
+@@ -0,0 +1,123 @@
++#!/usr/bin/env perl
++use strict;
++use warnings;
++
++=head1 NAME
++
++99-dump-qmake-project-info.t - manual test, dumps qmake project info from a build tree.
++
++=head1 SYNOPSIS
++
++  perl 99-dump-qmake-project-info.t ~/path/to/qtbase
++
++Dumps a bunch of information about all found qmake projects under the given directory,
++which can be manually checked for correctness.
++
++Since it is quite challenging to come up with a realistic test set of qmake projects
++for testing the QtQA::QMake::Project package, this script can be used to exercise
++that package over all the files found in a given build tree.  A one-line summary
++is printed for each found project, which should then be sanity checked.
++
++=cut
++
++use FindBin;
++use lib "$FindBin::Bin/../../..";
++
++use QtQA::QMake::Project;
++use File::chdir;
++use File::Spec::Functions;
++use File::Find::Rule;
++use Test::More;
++
++use feature qw(say);
++
++my %totals = (
++    app => 0,
++    lib => 0,
++    testcase => 0,
++    insignificant_test => 0,
++);
++
++sub dump_interesting_info
++{
++    my ($prj) = @_;
++
++    my $_PRO_FILE_PWD_ = $prj->values( '_PRO_FILE_PWD_' );
++    my $TARGET = $prj->values( 'TARGET' );
++    my $TEMPLATE = $prj->values( 'TEMPLATE' );
++    my $testcase = $prj->test( 'testcase' );
++    my $insignificant_test = $prj->test( 'insignificant_test' );
++    my @sources = $prj->values( 'SOURCES' );
++
++    ++$totals{ "$TEMPLATE" };
++    if ($testcase) {
++        ++$totals{ 'testcase' };
++        if ($insignificant_test) {
++            ++$totals{ 'insignificant_test' };
++        }
++    }
++
++    my $out = "$_PRO_FILE_PWD_ => $TARGET [$TEMPLATE]";
++    if (@sources) {
++        $out .= ', '.scalar(@sources).' sources';
++    }
++    if ($testcase) {
++        $out .= ', testcase'.( $insignificant_test ? ' (insignificant!)' : '');
++    }
++
++    say $out;
++
++    return;
++}
++
++sub test_makefiles
++{
++    my ($build_tree) = @_;
++
++    local $CWD = $build_tree;
++
++    my $find = File::Find::Rule
++        ->file()                      # must be a file...
++        ->name( 'Makefile' )          # named "Makefile"... (note: do not care about debug/release)
++        ->grep( qr{\Q$(QMAKE)\E} )   # must be generated by qmake
++        ->start( '.' )                # in the given tree
++    ;
++
++    my $prj = QtQA::QMake::Project->new( );
++
++    my $count = 0;
++    while (my $makefile = $find->match( )) {
++        ++$count;
++        $prj->set_makefile( $makefile );
++        eval {
++            dump_interesting_info( $prj );
++        };
++        if (my $error = $@) {
++            warn "$makefile => error: $error\n";
++        }
++    }
++
++    say "Total: $count project(s), "
++       ."$totals{ testcase } testcase(s) ($totals{ insignificant_test } insignificant), "
++       ."$prj->{ _qmake_count } qmake runs";
++
++    return;
++}
++
++sub run_test
++{
++    my (@args) = @_;
++    SKIP: {
++        skip( 'This is a manual test, see docs for info', 1 ) unless @args;
++        is( @args, 1 ) || return;
++        test_makefiles( $args[0] );
++    }
++
++    return;
++}
++
++if (!caller) {
++    run_test( @ARGV );
++    done_testing;
++}
++1;
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/01-typical.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/01-typical.pro
+new file mode 100644
+index 0000000..93124cf
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/01-typical.pro
+@@ -0,0 +1,3 @@
++TEMPLATE=app
++TARGET=myapp
++SOURCES=main.cpp
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/01-typical/main.cpp
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/02-default-target.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/02-default-target.pro
+new file mode 100644
+index 0000000..31b4fc3
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/02-default-target.pro
+@@ -0,0 +1,2 @@
++TEMPLATE=app
++SOURCES=main.cpp
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/02-default-target/main.cpp
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/03-list.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/03-list.pro
+new file mode 100644
+index 0000000..42ca1d7
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/03-list.pro
+@@ -0,0 +1,4 @@
++TEMPLATE=app
++TARGET=myapp
++SOURCES=main.cpp
++QT=core gui network xmlpatterns
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/03-list/main.cpp
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/04-error.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/04-error.pro
+new file mode 100644
+index 0000000..9231538
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/04-error.pro
+@@ -0,0 +1,6 @@
++TEMPLATE=app
++TARGET=myapp
++SOURCES=main.cpp
++
++ERROR=$$(FORCE_QMAKE_ERROR)
++!isEmpty(ERROR):error($$ERROR)
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/04-error/main.cpp
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/05 space in path.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/05 space in path.pro
+new file mode 100644
+index 0000000..6d458cc
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/05 space in path.pro	
+@@ -0,0 +1,2 @@
++TEMPLATE=app
++SOURCES=main.cpp "space in source.cpp"
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/main.cpp	
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/space in source.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/space in source.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/05 space in path/space in source.cpp	
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/06-ordering.pro b/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/06-ordering.pro
+new file mode 100644
+index 0000000..46b1372
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/06-ordering.pro
+@@ -0,0 +1,10 @@
++TEMPLATE=app
++TARGET=myapp
++SOURCES=main.cpp
++QT=core gui network xmlpatterns
++
++# We set QT_NAMESPACE here.
++# This influences DEFINES in qt.prf.
++# Therefore we can later inspect the value of DEFINES to determine whether
++# QtQA::QMake::Project has evaluated before or after qt.prf is loaded.
++QT_NAMESPACE=QtQA_QMake_Project
+diff --git a/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/main.cpp b/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/main.cpp
+new file mode 100644
+index 0000000..f969fe0
+--- /dev/null
++++ b/scripts/lib/perl5/QtQA/QMake/t/test_projects/06-ordering/main.cpp
+@@ -0,0 +1,42 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#error This file exists for test purposes, it should not be compiled
+diff --git a/scripts/setup.pl b/scripts/setup.pl
+index 208f00f..e5fb7df 100755
+--- a/scripts/setup.pl
++++ b/scripts/setup.pl
+@@ -172,11 +172,13 @@ sub all_required_cpan_modules
+         Params::Validate
+         Perl::Critic
+         Readonly
++        ReleaseAction
+         Test::Exception
+         Test::Exit
+         Test::More
+         Test::NoWarnings
+         Test::Perl::Critic
++        Test::Warn
+         Text::Diff
+         Text::Trim
+         Text::Wrap

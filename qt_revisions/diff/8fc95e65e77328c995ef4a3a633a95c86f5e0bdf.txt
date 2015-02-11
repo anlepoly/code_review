@@ -1,0 +1,186 @@
+diff --git a/src/qml/animations/qabstractanimationjob.cpp b/src/qml/animations/qabstractanimationjob.cpp
+index 20b8b4b..df8431e 100644
+--- a/src/qml/animations/qabstractanimationjob.cpp
++++ b/src/qml/animations/qabstractanimationjob.cpp
+@@ -44,6 +44,7 @@
+ #include "private/qabstractanimationjob_p.h"
+ #include "private/qanimationgroupjob_p.h"
+ #include "private/qanimationjobutil_p.h"
++#include "private/qqmlengine_p.h"
+ 
+ #define DEFAULT_TIMER_INTERVAL 16
+ 
+@@ -473,7 +474,17 @@ void QAbstractAnimationJob::start()
+ {
+     if (m_state == Running)
+         return;
+-    setState(Running);
++
++    if (QQmlEnginePrivate::designerMode()) {
++        if (state() != Stopped) {
++            m_currentTime = duration();
++            m_totalCurrentTime = totalDuration();
++            setState(Running);
++            setState(Stopped);
++        }
++    } else {
++        setState(Running);
++    }
+ }
+ 
+ void QAbstractAnimationJob::stop()
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index f0bf6e4..1376ad7 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -165,6 +165,7 @@ void qmlRegisterBaseTypes(const char *uri, int versionMajor, int versionMinor)
+ */
+ 
+ bool QQmlEnginePrivate::qml_debugging_enabled = false;
++bool QQmlEnginePrivate::s_designerMode = false;
+ 
+ // these types are part of the QML language
+ void QQmlEnginePrivate::registerBaseTypes(const char *uri, int versionMajor, int versionMinor)
+@@ -192,6 +193,16 @@ void QQmlEnginePrivate::defineQtQuick2Module()
+     qmlRegisterUncreatableType<QQmlLocale>("QtQuick", 2, 0, "Locale", QQmlEngine::tr("Locale cannot be instantiated.  Use Qt.locale()"));
+ }
+ 
++bool QQmlEnginePrivate::designerMode()
++{
++    return s_designerMode;
++}
++
++void QQmlEnginePrivate::activateDesignerMode()
++{
++    s_designerMode = true;
++}
++
+ 
+ /*!
+     \class QQmlImageProviderBase
+diff --git a/src/qml/qml/qqmlengine_p.h b/src/qml/qml/qqmlengine_p.h
+index cc07ee5..4f1ab84 100644
+--- a/src/qml/qml/qqmlengine_p.h
++++ b/src/qml/qml/qqmlengine_p.h
+@@ -265,6 +265,9 @@ public:
+     static void registerQtQuick2Types(const char *uri, int versionMajor, int versionMinor);
+     static void defineQtQuick2Module();
+ 
++    static bool designerMode();
++    static void activateDesignerMode();
++
+     static bool qml_debugging_enabled;
+ 
+     mutable QMutex mutex;
+@@ -305,6 +308,7 @@ private:
+     QHash<int, int> m_qmlLists;
+     QHash<int, QQmlCompiledData *> m_compositeTypes;
+     QHash<QUrl, QByteArray> debugChangesHash;
++    static bool s_designerMode;
+ 
+     // These members is protected by the full QQmlEnginePrivate::mutex mutex
+     struct Deletable { Deletable():next(0) {} virtual ~Deletable() {} Deletable *next; };
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 12de9ff..3ad442f 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -1322,28 +1322,28 @@ QQmlContextData *QQmlVME::complete(const Interrupt &interrupt)
+     bindValues.deallocate();
+     }
+ 
+-    {
+-    QQmlTrace trace("VME Component Complete");
+-    while (!parserStatus.isEmpty()) {
+-        QQmlParserStatus *status = parserStatus.pop();
++    if (!QQmlEnginePrivate::designerMode()) { // the qml designer does the component complete later
++        QQmlTrace trace("VME Component Complete");
++        while (!parserStatus.isEmpty()) {
++            QQmlParserStatus *status = parserStatus.pop();
+ #ifdef QML_ENABLE_TRACE
+-        QQmlData *data = parserStatusData.pop();
++            QQmlData *data = parserStatusData.pop();
+ #endif
+ 
+-        if (status && status->d) {
+-            status->d = 0;
++            if (status && status->d) {
++                status->d = 0;
+ #ifdef QML_ENABLE_TRACE
+-            QQmlTrace trace("Component complete");
+-            trace.addDetail("URL", data->outerContext->url);
+-            trace.addDetail("Line", data->lineNumber);
++                QQmlTrace trace("Component complete");
++                trace.addDetail("URL", data->outerContext->url);
++                trace.addDetail("Line", data->lineNumber);
+ #endif
+-            status->componentComplete();
++                status->componentComplete();
++            }
++
++            if (watcher.hasRecursed() || interrupt.shouldInterrupt())
++                return 0;
+         }
+-        
+-        if (watcher.hasRecursed() || interrupt.shouldInterrupt())
+-            return 0;
+-    }
+-    parserStatus.deallocate();
++        parserStatus.deallocate();
+     }
+ 
+     {
+diff --git a/src/quick/designer/designersupport.cpp b/src/quick/designer/designersupport.cpp
+index 1b0fea9..1e67303 100644
+--- a/src/quick/designer/designersupport.cpp
++++ b/src/quick/designer/designersupport.cpp
+@@ -44,11 +44,13 @@
+ 
+ #include <QtQuick/private/qquickshadereffectsource_p.h>
+ #include <QtQuick/private/qquickrectangle_p.h>
++#include <QtQml/private/qabstractanimationjob_p.h>
+ #include <private/qqmlengine_p.h>
+ #include <private/qquickview_p.h>
+ #include <private/qquickwindowmanager_p.h>
+ #include <QtQuick/private/qquickstategroup_p.h>
+ #include <QtGui/QImage>
++#include <private/qqmlvme_p.h>
+ 
+ #include "designerwindowmanager_p.h"
+ 
+@@ -429,6 +431,11 @@ void DesignerSupport::activateDesignerWindowManager()
+     QQuickWindowManager::setInstance(new DesignerWindowManager);
+ }
+ 
++void DesignerSupport::activateDesignerMode()
++{
++    QQmlEnginePrivate::activateDesignerMode();
++}
++
+ void DesignerSupport::createOpenGLContext(QQuickWindow *window)
+ {
+     DesignerWindowManager::createOpenGLContext(window);
+diff --git a/src/quick/designer/designersupport.h b/src/quick/designer/designersupport.h
+index 723e106..b0dbe18 100644
+--- a/src/quick/designer/designersupport.h
++++ b/src/quick/designer/designersupport.h
+@@ -145,6 +145,7 @@ public:
+     static void updateDirtyNode(QQuickItem *item);
+ 
+     static void activateDesignerWindowManager();
++    static void activateDesignerMode();
+ 
+     static void createOpenGLContext(QQuickWindow *window);
+ 
+diff --git a/src/quick/util/qquickbehavior.cpp b/src/quick/util/qquickbehavior.cpp
+index 4ea11c4..9f9ea67 100644
+--- a/src/quick/util/qquickbehavior.cpp
++++ b/src/quick/util/qquickbehavior.cpp
+@@ -175,7 +175,7 @@ void QQuickBehavior::setEnabled(bool enabled)
+ void QQuickBehavior::write(const QVariant &value)
+ {
+     Q_D(QQuickBehavior);
+-    bool bypass = !d->enabled || !d->finalized;
++    bool bypass = !d->enabled || !d->finalized || QQmlEnginePrivate::designerMode();
+     if (!bypass)
+         qmlExecuteDeferred(this);
+     if (!d->animation || bypass) {

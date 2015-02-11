@@ -1,0 +1,339 @@
+diff --git a/src/qmltest/quicktest.cpp b/src/qmltest/quicktest.cpp
+index 2f0f7ef..a1f06ba 100644
+--- a/src/qmltest/quicktest.cpp
++++ b/src/qmltest/quicktest.cpp
+@@ -62,6 +62,7 @@
+ #include <QtCore/qfile.h>
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qeventloop.h>
++#include <QtCore/qtextstream.h>
+ #include <QtGui/qtextdocument.h>
+ #include <stdio.h>
+ #include <QtGui/QGuiApplication>
+@@ -134,6 +135,51 @@ static inline QString stripQuotes(const QString &s)
+         return s;
+ }
+ 
++template <class View> void handleCompileErrors(const QFileInfo &fi, const View &view)
++{
++    // Error compiling the test - flag failure in the log and continue.
++    const QList<QDeclarativeError> errors = view.errors();
++    QuickTestResult results;
++    results.setTestCaseName(fi.baseName());
++    results.startLogging();
++    results.setFunctionName(QLatin1String("compile"));
++    results.setFunctionType(QuickTestResult::Func);
++    // Verbose warning output of all messages and relevant parameters
++    QString message;
++    QTextStream str(&message);
++    str << "\n  " << QDir::toNativeSeparators(fi.absoluteFilePath()) << " produced "
++        << errors.size() << " error(s):\n";
++    foreach (const QDeclarativeError &e, errors) {
++        str << "    ";
++        if (e.url().isLocalFile()) {
++            str << e.url().toLocalFile();
++        } else {
++            str << e.url().toString();
++        }
++        if (e.line() > 0)
++            str << ':' << e.line() << ',' << e.column();
++        str << ": " << e.description() << '\n';
++    }
++    str << "  Working directory: " << QDir::toNativeSeparators(QDir::current().absolutePath()) << '\n';
++    if (QDeclarativeEngine *engine = view.engine()) {
++        str << "  View: " << view.metaObject()->className() << ", import paths:\n";
++        foreach (const QString &i, engine->importPathList())
++            str << "    '" << QDir::toNativeSeparators(i) << "'\n";
++        const QStringList pluginPaths = engine->pluginPathList();
++        str << "  Plugin paths:\n";
++        foreach (const QString &p, pluginPaths)
++            str << "    '" << QDir::toNativeSeparators(p) << "'\n";
++    }
++    qWarning("%s", qPrintable(message));
++    // Fail with error 0.
++    results.fail(errors.at(0).description(),
++                 errors.at(0).url(), errors.at(0).line());
++    results.finishTestFunction();
++    results.setFunctionName(QString());
++    results.setFunctionType(QuickTestResult::NoWhere);
++    results.stopLogging();
++}
++
+ int quick_test_main(int argc, char **argv, const char *name, quick_test_viewport_create createViewport, const char *sourceDir)
+ {
+     QGuiApplication* app = 0;
+@@ -188,40 +234,52 @@ int quick_test_main(int argc, char **argv, const char *name, quick_test_viewport
+         if (translator.load(translationFile)) {
+             app->installTranslator(&translator);
+         } else {
+-            qWarning() << "Could not load the translation file" << translationFile;
++            qWarning("Could not load the translation file '%s'.", qPrintable(translationFile));
+         }
+     }
+ 
+     // Determine where to look for the test data.
+     if (testPath.isEmpty() && sourceDir)
+         testPath = QString::fromLocal8Bit(sourceDir);
+-    if (testPath.isEmpty())
+-        testPath = QLatin1String(".");
+-
++    if (testPath.isEmpty()) {
++        QDir current = QDir::current();
++#ifdef Q_OS_WIN
++        // Skip release/debug subfolders
++        if (!current.dirName().compare(QLatin1String("Release"), Qt::CaseInsensitive)
++            || !current.dirName().compare(QLatin1String("Debug"), Qt::CaseInsensitive))
++            current.cdUp();
++#endif // Q_OS_WIN
++        testPath = current.absolutePath();
++    }
+     QStringList files;
+ 
+-    if (testPath.endsWith(QLatin1String(".qml")) && QFileInfo(testPath).isFile()) {
++    const QFileInfo testPathInfo(testPath);
++    if (testPathInfo.isFile()) {
++        if (!testPath.endsWith(QStringLiteral(".qml"))) {
++            qWarning("'%s' does not have the suffix '.qml'.", qPrintable(testPath));
++            return 1;
++        }
+         files << testPath;
+-    } else {
++    } else if (testPathInfo.isDir()) {
+         // Scan the test data directory recursively, looking for "tst_*.qml" files.
+-        QStringList filters;
+-        filters += QLatin1String("tst_*.qml");
+-        QDirIterator iter(testPath, filters, QDir::Files,
++        const QStringList filters(QStringLiteral("tst_*.qml"));
++        QDirIterator iter(testPathInfo.absoluteFilePath(), filters, QDir::Files,
+                           QDirIterator::Subdirectories |
+                           QDirIterator::FollowSymlinks);
+         while (iter.hasNext())
+             files += iter.next();
+         files.sort();
+-    }
+-
+-    // Bail out if we didn't find any test cases.
+-    if (files.isEmpty()) {
+-        qWarning() << argv[0] << ": could not find any test cases under"
+-                   << testPath;
++        if (files.isEmpty()) {
++            qWarning("The directory '%s' does not contain any test files matching '%s'",
++                     qPrintable(testPath), qPrintable(filters.front()));
++            return 1;
++        }
++    } else {
++        qWarning("'%s' does not exist under '%s'.",
++                 qPrintable(testPath), qPrintable(QDir::currentPath()));
+         return 1;
+     }
+ 
+-
+     // Scan through all of the "tst_*.qml" files and run each of them
+     // in turn with a QDeclarativeView.
+ #ifdef QUICK_TEST_SCENEGRAPH
+@@ -235,7 +293,7 @@ int quick_test_main(int argc, char **argv, const char *name, quick_test_viewport
+                          &eventLoop, SLOT(quit()));
+         view.rootContext()->setContextProperty
+             (QLatin1String("qtest"), &rootobj);
+-        foreach (QString path, imports)
++        foreach (const QString &path, imports)
+             view.engine()->addImportPath(path);
+ 
+         foreach (QString file, files) {
+@@ -255,20 +313,7 @@ int quick_test_main(int argc, char **argv, const char *name, quick_test_viewport
+             if (QTest::printAvailableFunctions)
+                 continue;
+             if (view.status() == QQuickView::Error) {
+-                // Error compiling the test - flag failure in the log and continue.
+-                QList<QDeclarativeError> errors = view.errors();
+-                QuickTestResult results;
+-                results.setTestCaseName(fi.baseName());
+-                results.startLogging();
+-                results.setFunctionName(QLatin1String("compile"));
+-                results.setFunctionType(QuickTestResult::Func);
+-                results.fail(errors.at(0).description(),
+-                             errors.at(0).url().toString(),
+-                             errors.at(0).line());
+-                results.finishTestFunction();
+-                results.setFunctionName(QString());
+-                results.setFunctionType(QuickTestResult::NoWhere);
+-                results.stopLogging();
++                handleCompileErrors(fi, view);
+                 continue;
+             }
+             if (!rootobj.hasQuit) {
+@@ -312,19 +357,7 @@ int quick_test_main(int argc, char **argv, const char *name, quick_test_viewport
+                 continue;
+             if (view.status() == QDeclarativeView::Error) {
+                 // Error compiling the test - flag failure in the log and continue.
+-                QList<QDeclarativeError> errors = view.errors();
+-                QuickTestResult results;
+-                results.setTestCaseName(fi.baseName());
+-                results.startLogging();
+-                results.setFunctionName(QLatin1String("compile"));
+-                results.setFunctionType(QuickTestResult::Func);
+-                results.fail(errors.at(0).description(),
+-                             errors.at(0).url().toString(),
+-                             errors.at(0).line());
+-                results.finishTestFunction();
+-                results.setFunctionName(QString());
+-                results.setFunctionType(QuickTestResult::NoWhere);
+-                results.stopLogging();
++                handleCompileErrors(fi, view);
+                 continue;
+             }
+             if (!rootobj.hasQuit) {
+diff --git a/src/qmltest/quicktestresult.cpp b/src/qmltest/quicktestresult.cpp
+index 2feef36..27bb4d6 100644
+--- a/src/qmltest/quicktestresult.cpp
++++ b/src/qmltest/quicktestresult.cpp
+@@ -53,6 +53,8 @@
+ #include <QtCore/qbytearray.h>
+ #include <QtCore/qcoreapplication.h>
+ #include <QtCore/qdebug.h>
++#include <QtCore/QUrl>
++#include <QtCore/QDir>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -355,83 +357,82 @@ void QuickTestResult::finishTestFunction()
+     QTestResult::finishedCurrentTestFunction();
+ }
+ 
+-static QString qtest_fixFile(const QString &file)
++static QString qtestFixUrl(const QUrl &location)
+ {
+-    if (file.startsWith(QLatin1String("file://")))
+-        return file.mid(7);
+-    else
+-        return file;
++    if (location.isLocalFile()) // Use QUrl's logic for Windows drive letters.
++        return QDir::toNativeSeparators(location.toLocalFile());
++    return location.toString();
+ }
+ 
+ void QuickTestResult::fail
+-    (const QString &message, const QString &file, int line)
++    (const QString &message, const QUrl &location, int line)
+ {
+     QTestResult::addFailure(message.toLatin1().constData(),
+-                            qtest_fixFile(file).toLatin1().constData(), line);
++                            qtestFixUrl(location).toLatin1().constData(), line);
+ }
+ 
+ bool QuickTestResult::verify
+-    (bool success, const QString &message, const QString &file, int line)
++    (bool success, const QString &message, const QUrl &location, int line)
+ {
+     if (!success && message.isEmpty()) {
+         return QTestResult::verify
+             (success, "verify()", "",
+-             qtest_fixFile(file).toLatin1().constData(), line);
++             qtestFixUrl(location).toLatin1().constData(), line);
+     } else {
+         return QTestResult::verify
+             (success, message.toLatin1().constData(), "",
+-             qtest_fixFile(file).toLatin1().constData(), line);
++             qtestFixUrl(location).toLatin1().constData(), line);
+     }
+ }
+ 
+ bool QuickTestResult::compare
+     (bool success, const QString &message,
+      const QString &val1, const QString &val2,
+-     const QString &file, int line)
++     const QUrl &location, int line)
+ {
+     if (success) {
+         return QTestResult::compare
+             (success, message.toLocal8Bit().constData(),
+-             qtest_fixFile(file).toLatin1().constData(), line);
++             qtestFixUrl(location).toLatin1().constData(), line);
+     } else {
+         return QTestResult::compare
+             (success, message.toLocal8Bit().constData(),
+              QTest::toString(val1.toLatin1().constData()),
+              QTest::toString(val2.toLatin1().constData()),
+              "", "",
+-             qtest_fixFile(file).toLatin1().constData(), line);
++             qtestFixUrl(location).toLatin1().constData(), line);
+     }
+ }
+ 
+ void QuickTestResult::skip
+-    (const QString &message, const QString &file, int line)
++    (const QString &message, const QUrl &location, int line)
+ {
+     QTestResult::addSkip(message.toLatin1().constData(),
+-                         qtest_fixFile(file).toLatin1().constData(), line);
++                         qtestFixUrl(location).toLatin1().constData(), line);
+     QTestResult::setSkipCurrentTest(true);
+ }
+ 
+ bool QuickTestResult::expectFail
+-    (const QString &tag, const QString &comment, const QString &file, int line)
++    (const QString &tag, const QString &comment, const QUrl &location, int line)
+ {
+     return QTestResult::expectFail
+         (tag.toLatin1().constData(),
+          QTest::toString(comment.toLatin1().constData()),
+-         QTest::Abort, qtest_fixFile(file).toLatin1().constData(), line);
++         QTest::Abort, qtestFixUrl(location).toLatin1().constData(), line);
+ }
+ 
+ bool QuickTestResult::expectFailContinue
+-    (const QString &tag, const QString &comment, const QString &file, int line)
++    (const QString &tag, const QString &comment, const QUrl &location, int line)
+ {
+     return QTestResult::expectFail
+         (tag.toLatin1().constData(),
+          QTest::toString(comment.toLatin1().constData()),
+-         QTest::Continue, qtest_fixFile(file).toLatin1().constData(), line);
++         QTest::Continue, qtestFixUrl(location).toLatin1().constData(), line);
+ }
+ 
+-void QuickTestResult::warn(const QString &message, const QString &file, int line)
++void QuickTestResult::warn(const QString &message, const QUrl &location, int line)
+ {
+-    QTestLog::warn(message.toLatin1().constData(), qtest_fixFile(file).toLatin1().constData(), line);
++    QTestLog::warn(message.toLatin1().constData(), qtestFixUrl(location).toLatin1().constData(), line);
+ }
+ 
+ void QuickTestResult::ignoreWarning(const QString &message)
+diff --git a/src/qmltest/quicktestresult_p.h b/src/qmltest/quicktestresult_p.h
+index fdadf9c..898b4f8 100644
+--- a/src/qmltest/quicktestresult_p.h
++++ b/src/qmltest/quicktestresult_p.h
+@@ -50,6 +50,7 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class QUrl;
+ class QuickTestResultPrivate;
+ 
+ class Q_QUICK_TEST_EXPORT QuickTestResult : public QObject
+@@ -123,18 +124,18 @@ public Q_SLOTS:
+ 
+     void finishTestFunction();
+ 
+-    void fail(const QString &message, const QString &file, int line);
++    void fail(const QString &message, const QUrl &location, int line);
+     bool verify(bool success, const QString &message,
+-                const QString &file, int line);
++                const QUrl &location, int line);
+     bool compare(bool success, const QString &message,
+                  const QString &val1, const QString &val2,
+-                 const QString &file, int line);
+-    void skip(const QString &message, const QString &file, int line);
++                 const QUrl &location, int line);
++    void skip(const QString &message, const QUrl &location, int line);
+     bool expectFail(const QString &tag, const QString &comment,
+-                    const QString &file, int line);
++                    const QUrl &location, int line);
+     bool expectFailContinue(const QString &tag, const QString &comment,
+-                            const QString &file, int line);
+-    void warn(const QString &message, const QString &file, int line);
++                            const QUrl &location, int line);
++    void warn(const QString &message, const QUrl &location, int line);
+ 
+     void ignoreWarning(const QString &message);

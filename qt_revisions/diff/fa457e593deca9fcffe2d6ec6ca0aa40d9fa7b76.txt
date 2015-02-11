@@ -1,0 +1,208 @@
+diff --git a/src/qml/qml/qqmlpropertycache.cpp b/src/qml/qml/qqmlpropertycache.cpp
+index 14e474e..87e707d 100644
+--- a/src/qml/qml/qqmlpropertycache.cpp
++++ b/src/qml/qml/qqmlpropertycache.cpp
+@@ -1095,6 +1095,56 @@ int *QQmlPropertyCache::methodParameterTypes(QObject *object, int index,
+     }
+ }
+ 
++// Returns the return type of the method.
++int QQmlPropertyCache::methodReturnType(QObject *object, const QQmlPropertyData &data,
++                                        QByteArray *unknownTypeError)
++{
++    Q_ASSERT(object && data.coreIndex >= 0);
++
++    int type = data.propType;
++
++    const char *propTypeName = 0;
++
++    if (type == QMetaType::UnknownType) {
++        // Find the return type name from the method info
++        QMetaMethod m;
++
++        QQmlData *ddata = QQmlData::get(object, false);
++        if (ddata && ddata->propertyCache) {
++            QQmlPropertyCache *c = ddata->propertyCache;
++            Q_ASSERT(data.coreIndex < c->methodIndexCacheStart + c->methodIndexCache.count());
++
++            while (data.coreIndex < c->methodIndexCacheStart)
++                c = c->_parent;
++
++            const QMetaObject *metaObject = c->createMetaObject();
++            Q_ASSERT(metaObject);
++            m = metaObject->method(data.coreIndex);
++        } else {
++            m = object->metaObject()->method(data.coreIndex);
++        }
++
++        type = m.returnType();
++        propTypeName = m.typeName();
++    }
++
++    QMetaType::TypeFlags flags = QMetaType::typeFlags(type);
++    if (flags & QMetaType::IsEnumeration) {
++        type = QVariant::Int;
++    } else if (type == QMetaType::UnknownType ||
++               (type >= (int)QVariant::UserType && !(flags & QMetaType::PointerToQObject) &&
++               type != qMetaTypeId<QJSValue>())) {
++        //the UserType clause is to catch registered QFlags
++        type = EnumType(object->metaObject(), propTypeName, type);
++    }
++
++    if (type == QMetaType::UnknownType) {
++        if (unknownTypeError) *unknownTypeError = propTypeName;
++    }
++
++    return type;
++}
++
+ QQmlPropertyData qQmlPropertyCacheCreate(const QMetaObject *metaObject, const QString &property)
+ {
+     Q_ASSERT(metaObject);
+diff --git a/src/qml/qml/qqmlpropertycache_p.h b/src/qml/qml/qqmlpropertycache_p.h
+index 4641a8d..3e87fa3 100644
+--- a/src/qml/qml/qqmlpropertycache_p.h
++++ b/src/qml/qml/qqmlpropertycache_p.h
+@@ -296,6 +296,8 @@ public:
+                                               QQmlPropertyData &);
+     static int *methodParameterTypes(QObject *, int index, QVarLengthArray<int, 9> &dummy,
+                                      QByteArray *unknownTypeError);
++    static int methodReturnType(QObject *, const QQmlPropertyData &data,
++                                QByteArray *unknownTypeError);
+     static QList<QByteArray> signalParameterNames(QObject *, int index);
+ 
+     const char *className() const;
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 600d98d..4128358 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -1762,11 +1762,21 @@ static const QQmlPropertyData * RelatedMethod(QObject *object,
+ static v8::Handle<v8::Value> CallPrecise(QObject *object, const QQmlPropertyData &data,
+                                          QV8Engine *engine, CallArgs &callArgs)
+ {
++    QByteArray unknownTypeError;
++
++    int returnType = QQmlPropertyCache::methodReturnType(object, data, &unknownTypeError);
++
++    if (returnType == QMetaType::UnknownType) {
++        QString typeName = QString::fromLatin1(unknownTypeError);
++        QString error = QString::fromLatin1("Unknown method return type: %1").arg(typeName);
++        v8::ThrowException(v8::Exception::Error(engine->toString(error)));
++        return v8::Handle<v8::Value>();
++    }
++
+     if (data.hasArguments()) {
+ 
+         int *args = 0;
+         QVarLengthArray<int, 9> dummy;
+-        QByteArray unknownTypeError;
+ 
+         args = QQmlPropertyCache::methodParameterTypes(object, data.coreIndex, dummy, 
+                                                                &unknownTypeError);
+@@ -1784,11 +1794,11 @@ static v8::Handle<v8::Value> CallPrecise(QObject *object, const QQmlPropertyData
+             return v8::Handle<v8::Value>();
+         }
+ 
+-        return CallMethod(object, data.coreIndex, data.propType, args[0], args + 1, engine, callArgs);
++        return CallMethod(object, data.coreIndex, returnType, args[0], args + 1, engine, callArgs);
+ 
+     } else {
+ 
+-        return CallMethod(object, data.coreIndex, data.propType, 0, 0, engine, callArgs);
++        return CallMethod(object, data.coreIndex, returnType, 0, 0, engine, callArgs);
+ 
+     }
+ }
+diff --git a/tests/auto/qml/qqmlecmascript/data/invokableEnumRet.qml b/tests/auto/qml/qqmlecmascript/data/invokableEnumRet.qml
+new file mode 100644
+index 0000000..21dfd6a
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/invokableEnumRet.qml
+@@ -0,0 +1,11 @@
++import Qt.test 1.0
++import QtQuick 2.0
++
++MyQmlObject {
++    id: root
++    property bool test: false
++    Component.onCompleted: {
++        test = (root.getEnumValue() == 3)
++    }
++}
++
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 2631002..8f3804a 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -187,6 +187,8 @@ public:
+     int intProperty() const { return m_intProperty; }
+     void setIntProperty(int i) { m_intProperty = i; emit intChanged(); }
+     
++    Q_INVOKABLE MyEnum2 getEnumValue() const { return EnumValue4; }
++
+ signals:
+     void basicSignal();
+     void argumentSignal(int a, QString b, qreal c, MyEnum2 d, Qt::MouseButtons e);
+@@ -695,6 +697,8 @@ public:
+     Q_INVOKABLE void method_overload(const QJsonArray &a) { invoke(26); m_actuals << QVariant::fromValue(a); }
+     Q_INVOKABLE void method_overload(const QJsonValue &a) { invoke(27); m_actuals << QVariant::fromValue(a); }
+ 
++    Q_INVOKABLE void method_unknown(MyInvokableObject *o) { invoke(28); }
++
+ private:
+     friend class MyInvokableBaseObject;
+     void invoke(int idx) { if (m_invoked != -1) m_invokedError = true; m_invoked = idx;}
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 9f4a857..d344758 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -245,6 +245,7 @@ private slots:
+     void callQtInvokables();
+     void invokableObjectArg();
+     void invokableObjectRet();
++    void invokableEnumRet();
+     void qtbug_20344();
+     void qtbug_22679();
+     void qtbug_22843_data();
+@@ -2288,9 +2289,9 @@ void tst_qqmlecmascript::callQtInvokables()
+     }
+ 
+     o.reset();
+-    QVERIFY(EVALUATE_VALUE("object.method_NoArgs_unknown()", v8::Undefined()));
++    QVERIFY(EVALUATE_ERROR("object.method_NoArgs_unknown()"));
+     QCOMPARE(o.error(), false);
+-    QCOMPARE(o.invoked(), 5);
++    QCOMPARE(o.invoked(), -1);
+     QCOMPARE(o.actuals().count(), 0);
+ 
+     o.reset();
+@@ -2741,6 +2742,12 @@ void tst_qqmlecmascript::callQtInvokables()
+     QCOMPARE(o.invoked(), 27);
+     QCOMPARE(o.actuals().count(), 1);
+     QCOMPARE(qvariant_cast<QJsonValue>(o.actuals().at(0)), QJsonValue(QJsonValue::Undefined));
++
++    o.reset();
++    QVERIFY(EVALUATE_ERROR("object.method_unknown(null)"));
++    QCOMPARE(o.error(), false);
++    QCOMPARE(o.invoked(), -1);
++    QCOMPARE(o.actuals().count(), 0);
+ }
+ 
+ // QTBUG-13047 (check that you can pass registered object types as args)
+@@ -2768,6 +2775,16 @@ void tst_qqmlecmascript::invokableObjectRet()
+     delete o;
+ }
+ 
++void tst_qqmlecmascript::invokableEnumRet()
++{
++    QQmlComponent component(&engine, testFileUrl("invokableEnumRet.qml"));
++
++    QObject *o = component.create();
++    QVERIFY(o);
++    QCOMPARE(o->property("test").toBool(), true);
++    delete o;
++}
++
+ // QTBUG-5675
+ void tst_qqmlecmascript::listToVariant()
+ {

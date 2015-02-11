@@ -1,0 +1,1049 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index e171635..6f27925 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -3458,6 +3458,7 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+ 
+         Instruction::StoreV4Binding store;
+         store.value = js.compiledIndex;
++        store.fallbackValue = js.sharedIndex;
+         store.context = js.bindingContext.stack;
+         store.owner = js.bindingContext.owner;
+         store.isAlias = prop->isAlias;
+@@ -3473,11 +3474,18 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+         store.line = binding->location.start.line;
+         store.column = binding->location.start.column;
+         output->addInstruction(store);
++
++        if (store.fallbackValue > -1) {
++            //also create v8 instruction (needed to properly configure the fallback v8 binding)
++            JSBindingReference &js = static_cast<JSBindingReference &>(*binding->bindingReference);
++            js.dataType = BindingReference::V8;
++            genBindingAssignment(binding, prop, obj, valueTypeProperty);
++        }
+     } else if (ref.dataType == BindingReference::V8) {
+         const JSBindingReference &js = static_cast<const JSBindingReference &>(ref);
+ 
+         Instruction::StoreV8Binding store;
+-        store.value = js.compiledIndex;
++        store.value = js.sharedIndex;
+         store.context = js.bindingContext.stack;
+         store.owner = js.bindingContext.owner;
+         store.isAlias = prop->isAlias;
+@@ -3486,6 +3494,7 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+         } else {
+             store.isRoot = (compileState->root == obj);
+         }
++        store.isFallback = js.compiledIndex > -1;
+         store.line = binding->location.start.line;
+         store.column = binding->location.start.column;
+ 
+@@ -3514,6 +3523,7 @@ void QQmlCompiler::genBindingAssignment(QQmlScript::Value *binding,
+         } else {
+             store.isRoot = (compileState->root == obj);
+         }
++        store.isFallback = false;
+ 
+         Q_ASSERT(js.bindingContext.owner == 0 ||
+                  (js.bindingContext.owner != 0 && valueTypeProperty));
+@@ -3579,13 +3589,22 @@ bool QQmlCompiler::completeComponentBuild()
+         expr.property = binding.property;
+         expr.expression = binding.expression;
+ 
+-        int index = bindingCompiler.compile(expr, enginePrivate);
++        bool needsFallback = false;
++        int index = bindingCompiler.compile(expr, enginePrivate, &needsFallback);
+         if (index != -1) {
++            // Ensure the index value fits within the available space
++            Q_ASSERT(index < (1 << 15));
++
+             binding.dataType = BindingReference::V4;
+             binding.compiledIndex = index;
++            binding.sharedIndex = -1;
+             if (componentStats)
+                 componentStats->componentStat.optimizedBindings.append(b->value->location);
+-            continue;
++
++            if (!needsFallback)
++                continue;
++
++            // Drop through. We need to create a V8 binding in case the V4 binding is invalidated
+         }
+ 
+         // Pre-rewrite the expression
+@@ -3597,12 +3616,17 @@ bool QQmlCompiler::completeComponentBuild()
+         binding.rewrittenExpression = rewriteBinding(binding.expression.asAST(), expression, &isSharable);
+ 
+         if (isSharable && binding.property->type != qMetaTypeId<QQmlBinding*>()) {
+-            binding.dataType = BindingReference::V8;
+             sharedBindings.append(b);
+ 
+-            if (componentStats)
+-                componentStats->componentStat.sharedBindings.append(b->value->location);
++            if (!needsFallback) {
++                binding.dataType = BindingReference::V8;
++                binding.compiledIndex = -1;
++
++                if (componentStats)
++                    componentStats->componentStat.sharedBindings.append(b->value->location);
++            }
+         } else {
++            Q_ASSERT(!needsFallback);
+             binding.dataType = BindingReference::QtScript;
+ 
+             if (componentStats)
+@@ -3639,7 +3663,10 @@ bool QQmlCompiler::completeComponentBuild()
+ 
+             functionArray += expression.toUtf8();
+             lineNumber += expression.count(QLatin1Char('\n'));
+-            reference->compiledIndex = ii;
++
++            // Ensure the index value fits within the available space
++            Q_ASSERT(ii < (1 << 15));
++            reference->sharedIndex = ii;
+         }
+         functionArray.append("]", 1);
+ 
+diff --git a/src/qml/qml/qqmlcompiler_p.h b/src/qml/qml/qqmlcompiler_p.h
+index b919b53..fc80ca9 100644
+--- a/src/qml/qml/qqmlcompiler_p.h
++++ b/src/qml/qml/qqmlcompiler_p.h
+@@ -201,7 +201,8 @@ namespace QQmlCompilerTypes {
+         QQmlScript::Property *property;
+         QQmlScript::Value *value;
+ 
+-        int compiledIndex;
++        int compiledIndex:15;
++        int sharedIndex:15;
+ 
+         QString rewrittenExpression;
+         BindingContext bindingContext;
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index 8b7dc38..313aed1 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -240,6 +240,7 @@ union QQmlInstruction
+         QML_INSTR_HEADER
+         unsigned int property;
+         int value;
++        int fallbackValue;
+         short context;
+         short owner;
+         bool isRoot;
+@@ -255,6 +256,7 @@ union QQmlInstruction
+         short owner;
+         bool isRoot;
+         bool isAlias;
++        bool isFallback;
+         ushort line;
+         ushort column;
+     };
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index d0c2761..132664d 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -56,6 +56,7 @@
+ #include "qqmlvmemetaobject_p.h"
+ #include "qqmlexpression_p.h"
+ #include "qqmlvaluetypeproxybinding_p.h"
++#include <private/qv8bindings_p.h>
+ 
+ #include <QStringList>
+ #include <private/qmetaobject_p.h>
+@@ -961,6 +962,31 @@ QQmlPropertyPrivate::setBindingNoEnable(QObject *object, int coreIndex, int valu
+ }
+ 
+ /*!
++    Activates a shared binding which was previously created but not added to the
++    object.  This is needed when an optimized binding is invalidated.
++*/
++QQmlAbstractBinding *QQmlPropertyPrivate::activateSharedBinding(QQmlContextData *context,
++                                                                int sharedIdx, WriteFlags flags)
++{
++    QQmlAbstractBinding *newBinding = 0;
++    newBinding = context->v8bindings->binding(sharedIdx);
++
++    if (!newBinding)
++        return newBinding;
++
++    // This binding now references the bindings object
++    context->v8bindings->addref();
++
++    QObject *object = newBinding->object();
++    int pi = newBinding->propertyIndex();
++
++    int core = pi & 0xFFFFFF;
++    int vt = (pi & 0xFF000000)?(pi >> 24):-1;
++
++    return setBinding(object, core, vt, newBinding, flags);
++}
++
++/*!
+     Returns the expression associated with this signal property, or 0 if no 
+     signal expression exists.
+ */
+diff --git a/src/qml/qml/qqmlproperty_p.h b/src/qml/qml/qqmlproperty_p.h
+index 36aa142..0131e7e 100644
+--- a/src/qml/qml/qqmlproperty_p.h
++++ b/src/qml/qml/qqmlproperty_p.h
+@@ -119,6 +119,8 @@ public:
+     static QQmlAbstractBinding *setBindingNoEnable(QObject *, int coreIndex,
+                                                            int valueTypeIndex /* -1 */,
+                                                            QQmlAbstractBinding *);
++    static QQmlAbstractBinding *activateSharedBinding(QQmlContextData *context,
++                                                      int sharedIdx, WriteFlags flags);
+     static QQmlAbstractBinding *binding(QObject *, int coreIndex,
+                                                 int valueTypeIndex /* -1 */);
+ 
+diff --git a/src/qml/qml/qqmlpropertycache.cpp b/src/qml/qml/qqmlpropertycache.cpp
+index d922b99..8570df7 100644
+--- a/src/qml/qml/qqmlpropertycache.cpp
++++ b/src/qml/qml/qqmlpropertycache.cpp
+@@ -347,6 +347,7 @@ void QQmlPropertyCache::appendProperty(const QString &name,
+     if (QQmlPropertyData **old = stringCache.value(string)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     propertyIndexCache.append(data);
+@@ -366,6 +367,7 @@ void QQmlPropertyCache::appendProperty(const QHashedCStringRef &name,
+     if (QQmlPropertyData **old = stringCache.value(name)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     propertyIndexCache.append(data);
+@@ -403,6 +405,7 @@ void QQmlPropertyCache::appendSignal(const QString &name, quint32 flags, int cor
+     if (QQmlPropertyData **old = stringCache.value(string)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     methodIndexCache.append(data);
+@@ -441,6 +444,7 @@ void QQmlPropertyCache::appendSignal(const QHashedCStringRef &name, quint32 flag
+     if (QQmlPropertyData **old = stringCache.value(name)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     methodIndexCache.append(data);
+@@ -477,6 +481,7 @@ void QQmlPropertyCache::appendMethod(const QString &name, quint32 flags, int cor
+     if (QQmlPropertyData **old = stringCache.value(string)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     methodIndexCache.append(data);
+@@ -510,6 +515,7 @@ void QQmlPropertyCache::appendMethod(const QHashedCStringRef &name, quint32 flag
+     if (QQmlPropertyData **old = stringCache.value(name)) {
+         data.overrideIndexIsProperty = !(*old)->isFunction();
+         data.overrideIndex = (*old)->coreIndex;
++        (*old)->flags |= QQmlPropertyData::IsOverridden;
+     }
+ 
+     methodIndexCache.append(data);
+@@ -738,6 +744,7 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+                 data->flags |= QQmlPropertyData::IsOverload;
+             data->overrideIndexIsProperty = !old->isFunction();
+             data->overrideIndex = old->coreIndex;
++            old->flags |= QQmlPropertyData::IsOverridden;
+         }
+     }
+ 
+@@ -797,6 +804,7 @@ void QQmlPropertyCache::append(QQmlEngine *engine, const QMetaObject *metaObject
+         } else if (old) {
+             data->overrideIndexIsProperty = !old->isFunction();
+             data->overrideIndex = old->coreIndex;
++            old->flags |= QQmlPropertyData::IsOverridden;
+         }
+     }
+ }
+diff --git a/src/qml/qml/qqmlpropertycache_p.h b/src/qml/qml/qqmlpropertycache_p.h
+index 3e87fa3..b62d34c 100644
+--- a/src/qml/qml/qqmlpropertycache_p.h
++++ b/src/qml/qml/qqmlpropertycache_p.h
+@@ -89,33 +89,34 @@ public:
+         IsResettable       = 0x00000004, // Has RESET function
+         IsAlias            = 0x00000008, // Is a QML alias to another property
+         IsFinal            = 0x00000010, // Has FINAL flag
+-        IsDirect           = 0x00000020, // Exists on a C++ QMetaObject
+-        HasAccessors       = 0x00000040, // Has property accessors
++        IsOverridden       = 0x00000020, // Is overridden by a extension property
++        IsDirect           = 0x00000040, // Exists on a C++ QMetaObject
++        HasAccessors       = 0x00000080, // Has property accessors
+ 
+         // These are mutualy exclusive
+-        IsFunction         = 0x00000080, // Is an invokable
+-        IsQObjectDerived   = 0x00000100, // Property type is a QObject* derived type
+-        IsEnumType         = 0x00000200, // Property type is an enum
+-        IsQList            = 0x00000400, // Property type is a QML list
+-        IsQmlBinding       = 0x00000800, // Property type is a QQmlBinding*
+-        IsQJSValue         = 0x00001000, // Property type is a QScriptValue
+-        IsV8Handle         = 0x00002000, // Property type is a QQmlV8Handle
+-        IsVarProperty      = 0x00004000, // Property type is a "var" property of VMEMO
+-        IsValueTypeVirtual = 0x00008000, // Property is a value type "virtual" property
+-        IsQVariant         = 0x00010000, // Property is a QVariant
++        IsFunction         = 0x00000100, // Is an invokable
++        IsQObjectDerived   = 0x00000200, // Property type is a QObject* derived type
++        IsEnumType         = 0x00000400, // Property type is an enum
++        IsQList            = 0x00000800, // Property type is a QML list
++        IsQmlBinding       = 0x00001000, // Property type is a QQmlBinding*
++        IsQJSValue         = 0x00002000, // Property type is a QScriptValue
++        IsV8Handle         = 0x00004000, // Property type is a QQmlV8Handle
++        IsVarProperty      = 0x00008000, // Property type is a "var" property of VMEMO
++        IsValueTypeVirtual = 0x00010000, // Property is a value type "virtual" property
++        IsQVariant         = 0x00020000, // Property is a QVariant
+ 
+         // Apply only to IsFunctions
+-        IsVMEFunction      = 0x00020000, // Function was added by QML
+-        HasArguments       = 0x00040000, // Function takes arguments
+-        IsSignal           = 0x00080000, // Function is a signal
+-        IsVMESignal        = 0x00100000, // Signal was added by QML
+-        IsV8Function       = 0x00200000, // Function takes QQmlV8Function* args
+-        IsSignalHandler    = 0x00400000, // Function is a signal handler
+-        IsOverload         = 0x00800000, // Function is an overload of another function
+-        IsCloned           = 0x01000000, // The function was marked as cloned
++        IsVMEFunction      = 0x00040000, // Function was added by QML
++        HasArguments       = 0x00080000, // Function takes arguments
++        IsSignal           = 0x00100000, // Function is a signal
++        IsVMESignal        = 0x00200000, // Signal was added by QML
++        IsV8Function       = 0x00400000, // Function takes QQmlV8Function* args
++        IsSignalHandler    = 0x00800000, // Function is a signal handler
++        IsOverload         = 0x01000000, // Function is an overload of another function
++        IsCloned           = 0x02000000, // The function was marked as cloned
+ 
+         // Internal QQmlPropertyCache flags
+-        NotFullyResolved   = 0x02000000, // True if the type data is to be lazily resolved
++        NotFullyResolved   = 0x04000000, // True if the type data is to be lazily resolved
+ 
+         // Flags that are set based on the propType field
+         PropTypeFlagMask = IsQObjectDerived | IsEnumType | IsQList | IsQmlBinding | IsQJSValue |
+@@ -133,6 +134,7 @@ public:
+     bool isResettable() const { return flags & IsResettable; }
+     bool isAlias() const { return flags & IsAlias; }
+     bool isFinal() const { return flags & IsFinal; }
++    bool isOverridden() const { return flags & IsOverridden; }
+     bool isDirect() const { return flags & IsDirect; }
+     bool hasAccessors() const { return flags & HasAccessors; }
+     bool isFunction() const { return flags & IsFunction; }
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index b9924e3..7a6d008 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -847,7 +847,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 QML_NEXT_INSTR(StoreV4Binding);
+ 
+             QQmlAbstractBinding *binding = 
+-                CTXT->v4bindings->configBinding(instr.value, target, scope, property,
++                CTXT->v4bindings->configBinding(instr.value, instr.fallbackValue, target, scope, property,
+                                                 instr.line, instr.column);
+             bindValues.push(binding);
+             binding->m_mePtr = &bindValues.top();
+@@ -881,7 +881,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+ 
+             QQmlAbstractBinding *binding = CTXT->v8bindings->configBinding(target, scope,
+                                                                                    &instr);
+-            if (binding) {
++            if (binding && !instr.isFallback) {
+                 bindValues.push(binding);
+                 binding->m_mePtr = &bindValues.top();
+ 
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index f011bc8..c0e0f22 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -298,13 +298,14 @@ QV4Bindings::~QV4Bindings()
+     delete [] subscriptions; subscriptions = 0;
+ }
+ 
+-QQmlAbstractBinding *QV4Bindings::configBinding(int index, QObject *target, 
++QQmlAbstractBinding *QV4Bindings::configBinding(int index, int fallbackIndex, QObject *target,
+                                                         QObject *scope, int property,
+                                                         int line, int column)
+ {
+     Binding *rv = bindings + index;
+ 
+     rv->index = index;
++    rv->fallbackIndex = fallbackIndex;
+     rv->property = property;
+     rv->target = target;
+     rv->scope = scope;
+@@ -436,6 +437,9 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+         return;
+     }
+ 
++    bool invalidated = false;
++    bool *inv = (binding->fallbackIndex != -1) ? &invalidated : 0;
++
+     binding->updating = true;
+     if (binding->property & 0xFFFF0000) {
+         QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
+@@ -445,9 +449,11 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+         vt->read(*binding->target, binding->property & 0xFFFF);
+ 
+         QObject *target = vt;
+-        run(binding->index, binding->executedBlocks, context, binding, binding->scope, target, flags);
++        run(binding->index, binding->executedBlocks, context, binding, binding->scope, target, flags, inv);
+ 
+-        vt->write(*binding->target, binding->property & 0xFFFF, flags);
++        if (!invalidated) {
++            vt->write(*binding->target, binding->property & 0xFFFF, flags);
++        }
+     } else {
+         QQmlData *data = QQmlData::get(*binding->target);
+         QQmlPropertyData *propertyData = (data && data->propertyCache ? data->propertyCache->property(binding->property) : 0);
+@@ -457,12 +463,20 @@ void QV4Bindings::run(Binding *binding, QQmlPropertyPrivate::WriteFlags flags)
+             v8::HandleScope handle_scope;
+             v8::Context::Scope context_scope(QQmlEnginePrivate::get(context->engine)->v8engine()->context());
+ 
+-            run(binding->index, binding->executedBlocks, context, binding, binding->scope, *binding->target, flags);
++            run(binding->index, binding->executedBlocks, context, binding, binding->scope, *binding->target, flags, inv);
+         } else {
+-            run(binding->index, binding->executedBlocks, context, binding, binding->scope, *binding->target, flags);
++            run(binding->index, binding->executedBlocks, context, binding, binding->scope, *binding->target, flags, inv);
+         }
+     }
+     binding->updating = false;
++
++    if (invalidated) {
++        // This binding is no longer valid - fallback to V8
++        Q_ASSERT(binding->fallbackIndex > -1);
++        QQmlAbstractBinding *b = QQmlPropertyPrivate::activateSharedBinding(context, binding->fallbackIndex, flags);
++        Q_ASSERT(b == binding);
++        b->destroy();
++    }
+ }
+ 
+ 
+@@ -765,6 +779,25 @@ inline quint32 QV4Bindings::toUint32(double n)
+     MARK_REGISTER(reg); \
+ }
+ 
++//TODO: avoid construction of name and name-based lookup
++#define INVALIDATION_CHECK(inv, obj, index) { \
++    if ((inv) != 0) { \
++        QQmlData *data = QQmlData::get((obj)); \
++        if (data && !data->propertyCache) { \
++            data->propertyCache = QQmlEnginePrivate::get(context->engine)->cache(object); \
++            if (data->propertyCache) data->propertyCache->addref(); \
++        } \
++        QQmlPropertyData *prop = (data && data->propertyCache) ? data->propertyCache->property((index)) : 0; \
++        if (prop && prop->isOverridden()) { \
++            int resolvedIndex = data->propertyCache->property(prop->name(obj))->coreIndex; \
++            if (index < resolvedIndex) { \
++                *(inv) = true; \
++                goto programExit; \
++            } \
++        } \
++    } \
++}
++
+ #ifdef QML_THREADED_INTERPRETER
+ void **QV4Bindings::getDecodeInstrTable()
+ {
+@@ -774,7 +807,7 @@ void **QV4Bindings::getDecodeInstrTable()
+         quint32 executedBlocks = 0;
+         dummy->run(0, executedBlocks, 0, 0, 0, 0, 
+                    QQmlPropertyPrivate::BypassInterceptor, 
+-                   &decode_instr);
++                   0, &decode_instr);
+         dummy->release();
+     }
+     return decode_instr;
+@@ -784,7 +817,8 @@ void **QV4Bindings::getDecodeInstrTable()
+ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+                                  QQmlContextData *context, QQmlDelayedError *error,
+                                  QObject *scope, QObject *output, 
+-                                 QQmlPropertyPrivate::WriteFlags storeFlags
++                                 QQmlPropertyPrivate::WriteFlags storeFlags,
++                                 bool *invalidated
+ #ifdef QML_THREADED_INTERPRETER
+                                  ,void ***table
+ #endif
+@@ -857,8 +891,10 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+ 
+         QObject *object = reg.getQObject();
+         if (!object) {
+-            reg.setUndefined();
++            THROW_EXCEPTION(instr->fetchAndSubscribe.exceptionId);
+         } else {
++            INVALIDATION_CHECK(invalidated, object, instr->fetchAndSubscribe.property.coreIndex);
++
+             int subIdx = instr->fetchAndSubscribe.subscription;
+             Subscription *sub = 0;
+             if (subIdx != -1) {
+@@ -2111,6 +2147,8 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         if (!object) {
+             THROW_EXCEPTION(instr->fetch.exceptionId);
+         } else {
++            INVALIDATION_CHECK(invalidated, object, instr->fetch.index);
++
+             const Register::Type valueType = (Register::Type)instr->fetch.valueType;
+             reg.init(valueType);
+             if (instr->fetch.valueType >= FirstCleanupType)
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index e9c6301..0c92cc4 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -71,7 +71,7 @@ public:
+     QV4Bindings(const char *program, QQmlContextData *context);
+     virtual ~QV4Bindings();
+ 
+-    QQmlAbstractBinding *configBinding(int index, QObject *target, 
++    QQmlAbstractBinding *configBinding(int index, int fallbackIndex, QObject *target,
+                                                QObject *scope, int property,
+                                                int line, int column);
+ 
+@@ -80,8 +80,8 @@ public:
+ #endif
+ 
+     struct Binding : public QQmlAbstractBinding, public QQmlDelayedError {
+-        Binding() : QQmlAbstractBinding(V4), enabled(false), updating(0), property(0),
+-                    scope(0), target(0), executedBlocks(0), parent(0) {}
++        Binding() : QQmlAbstractBinding(V4), index(-1), fallbackIndex(-1), enabled(false),
++                    updating(0), property(0), scope(0), target(0), executedBlocks(0), parent(0) {}
+ 
+         // Inherited from QQmlAbstractBinding
+         static void destroy(QQmlAbstractBinding *);
+@@ -96,9 +96,11 @@ public:
+             int targetProperty;
+         };
+ 
+-        int index:30;
++        int index:15;
++        int fallbackIndex:15;
+         bool enabled:1;
+         bool updating:1;
++
+         // Encoding of property is coreIndex | (propType << 16) | (valueTypeIndex << 24)
+         // propType and valueTypeIndex are only set if the property is a value type property
+         int property;
+@@ -134,7 +136,8 @@ private:
+     void init();
+     void run(int instr, quint32 &executedBlocks, QQmlContextData *context,
+              QQmlDelayedError *error, QObject *scope, QObject *output, 
+-             QQmlPropertyPrivate::WriteFlags storeFlags
++             QQmlPropertyPrivate::WriteFlags storeFlags,
++             bool *invalidated
+ #ifdef QML_THREADED_INTERPRETER
+              , void ***decode_instr = 0
+ #endif
+diff --git a/src/qml/qml/v4/qv4compiler.cpp b/src/qml/qml/v4/qv4compiler.cpp
+index bac1f2c..8f87583 100644
+--- a/src/qml/qml/v4/qv4compiler.cpp
++++ b/src/qml/qml/v4/qv4compiler.cpp
+@@ -66,7 +66,7 @@ using namespace QQmlJS;
+ QV4CompilerPrivate::QV4CompilerPrivate()
+     : subscriptionOffset(0)
+     , _function(0) , _block(0) , _discarded(false), registerCount(0)
+-    , bindingLine(0), bindingColumn(0)
++    , bindingLine(0), bindingColumn(0), invalidatable(false)
+ {
+ }
+ 
+@@ -1258,6 +1258,7 @@ void QV4CompilerPrivate::resetInstanceState()
+     patches.clear();
+     pool.clear();
+     currentReg = 0;
++    invalidatable = false;
+ }
+ 
+ /*!
+@@ -1304,7 +1305,7 @@ bool QV4CompilerPrivate::compile(QQmlJS::AST::Node *node)
+     IR::Function thisFunction(&pool), *function = &thisFunction;
+ 
+     QV4IRBuilder irBuilder(expression, engine);
+-    if (!irBuilder(function, node))
++    if (!irBuilder(function, node, &invalidatable))
+         return false;
+ 
+     bool discarded = false;
+@@ -1445,7 +1446,7 @@ bool QV4Compiler::isValid() const
+ /* 
+ -1 on failure, otherwise the binding index to use.
+ */
+-int QV4Compiler::compile(const Expression &expression, QQmlEnginePrivate *engine)
++int QV4Compiler::compile(const Expression &expression, QQmlEnginePrivate *engine, bool *invalidatable)
+ {
+     if (!expression.expression.asAST()) return false;
+ 
+@@ -1456,6 +1457,7 @@ int QV4Compiler::compile(const Expression &expression, QQmlEnginePrivate *engine
+     d->engine = engine;
+ 
+     if (d->compile(expression.expression.asAST())) {
++        *invalidatable = d->isInvalidatable();
+         return d->commitCompile();
+     } else {
+         return -1;
+diff --git a/src/qml/qml/v4/qv4compiler_p.h b/src/qml/qml/v4/qv4compiler_p.h
+index cf0d519..ec246ca 100644
+--- a/src/qml/qml/v4/qv4compiler_p.h
++++ b/src/qml/qml/v4/qv4compiler_p.h
+@@ -89,7 +89,7 @@ public:
+     };
+ 
+     // -1 on failure, otherwise the binding index to use
+-    int compile(const Expression &, QQmlEnginePrivate *);
++    int compile(const Expression &, QQmlEnginePrivate *, bool *);
+ 
+     // Returns the compiled program
+     QByteArray program() const;
+diff --git a/src/qml/qml/v4/qv4compiler_p_p.h b/src/qml/qml/v4/qv4compiler_p_p.h
+index 0c06ade..12beaa0 100644
+--- a/src/qml/qml/v4/qv4compiler_p_p.h
++++ b/src/qml/qml/v4/qv4compiler_p_p.h
+@@ -127,6 +127,8 @@ public:
+ 
+     bool compile(QQmlJS::AST::Node *);
+ 
++    bool isInvalidatable() const { return invalidatable; }
++
+     int registerLiteralString(quint8 reg, const QStringRef &);
+     QByteArray data;
+ 
+@@ -235,6 +237,7 @@ private:
+     quint32 currentBlockMask;
+     int bindingLine;
+     int bindingColumn;
++    bool invalidatable;
+ };
+ 
+ 
+diff --git a/src/qml/qml/v4/qv4irbuilder.cpp b/src/qml/qml/v4/qv4irbuilder.cpp
+index ddc2264..79090b4 100644
+--- a/src/qml/qml/v4/qv4irbuilder.cpp
++++ b/src/qml/qml/v4/qv4irbuilder.cpp
+@@ -91,14 +91,15 @@ static IR::Type irTypeFromVariantType(int t, QQmlEnginePrivate *engine)
+     }
+ }
+ 
+-QV4IRBuilder::QV4IRBuilder(const QV4Compiler::Expression *expr, 
+-                                                             QQmlEnginePrivate *engine)
+-: m_expression(expr), m_engine(engine), _function(0), _block(0), _discard(false)
++QV4IRBuilder::QV4IRBuilder(const QV4Compiler::Expression *expr,
++                           QQmlEnginePrivate *engine)
++: m_expression(expr), m_engine(engine), _function(0), _block(0), _discard(false),
++  _invalidatable(false)
+ {
+ }
+ 
+ bool QV4IRBuilder::operator()(QQmlJS::IR::Function *function,
+-                                         QQmlJS::AST::Node *ast)
++                              QQmlJS::AST::Node *ast, bool *invalidatable)
+ {
+     bool discarded = false;
+ 
+@@ -142,6 +143,7 @@ bool QV4IRBuilder::operator()(QQmlJS::IR::Function *function,
+     qSwap(_function, function);
+     qSwap(_discard, discarded);
+ 
++    *invalidatable = _invalidatable;
+     return !discarded;
+ }
+ 
+@@ -615,12 +617,8 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                     if (!data || data->isFunction())
+                         return false; // Don't support methods (or non-existing properties ;)
+ 
+-                    if(!data->isFinal()) {
+-                        if (qmlVerboseCompiler())
+-                            qWarning() << "*** non-final attached property:"
+-                                       << (*baseName->id + QLatin1Char('.') + ast->name.toString());
+-                        return false; // We don't know enough about this property
+-                    }
++                    if (!data->isFinal())
++                        _invalidatable = true;
+ 
+                     IR::Type irType = irTypeFromVariantType(data->propType, m_engine);
+                     _expr.code = _block->SYMBOL(baseName, irType, name, attachedMeta, data, line, column);
+@@ -654,12 +652,8 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                     if (!data || data->isFunction())
+                         return false; // Don't support methods (or non-existing properties ;)
+ 
+-                    if (!data->isFinal()) {
+-                        if (qmlVerboseCompiler())
+-                            qWarning() << "*** non-final attached property:"
+-                                       << (*baseName->id + QLatin1Char('.') + ast->name.toString());
+-                        return false; // We don't know enough about this property
+-                    }
++                    if (!data->isFinal())
++                        _invalidatable = true;
+ 
+                     IR::Type irType = irTypeFromVariantType(data->propType, m_engine);
+                     _expr.code = _block->SYMBOL(baseName, irType, name, baseName->meta, data, line, column);
+@@ -690,20 +684,15 @@ bool QV4IRBuilder::visit(AST::FieldMemberExpression *ast)
+                 break;
+ 
+             case IR::Name::Property: 
+-                if (baseName->type == IR::ObjectType && !baseName->meta.isNull() &&
+-                    baseName->property->isFinal()) {
++                if (baseName->type == IR::ObjectType && !baseName->meta.isNull()) {
+                     QQmlMetaObject meta = m_engine->metaObjectForType(baseName->property->propType);
+                     QQmlPropertyCache *cache = meta.propertyCache(m_engine);
+                     if (!cache)
+                         return false;
+ 
+                     if (QQmlPropertyData *data = cache->property(name)) {
+-                        if (!data->isFinal()) {
+-                            if (qmlVerboseCompiler())
+-                                qWarning() << "*** non-final property access:"
+-                                           << (*baseName->id + QLatin1Char('.') + ast->name.toString());
+-                            return false; // We don't know enough about this property
+-                        }
++                        if (!baseName->property->isFinal() || !data->isFinal())
++                            _invalidatable = true;
+ 
+                         IR::Type irType = irTypeFromVariantType(data->propType, m_engine);
+                         _expr.code = _block->SYMBOL(baseName, irType, name,
+diff --git a/src/qml/qml/v4/qv4irbuilder_p.h b/src/qml/qml/v4/qv4irbuilder_p.h
+index e73ec22..e4f75d5 100644
+--- a/src/qml/qml/v4/qv4irbuilder_p.h
++++ b/src/qml/qml/v4/qv4irbuilder_p.h
+@@ -55,7 +55,7 @@ class QV4IRBuilder : public QQmlJS::AST::Visitor
+ public:
+     QV4IRBuilder(const QV4Compiler::Expression *, QQmlEnginePrivate *);
+ 
+-    bool operator()(QQmlJS::IR::Function *, QQmlJS::AST::Node *);
++    bool operator()(QQmlJS::IR::Function *, QQmlJS::AST::Node *, bool *invalidatable);
+ 
+ protected:
+     struct ExprResult {
+@@ -229,6 +229,7 @@ private:
+     QQmlJS::IR::Function *_function;
+     QQmlJS::IR::BasicBlock *_block;
+     bool _discard;
++    bool _invalidatable;
+ 
+     ExprResult _expr;
+ };
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index 00134c5..5a6abdb 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -296,7 +296,8 @@ QV8Bindings::configBinding(QObject *target, QObject *scope,
+     rv->setNotifyOnValueChanged(true);
+     rv->parent = this;
+ 
+-    addref(); // This is decremented in Binding::destroy()
++    if (!i->isFallback)
++        addref(); // This is decremented in Binding::destroy()
+ 
+     return rv;
+ }
+diff --git a/src/qml/qml/v8/qv8bindings_p.h b/src/qml/qml/v8/qv8bindings_p.h
+index fc6617b..c7c2a3c 100644
+--- a/src/qml/qml/v8/qv8bindings_p.h
++++ b/src/qml/qml/v8/qv8bindings_p.h
+@@ -129,6 +129,8 @@ public:
+     inline void addref();
+     inline void release();
+ 
++    QQmlAbstractBinding *binding(int index) const { return bindings + index; }
++
+ private:
+     Q_DISABLE_COPY(QV8Bindings)
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/data/BaseComponent.qml b/tests/auto/qml/qqmlecmascript/data/BaseComponent.qml
+new file mode 100644
+index 0000000..bad4bf8
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/BaseComponent.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++Item {
++    property Item baz: Item { width: 100 }
++    property string bar: baz.width
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.1.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.1.qml
+new file mode 100644
+index 0000000..8de6607
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.1.qml
+@@ -0,0 +1,11 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    BaseComponent {
++        id: foo
++    }
++
++    Component.onCompleted: success = (foo.bar == '100')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml
+new file mode 100644
+index 0000000..c33c895
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.2.qml
+@@ -0,0 +1,12 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    BaseComponent {
++        id: foo
++        property Text baz: Text { width: 200 }
++    }
++
++    Component.onCompleted: success = (foo.bar == '200')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.3.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.3.qml
+new file mode 100644
+index 0000000..4080b8d
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.3.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsObject 1.0 as ModuleAPI
++
++Item {
++    property bool success: false
++    property string foo: ModuleAPI.test
++
++    Component.onCompleted: success = (foo == '100')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.4.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.4.qml
+new file mode 100644
+index 0000000..b7bd294
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.4.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsDerived 1.0 as ModuleAPI
++
++Item {
++    property bool success: false
++    property string foo: ModuleAPI.test
++
++    Component.onCompleted: success = (foo == 'hello')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.5.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.5.qml
+new file mode 100644
+index 0000000..3e869c1
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.5.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsObject 1.0
++
++Item {
++    property bool success: false
++    property string foo: FallbackBindingsType.test
++
++    Component.onCompleted: success = (foo == '100')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/fallbackBindings.6.qml b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.6.qml
+new file mode 100644
+index 0000000..1382161
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/fallbackBindings.6.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++import Qt.test.fallbackBindingsDerived 1.0
++
++Item {
++    property bool success: false
++    property string foo: FallbackBindingsType.test
++
++    Component.onCompleted: success = (foo == 'hello')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.cpp b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+index f488c6a..b02e996 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.cpp
++++ b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+@@ -157,6 +157,22 @@ static QObject *qobject_api_engine_parent(QQmlEngine *engine, QJSEngine *scriptE
+     return o;
+ }
+ 
++static QObject *fallback_bindings_object(QQmlEngine *engine, QJSEngine *scriptEngine)
++{
++    Q_UNUSED(engine)
++    Q_UNUSED(scriptEngine)
++
++    return new FallbackBindingsObject();
++}
++
++static QObject *fallback_bindings_derived(QQmlEngine *engine, QJSEngine *scriptEngine)
++{
++    Q_UNUSED(engine)
++    Q_UNUSED(scriptEngine)
++
++    return new FallbackBindingsDerived();
++}
++
+ class MyWorkerObjectThread : public QThread
+ {
+ public:
+@@ -231,6 +247,12 @@ void registerTypes()
+     qmlRegisterType<MySequenceConversionObject>("Qt.test", 1, 0, "MySequenceConversionObject");
+ 
+     qmlRegisterType<MyUnregisteredEnumTypeObject>("Qt.test", 1, 0, "MyUnregisteredEnumTypeObject");
++
++    qmlRegisterModuleApi<FallbackBindingsObject>("Qt.test.fallbackBindingsObject", 1, 0, fallback_bindings_object);
++    qmlRegisterModuleApi<FallbackBindingsObject>("Qt.test.fallbackBindingsDerived", 1, 0, fallback_bindings_derived);
++
++    qmlRegisterType<FallbackBindingsTypeObject>("Qt.test.fallbackBindingsObject", 1, 0, "FallbackBindingsType");
++    qmlRegisterType<FallbackBindingsTypeDerived>("Qt.test.fallbackBindingsDerived", 1, 0, "FallbackBindingsType");
+ }
+ 
+ #include "testtypes.moc"
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 06e54ea..d857b64 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1496,6 +1496,104 @@ private:
+     MyEnum m_ev;
+ };
+ 
++class FallbackBindingsObject : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY (int test READ test NOTIFY testChanged)
++public:
++    FallbackBindingsObject(QObject* parent = 0)
++        : QObject(parent), m_test(100)
++    {
++    }
++
++    int test() const { return m_test; }
++
++Q_SIGNALS:
++    void testChanged();
++
++private:
++    int m_test;
++};
++
++class FallbackBindingsDerived : public FallbackBindingsObject
++{
++    Q_OBJECT
++    Q_PROPERTY (QString test READ test NOTIFY testChanged)
++public:
++    FallbackBindingsDerived(QObject* parent = 0)
++        : FallbackBindingsObject(parent), m_test("hello")
++    {
++    }
++
++    QString test() const { return m_test; }
++
++Q_SIGNALS:
++    void testChanged();
++
++private:
++    QString m_test;
++};
++
++class FallbackBindingsAttachedObject : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY (int test READ test NOTIFY testChanged)
++public:
++    FallbackBindingsAttachedObject(QObject *parent) : QObject(parent), m_test(100) {}
++
++    int test() const { return m_test; }
++
++Q_SIGNALS:
++    void testChanged();
++
++private:
++    int m_test;
++};
++
++class FallbackBindingsAttachedDerived : public FallbackBindingsAttachedObject
++{
++    Q_OBJECT
++    Q_PROPERTY (QString test READ test NOTIFY testChanged)
++public:
++    FallbackBindingsAttachedDerived(QObject* parent = 0)
++        : FallbackBindingsAttachedObject(parent), m_test("hello")
++    {
++    }
++
++    QString test() const { return m_test; }
++
++Q_SIGNALS:
++    void testChanged();
++
++private:
++    QString m_test;
++};
++
++class FallbackBindingsTypeObject : public QObject
++{
++    Q_OBJECT
++public:
++    FallbackBindingsTypeObject() : QObject() {}
++
++    static FallbackBindingsAttachedObject *qmlAttachedProperties(QObject *o) {
++        return new FallbackBindingsAttachedObject(o);
++    }
++};
++
++class FallbackBindingsTypeDerived : public QObject
++{
++    Q_OBJECT
++public:
++    FallbackBindingsTypeDerived() : QObject() {}
++
++    static FallbackBindingsAttachedObject *qmlAttachedProperties(QObject *o) {
++        return new FallbackBindingsAttachedDerived(o);
++    }
++};
++
++QML_DECLARE_TYPEINFO(FallbackBindingsTypeObject, QML_HAS_ATTACHED_PROPERTIES)
++QML_DECLARE_TYPEINFO(FallbackBindingsTypeDerived, QML_HAS_ATTACHED_PROPERTIES)
++
+ void registerTypes();
+ 
+ #endif // TESTTYPES_H
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index e2f818c..39174f0 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -272,6 +272,8 @@ private slots:
+     void secondAlias();
+     void varAlias();
+     void overrideDataAssert();
++    void fallbackBindings_data();
++    void fallbackBindings();
+ 
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+@@ -6996,6 +6998,29 @@ void tst_qqmlecmascript::overrideDataAssert()
+     delete object;
+ }
+ 
++void tst_qqmlecmascript::fallbackBindings_data()
++{
++    QTest::addColumn<QString>("source");
++
++    QTest::newRow("Property without fallback") << "fallbackBindings.1.qml";
++    QTest::newRow("Property fallback") << "fallbackBindings.2.qml";
++    QTest::newRow("ModuleAPI without fallback") << "fallbackBindings.3.qml";
++    QTest::newRow("ModuleAPI fallback") << "fallbackBindings.4.qml";
++    QTest::newRow("Attached without fallback") << "fallbackBindings.5.qml";
++    QTest::newRow("Attached fallback") << "fallbackBindings.6.qml";
++}
++
++void tst_qqmlecmascript::fallbackBindings()
++{
++    QFETCH(QString, source);
++
++    QQmlComponent component(&engine, testFileUrl(source));
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++
++    QCOMPARE(object->property("success").toBool(), true);
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

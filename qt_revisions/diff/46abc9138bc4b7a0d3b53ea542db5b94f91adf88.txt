@@ -1,0 +1,132 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.h b/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.h
+index 7fa1779..8627153 100644
+--- a/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.h
++++ b/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.h
+@@ -119,4 +119,5 @@
+ - (QT_MANGLE_NAMESPACE(QCocoaMenuLoader) *)menuLoader;
+ - (void)setReflectionDelegate:(NSObject <NSApplicationDelegate> *)oldDelegate;
+ - (void)getUrl:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)replyEvent;
++- (void) removeAppleEventHandlers;
+ @end
+diff --git a/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.mm b/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.mm
+index a2b5374..09dec60 100644
+--- a/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.mm
++++ b/src/plugins/platforms/cocoa/qcocoaapplicationdelegate.mm
+@@ -217,6 +217,43 @@ static void cleanupCocoaApplicationDelegate()
+     return NSTerminateCancel;
+ }
+ 
++- (void) applicationWillFinishLaunching:(NSNotification *)notification
++{
++    Q_UNUSED(notification);
++
++    /*
++        From the Cocoa documentation: "A good place to install event handlers
++        is in the applicationWillFinishLaunching: method of the application
++        delegate. At that point, the Application Kit has installed its default
++        event handlers, so if you install a handler for one of the same events,
++        it will replace the Application Kit version."
++    */
++
++    /*
++        If Qt is used as a plugin, we let the 3rd party application handle
++        events like quit and open file events. Otherwise, if we install our own
++        handlers, we easily end up breaking functionality the 3rd party
++        application depends on.
++     */
++    NSAppleEventManager *eventManager = [NSAppleEventManager sharedAppleEventManager];
++    [eventManager setEventHandler:self
++                      andSelector:@selector(appleEventQuit:withReplyEvent:)
++                    forEventClass:kCoreEventClass
++                       andEventID:kAEQuitApplication];
++    [eventManager setEventHandler:self
++                      andSelector:@selector(getUrl:withReplyEvent:)
++                    forEventClass:kInternetEventClass
++                       andEventID:kAEGetURL];
++}
++
++// called by QCocoaIntegration's destructor before resetting the application delegate to nil
++- (void) removeAppleEventHandlers
++{
++    NSAppleEventManager *eventManager = [NSAppleEventManager sharedAppleEventManager];
++    [eventManager removeEventHandlerForEventClass:kCoreEventClass andEventID:kAEQuitApplication];
++    [eventManager removeEventHandlerForEventClass:kInternetEventClass andEventID:kAEGetURL];
++}
++
+ - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
+ {
+     Q_UNUSED(aNotification);
+@@ -347,22 +384,15 @@ static void cleanupCocoaApplicationDelegate()
+ 
+ - (void)getUrl:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)replyEvent
+ {
+-    Q_UNUSED(event);
+     Q_UNUSED(replyEvent);
+-/*
+     NSString *urlString = [[event paramDescriptorForKeyword:keyDirectObject] stringValue];
+-    QUrl url(QCFString::toQString(urlString));
+-    QFileOpenEvent qtEvent(url);
+-    qt_sendSpontaneousEvent(qAppInstance(), &qtEvent);
+-*/
++    QWindowSystemInterface::handleFileOpenEvent(QCFString::toQString(urlString));
+ }
+ 
+ - (void)appleEventQuit:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)replyEvent
+ {
+     Q_UNUSED(event);
+     Q_UNUSED(replyEvent);
+-    qDebug() << "appleEventQuit";
+-
+     [NSApp terminate:self];
+ }
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+index ddaa7a7..a00f3eb 100644
+--- a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
++++ b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+@@ -1042,26 +1042,6 @@ void QCocoaEventDispatcherPrivate::firstLoopEntry(CFRunLoopObserverRef ref,
+ {
+     Q_UNUSED(ref);
+     Q_UNUSED(activity);
+-/*
+-    // This function is called when NSApplication has finished initialization,
+-    // which appears to be just after [NSApplication run] has started to execute.
+-    // By setting up our apple events handlers this late, we override the ones
+-    // set up by NSApplication.
+-
+-    // If Qt is used as a plugin, we let the 3rd party application handle events
+-    // like quit and open file events. Otherwise, if we install our own handlers, we
+-    // easily end up breaking functionallity the 3rd party application depend on:
+-    if (QGuiApplication::testAttribute(Qt::AA_MacPluginApplication))
+-        return;
+-
+-    QT_MANGLE_NAMESPACE(QCocoaApplicationDelegate) *newDelegate = [QT_MANGLE_NAMESPACE(QCocoaApplicationDelegate) sharedDelegate];
+-    NSAppleEventManager *eventManager = [NSAppleEventManager sharedAppleEventManager];
+-    [eventManager setEventHandler:newDelegate andSelector:@selector(appleEventQuit:withReplyEvent:)
+-     forEventClass:kCoreEventClass andEventID:kAEQuitApplication];
+-    [eventManager setEventHandler:newDelegate andSelector:@selector(getUrl:withReplyEvent:)
+-      forEventClass:kInternetEventClass andEventID:kAEGetURL];
+-*/
+-
+     static_cast<QCocoaEventDispatcherPrivate *>(info)->processPostedEvents();
+ }
+ 
+diff --git a/src/plugins/platforms/cocoa/qcocoaintegration.mm b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+index 9ea00d3..29c5ec7 100644
+--- a/src/plugins/platforms/cocoa/qcocoaintegration.mm
++++ b/src/plugins/platforms/cocoa/qcocoaintegration.mm
+@@ -148,7 +148,13 @@ QCocoaIntegration::QCocoaIntegration()
+ 
+ QCocoaIntegration::~QCocoaIntegration()
+ {
+-    [[NSApplication sharedApplication] setDelegate: 0];
++    if (!QCoreApplication::testAttribute(Qt::AA_MacPluginApplication)) {
++        // remove the apple event handlers installed by QCocoaApplicationDelegate
++        QT_MANGLE_NAMESPACE(QCocoaApplicationDelegate) *delegate = [QT_MANGLE_NAMESPACE(QCocoaApplicationDelegate) sharedDelegate];
++        [delegate removeAppleEventHandlers];
++        // reset the application delegate
++        [[NSApplication sharedApplication] setDelegate: 0];
++    }
+ 
+     // Delete the clipboard integration and destroy mime type converters.
+     // Deleting the clipboard integration flushes promised pastes using

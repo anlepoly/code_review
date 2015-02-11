@@ -1,0 +1,316 @@
+diff --git a/src/assistant/assistant/helpenginewrapper.cpp b/src/assistant/assistant/helpenginewrapper.cpp
+index 2d278b3..284aa87 100644
+--- a/src/assistant/assistant/helpenginewrapper.cpp
++++ b/src/assistant/assistant/helpenginewrapper.cpp
+@@ -42,6 +42,7 @@
+ 
+ #include "helpenginewrapper.h"
+ #include "../shared/collectionconfiguration.h"
++#include "../help/qhelpengine_p.h"
+ 
+ #include <QtCore/QDateTime>
+ #include <QtCore/QFileInfo>
+@@ -335,6 +336,12 @@ QString HelpEngineWrapper::error() const
+     return d->m_helpEngine->error();
+ }
+ 
++QString HelpEngineWrapper::virtualFolderForNameSpace(const QString &nameSpace) const
++{
++    TRACE_OBJ
++    return d->m_helpEngine->d->nameSpaceVirtualFolderMap.value(nameSpace, QString());
++}
++
+ const QStringList HelpEngineWrapper::qtDocInfo(const QString &component) const
+ {
+     TRACE_OBJ
+diff --git a/src/assistant/assistant/helpenginewrapper.h b/src/assistant/assistant/helpenginewrapper.h
+index 479bec7..54e1455 100644
+--- a/src/assistant/assistant/helpenginewrapper.h
++++ b/src/assistant/assistant/helpenginewrapper.h
+@@ -99,7 +99,8 @@ public:
+     QMap<QString, QUrl>	linksForIdentifier(const QString &id) const;
+     const QStringList filterAttributes() const;
+     const QStringList filterAttributes(const QString &filterName) const;
+-    QString	error() const;   
++    QString error() const;
++    QString virtualFolderForNameSpace(const QString &nameSpace) const;
+ 
+     /*
+      * To be called after assistant has finished looking for new documentation.
+diff --git a/src/assistant/assistant/helpviewer.cpp b/src/assistant/assistant/helpviewer.cpp
+index 87ba49e..f739726 100644
+--- a/src/assistant/assistant/helpviewer.cpp
++++ b/src/assistant/assistant/helpviewer.cpp
+@@ -58,8 +58,6 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-const QString HelpViewer::DocPath = QLatin1String("qthelp://com.trolltech.");
+-
+ const QString HelpViewer::AboutBlank =
+     QCoreApplication::translate("HelpViewer", "<title>about:blank</title>");
+ 
+@@ -68,7 +66,7 @@ const QString HelpViewer::LocalHelpFile = QLatin1String("qthelp://"
+ 
+ const QString HelpViewer::PageNotFoundMessage =
+     QCoreApplication::translate("HelpViewer", "<title>Error 404...</title><div "
+-    "align=\"center\"><br><br><h1>The page could not be found</h1><br><h3>'%1'"
++    "align=\"center\"><br><br><h1>The page could not be found.</h1><br><h3>'%1'"
+     "</h3></div>");
+ 
+ struct ExtensionMap {
+@@ -179,6 +177,31 @@ bool HelpViewer::launchWithExternalApp(const QUrl &url)
+     return false;
+ }
+ 
++QString HelpViewer::fixupVirtualFolderForUrl(const HelpEngineWrapper *engine, const QUrl &url, bool *fixed)
++{
++    TRACE_OBJ
++    Q_ASSERT(engine);
++
++    QString ret = url.toString();
++    const QString virtualFolder = engine->virtualFolderForNameSpace(url.host());
++    QString effectiveVirtualFolder = virtualFolder;
++    const QStringList tokens = url.path().split('/');
++    Q_FOREACH (const QString& token, tokens) {
++        if (!token.isEmpty()) {
++            effectiveVirtualFolder = token;
++            break;
++        }
++    }
++
++    if (QString::localeAwareCompare(effectiveVirtualFolder, virtualFolder)) {
++        ret = url.scheme() + QLatin1String("://") + url.host() + QLatin1Char('/')
++                + virtualFolder + QLatin1String("/..") + url.path();
++    }
++    if (fixed && engine->findFile(ret).isValid())
++        *fixed = true;
++    return ret;
++}
++
+ // -- public slots
+ 
+ void HelpViewer::home()
+diff --git a/src/assistant/assistant/helpviewer.h b/src/assistant/assistant/helpviewer.h
+index 5050877..216d705 100644
+--- a/src/assistant/assistant/helpviewer.h
++++ b/src/assistant/assistant/helpviewer.h
+@@ -58,6 +58,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class HelpEngineWrapper;
++
+ #if !defined(QT_NO_WEBKIT)
+ class HelpViewer : public QWebView
+ #else
+@@ -100,7 +102,6 @@ public:
+     bool findText(const QString &text, FindFlags flags, bool incremental,
+         bool fromSearch);
+ 
+-    static const QString DocPath;
+     static const QString AboutBlank;
+     static const QString LocalHelpFile;
+     static const QString PageNotFoundMessage;
+@@ -109,6 +110,7 @@ public:
+     static bool canOpenPage(const QString &url);
+     static QString mimeFromUrl(const QUrl &url);
+     static bool launchWithExternalApp(const QUrl &url);
++    static QString fixupVirtualFolderForUrl(const HelpEngineWrapper *engine, const QUrl &url, bool *fixed = 0);
+ 
+ public slots:
+ #ifndef QT_NO_CLIPBOARD
+diff --git a/src/assistant/assistant/helpviewer_qtb.cpp b/src/assistant/assistant/helpviewer_qtb.cpp
+index 620debe..cc64b99 100644
+--- a/src/assistant/assistant/helpviewer_qtb.cpp
++++ b/src/assistant/assistant/helpviewer_qtb.cpp
+@@ -165,10 +165,14 @@ void HelpViewer::setSource(const QUrl &url)
+     emit loadStarted();
+     QString string = url.toString();
+     const HelpEngineWrapper &engine = HelpEngineWrapper::instance();
+-    const QUrl &resolvedUrl = (string == QLatin1String("help") ? LocalHelpFile :
++    QUrl resolvedUrl = (string == QLatin1String("help") ? LocalHelpFile :
+         engine.findFile(string));
++    bool fileFound = resolvedUrl.isValid();
++    if (!fileFound && isLocalUrl(url))
++        resolvedUrl = fixupVirtualFolderForUrl(&engine, url, &fileFound);
++
+     QTextBrowser::setSource(resolvedUrl);
+-    if (!url.isValid()) {
++    if (!fileFound) {
+         setHtml(string == QLatin1String("about:blank") ? AboutBlank
+             : PageNotFoundMessage.arg(url.toString()));
+     }
+@@ -378,8 +382,9 @@ QVariant HelpViewer::loadResource(int type, const QUrl &name)
+     TRACE_OBJ
+     QByteArray ba;
+     if (type < 4) {
+-        ba = HelpEngineWrapper::instance().fileData(name);
+-        if (name.toString().endsWith(QLatin1String(".svg"), Qt::CaseInsensitive)) {
++        QUrl url = fixupVirtualFolderForUrl(&HelpEngineWrapper::instance(), name);
++        ba = HelpEngineWrapper::instance().fileData(url);
++        if (url.toString().endsWith(QLatin1String(".svg"), Qt::CaseInsensitive)) {
+             QImage image;
+             image.loadFromData(ba, "svg");
+             if (!image.isNull())
+diff --git a/src/assistant/assistant/helpviewer_qwv.cpp b/src/assistant/assistant/helpviewer_qwv.cpp
+index 6868ddb..e832549 100644
+--- a/src/assistant/assistant/helpviewer_qwv.cpp
++++ b/src/assistant/assistant/helpviewer_qwv.cpp
+@@ -95,6 +95,7 @@ HelpNetworkReply::HelpNetworkReply(const QNetworkRequest &request,
+     setHeader(QNetworkRequest::ContentLengthHeader, QByteArray::number(origLen));
+     QTimer::singleShot(0, this, SIGNAL(metaDataChanged()));
+     QTimer::singleShot(0, this, SIGNAL(readyRead()));
++    QTimer::singleShot(0, this, SIGNAL(finished()));
+ }
+ 
+ void HelpNetworkReply::abort()
+@@ -138,24 +139,15 @@ QNetworkReply *HelpNetworkAccessManager::createRequest(Operation /*op*/,
+ {
+     TRACE_OBJ
+     QString url = request.url().toString();
++
+     const HelpEngineWrapper &engine = HelpEngineWrapper::instance();
+-    // TODO: For some reason the url to load is already wrong (passed from webkit)
+-    // though the css file and the references inside should work that way. One 
+-    // possible problem might be that the css is loaded at the same level as the
+-    // html, thus a path inside the css like (../images/foo.png) might cd out of
+-    // the virtual folder
+-    if (!engine.findFile(url).isValid()) {
+-        if (url.startsWith(HelpViewer::DocPath)) {
+-            QUrl newUrl = request.url();
+-            if (!newUrl.path().startsWith(QLatin1String("/qdoc/"))) {
+-                newUrl.setPath(QLatin1String("qdoc") + newUrl.path());
+-                url = newUrl.toString();
+-            }
+-        }
+-    }
++
++    bool fileFound = engine.findFile(url).isValid();
++    if (!fileFound && HelpViewer::isLocalUrl(request.url()))
++        url = HelpViewer::fixupVirtualFolderForUrl(&engine, request.url(), &fileFound);
+ 
+     const QString &mimeType = HelpViewer::mimeFromUrl(url);
+-    const QByteArray &data = engine.findFile(url).isValid() ? engine.fileData(url)
++    const QByteArray &data = fileFound ? engine.fileData(url)
+         : HelpViewer::PageNotFoundMessage.arg(url).toUtf8();
+ 
+     return new HelpNetworkReply(request, data, mimeType.isEmpty()
+diff --git a/src/assistant/assistant/mainwindow.cpp b/src/assistant/assistant/mainwindow.cpp
+index 36f4ed6..384b2e9 100644
+--- a/src/assistant/assistant/mainwindow.cpp
++++ b/src/assistant/assistant/mainwindow.cpp
+@@ -1029,7 +1029,6 @@ QString MainWindow::collectionFileDirectory(bool createDir, const QString &cache
+         else
+             collectionPath = collectionPath + QDir::separator() + cacheDir;
+     }
+-    collectionPath = QDir::cleanPath(collectionPath);
+     if (createDir) {
+         QDir dir;
+         if (!dir.exists(collectionPath))
+diff --git a/src/assistant/help/qhelpcontentwidget.cpp b/src/assistant/help/qhelpcontentwidget.cpp
+index 75f9f7e..37c9bf0 100644
+--- a/src/assistant/help/qhelpcontentwidget.cpp
++++ b/src/assistant/help/qhelpcontentwidget.cpp
+@@ -44,7 +44,6 @@
+ #include "qhelpengine_p.h"
+ #include "qhelpdbreader_p.h"
+ 
+-#include <QtCore/QDir>
+ #include <QtCore/QStack>
+ #include <QtCore/QThread>
+ #include <QtCore/QMutex>
+@@ -559,7 +558,7 @@ bool QHelpContentWidget::searchContentItem(QHelpContentModel *model,
+     if (!parentItem)
+         return false;
+ 
+-    if (QDir::cleanPath(parentItem->url().path()) == path) {
++    if (parentItem->url().path() == path) {
+         m_syncIndex = parent;
+         return true;
+     }
+diff --git a/src/assistant/help/qhelpengine.h b/src/assistant/help/qhelpengine.h
+index 3bff849..72a8d39 100644
+--- a/src/assistant/help/qhelpengine.h
++++ b/src/assistant/help/qhelpengine.h
+@@ -74,6 +74,8 @@ public:
+ 
+ private:
+     QHelpEnginePrivate *d;
++
++    friend class HelpEngineWrapper;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/assistant/help/qhelpengine_p.h b/src/assistant/help/qhelpengine_p.h
+index c8d9d06..48412a0 100644
+--- a/src/assistant/help/qhelpengine_p.h
++++ b/src/assistant/help/qhelpengine_p.h
+@@ -53,6 +53,7 @@
+ // We mean it.
+ //
+ 
++#include <QtCore/QHash>
+ #include <QtCore/QMap>
+ #include <QtCore/QStringList>
+ #include <QtCore/QObject>
+@@ -88,6 +89,7 @@ public:
+     QMap<QString, QHelpDBReader*> fileNameReaderMap;
+     QMultiMap<QString, QHelpDBReader*> virtualFolderMap;
+     QStringList orderedFileNameList;
++    QHash<QString, QString> nameSpaceVirtualFolderMap;
+ 
+     QHelpCollectionHandler *collectionHandler;
+     QString currentFilter;
+diff --git a/src/assistant/help/qhelpenginecore.cpp b/src/assistant/help/qhelpenginecore.cpp
+index 6876a69..e67f8bb 100644
+--- a/src/assistant/help/qhelpenginecore.cpp
++++ b/src/assistant/help/qhelpenginecore.cpp
+@@ -88,6 +88,7 @@ void QHelpEngineCorePrivate::clearMaps()
+     fileNameReaderMap.clear();
+     virtualFolderMap.clear();
+     orderedFileNameList.clear();
++    nameSpaceVirtualFolderMap.clear();
+ }
+ 
+ bool QHelpEngineCorePrivate::setup()
+@@ -128,6 +129,7 @@ bool QHelpEngineCorePrivate::setup()
+         fileNameReaderMap.insert(absFileName, reader);
+         virtualFolderMap.insert(info.folderName, reader);
+         orderedFileNameList.append(absFileName);
++        nameSpaceVirtualFolderMap.insert(info.namespaceName, info.folderName);
+     }
+     q->currentFilter();
+     emit q->setupFinished();
+@@ -365,11 +367,11 @@ QString QHelpEngineCore::documentationFileName(const QString &namespaceName)
+         foreach(const QHelpCollectionHandler::DocInfo &info, docList) {
+             if (info.namespaceName == namespaceName) {
+                 if (QDir::isAbsolutePath(info.fileName))
+-                    return QDir::cleanPath(info.fileName);
++                    return info.fileName;
+ 
+                 QFileInfo fi(d->collectionHandler->collectionFile());
+                 fi.setFile(fi.absolutePath() + QDir::separator() + info.fileName);
+-                return QDir::cleanPath(fi.absoluteFilePath());
++                return fi.absoluteFilePath();
+             }
+         }
+     }
+@@ -553,7 +555,7 @@ QUrl QHelpEngineCore::findFile(const QUrl &url) const
+         return res;
+ 
+     QString ns = url.authority();
+-    QString filePath = QDir::cleanPath(url.path());
++    QString filePath = url.path();
+     if (filePath.startsWith(QLatin1Char('/')))
+         filePath = filePath.mid(1);
+     QString virtualFolder = filePath.mid(0, filePath.indexOf(QLatin1Char('/'), 1));
+@@ -603,7 +605,7 @@ QByteArray QHelpEngineCore::fileData(const QUrl &url) const
+         return QByteArray();
+ 
+     QString ns = url.authority();
+-    QString filePath = QDir::cleanPath(url.path());
++    QString filePath = url.path();
+     if (filePath.startsWith(QLatin1Char('/')))
+         filePath = filePath.mid(1);
+     QString virtualFolder = filePath.mid(0, filePath.indexOf(QLatin1Char('/'), 1));

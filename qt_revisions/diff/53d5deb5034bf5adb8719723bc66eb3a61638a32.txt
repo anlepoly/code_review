@@ -1,0 +1,1201 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 2dbabdb..4ae956a 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -264,7 +264,7 @@ void QQmlEngineDebugService::buildObjectDump(QDataStream &message,
+             QQmlObjectProperty prop;
+             prop.type = QQmlObjectProperty::SignalProperty;
+             prop.hasNotifySignal = false;
+-            QQmlExpression *expr = signalHandler->expression();
++            QQmlBoundSignalExpression *expr = signalHandler->expression();
+             if (expr) {
+                 prop.value = expr->expression();
+                 QObject *scope = expr->scopeObject();
+@@ -605,9 +605,9 @@ bool QQmlEngineDebugService::setBinding(int objectId,
+                 if (isLiteralValue) {
+                     property.write(expression);
+                 } else if (hasValidSignal(object, propertyName)) {
+-                    QQmlExpression *qmlExpression = new QQmlExpression(context, object, expression.toString());
++                    QQmlBoundSignalExpression *qmlExpression = new QQmlBoundSignalExpression(QQmlContextData::get(context), object, expression.toString(),
++                                                                                             false, filename, line, column);
+                     QQmlPropertyPrivate::setSignalExpression(property, qmlExpression);
+-                    qmlExpression->setSourceLocation(filename, line, column);
+                 } else if (property.isProperty()) {
+                     QQmlBinding *binding = new QQmlBinding(expression.toString(), false, object, QQmlContextData::get(context), filename, line, column);;
+                     binding->setTarget(property);
+diff --git a/src/qml/debugger/qqmlprofilerservice_p.h b/src/qml/debugger/qqmlprofilerservice_p.h
+index 2037643..a988246 100644
+--- a/src/qml/debugger/qqmlprofilerservice_p.h
++++ b/src/qml/debugger/qqmlprofilerservice_p.h
+@@ -54,7 +54,7 @@
+ //
+ 
+ #include <private/qqmldebugservice_p.h>
+-#include "qqmlexpression.h"
++#include <private/qqmlboundsignal_p.h>
+ 
+ #include <QtCore/qelapsedtimer.h>
+ #include <QtCore/qmetaobject.h>
+@@ -201,7 +201,7 @@ struct QQmlBindingProfiler {
+ };
+ 
+ struct QQmlHandlingSignalProfiler {
+-    QQmlHandlingSignalProfiler(const QMetaMethod &signal, QQmlExpression *expression)
++    QQmlHandlingSignalProfiler(const QMetaMethod &signal, QQmlBoundSignalExpression *expression)
+     {
+         enabled = QQmlProfilerService::instance
+                 ? QQmlProfilerService::instance->profilingEnabled() : false;
+@@ -209,7 +209,7 @@ struct QQmlHandlingSignalProfiler {
+             init(signal, expression);
+     }
+ 
+-    QQmlHandlingSignalProfiler(QObject *object, int index, QQmlExpression *expression)
++    QQmlHandlingSignalProfiler(QObject *object, int index, QQmlBoundSignalExpression *expression)
+     {
+         enabled = QQmlProfilerService::instance
+                 ? QQmlProfilerService::instance->profilingEnabled() : false;
+@@ -226,7 +226,7 @@ struct QQmlHandlingSignalProfiler {
+     bool enabled;
+ 
+ private:
+-    void init(const QMetaMethod &signal, QQmlExpression *expression)
++    void init(const QMetaMethod &signal, QQmlBoundSignalExpression *expression)
+     {
+         QQmlProfilerService *service = QQmlProfilerService::instance;
+         service->startRange(QQmlProfilerService::HandlingSignal);
+diff --git a/src/qml/qml/qqmlabstractexpression_p.h b/src/qml/qml/qqmlabstractexpression_p.h
+index fe2ee17..1d5ecac 100644
+--- a/src/qml/qml/qqmlabstractexpression_p.h
++++ b/src/qml/qml/qqmlabstractexpression_p.h
+@@ -59,7 +59,7 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QQmlAbstractExpression
++class Q_QML_PRIVATE_EXPORT QQmlAbstractExpression
+ {
+ public:
+     QQmlAbstractExpression();
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index b375a70..446bad8 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -49,6 +49,7 @@
+ #include "qqml.h"
+ #include "qqmlcontext.h"
+ #include "qqmlglobal_p.h"
++#include "qqmlrewrite_p.h"
+ #include <private/qqmlprofilerservice_p.h>
+ #include <private/qv8debugservice_p.h>
+ 
+@@ -59,6 +60,105 @@ Q_DECLARE_METATYPE(QJSValue)
+ 
+ QT_BEGIN_NAMESPACE
+ 
++static QQmlJavaScriptExpression::VTable QQmlBoundSignalExpression_jsvtable = {
++    QQmlBoundSignalExpression::expressionIdentifier,
++    QQmlBoundSignalExpression::expressionChanged
++};
++
++QQmlBoundSignalExpression::QQmlBoundSignalExpression(QQmlContextData *ctxt, QObject *scope, const QByteArray &expression,
++                                                     bool isRewritten, const QString &fileName, int line, int column)
++    : QQmlJavaScriptExpression(&QQmlBoundSignalExpression_jsvtable)
++{
++    setNotifyOnValueChanged(false);
++    setContext(ctxt);
++    setScopeObject(scope);
++    m_expression = QString::fromUtf8(expression);
++    m_expressionFunctionValid = false;
++    m_expressionFunctionRewritten = isRewritten;
++    m_fileName = fileName;
++    m_line = line;
++    m_column = column;
++}
++
++QQmlBoundSignalExpression::QQmlBoundSignalExpression(QQmlContextData *ctxt, QObject *scope, const QString &expression,
++                                                     bool isRewritten, const QString &fileName, int line, int column)
++    : QQmlJavaScriptExpression(&QQmlBoundSignalExpression_jsvtable)
++{
++    setNotifyOnValueChanged(false);
++    setContext(ctxt);
++    setScopeObject(scope);
++    m_expression = expression;
++    m_expressionFunctionValid = false;
++    m_expressionFunctionRewritten = isRewritten;
++    m_fileName = fileName;
++    m_line = line;
++    m_column = column;
++}
++
++QQmlBoundSignalExpression::~QQmlBoundSignalExpression()
++{
++    qPersistentDispose(m_v8function);
++    qPersistentDispose(m_v8qmlscope);
++}
++
++QString QQmlBoundSignalExpression::expressionIdentifier(QQmlJavaScriptExpression *e)
++{
++    QQmlBoundSignalExpression *This = static_cast<QQmlBoundSignalExpression *>(e);
++    return QLatin1String("\"") + This->m_expression + QLatin1String("\"");
++}
++
++void QQmlBoundSignalExpression::expressionChanged(QQmlJavaScriptExpression *)
++{
++    // bound signals do not notify on change.
++}
++
++// This mirrors code in QQmlExpressionPrivate::value() and v8value().
++// Any change made here should be made there and vice versa.
++void QQmlBoundSignalExpression::evaluate(QObject *secondaryScope)
++{
++    Q_ASSERT (context() && engine());
++    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine());
++
++    ep->referenceScarceResources(); // "hold" scarce resources in memory during evaluation.
++    {
++        v8::HandleScope handle_scope;
++        v8::Context::Scope context_scope(ep->v8engine()->context());
++        if (!m_expressionFunctionValid) {
++            bool ok = true;
++            QString code;
++            if (m_expressionFunctionRewritten) {
++                code = m_expression;
++            } else {
++                QQmlRewrite::RewriteSignalHandler rewriteSignalHandler;
++                code = rewriteSignalHandler(m_expression, m_functionName, &ok);
++            }
++
++            if (ok)
++                m_v8function = evalFunction(context(), scopeObject(), code, m_fileName, m_line, &m_v8qmlscope);
++
++            if (m_v8function.IsEmpty() || m_v8function->IsNull()) {
++                ep->dereferenceScarceResources();
++                return; // could not evaluate function.  Not valid.
++            }
++
++            setUseSharedContext(false);
++            m_expressionFunctionValid = true;
++        }
++
++        if (secondaryScope) {
++            QObject *restoreSecondaryScope = 0;
++            restoreSecondaryScope = ep->v8engine()->contextWrapper()->setSecondaryScope(m_v8qmlscope, secondaryScope);
++            QQmlJavaScriptExpression::evaluate(context(), m_v8function, 0);
++            ep->v8engine()->contextWrapper()->setSecondaryScope(m_v8qmlscope, restoreSecondaryScope);
++        } else {
++            QQmlJavaScriptExpression::evaluate(context(), m_v8function, 0);
++        }
++    }
++    ep->dereferenceScarceResources(); // "release" scarce resources if top-level expression evaluation is complete.
++}
++
++////////////////////////////////////////////////////////////////////////
++
+ class QQmlBoundSignalParameters : public QObject
+ {
+ Q_OBJECT
+@@ -144,7 +244,7 @@ int QQmlBoundSignal::index() const
+ /*!
+     Returns the signal expression.
+ */
+-QQmlExpression *QQmlBoundSignal::expression() const
++QQmlBoundSignalExpression *QQmlBoundSignal::expression() const
+ {
+     return m_expression;
+ }
+@@ -156,9 +256,9 @@ QQmlExpression *QQmlBoundSignal::expression() const
+     The QQmlBoundSignal instance takes ownership of \a e.  The caller is 
+     assumes ownership of the returned QQmlExpression.
+ */
+-QQmlExpression *QQmlBoundSignal::setExpression(QQmlExpression *e)
++QQmlBoundSignalExpression *QQmlBoundSignal::setExpression(QQmlBoundSignalExpression *e)
+ {
+-    QQmlExpression *rv = m_expression;
++    QQmlBoundSignalExpression *rv = m_expression;
+     m_expression = e;
+     if (m_expression) m_expression->setNotifyOnValueChanged(false);
+     return rv;
+@@ -183,8 +283,8 @@ int QQmlBoundSignal::qt_metacall(QMetaObject::Call c, int id, void **a)
+         }
+ 
+         if (m_params) m_params->setValues(a);
+-        if (m_expression && m_expression->engine()) {
+-            QQmlExpressionPrivate::get(m_expression)->value(m_params);
++        if (m_expression && m_expression->context() && m_expression->engine()) {
++            m_expression->evaluate(m_params);
+             if (m_expression && m_expression->hasError())
+                 QQmlEnginePrivate::warning(m_expression->engine(), m_expression->error());
+         }
+@@ -324,7 +424,7 @@ int QQmlBoundSignalNoParams::index() const
+ /*!
+     Returns the signal expression.
+ */
+-QQmlExpression *QQmlBoundSignalNoParams::expression() const
++QQmlBoundSignalExpression *QQmlBoundSignalNoParams::expression() const
+ {
+     return m_expression;
+ }
+@@ -336,9 +436,9 @@ QQmlExpression *QQmlBoundSignalNoParams::expression() const
+     The QQmlBoundSignalNoParams instance takes ownership of \a e.  The caller is
+     assumes ownership of the returned QQmlExpression.
+ */
+-QQmlExpression *QQmlBoundSignalNoParams::setExpression(QQmlExpression *e)
++QQmlBoundSignalExpression *QQmlBoundSignalNoParams::setExpression(QQmlBoundSignalExpression *e)
+ {
+-    QQmlExpression *rv = m_expression;
++    QQmlBoundSignalExpression *rv = m_expression;
+     m_expression = e;
+     if (m_expression) m_expression->setNotifyOnValueChanged(false);
+     return rv;
+@@ -356,9 +456,8 @@ void QQmlBoundSignalNoParams::subscriptionCallback(QQmlNotifierEndpoint *e)
+     QQmlHandlingSignalProfiler prof(s->m_owner, s->m_index, s->m_expression);
+ 
+     s->m_isEvaluating = true;
+-
+     if (s->m_expression && s->m_expression->engine()) {
+-        QQmlExpressionPrivate::get(s->m_expression)->value();
++        s->m_expression->evaluate(); // evaluate signal expression.
+         if (s->m_expression && s->m_expression->hasError())
+             QQmlEnginePrivate::warning(s->m_expression->engine(), s->m_expression->error());
+     }
+diff --git a/src/qml/qml/qqmlboundsignal_p.h b/src/qml/qml/qqmlboundsignal_p.h
+index 5fc8c35..22cc5a9 100644
+--- a/src/qml/qml/qqmlboundsignal_p.h
++++ b/src/qml/qml/qqmlboundsignal_p.h
+@@ -53,15 +53,52 @@
+ // We mean it.
+ //
+ 
+-#include "qqmlexpression.h"
+-
+ #include <QtCore/qmetaobject.h>
+ 
++#include <private/qqmlabstractexpression_p.h>
++#include <private/qqmljavascriptexpression_p.h>
+ #include <private/qqmlnotifier_p.h>
+ #include <private/qobject_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class Q_QML_PRIVATE_EXPORT QQmlBoundSignalExpression : public QQmlAbstractExpression, public QQmlJavaScriptExpression
++{
++public:
++    QQmlBoundSignalExpression(QQmlContextData *ctxt, QObject *scope, const QByteArray &expression,
++                              bool isRewritten, const QString &fileName, int line, int column);
++    QQmlBoundSignalExpression(QQmlContextData *ctxt, QObject *scope, const QString &expression,
++                              bool isRewritten, const QString &fileName, int line, int column);
++    ~QQmlBoundSignalExpression();
++
++    // "inherited" from QQmlJavaScriptExpression.
++    static QString expressionIdentifier(QQmlJavaScriptExpression *);
++    static void expressionChanged(QQmlJavaScriptExpression *);
++
++    // evaluation of a bound signal expression doesn't return any value
++    void evaluate(QObject *secondaryScope = 0);
++
++    QString sourceFile() const { return m_fileName; }
++    int lineNumber() const { return m_line; }
++    int columnNumber() const { return m_column; }
++    QString expression() const { return m_expression; }
++
++    QQmlEngine *engine() const { return context() ? context()->engine : 0; }
++
++private:
++    v8::Persistent<v8::Object> m_v8qmlscope;
++    v8::Persistent<v8::Function> m_v8function;
++
++    QString m_expression;
++    QString m_functionName; // hint for debugger
++    QString m_fileName;
++    int m_line;
++    int m_column;
++
++    bool m_expressionFunctionValid:1;
++    bool m_expressionFunctionRewritten:1;
++};
++
+ class Q_QML_EXPORT QQmlAbstractBoundSignal
+ {
+ public:
+@@ -69,8 +106,8 @@ public:
+     virtual ~QQmlAbstractBoundSignal();
+ 
+     virtual int index() const = 0;
+-    virtual QQmlExpression *expression() const = 0;
+-    virtual QQmlExpression *setExpression(QQmlExpression *) = 0;
++    virtual QQmlBoundSignalExpression *expression() const = 0;
++    virtual QQmlBoundSignalExpression *setExpression(QQmlBoundSignalExpression *) = 0;
+     virtual QObject *object() = 0;
+ 
+     void addToObject();
+@@ -93,8 +130,8 @@ public:
+ 
+     int index() const;
+ 
+-    QQmlExpression *expression() const;
+-    QQmlExpression *setExpression(QQmlExpression *);
++    QQmlBoundSignalExpression *expression() const;
++    QQmlBoundSignalExpression *setExpression(QQmlBoundSignalExpression *);
+     QObject *object() { return m_owner; }
+ 
+     bool isEvaluating() const { return m_isEvaluating; }
+@@ -103,7 +140,7 @@ protected:
+     virtual int qt_metacall(QMetaObject::Call c, int id, void **a);
+ 
+ private:
+-    QQmlExpression *m_expression;
++    QQmlBoundSignalExpression *m_expression;
+     QMetaMethod m_signal;
+     bool m_paramsValid : 1;
+     bool m_isEvaluating : 1;
+@@ -120,8 +157,8 @@ public:
+ 
+     int index() const;
+ 
+-    QQmlExpression *expression() const;
+-    QQmlExpression *setExpression(QQmlExpression *);
++    QQmlBoundSignalExpression *expression() const;
++    QQmlBoundSignalExpression *setExpression(QQmlBoundSignalExpression *);
+     QObject *object() { return m_owner; }
+ 
+     static void subscriptionCallback(QQmlNotifierEndpoint *e);
+@@ -129,7 +166,7 @@ public:
+     bool isEvaluating() const { return m_isEvaluating; }
+ 
+ private:
+-    QQmlExpression *m_expression;
++    QQmlBoundSignalExpression *m_expression;
+     QObject *m_owner;
+     int m_index;
+     bool m_isEvaluating;
+diff --git a/src/qml/qml/qqmlexpression.cpp b/src/qml/qml/qqmlexpression.cpp
+index d760486..6e20047 100644
+--- a/src/qml/qml/qqmlexpression.cpp
++++ b/src/qml/qml/qqmlexpression.cpp
+@@ -351,7 +351,7 @@ void QQmlExpression::setExpression(const QString &expression)
+ }
+ 
+ // Must be called with a valid handle scope
+-v8::Local<v8::Value> QQmlExpressionPrivate::v8value(QObject *secondaryScope, bool *isUndefined)
++v8::Local<v8::Value> QQmlExpressionPrivate::v8value(bool *isUndefined)
+ {
+     if (!expressionFunctionValid) {
+         bool ok = true;
+@@ -369,21 +369,10 @@ v8::Local<v8::Value> QQmlExpressionPrivate::v8value(QObject *secondaryScope, boo
+         expressionFunctionValid = true;
+     }
+ 
+-
+-    if (secondaryScope) {
+-        v8::Local<v8::Value> result;
+-        QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context()->engine);
+-        QObject *restoreSecondaryScope = 0;
+-        restoreSecondaryScope = ep->v8engine()->contextWrapper()->setSecondaryScope(v8qmlscope, secondaryScope);
+-        result = evaluate(context(), v8function, isUndefined);
+-        ep->v8engine()->contextWrapper()->setSecondaryScope(v8qmlscope, restoreSecondaryScope);
+-        return result;
+-    } else {
+-        return evaluate(context(), v8function, isUndefined);
+-    }
++    return evaluate(context(), v8function, isUndefined);
+ }
+ 
+-QVariant QQmlExpressionPrivate::value(QObject *secondaryScope, bool *isUndefined)
++QVariant QQmlExpressionPrivate::value(bool *isUndefined)
+ {
+     Q_Q(QQmlExpression);
+ 
+@@ -400,7 +389,7 @@ QVariant QQmlExpressionPrivate::value(QObject *secondaryScope, bool *isUndefined
+     {
+         v8::HandleScope handle_scope;
+         v8::Context::Scope context_scope(ep->v8engine()->context());
+-        v8::Local<v8::Value> result = v8value(secondaryScope, isUndefined);
++        v8::Local<v8::Value> result = v8value(isUndefined);
+         rv = ep->v8engine()->toVariant(result, qMetaTypeId<QList<QObject*> >());
+     }
+ 
+@@ -421,7 +410,7 @@ QVariant QQmlExpressionPrivate::value(QObject *secondaryScope, bool *isUndefined
+ QVariant QQmlExpression::evaluate(bool *valueIsUndefined)
+ {
+     Q_D(QQmlExpression);
+-    return d->value(0, valueIsUndefined);
++    return d->value(valueIsUndefined);
+ }
+ 
+ /*!
+diff --git a/src/qml/qml/qqmlexpression_p.h b/src/qml/qml/qqmlexpression_p.h
+index 186e3ae..d3d27f2 100644
+--- a/src/qml/qml/qqmlexpression_p.h
++++ b/src/qml/qml/qqmlexpression_p.h
+@@ -82,9 +82,9 @@ public:
+     void init(QQmlContextData *, const QString &, bool, QObject *, const QString &, int, int);
+     void init(QQmlContextData *, const QByteArray &, bool, QObject *, const QString &, int, int);
+ 
+-    QVariant value(QObject *secondaryScope = 0, bool *isUndefined = 0);
++    QVariant value(bool *isUndefined = 0);
+ 
+-    v8::Local<v8::Value> v8value(QObject *secondaryScope = 0, bool *isUndefined = 0);
++    v8::Local<v8::Value> v8value(bool *isUndefined = 0);
+ 
+     static inline QQmlExpressionPrivate *get(QQmlExpression *expr);
+     static inline QQmlExpression *get(QQmlExpressionPrivate *expr);
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index b798215..1b01a7d 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -920,7 +920,7 @@ QQmlPropertyPrivate::setBindingNoEnable(QObject *object, int coreIndex, int valu
+     Returns the expression associated with this signal property, or 0 if no 
+     signal expression exists.
+ */
+-QQmlExpression *
++QQmlBoundSignalExpression *
+ QQmlPropertyPrivate::signalExpression(const QQmlProperty &that)
+ {
+     if (!(that.type() & QQmlProperty::SignalProperty))
+@@ -948,9 +948,9 @@ QQmlPropertyPrivate::signalExpression(const QQmlProperty &that)
+     Ownership of \a expr transfers to QML.  Ownership of the return value is
+     assumed by the caller.
+ */
+-QQmlExpression *
++QQmlBoundSignalExpression *
+ QQmlPropertyPrivate::setSignalExpression(const QQmlProperty &that,
+-                                                     QQmlExpression *expr) 
++                                         QQmlBoundSignalExpression *expr)
+ {
+     if (!(that.type() & QQmlProperty::SignalProperty)) {
+         delete expr;
+@@ -975,7 +975,7 @@ QQmlPropertyPrivate::setSignalExpression(const QQmlProperty &that,
+             signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object);
+         else
+             signal = new QQmlBoundSignalNoParams(that.d->object, that.method(), that.d->object);
+-        QQmlExpression *oldExpr = signal->setExpression(expr);
++        QQmlBoundSignalExpression *oldExpr = signal->setExpression(expr);
+         signal->addToObject();
+         return oldExpr;
+     } else {
+diff --git a/src/qml/qml/qqmlproperty_p.h b/src/qml/qml/qqmlproperty_p.h
+index f4a9ced..e33c95a 100644
+--- a/src/qml/qml/qqmlproperty_p.h
++++ b/src/qml/qml/qqmlproperty_p.h
+@@ -64,7 +64,7 @@
+ QT_BEGIN_NAMESPACE
+ 
+ class QQmlContext;
+-class QQmlExpression;
++class QQmlBoundSignalExpression;
+ class QQmlEnginePrivate;
+ class QQmlJavaScriptExpression;
+ class Q_QML_PRIVATE_EXPORT QQmlPropertyPrivate : public QQmlRefCount
+@@ -140,9 +140,9 @@ public:
+     static QQmlAbstractBinding *setBinding(const QQmlProperty &that,
+                                                    QQmlAbstractBinding *,
+                                                    WriteFlags flags = DontRemoveBinding);
+-    static QQmlExpression *signalExpression(const QQmlProperty &that);
+-    static QQmlExpression *setSignalExpression(const QQmlProperty &that, 
+-                                                       QQmlExpression *) ;
++    static QQmlBoundSignalExpression *signalExpression(const QQmlProperty &that);
++    static QQmlBoundSignalExpression *setSignalExpression(const QQmlProperty &that,
++                                                          QQmlBoundSignalExpression *) ;
+     static bool write(const QQmlProperty &that, const QVariant &, WriteFlags);
+     static bool writeBinding(QObject *, const QQmlPropertyData &,
+                              QQmlContextData *context,
+diff --git a/src/qml/qml/qqmlrewrite.cpp b/src/qml/qml/qqmlrewrite.cpp
+index 72bd239..0bd8597 100644
+--- a/src/qml/qml/qqmlrewrite.cpp
++++ b/src/qml/qml/qqmlrewrite.cpp
+@@ -419,6 +419,21 @@ QString RewriteSignalHandler::operator()(QQmlJS::AST::Node *node, const QString
+     return rewritten;
+ }
+ 
++QString RewriteSignalHandler::operator()(const QString &code, const QString &name, bool *ok)
++{
++    Engine engine;
++    Lexer lexer(&engine);
++    Parser parser(&engine);
++    lexer.setCode(code, 0);
++    parser.parseStatement();
++    if (!parser.statement()) {
++        if (ok) *ok = false;
++        return QString();
++    }
++    if (ok) *ok = true;
++    return operator()(parser.statement(), code, name);
++}
++
+ } // namespace QQmlRewrite
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlrewrite_p.h b/src/qml/qml/qqmlrewrite_p.h
+index 1d69839..73ff50a 100644
+--- a/src/qml/qml/qqmlrewrite_p.h
++++ b/src/qml/qml/qqmlrewrite_p.h
+@@ -133,6 +133,7 @@ class RewriteSignalHandler: protected AST::Visitor
+ public:
+     RewriteSignalHandler();
+     QString operator()(QQmlJS::AST::Node *node, const QString &code, const QString &name);
++    QString operator()(const QString &code, const QString &name, bool *ok = 0);
+ 
+ protected:
+     void rewriteMultilineStrings(QString &code);
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 6010adf..5a9fa40 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -716,8 +716,8 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 bs = new QQmlBoundSignal(target, signal, target);
+             else
+                 bs = new QQmlBoundSignalNoParams(target, signal, target);
+-            QQmlExpression *expr =
+-                new QQmlExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column, *new QQmlExpressionPrivate);
++            QQmlBoundSignalExpression *expr =
++                new QQmlBoundSignalExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column);
+             bs->setExpression(expr);
+             bs->addToObject();
+         QML_END_INSTR(StoreSignal)
+diff --git a/src/quick/util/qquickconnections.cpp b/src/quick/util/qquickconnections.cpp
+index acc9738..2ba34a2 100644
+--- a/src/quick/util/qquickconnections.cpp
++++ b/src/quick/util/qquickconnections.cpp
+@@ -280,8 +280,8 @@ void QQuickConnections::connectSignals()
+                     location = ddata->outerContext->urlString;
+             }
+ 
+-            QQmlExpression *expression = ctxtdata ?
+-                QQmlExpressionPrivate::create(ctxtdata, 0, script, true, location, line, column) : 0;
++            QQmlBoundSignalExpression *expression = ctxtdata ?
++                new QQmlBoundSignalExpression(ctxtdata, 0, script, true, location, line, column) : 0;
+             signal->setExpression(expression);
+             signal->addToObject();
+             d->boundsignals += signal;
+diff --git a/src/quick/util/qquickpropertychanges.cpp b/src/quick/util/qquickpropertychanges.cpp
+index 8b0818c..4bff006 100644
+--- a/src/quick/util/qquickpropertychanges.cpp
++++ b/src/quick/util/qquickpropertychanges.cpp
+@@ -55,6 +55,7 @@
+ #include <private/qqmlproperty_p.h>
+ #include <private/qqmlcontext_p.h>
+ #include <private/qquickstate_p_p.h>
++#include <private/qqmlboundsignal_p.h>
+ 
+ #include <QtCore/qdebug.h>
+ 
+@@ -139,7 +140,7 @@ class QQuickReplaceSignalHandler : public QQuickActionEvent
+ {
+ public:
+     QQuickReplaceSignalHandler() : expression(0), reverseExpression(0),
+-                                rewindExpression(0), ownedExpression(0) {}
++                                rewindExpression(0), ownedExpression(0), ownedExpressionWatcher(0) {}
+     ~QQuickReplaceSignalHandler() {
+         delete ownedExpression;
+     }
+@@ -147,22 +148,35 @@ public:
+     virtual EventType type() const { return SignalHandler; }
+ 
+     QQmlProperty property;
+-    QQmlExpression *expression;
+-    QQmlExpression *reverseExpression;
+-    QQmlExpression *rewindExpression;
+-    QQmlGuard<QQmlExpression> ownedExpression;
++    QQmlBoundSignalExpression *expression;
++    QQmlBoundSignalExpression *reverseExpression;
++    QQmlBoundSignalExpression *rewindExpression;
++    QQmlBoundSignalExpression *ownedExpression;
++    QQmlAbstractExpression::DeleteWatcher *ownedExpressionWatcher; // TODO: refactor the ownership impl.
+ 
+     virtual void execute(Reason) {
+         ownedExpression = QQmlPropertyPrivate::setSignalExpression(property, expression);
+-        if (ownedExpression == expression)
++        if (ownedExpression == expression) {
++            delete ownedExpressionWatcher;
++            ownedExpressionWatcher = 0;
+             ownedExpression = 0;
++        } else if (ownedExpression) {
++            delete ownedExpressionWatcher;
++            ownedExpressionWatcher = new QQmlAbstractExpression::DeleteWatcher(ownedExpression);
++        }
+     }
+ 
+     virtual bool isReversable() { return true; }
+     virtual void reverse(Reason) {
+         ownedExpression = QQmlPropertyPrivate::setSignalExpression(property, reverseExpression);
+-        if (ownedExpression == reverseExpression)
++        if (ownedExpression == reverseExpression) {
++            delete ownedExpressionWatcher;
++            ownedExpressionWatcher = 0;
+             ownedExpression = 0;
++        } else if (ownedExpression) {
++            delete ownedExpressionWatcher;
++            ownedExpressionWatcher = new QQmlAbstractExpression::DeleteWatcher(ownedExpression);
++        }
+     }
+ 
+     virtual void saveOriginals() {
+@@ -181,6 +195,8 @@ public:
+         if (rsh->ownedExpression == reverseExpression) {
+             ownedExpression = rsh->ownedExpression;
+             rsh->ownedExpression = 0;
++            delete ownedExpressionWatcher;
++            ownedExpressionWatcher = new QQmlAbstractExpression::DeleteWatcher(ownedExpression);
+         }
+     }
+ 
+@@ -225,11 +241,17 @@ public:
+     public:
+         ExpressionChange(const QString &_name,
+                          QQmlBinding::Identifier _id,
+-                         QQmlExpression *_expr)
+-            : name(_name), id(_id), expression(_expr) {}
++                         const QString& _expr,
++                         const QUrl &_url,
++                         int _line,
++                         int _column)
++            : name(_name), id(_id), expression(_expr), url(_url), line(_line), column(_column) {}
+         QString name;
+         QQmlBinding::Identifier id;
+-        QQmlExpression *expression;
++        QString expression;
++        QUrl url;
++        int line;
++        int column;
+     };
+ 
+     QList<QPair<QString, QVariant> > properties;
+@@ -334,20 +356,36 @@ void QQuickPropertyChangesPrivate::decode()
+ 
+         QQmlProperty prop = property(name);      //### better way to check for signal property?
+         if (prop.type() & QQmlProperty::SignalProperty) {
+-            QQmlExpression *expression = new QQmlExpression(qmlContext(q), object, data.toString());
++            QString expression = data.toString();
++            QUrl url = QUrl();
++            int line = -1;
++            int column = -1;
++
+             QQmlData *ddata = QQmlData::get(q);
+-            if (ddata && ddata->outerContext && !ddata->outerContext->url.isEmpty())
+-                expression->setSourceLocation(ddata->outerContext->url.toString(), ddata->lineNumber, ddata->columnNumber);
++            if (ddata && ddata->outerContext && !ddata->outerContext->url.isEmpty()) {
++                url = ddata->outerContext->url;
++                line = ddata->lineNumber;
++                column = ddata->columnNumber;
++            }
++
+             QQuickReplaceSignalHandler *handler = new QQuickReplaceSignalHandler;
+             handler->property = prop;
+-            handler->expression = expression;
++            handler->expression = new QQmlBoundSignalExpression(QQmlContextData::get(qmlContext(q)), object, expression, false, url.toString(), line, column);
+             signalReplacements << handler;
+-        } else if (isScript) {
+-            QQmlExpression *expression = new QQmlExpression(qmlContext(q), object, data.toString());
++        } else if (isScript) { // binding
++            QString expression = data.toString();
++            QUrl url = QUrl();
++            int line = -1;
++            int column = -1;
++
+             QQmlData *ddata = QQmlData::get(q);
+-            if (ddata && ddata->outerContext && !ddata->outerContext->url.isEmpty())
+-                expression->setSourceLocation(ddata->outerContext->url.toString(), ddata->lineNumber, ddata->columnNumber);
+-            expressions << ExpressionChange(name, id, expression);
++            if (ddata && ddata->outerContext && !ddata->outerContext->url.isEmpty()) {
++                url = ddata->outerContext->url;
++                line = ddata->lineNumber;
++                column = ddata->columnNumber;
++            }
++
++            expressions << ExpressionChange(name, id, expression, url, line, column);
+         } else {
+             properties << qMakePair(name, data);
+         }
+@@ -374,8 +412,6 @@ QQuickPropertyChanges::QQuickPropertyChanges()
+ QQuickPropertyChanges::~QQuickPropertyChanges()
+ {
+     Q_D(QQuickPropertyChanges);
+-    for(int ii = 0; ii < d->expressions.count(); ++ii)
+-        delete d->expressions.at(ii).expression;
+     for(int ii = 0; ii < d->signalReplacements.count(); ++ii)
+         delete d->signalReplacements.at(ii);
+ }
+@@ -460,7 +496,8 @@ QQuickPropertyChanges::ActionList QQuickPropertyChanges::actions()
+ 
+     for (int ii = 0; ii < d->expressions.count(); ++ii) {
+ 
+-        const QString &property = d->expressions.at(ii).name;
++        QQuickPropertyChangesPrivate::ExpressionChange e = d->expressions.at(ii);
++        const QString &property = e.name;
+         QQmlProperty prop = d->property(property);
+ 
+         if (prop.isValid()) {
+@@ -471,16 +508,18 @@ QQuickPropertyChanges::ActionList QQuickPropertyChanges::actions()
+             a.specifiedObject = d->object;
+             a.specifiedProperty = property;
+ 
++            QQmlBinding *newBinding = e.id != QQmlBinding::Invalid ? QQmlBinding::createBinding(e.id, object(), qmlContext(this), e.url.toString(), e.column) : 0;
++            if (!newBinding)
++                newBinding = new QQmlBinding(e.expression, false, object(), QQmlContextData::get(qmlContext(this)), e.url.toString(), e.line, e.column);
++
+             if (d->isExplicit) {
+-                a.toValue = d->expressions.at(ii).expression->evaluate();
++                // in this case, we don't want to assign a binding, per se,
++                // so we evaluate the expression and assign the result.
++                // XXX TODO: add a static QQmlJavaScriptExpression::evaluate(QString)
++                // so that we can avoid creating then destroying the binding in this case.
++                a.toValue = newBinding->evaluate();
++                newBinding->destroy();
+             } else {
+-                QQmlExpression *e = d->expressions.at(ii).expression;
+-
+-                QQmlBinding::Identifier id = d->expressions.at(ii).id;
+-                QQmlBinding *newBinding = id != QQmlBinding::Invalid ? QQmlBinding::createBinding(id, object(), qmlContext(this), e->sourceFile(), e->lineNumber()) : 0;
+-                if (!newBinding)
+-                    newBinding = new QQmlBinding(e->expression(), false, object(), QQmlContextData::get(qmlContext(this)),
+-                                                 e->sourceFile(), e->lineNumber(), e->columnNumber());
+                 newBinding->setTarget(prop);
+                 a.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+                 a.deletableToBinding = true;
+@@ -635,14 +674,14 @@ void QQuickPropertyChanges::changeExpression(const QString &name, const QString
+ 
+     QMutableListIterator<ExpressionEntry> expressionIterator(d->expressions);
+     while (expressionIterator.hasNext()) {
+-        const ExpressionEntry &entry = expressionIterator.next();
++        ExpressionEntry &entry = expressionIterator.next();
+         if (entry.name == name) {
+-            entry.expression->setExpression(expression);
++            entry.expression = expression;
+             if (state() && state()->isStateActive()) {
+                 QQmlAbstractBinding *oldBinding = QQmlPropertyPrivate::binding(d->property(name));
+                 if (oldBinding) {
+-                       QQmlPropertyPrivate::setBinding(d->property(name), 0);
+-                       oldBinding->destroy();
++                   QQmlPropertyPrivate::setBinding(d->property(name), 0);
++                   oldBinding->destroy();
+                 }
+ 
+                 QQmlBinding *newBinding = new QQmlBinding(expression, object(), qmlContext(this));
+@@ -653,8 +692,8 @@ void QQuickPropertyChanges::changeExpression(const QString &name, const QString
+         }
+     }
+ 
+-    QQmlExpression *newExpression = new QQmlExpression(qmlContext(this), d->object, expression);
+-    expressionIterator.insert(ExpressionEntry(name, QQmlBinding::Invalid, newExpression));
++    // adding a new expression.
++    expressionIterator.insert(ExpressionEntry(name, QQmlBinding::Invalid, expression, QUrl(), -1, -1));
+ 
+     if (state() && state()->isStateActive()) {
+         if (hadValue) {
+@@ -675,11 +714,14 @@ void QQuickPropertyChanges::changeExpression(const QString &name, const QString
+             action.specifiedObject = object();
+             action.specifiedProperty = name;
+ 
+-
++            QQmlBinding *newBinding = new QQmlBinding(expression, object(), qmlContext(this));
+             if (d->isExplicit) {
+-                action.toValue = newExpression->evaluate();
++                // don't assign the binding, merely evaluate the expression.
++                // XXX TODO: add a static QQmlJavaScriptExpression::evaluate(QString)
++                // so that we can avoid creating then destroying the binding in this case.
++                action.toValue = newBinding->evaluate();
++                newBinding->destroy();
+             } else {
+-                QQmlBinding *newBinding = new QQmlBinding(newExpression->expression(), object(), qmlContext(this));
+                 newBinding->setTarget(d->property(name));
+                 action.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+                 action.deletableToBinding = true;
+@@ -714,7 +756,7 @@ QVariant QQuickPropertyChanges::property(const QString &name) const
+     while (expressionIterator.hasNext()) {
+         const ExpressionEntry &entry = expressionIterator.next();
+         if (entry.name == name) {
+-            return QVariant(entry.expression->expression());
++            return QVariant(entry.expression);
+         }
+     }
+ 
+@@ -773,7 +815,7 @@ QString QQuickPropertyChanges::expression(const QString &name) const
+     while (expressionIterator.hasNext()) {
+         const ExpressionEntry &entry = expressionIterator.next();
+         if (entry.name == name) {
+-            return entry.expression->expression();
++            return entry.expression;
+         }
+     }
+ 
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+index b66ba28..d99b4e6 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+@@ -205,7 +205,7 @@ void tst_QQmlEngineDebugService::recursiveObjectTest(
+         // signal properties are fake - they are generated from QQmlAbstractBoundSignal children
+         if (p.name.startsWith("on") && p.name.length() > 2 && p.name[2].isUpper()) {
+             QString signal = p.value.toString();
+-            QQmlExpression *expr = QQmlPropertyPrivate::signalExpression(QQmlProperty(o, p.name));
++            QQmlBoundSignalExpression *expr = QQmlPropertyPrivate::signalExpression(QQmlProperty(o, p.name));
+             QVERIFY(expr && expr->expression() == signal);
+             QVERIFY(p.valueTypeName.isEmpty());
+             QVERIFY(p.binding.isEmpty());
+diff --git a/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp b/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
+index 2dde5f0..23f7c34 100644
+--- a/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
++++ b/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
+@@ -45,6 +45,7 @@
+ #include <QtQml/qqmlproperty.h>
+ #include <QtQml/private/qqmlproperty_p.h>
+ #include <private/qqmlbinding_p.h>
++#include <private/qqmlboundsignal_p.h>
+ #include <QtWidgets/QLineEdit>
+ #include <QtCore/qfileinfo.h>
+ #include <QtCore/qdir.h>
+@@ -146,8 +147,9 @@ void tst_qqmlproperty::qmlmetaproperty()
+ 
+     QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+     QVERIFY(binding != 0);
+-    QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-    QVERIFY(expression != 0);
++    QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++    QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++    QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+     QObject *obj = new QObject;
+ 
+@@ -179,8 +181,8 @@ void tst_qqmlproperty::qmlmetaproperty()
+     QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+     QVERIFY(binding == 0);
+     QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-    QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-    QVERIFY(expression == 0);
++    QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++    QVERIFY(sigExprWatcher.wasDeleted());
+     QCOMPARE(prop.index(), -1);
+     QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -249,8 +251,9 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+ 
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -282,8 +285,8 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), -1);
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -296,8 +299,9 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -331,8 +335,8 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+         QVERIFY(binding != 0);
+         QVERIFY(QQmlPropertyPrivate::binding(prop) == binding.data());
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfProperty("defaultProperty"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -350,8 +354,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+ 
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -383,8 +388,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), -1);
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -397,8 +402,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -432,8 +438,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QVERIFY(binding != 0);
+         QVERIFY(QQmlPropertyPrivate::binding(prop) == binding.data());
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfProperty("defaultProperty"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -446,8 +452,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -479,9 +486,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression != 0);
+-        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == expression.data());
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(!sigExprWatcher.wasDeleted());
++        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == sigExpr);
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfMethod("clicked()"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -494,8 +501,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -527,9 +535,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression != 0);
+-        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == expression.data());
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(!sigExprWatcher.wasDeleted());
++        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == sigExpr);
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfMethod("oddlyNamedNotifySignal()"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -547,8 +555,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+ 
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -580,8 +589,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), -1);
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -594,8 +603,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -629,8 +639,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+         QVERIFY(binding != 0);
+         QVERIFY(QQmlPropertyPrivate::binding(prop) == binding.data());
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfProperty("defaultProperty"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -648,8 +658,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+ 
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -681,8 +692,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), -1);
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -695,8 +706,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -730,8 +742,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QVERIFY(binding != 0);
+         QVERIFY(QQmlPropertyPrivate::binding(prop) == binding.data());
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression == 0);
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(sigExprWatcher.wasDeleted());
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfProperty("defaultProperty"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -744,8 +756,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -777,9 +790,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression != 0);
+-        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == expression.data());
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(!sigExprWatcher.wasDeleted());
++        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == sigExpr);
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfMethod("clicked()"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -792,8 +805,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+-        QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+-        QVERIFY(expression != 0);
++        QQmlBoundSignalExpression *sigExpr = new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1);
++        QQmlAbstractExpression::DeleteWatcher sigExprWatcher(sigExpr);
++        QVERIFY(sigExpr != 0 && !sigExprWatcher.wasDeleted());
+ 
+         QObject *obj = new QObject;
+ 
+@@ -825,9 +839,9 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+         QVERIFY(QQmlPropertyPrivate::setBinding(prop, binding.data()) == 0);
+         QVERIFY(binding == 0);
+         QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == 0);
+-        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, expression.data()) == 0);
+-        QVERIFY(expression != 0);
+-        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == expression.data());
++        QVERIFY(QQmlPropertyPrivate::setSignalExpression(prop, sigExpr) == 0);
++        QVERIFY(!sigExprWatcher.wasDeleted());
++        QVERIFY(QQmlPropertyPrivate::signalExpression(prop) == sigExpr);
+         QCOMPARE(prop.index(), dobject.metaObject()->indexOfMethod("oddlyNamedNotifySignal()"));
+         QCOMPARE(QQmlPropertyPrivate::valueTypeCoreIndex(prop), -1);
+ 
+@@ -973,7 +987,7 @@ void tst_qqmlproperty::read()
+         QQmlProperty p(&o, "onClicked");
+         QCOMPARE(p.read(), QVariant());
+ 
+-        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlExpression()));
++        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1)));
+         QVERIFY(0 != QQmlPropertyPrivate::signalExpression(p));
+ 
+         QCOMPARE(p.read(), QVariant());
+@@ -985,7 +999,7 @@ void tst_qqmlproperty::read()
+         QQmlProperty p(&o, "onPropertyWithNotifyChanged");
+         QCOMPARE(p.read(), QVariant());
+ 
+-        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlExpression()));
++        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1)));
+         QVERIFY(0 != QQmlPropertyPrivate::signalExpression(p));
+ 
+         QCOMPARE(p.read(), QVariant());
+@@ -1141,7 +1155,7 @@ void tst_qqmlproperty::write()
+         QQmlProperty p(&o, "onClicked");
+         QCOMPARE(p.write(QVariant("console.log(1921)")), false);
+ 
+-        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlExpression()));
++        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1)));
+         QVERIFY(0 != QQmlPropertyPrivate::signalExpression(p));
+ 
+         QCOMPARE(p.write(QVariant("console.log(1921)")), false);
+@@ -1155,7 +1169,7 @@ void tst_qqmlproperty::write()
+         QQmlProperty p(&o, "onPropertyWithNotifyChanged");
+         QCOMPARE(p.write(QVariant("console.log(1921)")), false);
+ 
+-        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlExpression()));
++        QVERIFY(0 == QQmlPropertyPrivate::setSignalExpression(p, new QQmlBoundSignalExpression(QQmlContextData::get(engine.rootContext()), 0, QLatin1String("null"), false, QString(), -1, -1)));
+         QVERIFY(0 != QQmlPropertyPrivate::signalExpression(p));
+ 
+         QCOMPARE(p.write(QVariant("console.log(1921)")), false);
+diff --git a/tools/qmlprofiler/qmlprofiler.pro b/tools/qmlprofiler/qmlprofiler.pro
+index b905544..7ab61e7 100644
+--- a/tools/qmlprofiler/qmlprofiler.pro
++++ b/tools/qmlprofiler/qmlprofiler.pro
+@@ -2,7 +2,7 @@ TEMPLATE = app
+ TARGET   = qmlprofiler
+ DESTDIR = $$QT.qml.bins
+ 
+-QT += qml qml-private network core-private
++QT += qml qml-private v8-private network core-private
+ 
+ target.path = $$[QT_INSTALL_BINS]
+ INSTALLS += target

@@ -1,0 +1,156 @@
+diff --git a/src/testlib/qtestcase.cpp b/src/testlib/qtestcase.cpp
+index 0440e26..d94abff 100644
+--- a/src/testlib/qtestcase.cpp
++++ b/src/testlib/qtestcase.cpp
+@@ -934,16 +934,24 @@ QT_BEGIN_NAMESPACE
+     QTouchEventSequence is called (ie when the object returned runs out of scope).
+ */
+ 
+-static void installCoverageTool(const char * appname, const char * testname)
++static bool installCoverageTool(const char * appname, const char * testname)
+ {
+ #ifdef __COVERAGESCANNER__
++    if (!qgetenv("QT_TESTCOCOON_ACTIVE").isEmpty())
++        return false;
++    // Set environment variable QT_TESTCOCOON_ACTIVE to prevent an eventual subtest from
++    // being considered as a stand-alone test regarding the coverage analysis.
++    qputenv("QT_TESTCOCOON_ACTIVE", "1");
++
+     // Install Coverage Tool
+     __coveragescanner_install(appname);
+     __coveragescanner_testname(testname);
+     __coveragescanner_clear();
++    return true;
+ #else
+     Q_UNUSED(appname);
+     Q_UNUSED(testname);
++    return false;
+ #endif
+ }
+ 
+@@ -1962,7 +1970,8 @@ int QTest::qExec(QObject *testObject, int argc, char **argv)
+ 
+     qtest_qParseArgs(argc, argv, false);
+ 
+-    installCoverageTool(argv[0], metaObject->className());
++    bool installedTestCoverage = installCoverageTool(argv[0], metaObject->className());
++    QTestLog::setInstalledTestCoverage(installedTestCoverage);
+ 
+ #ifdef QTESTLIB_USE_VALGRIND
+     if (QBenchmarkGlobalData::current->mode() == QBenchmarkGlobalData::CallgrindParentProcess) {
+diff --git a/src/testlib/qtestlog.cpp b/src/testlib/qtestlog.cpp
+index 29dfbc1..c8487a2 100644
+--- a/src/testlib/qtestlog.cpp
++++ b/src/testlib/qtestlog.cpp
+@@ -56,9 +56,11 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-static void saveCoverageTool(const char * appname, bool testfailed)
++static void saveCoverageTool(const char * appname, bool testfailed, bool installedTestCoverage)
+ {
+ #ifdef __COVERAGESCANNER__
++    if (!installedTestCoverage)
++        return;
+     // install again to make sure the filename is correct.
+     // without this, a plugin or similar may have changed the filename.
+     __coveragescanner_install(appname);
+@@ -66,9 +68,11 @@ static void saveCoverageTool(const char * appname, bool testfailed)
+     __coveragescanner_save();
+     __coveragescanner_testname("");
+     __coveragescanner_clear();
++    unsetenv("QT_TESTCOCOON_ACTIVE");
+ #else
+     Q_UNUSED(appname);
+     Q_UNUSED(testfailed);
++    Q_UNUSED(installedTestCoverage);
+ #endif
+ }
+ 
+@@ -198,6 +202,7 @@ namespace QTest {
+ 
+     static int verbosity = 0;
+     static int maxWarnings = 2002;
++    static bool installedTestCoverage = true;
+ 
+     static QtMsgHandler oldMessageHandler;
+ 
+@@ -388,7 +393,7 @@ void QTestLog::stopLogging()
+     QTest::TestLoggers::stopLogging();
+     QTest::TestLoggers::destroyLoggers();
+     QTest::loggerUsingStdout = false;
+-    saveCoverageTool(QTestResult::currentAppname(), failCount() != 0);
++    saveCoverageTool(QTestResult::currentAppname(), failCount() != 0, QTestLog::installedTestCoverage());
+ }
+ 
+ void QTestLog::addLogger(LogMode mode, const char *filename)
+@@ -502,4 +507,14 @@ void QTestLog::resetCounters()
+     QTest::skips = 0;
+ }
+ 
++void QTestLog::setInstalledTestCoverage(bool installed)
++{
++    QTest::installedTestCoverage = installed;
++}
++
++bool QTestLog::installedTestCoverage()
++{
++    return QTest::installedTestCoverage;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/testlib/qtestlog_p.h b/src/testlib/qtestlog_p.h
+index 1fe5236..1a9754e 100644
+--- a/src/testlib/qtestlog_p.h
++++ b/src/testlib/qtestlog_p.h
+@@ -103,6 +103,9 @@ public:
+ 
+     static void resetCounters();
+ 
++    static void setInstalledTestCoverage(bool installed);
++    static bool installedTestCoverage();
++
+ private:
+     QTestLog();
+     ~QTestLog();
+diff --git a/tests/auto/testlib/selftests/tst_selftests.cpp b/tests/auto/testlib/selftests/tst_selftests.cpp
+index dc7966b..7e671a5 100644
+--- a/tests/auto/testlib/selftests/tst_selftests.cpp
++++ b/tests/auto/testlib/selftests/tst_selftests.cpp
+@@ -456,23 +456,26 @@ void tst_Selftests::runSubTest_data()
+     }
+ }
+ 
++static void insertEnvironmentVariable(QString const& name, QProcessEnvironment &result)
++{
++    const QProcessEnvironment systemEnvironment = QProcessEnvironment::systemEnvironment();
++    const QString value = systemEnvironment.value(name);
++    if (!value.isEmpty())
++        result.insert(name, value);
++}
++
+ static inline QProcessEnvironment processEnvironment()
+ {
+     QProcessEnvironment result;
+-    const QString path = QStringLiteral("PATH");
+-    const QProcessEnvironment systemEnvironment = QProcessEnvironment::systemEnvironment();
+-    result.insert(path, systemEnvironment.value(path));
++    insertEnvironmentVariable(QStringLiteral("PATH"), result);
+     // Preserve DISPLAY for X11 as some tests use QtGui.
+ #if defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
+-    const QString display = QStringLiteral("DISPLAY");
+-    const QString displayValue = systemEnvironment.value(display);
+-    if (!displayValue.isEmpty())
+-        result.insert(display, displayValue);
++    insertEnvironmentVariable(QStringLiteral("DISPLAY"), result);
++#endif
++    insertEnvironmentVariable(QStringLiteral("QT_QPA_PLATFORM"), result);
++#ifdef __COVERAGESCANNER__
++    insertEnvironmentVariable(QStringLiteral("QT_TESTCOCOON_ACTIVE"), result);
+ #endif
+-    const QString platform = QStringLiteral("QT_QPA_PLATFORM");
+-    const QString platformValue = systemEnvironment.value(platform);
+-    if (!platformValue.isEmpty())
+-        result.insert(platform, platformValue);
+     return result;
+ }

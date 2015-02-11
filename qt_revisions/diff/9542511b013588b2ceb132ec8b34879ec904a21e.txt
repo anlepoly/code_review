@@ -1,0 +1,421 @@
+diff --git a/src/qml/debugger/qqmlprofilerservice_p.h b/src/qml/debugger/qqmlprofilerservice_p.h
+index 8662abb..208fde5 100644
+--- a/src/qml/debugger/qqmlprofilerservice_p.h
++++ b/src/qml/debugger/qqmlprofilerservice_p.h
+@@ -201,7 +201,7 @@ struct QQmlBindingProfiler {
+ };
+ 
+ struct QQmlHandlingSignalProfiler {
+-    QQmlHandlingSignalProfiler(const QMetaMethod &signal, QQmlBoundSignalExpression *expression)
++    QQmlHandlingSignalProfiler(QObject *object, int index, QQmlBoundSignalExpression *expression)
+     {
+         enabled = QQmlProfilerService::instance
+                 ? QQmlProfilerService::instance->profilingEnabled() : false;
+@@ -209,7 +209,7 @@ struct QQmlHandlingSignalProfiler {
+             QQmlProfilerService *service = QQmlProfilerService::instance;
+             service->startRange(QQmlProfilerService::HandlingSignal);
+             service->rangeData(QQmlProfilerService::HandlingSignal,
+-                               QString::fromLatin1(signal.methodSignature()) + QLatin1String(": ")
++                               QLatin1String(object->metaObject()->method(index).methodSignature()) + QLatin1String(": ")
+                                + expression->expression());
+             service->rangeLocation(QQmlProfilerService::HandlingSignal,
+                                    expression->sourceFile(), expression->lineNumber(),
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index b77484c..db689b0 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -163,7 +163,7 @@ class QQmlBoundSignalParameters : public QObject
+ {
+ Q_OBJECT
+ public:
+-    QQmlBoundSignalParameters(const QMetaMethod &, QObject * = 0);
++    QQmlBoundSignalParameters(const QMetaMethod &, QQmlAbstractBoundSignal*);
+     ~QQmlBoundSignalParameters();
+ 
+     void setValues(void **);
+@@ -187,8 +187,6 @@ private:
+     QMetaObject *myMetaObject;
+ };
+ 
+-static int evaluateIdx = -1;
+-
+ QQmlAbstractBoundSignal::QQmlAbstractBoundSignal()
+ : m_prevSignal(0), m_nextSignal(0)
+ {
+@@ -196,12 +194,7 @@ QQmlAbstractBoundSignal::QQmlAbstractBoundSignal()
+ 
+ QQmlAbstractBoundSignal::~QQmlAbstractBoundSignal()
+ {
+-    if (m_prevSignal) {
+-        *m_prevSignal = m_nextSignal;
+-        if (m_nextSignal) m_nextSignal->m_prevSignal = m_prevSignal;
+-        m_prevSignal = 0;
+-        m_nextSignal = 0;
+-    }
++    removeFromObject();
+ }
+ 
+ void QQmlAbstractBoundSignal::addToObject(QObject *obj)
+@@ -217,29 +210,35 @@ void QQmlAbstractBoundSignal::addToObject(QObject *obj)
+     data->signalHandlers = this;
+ }
+ 
++void QQmlAbstractBoundSignal::removeFromObject()
++{
++    if (m_prevSignal) {
++        *m_prevSignal = m_nextSignal;
++        if (m_nextSignal) m_nextSignal->m_prevSignal = m_prevSignal;
++        m_prevSignal = 0;
++        m_nextSignal = 0;
++    }
++}
++
+ QQmlBoundSignal::QQmlBoundSignal(QObject *scope, const QMetaMethod &signal,
+                                QObject *owner)
+-: m_expression(0), m_params(0), m_scope(scope), m_signal(signal), m_paramsValid(false), m_isEvaluating(false)
++: m_expression(0), m_params(0), m_scope(scope), m_index(signal.methodIndex()), m_paramsValid(false), m_isEvaluating(false)
+ {
+-    // This is thread safe.  Although it may be updated by two threads, they
+-    // will both set it to the same value - so the worst thing that can happen
+-    // is that they both do the work to figure it out.  Boo hoo.
+-    if (evaluateIdx == -1) evaluateIdx = metaObject()->methodCount();
+-
+     addToObject(owner);
+-
+-    QQmlPropertyPrivate::connect(scope, m_signal.methodIndex(), this, evaluateIdx);
++    callback = &subscriptionCallback;
++    QQmlNotifierEndpoint::connect(scope, m_index);
+ }
+ 
+ QQmlBoundSignal::~QQmlBoundSignal()
+ {
+     delete m_expression;
+     m_expression = 0;
++    delete m_params;
+ }
+ 
+-int QQmlBoundSignal::index() const 
+-{ 
+-    return m_signal.methodIndex();
++int QQmlBoundSignal::index() const
++{
++    return m_index;
+ }
+ 
+ /*!
+@@ -265,41 +264,40 @@ QQmlBoundSignalExpression *QQmlBoundSignal::setExpression(QQmlBoundSignalExpress
+     return rv;
+ }
+ 
+-int QQmlBoundSignal::qt_metacall(QMetaObject::Call c, int id, void **a)
++void QQmlBoundSignal::subscriptionCallback(QQmlNotifierEndpoint *e, void **a)
+ {
+-    if (c == QMetaObject::InvokeMetaMethod && id == evaluateIdx) {
+-        if (!m_expression)
+-            return -1;
++    QQmlBoundSignal *s = static_cast<QQmlBoundSignal*>(e);
++    if (!s->m_expression)
++        return;
+ 
+-        if (QQmlDebugService::isDebuggingEnabled())
+-            QV8DebugService::instance()->signalEmitted(QString::fromAscii(m_signal.methodSignature().constData()));
++    if (QQmlDebugService::isDebuggingEnabled())
++        QV8DebugService::instance()->signalEmitted(QString::fromAscii(s->m_scope->metaObject()->method(s->m_index).methodSignature()));
+ 
+-        QQmlHandlingSignalProfiler prof(m_signal, m_expression);
++    QQmlHandlingSignalProfiler prof(s->m_scope, s->m_index, s->m_expression);
+ 
+-        m_isEvaluating = true;
+-        if (!m_paramsValid) {
+-            if (!m_signal.parameterTypes().isEmpty())
+-                m_params = new QQmlBoundSignalParameters(m_signal, this);
+-            m_paramsValid = true;
+-        }
++    s->m_isEvaluating = true;
+ 
+-        if (m_params) m_params->setValues(a);
+-        if (m_expression && m_expression->context() && m_expression->engine()) {
+-            m_expression->evaluate(m_params);
+-            if (m_expression && m_expression->hasError())
+-                QQmlEnginePrivate::warning(m_expression->engine(), m_expression->error());
+-        }
+-        if (m_params) m_params->clearValues();
+-        m_isEvaluating = false;
+-        return -1;
+-    } else {
+-        return QObject::qt_metacall(c, id, a);
++    if (!s->m_paramsValid) {
++        QMetaMethod signal = s->m_scope->metaObject()->method(s->m_index);
++        if (!signal.parameterTypes().isEmpty())
++            s->m_params = new QQmlBoundSignalParameters(signal, s);
++        s->m_paramsValid = true;
+     }
++
++    if (s->m_params) s->m_params->setValues(a);
++    if (s->m_expression && s->m_expression->engine()) {
++        s->m_expression->evaluate(s->m_params);
++        if (s->m_expression && s->m_expression->hasError())
++            QQmlEnginePrivate::warning(s->m_expression->engine(), s->m_expression->error());
++    }
++    if (s->m_params) s->m_params->clearValues();
++
++    s->m_isEvaluating = false;
+ }
+ 
+ QQmlBoundSignalParameters::QQmlBoundSignalParameters(const QMetaMethod &method, 
+-                                                                     QObject *parent)
+-: QObject(parent), types(0), values(0)
++                                                     QQmlAbstractBoundSignal *owner)
++: types(0), values(0)
+ {
+     MetaObject *mo = new MetaObject(this);
+ 
+@@ -348,7 +346,7 @@ QQmlBoundSignalParameters::QQmlBoundSignalParameters(const QMetaMethod &method,
+                 if (scope == "Qt")
+                     meta = &QObject::staticQtMetaObject;
+                 else
+-                    meta = static_cast<QQmlBoundSignal*>(parent)->scope()->metaObject();
++                    meta = owner->scope()->metaObject();
+                 for (int i = meta->enumeratorCount() - 1; i >= 0; --i) {
+                     QMetaEnum m = meta->enumerator(i);
+                     if ((m.name() == name) && (scope.isEmpty() || (m.scope() == scope))) {
+diff --git a/src/qml/qml/qqmlboundsignal_p.h b/src/qml/qml/qqmlboundsignal_p.h
+index c6ce875..e411588 100644
+--- a/src/qml/qml/qqmlboundsignal_p.h
++++ b/src/qml/qml/qqmlboundsignal_p.h
+@@ -57,6 +57,7 @@
+ 
+ #include <private/qqmlabstractexpression_p.h>
+ #include <private/qqmljavascriptexpression_p.h>
++#include <private/qqmlnotifier_p.h>
+ #include <private/qobject_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -109,6 +110,7 @@ public:
+     virtual QQmlBoundSignalExpression *setExpression(QQmlBoundSignalExpression *) = 0;
+     virtual QObject *scope() = 0;
+ 
++    void removeFromObject();
+ protected:
+     void addToObject(QObject *owner);
+ 
+@@ -121,8 +123,8 @@ private:
+ };
+ 
+ class QQmlBoundSignalParameters;
+-class Q_QML_EXPORT QQmlBoundSignal : public QObject,
+-                                     public QQmlAbstractBoundSignal
++class Q_QML_EXPORT QQmlBoundSignal : public QQmlAbstractBoundSignal,
++                                     public QQmlNotifierEndpoint
+ {
+ public:
+     QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, QObject *owner);
+@@ -134,20 +136,20 @@ public:
+     QQmlBoundSignalExpression *setExpression(QQmlBoundSignalExpression *);
+     QObject *scope() { return m_scope; }
+ 
+-    bool isEvaluating() const { return m_isEvaluating; }
++    static void subscriptionCallback(QQmlNotifierEndpoint *e, void **);
+ 
+-protected:
+-    virtual int qt_metacall(QMetaObject::Call c, int id, void **a);
++    bool isEvaluating() const { return m_isEvaluating; }
+ 
+ private:
+     QQmlBoundSignalExpression *m_expression;
+     QQmlBoundSignalParameters *m_params;
+     QObject *m_scope;
+-    QMetaMethod m_signal;
++    int m_index;
+     bool m_paramsValid : 1;
+     bool m_isEvaluating : 1;
+ };
+ 
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLBOUNDSIGNAL_P_H
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index aee9c5c..7317689 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -448,13 +448,13 @@ void QQmlData::objectNameChanged(QAbstractDeclarativeData *d, QObject *o)
+     static_cast<QQmlData *>(d)->objectNameChanged(o);
+ }
+ 
+-void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int index, void **)
++void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int index, void **a)
+ {
+     QQmlData *ddata = QQmlData::get(object, false);
+     if (!ddata) return; // Probably being deleted
+ 
+     QQmlNotifierEndpoint *ep = ddata->notify(index);
+-    if (ep) QQmlNotifier::emitNotify(ep);
++    if (ep) QQmlNotifier::emitNotify(ep, a);
+ }
+ 
+ int QQmlData::receivers(QAbstractDeclarativeData *d, const QObject *, int index)
+diff --git a/src/qml/qml/qqmlengine_p.h b/src/qml/qml/qqmlengine_p.h
+index 73a0b5a..2521888 100644
+--- a/src/qml/qml/qqmlengine_p.h
++++ b/src/qml/qml/qqmlengine_p.h
+@@ -109,7 +109,7 @@ class QQmlJavaScriptExpressionGuard : public QQmlNotifierEndpoint
+ public:
+     inline QQmlJavaScriptExpressionGuard(QQmlJavaScriptExpression *);
+ 
+-    static inline void endpointCallback(QQmlNotifierEndpoint *);
++    static inline void endpointCallback(QQmlNotifierEndpoint *, void **);
+     static inline QQmlJavaScriptExpressionGuard *New(QQmlJavaScriptExpression *e,
+                                                              QQmlEngine *engine);
+     inline void Delete();
+diff --git a/src/qml/qml/qqmljavascriptexpression_p.h b/src/qml/qml/qqmljavascriptexpression_p.h
+index 5d790e4..12be382 100644
+--- a/src/qml/qml/qqmljavascriptexpression_p.h
++++ b/src/qml/qml/qqmljavascriptexpression_p.h
+@@ -256,7 +256,7 @@ QQmlJavaScriptExpressionGuard::QQmlJavaScriptExpressionGuard(QQmlJavaScriptExpre
+     callback = &endpointCallback;
+ }
+ 
+-void QQmlJavaScriptExpressionGuard::endpointCallback(QQmlNotifierEndpoint *e)
++void QQmlJavaScriptExpressionGuard::endpointCallback(QQmlNotifierEndpoint *e, void **)
+ {
+     QQmlJavaScriptExpression *expression =
+         static_cast<QQmlJavaScriptExpressionGuard *>(e)->expression;
+diff --git a/src/qml/qml/qqmlnotifier.cpp b/src/qml/qml/qqmlnotifier.cpp
+index 270eee5..1ed3a29 100644
+--- a/src/qml/qml/qqmlnotifier.cpp
++++ b/src/qml/qml/qqmlnotifier.cpp
+@@ -44,20 +44,20 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-void QQmlNotifier::emitNotify(QQmlNotifierEndpoint *endpoint)
++void QQmlNotifier::emitNotify(QQmlNotifierEndpoint *endpoint, void **a)
+ {
+     QQmlNotifierEndpoint **oldDisconnected = endpoint->disconnected;
+     endpoint->disconnected = &endpoint;
+     endpoint->notifying = 1;
+ 
+     if (endpoint->next)
+-        emitNotify(endpoint->next);
++        emitNotify(endpoint->next, a);
+ 
+     if (endpoint) {
+ 
+         Q_ASSERT(endpoint->callback);
+         
+-        endpoint->callback(endpoint);
++        endpoint->callback(endpoint, a);
+ 
+         if (endpoint) 
+             endpoint->disconnected = oldDisconnected;
+diff --git a/src/qml/qml/qqmlnotifier_p.h b/src/qml/qml/qqmlnotifier_p.h
+index ab07113..3192531 100644
+--- a/src/qml/qml/qqmlnotifier_p.h
++++ b/src/qml/qml/qqmlnotifier_p.h
+@@ -59,7 +59,7 @@ private:
+     friend class QQmlData;
+     friend class QQmlNotifierEndpoint;
+ 
+-    static void emitNotify(QQmlNotifierEndpoint *);
++    static void emitNotify(QQmlNotifierEndpoint *, void **a);
+     QQmlNotifierEndpoint *endpoints;
+ };
+ 
+@@ -69,7 +69,7 @@ public:
+     inline QQmlNotifierEndpoint();
+     inline ~QQmlNotifierEndpoint();
+ 
+-    typedef void (*Callback)(QQmlNotifierEndpoint *);
++    typedef void (*Callback)(QQmlNotifierEndpoint *, void **);
+     Callback callback;
+ 
+     inline bool isConnected();
+@@ -124,7 +124,8 @@ QQmlNotifier::~QQmlNotifier()
+ 
+ void QQmlNotifier::notify()
+ {
+-    if (endpoints) emitNotify(endpoints);
++    void *args[] = { 0 };
++    if (endpoints) emitNotify(endpoints, args);
+ }
+ 
+ QQmlNotifierEndpoint::QQmlNotifierEndpoint()
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index afcc57e..d163282 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -127,7 +127,7 @@ class QQmlVMEMetaObjectEndpoint : public QQmlNotifierEndpoint
+ {
+ public:
+     QQmlVMEMetaObjectEndpoint();
+-    static void vmecallback(QQmlNotifierEndpoint *);
++    static void vmecallback(QQmlNotifierEndpoint *, void **);
+     void tryConnect();
+ 
+     QFlagPointer<QQmlVMEMetaObject> metaObject;
+@@ -414,7 +414,7 @@ QQmlVMEMetaObjectEndpoint::QQmlVMEMetaObjectEndpoint()
+     callback = &vmecallback;
+ }
+ 
+-void QQmlVMEMetaObjectEndpoint::vmecallback(QQmlNotifierEndpoint *e)
++void QQmlVMEMetaObjectEndpoint::vmecallback(QQmlNotifierEndpoint *e, void **)
+ {
+     QQmlVMEMetaObjectEndpoint *vmee = static_cast<QQmlVMEMetaObjectEndpoint*>(e);
+     vmee->tryConnect();
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index db6811f..5bb993f 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -288,7 +288,7 @@ QObject *QV4Bindings::Binding::object() const
+     return target;
+ }
+ 
+-void QV4Bindings::Subscription::subscriptionCallback(QQmlNotifierEndpoint *e) 
++void QV4Bindings::Subscription::subscriptionCallback(QQmlNotifierEndpoint *e, void **)
+ {
+     Subscription *s = static_cast<Subscription *>(e);
+     s->bindings->subscriptionNotify(s->method);
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index 3a7d175..78a3f9b 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -112,7 +112,7 @@ private:
+     {
+     public:
+         Subscription() : bindings(0), method(-1) { callback = &subscriptionCallback; }
+-        static void subscriptionCallback(QQmlNotifierEndpoint *e);
++        static void subscriptionCallback(QQmlNotifierEndpoint *e, void**);
+         QV4Bindings *bindings;
+         int method;
+     };
+diff --git a/src/quick/util/qquickconnections.cpp b/src/quick/util/qquickconnections.cpp
+index 27b66ba..8116ac3 100644
+--- a/src/quick/util/qquickconnections.cpp
++++ b/src/quick/util/qquickconnections.cpp
+@@ -151,6 +151,16 @@ QObject *QQuickConnections::target() const
+     return d->targetSet ? d->target : parent();
+ }
+ 
++class QQmlBoundSignalDeleter : public QObject
++{
++public:
++    QQmlBoundSignalDeleter(QQmlBoundSignal *signal) : m_signal(signal) { m_signal->removeFromObject(); }
++    ~QQmlBoundSignalDeleter() { delete m_signal; }
++
++private:
++    QQmlBoundSignal *m_signal;
++};
++
+ void QQuickConnections::setTarget(QObject *obj)
+ {
+     Q_D(QQuickConnections);
+@@ -161,7 +171,7 @@ void QQuickConnections::setTarget(QObject *obj)
+         // It is possible that target is being changed due to one of our signal
+         // handlers -> use deleteLater().
+         if (s->isEvaluating())
+-            s->deleteLater();
++            (new QQmlBoundSignalDeleter(s))->deleteLater();
+         else
+             delete s;
+     }

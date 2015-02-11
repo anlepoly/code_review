@@ -1,0 +1,2122 @@
+diff --git a/src/plugins/blackberry/bbmediaplayercontrol.cpp b/src/plugins/blackberry/bbmediaplayercontrol.cpp
+new file mode 100644
+index 0000000..1910b38
+--- /dev/null
++++ b/src/plugins/blackberry/bbmediaplayercontrol.cpp
+@@ -0,0 +1,611 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbmediaplayercontrol.h"
++#include "bbvideowindowcontrol.h"
++#include "bbutil.h"
++#include <QtCore/qabstracteventdispatcher.h>
++#include <QtCore/qcoreapplication.h>
++#include <QtCore/qdir.h>
++#include <QtCore/qfileinfo.h>
++#include <QtCore/qtimer.h>
++#include <QtCore/quuid.h>
++#include <mm/renderer.h>
++#include <bps/mmrenderer.h>
++#include <bps/screen.h>
++#include <errno.h>
++#include <sys/strm.h>
++#include <sys/stat.h>
++
++//#define QBBMEDIA_DEBUG
++
++#ifdef QBBMEDIA_DEBUG
++#define qBbMediaDebug qDebug
++#else
++#define qBbMediaDebug QT_NO_QDEBUG_MACRO
++#endif
++
++QT_BEGIN_NAMESPACE
++
++static int idCounter = 0;
++
++static bool s_eventFilterInstalled = 0;
++static QAbstractEventDispatcher::EventFilter s_previousEventFilter = 0;
++static QHash< int, BbMediaPlayerControl* > s_idToPlayerMap;
++
++static bool s_eventFilter(void *message)
++{
++    bps_event_t * const event = static_cast<bps_event_t *>(message);
++
++    if (event &&
++        (bps_event_get_domain(event) == mmrenderer_get_domain() ||
++         bps_event_get_domain(event) == screen_get_domain() )) {
++        const int id = mmrenderer_event_get_userdata(event);
++        BbMediaPlayerControl * const control = s_idToPlayerMap.value(id);
++        if (control)
++            control->bpsEventHandler(event);
++    }
++
++    if (s_previousEventFilter)
++        return s_previousEventFilter(message);
++    else
++        return false;
++}
++
++BbMediaPlayerControl::BbMediaPlayerControl(QObject *parent)
++    : QMediaPlayerControl(parent),
++      m_connection(0),
++      m_context(0),
++      m_audioId(-1),
++      m_state(QMediaPlayer::StoppedState),
++      m_volume(100),
++      m_muted(false),
++      m_rate(1),
++      m_id(-1),
++      m_eventMonitor(0),
++      m_position(0),
++      m_mediaStatus(QMediaPlayer::NoMedia),
++      m_playAfterMediaLoaded(false),
++      m_inputAttached(false),
++      m_stopEventsToIgnore(0),
++      m_bufferStatus(0)
++{
++    if (!s_eventFilterInstalled) {
++        s_eventFilterInstalled = true;
++        s_previousEventFilter =
++                QCoreApplication::eventDispatcher()->setEventFilter(s_eventFilter);
++    }
++
++    openConnection();
++}
++
++BbMediaPlayerControl::~BbMediaPlayerControl()
++{
++    stop();
++    detach();
++    closeConnection();
++}
++
++void BbMediaPlayerControl::openConnection()
++{
++    m_connection = mmr_connect(NULL);
++    if (!m_connection) {
++        emitPError("Unable to connect to the multimedia renderer");
++        return;
++    }
++
++    m_id = idCounter++;
++    m_contextName = QString("BbMediaPlayerControl_%1_%2").arg(m_id)
++                                                         .arg(QCoreApplication::applicationPid());
++    m_context = mmr_context_create(m_connection, m_contextName.toLatin1(),
++                                   0, S_IRWXU|S_IRWXG|S_IRWXO);
++    if (!m_context) {
++        emitPError("Unable to create context");
++        closeConnection();
++        return;
++    }
++
++    s_idToPlayerMap.insert(m_id, this);
++    m_eventMonitor = mmrenderer_request_events(m_contextName.toLatin1(), 0, m_id);
++    if (!m_eventMonitor) {
++        qBbMediaDebug() << "Unable to request multimedia events";
++        emit error(0, "Unable to request multimedia events");
++    }
++}
++
++void BbMediaPlayerControl::closeConnection()
++{
++    s_idToPlayerMap.remove(m_id);
++    if (m_eventMonitor) {
++        mmrenderer_stop_events(m_eventMonitor);
++        m_eventMonitor = 0;
++    }
++
++    if (m_context) {
++        mmr_context_destroy(m_context);
++        m_context = 0;
++        m_contextName.clear();
++    }
++
++    if (m_connection) {
++        mmr_disconnect(m_connection);
++        m_connection = 0;
++    }
++}
++
++void BbMediaPlayerControl::attach()
++{
++    if (m_media.isNull() || !m_context) {
++        setMediaStatus(QMediaPlayer::NoMedia);
++        return;
++    }
++
++    if (m_videoControl)
++        m_videoControl->attachDisplay(m_context);
++
++    m_audioId = mmr_output_attach(m_context, "audio:default", "audio");
++    if (m_audioId == -1) {
++        emitMmError("mmr_output_attach() for audio failed");
++        return;
++    }
++
++    // If this is a local file, use the full path as the resource identifier
++    QString mediaFile = m_media.canonicalUrl().toString();
++
++    // The mmrenderer does not support playback from resource files, so copy it to a temporary
++    // file
++    const QString resourcePrefix("qrc:");
++    if (mediaFile.startsWith(resourcePrefix)) {
++        mediaFile.remove(0, resourcePrefix.length() - 1);
++        const QFileInfo resourceFileInfo(mediaFile);
++        m_tempMediaFileName = QDir::tempPath() + "/qtmedia_" + QUuid::createUuid().toString() + "." +
++                              resourceFileInfo.suffix();
++        if (!QFile::copy(mediaFile, m_tempMediaFileName)) {
++            const QString errorMsg =
++                QString("Failed to copy resource file to temporary file %1 for playback").arg(m_tempMediaFileName);
++            qBbMediaDebug() << errorMsg;
++            emit error(0, errorMsg);
++            detach();
++            return;
++        }
++        mediaFile = m_tempMediaFileName;
++    }
++
++    if (m_media.canonicalUrl().scheme().isEmpty()) {
++        const QFileInfo fileInfo(mediaFile);
++        mediaFile = "file://" + fileInfo.absoluteFilePath();
++    }
++
++    if (mmr_input_attach(m_context, QFile::encodeName(mediaFile), "track") != 0) {
++        emitMmError(QString("mmr_input_attach() for %1 failed").arg(mediaFile));
++        setMediaStatus(QMediaPlayer::InvalidMedia);
++        detach();
++        return;
++    }
++
++    // For whatever reason, the mmrenderer sends out a MMR_STOPPED event when calling
++    // mmr_input_attach() above. Ignore it, as otherwise we'll trigger stopping right after we
++    // started.
++    m_stopEventsToIgnore++;
++
++    m_inputAttached = true;
++    setMediaStatus(QMediaPlayer::LoadedMedia);
++    m_bufferStatus = 0;
++    emit bufferStatusChanged(m_bufferStatus);
++}
++
++void BbMediaPlayerControl::detach()
++{
++    if (m_context) {
++        if (m_inputAttached) {
++            mmr_input_detach(m_context);
++            m_inputAttached = false;
++        }
++        if (m_videoControl)
++            m_videoControl->detachDisplay();
++        if (m_audioId != -1 && m_context) {
++            mmr_output_detach(m_context, m_audioId);
++            m_audioId = -1;
++        }
++    }
++
++    if (!m_tempMediaFileName.isEmpty()) {
++        QFile::remove(m_tempMediaFileName);
++        m_tempMediaFileName.clear();
++    }
++}
++
++QMediaPlayer::State BbMediaPlayerControl::state() const
++{
++    return m_state;
++}
++
++QMediaPlayer::MediaStatus BbMediaPlayerControl::mediaStatus() const
++{
++    return m_mediaStatus;
++}
++
++qint64 BbMediaPlayerControl::duration() const
++{
++    return m_metaData.duration();
++}
++
++qint64 BbMediaPlayerControl::position() const
++{
++    return m_position;
++}
++
++void BbMediaPlayerControl::setPosition(qint64 position)
++{
++    if (m_position != position) {
++        m_position = position;
++
++        // Don't update in stopped state, it would not have any effect. Instead, the position is
++        // updated in play().
++        if (m_state != QMediaPlayer::StoppedState)
++            setPositionInternal(m_position);
++
++        emit positionChanged(m_position);
++    }
++}
++
++int BbMediaPlayerControl::volume() const
++{
++    return m_volume;
++}
++
++void BbMediaPlayerControl::setVolumeInternal(int newVolume)
++{
++    if (!m_context)
++        return;
++
++    newVolume = qBound(0, newVolume, 100);
++    if (m_audioId != -1) {
++        strm_dict_t * dict = strm_dict_new();
++        dict = strm_dict_set(dict, "volume", QString::number(newVolume).toLatin1());
++        if (mmr_output_parameters(m_context, m_audioId, dict) != 0)
++            emitMmError("mmr_output_parameters: Setting volume failed");
++    }
++}
++
++void BbMediaPlayerControl::setPlaybackRateInternal(qreal rate)
++{
++    if (!m_context)
++        return;
++
++    const int mmRate = rate * 1000;
++    if (mmr_speed_set(m_context, mmRate) != 0)
++        emitMmError("mmr_speed_set failed");
++}
++
++void BbMediaPlayerControl::setPositionInternal(qint64 position)
++{
++    if (!m_context)
++        return;
++
++    if (mmr_seek(m_context, QString::number(position).toLatin1()) != 0)
++        emitMmError("Seeking failed");
++}
++
++void BbMediaPlayerControl::setMediaStatus(QMediaPlayer::MediaStatus status)
++{
++    if (m_mediaStatus != status) {
++        m_mediaStatus = status;
++        emit mediaStatusChanged(m_mediaStatus);
++    }
++}
++
++void BbMediaPlayerControl::setState(QMediaPlayer::State state)
++{
++    if (m_state != state) {
++        m_state = state;
++        emit stateChanged(m_state);
++    }
++}
++
++void BbMediaPlayerControl::stopInternal(StopCommand stopCommand)
++{
++    if (m_state != QMediaPlayer::StoppedState) {
++
++        if (stopCommand == StopMmRenderer) {
++            ++m_stopEventsToIgnore;
++            mmr_stop(m_context);
++        }
++
++        setState(QMediaPlayer::StoppedState);
++    }
++
++    if (m_position != 0) {
++        m_position = 0;
++        emit positionChanged(0);
++    }
++}
++
++void BbMediaPlayerControl::setVolume(int volume)
++{
++    const int newVolume = qBound(0, volume, 100);
++    if (m_volume != newVolume) {
++        m_volume = newVolume;
++        if (!m_muted)
++            setVolumeInternal(m_volume);
++        emit volumeChanged(m_volume);
++    }
++}
++
++bool BbMediaPlayerControl::isMuted() const
++{
++    return m_muted;
++}
++
++void BbMediaPlayerControl::setMuted(bool muted)
++{
++    if (m_muted != muted) {
++        m_muted = muted;
++        setVolumeInternal(muted ? 0 : m_volume);
++        emit mutedChanged(muted);
++    }
++}
++
++int BbMediaPlayerControl::bufferStatus() const
++{
++    return m_bufferStatus;
++}
++
++bool BbMediaPlayerControl::isAudioAvailable() const
++{
++    return m_metaData.hasAudio();
++}
++
++bool BbMediaPlayerControl::isVideoAvailable() const
++{
++    return m_metaData.hasVideo();
++}
++
++bool BbMediaPlayerControl::isSeekable() const
++{
++    // We can currently not get that information from the mmrenderer API. Just pretend we can seek,
++    // it will fail at runtime if we can not.
++    return true;
++}
++
++QMediaTimeRange BbMediaPlayerControl::availablePlaybackRanges() const
++{
++    // We can't get this information from the mmrenderer API yet, so pretend we can seek everywhere
++    return QMediaTimeRange(0, m_metaData.duration());
++}
++
++qreal BbMediaPlayerControl::playbackRate() const
++{
++    return m_rate;
++}
++
++void BbMediaPlayerControl::setPlaybackRate(qreal rate)
++{
++    if (m_rate != rate) {
++        m_rate = rate;
++        setPlaybackRateInternal(m_rate);
++        emit playbackRateChanged(m_rate);
++    }
++}
++
++QMediaContent BbMediaPlayerControl::media() const
++{
++    return m_media;
++}
++
++const QIODevice *BbMediaPlayerControl::mediaStream() const
++{
++    // Always 0, we don't support QIODevice streams
++    return 0;
++}
++
++void BbMediaPlayerControl::setMedia(const QMediaContent &media, QIODevice *stream)
++{
++    Q_UNUSED(stream); // not supported
++
++    stop();
++    detach();
++
++    m_media = media;
++    emit mediaChanged(m_media);
++
++    // Slight hack: With MediaPlayer QtQuick elements that have autoPlay set to true, playback
++    // would start before the QtQuick canvas is propagated to all elements, and therefore our
++    // video output would not work. Therefore, delay actually playing the media a bit so that the
++    // canvas is ready.
++    // The mmrenderer doesn't allow to attach video outputs after playing has started, otherwise
++    // this would be unnecessary.
++    setMediaStatus(QMediaPlayer::LoadingMedia);
++    QTimer::singleShot(0, this, SLOT(continueLoadMedia()));
++}
++
++void BbMediaPlayerControl::continueLoadMedia()
++{
++    attach();
++    updateMetaData();
++    if (m_playAfterMediaLoaded)
++        play();
++}
++
++void BbMediaPlayerControl::play()
++{
++    if (m_playAfterMediaLoaded)
++        m_playAfterMediaLoaded = false;
++
++    // No-op if we are already playing, except if we were called from continueLoadMedia(), in which
++    // case m_playAfterMediaLoaded is true (hence the 'else').
++    else if (m_state == QMediaPlayer::PlayingState)
++        return;
++
++    if (m_mediaStatus == QMediaPlayer::LoadingMedia) {
++
++        // State changes are supposed to be synchronous
++        setState(QMediaPlayer::PlayingState);
++
++        // Defer playing to later, when the timer triggers continueLoadMedia()
++        m_playAfterMediaLoaded = true;
++        return;
++    }
++
++    // Un-pause the state when it is paused
++    if (m_state == QMediaPlayer::PausedState) {
++        setPlaybackRateInternal(m_rate);
++        setState(QMediaPlayer::PlayingState);
++        return;
++    }
++
++    if (m_media.isNull() || !m_connection || !m_context || m_audioId == -1) {
++        setState(QMediaPlayer::StoppedState);
++        return;
++    }
++
++    setPositionInternal(m_position);
++    setVolumeInternal(m_volume);
++    setPlaybackRateInternal(m_rate);
++
++    if (mmr_play(m_context) != 0) {
++        setState(QMediaPlayer::StoppedState);
++        emitMmError("mmr_play() failed");
++        return;
++    }
++
++    setState( QMediaPlayer::PlayingState);
++}
++
++void BbMediaPlayerControl::pause()
++{
++    if (m_state == QMediaPlayer::PlayingState) {
++        setPlaybackRateInternal(0);
++        setState(QMediaPlayer::PausedState);
++    }
++}
++
++void BbMediaPlayerControl::stop()
++{
++    stopInternal(StopMmRenderer);
++}
++
++void BbMediaPlayerControl::setVideoControl(BbVideoWindowControl *videoControl)
++{
++    m_videoControl = videoControl;
++}
++
++void BbMediaPlayerControl::bpsEventHandler(bps_event_t *event)
++{
++    if (m_videoControl)
++        m_videoControl->bpsEventHandler(event);
++
++    if (bps_event_get_domain(event) != mmrenderer_get_domain())
++        return;
++
++    if (bps_event_get_code(event) == MMRENDERER_STATE_CHANGE) {
++        const mmrenderer_state_t newState = mmrenderer_event_get_state(event);
++        if (newState == MMR_STOPPED) {
++
++            // Only react to stop events that happen when the end of the stream is reached and
++            // playback is stopped because of this.
++            // Ignore other stop event sources, souch as calling mmr_stop() ourselves and
++            // mmr_input_attach().
++            if (m_stopEventsToIgnore > 0)
++                --m_stopEventsToIgnore;
++            else
++                stopInternal(IgnoreMmRenderer);
++            return;
++        }
++    }
++
++    if (bps_event_get_code(event) == MMRENDERER_STATUS_UPDATE) {
++
++        // Prevent spurious position change events from overriding our own position, for example
++        // when setting the position to 0 in stop().
++        if (m_state != QMediaPlayer::PlayingState)
++            return;
++
++        const qint64 newPosition = QString::fromLatin1(mmrenderer_event_get_position(event)).toLongLong();
++        if (newPosition != 0 && newPosition != m_position) {
++            m_position = newPosition;
++            emit positionChanged(m_position);
++        }
++
++        const QString bufferStatus = QString::fromLatin1(mmrenderer_event_get_bufferlevel(event));
++        const int slashPos = bufferStatus.indexOf('/');
++        if (slashPos != -1) {
++            const int fill = bufferStatus.left(slashPos).toInt();
++            const int capacity = bufferStatus.mid(slashPos + 1).toInt();
++            if (capacity != 0) {
++                m_bufferStatus = fill / static_cast<float>(capacity) * 100.0f;
++                emit bufferStatusChanged(m_bufferStatus);
++            }
++        }
++    }
++}
++
++void BbMediaPlayerControl::updateMetaData()
++{
++    if (m_mediaStatus == QMediaPlayer::LoadedMedia)
++        m_metaData.parse(m_contextName);
++    else
++        m_metaData.clear();
++
++    if (m_videoControl)
++        m_videoControl->setMetaData(m_metaData);
++
++    emit durationChanged(m_metaData.duration());
++    emit audioAvailableChanged(m_metaData.hasAudio());
++    emit videoAvailableChanged(m_metaData.hasVideo());
++    emit availablePlaybackRangesChanged(availablePlaybackRanges());
++}
++
++void BbMediaPlayerControl::emitMmError(const QString &msg)
++{
++    int errorCode = MMR_ERROR_NONE;
++    const QString errorMessage = mmErrorMessage(msg, m_context, &errorCode);
++    qBbMediaDebug() << errorMessage;
++    emit error(errorCode, errorMessage);
++}
++
++void BbMediaPlayerControl::emitPError(const QString &msg)
++{
++    const QString errorMessage = QString("%1: %2").arg(msg).arg(strerror(errno));
++    qBbMediaDebug() << errorMessage;
++    emit error(errno, errorMessage);
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbmediaplayercontrol.h b/src/plugins/blackberry/bbmediaplayercontrol.h
+new file mode 100644
+index 0000000..a6953a2
+--- /dev/null
++++ b/src/plugins/blackberry/bbmediaplayercontrol.h
+@@ -0,0 +1,151 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBMEDIAPLAYERCONTROL_H
++#define BBMEDIAPLAYERCONTROL_H
++
++#include "bbmetadata.h"
++#include <qmediaplayercontrol.h>
++#include <QtCore/qpointer.h>
++
++struct bps_event_t;
++typedef struct mmr_connection mmr_connection_t;
++typedef struct mmr_context mmr_context_t;
++typedef struct mmrenderer_monitor mmrenderer_monitor_t;
++
++QT_BEGIN_NAMESPACE
++
++class BbVideoWindowControl;
++
++class BbMediaPlayerControl : public QMediaPlayerControl
++{
++    Q_OBJECT
++public:
++    explicit BbMediaPlayerControl(QObject *parent = 0);
++    ~BbMediaPlayerControl();
++
++    QMediaPlayer::State state() const;
++
++    QMediaPlayer::MediaStatus mediaStatus() const;
++
++    qint64 duration() const;
++
++    qint64 position() const;
++    void setPosition(qint64 position);
++
++    int volume() const;
++    void setVolume(int volume);
++
++    bool isMuted() const;
++    void setMuted(bool muted);
++
++    int bufferStatus() const;
++
++    bool isAudioAvailable() const;
++    bool isVideoAvailable() const;
++
++    bool isSeekable() const;
++
++    QMediaTimeRange availablePlaybackRanges() const;
++
++    qreal playbackRate() const;
++    void setPlaybackRate(qreal rate);
++
++    QMediaContent media() const;
++    const QIODevice *mediaStream() const;
++    void setMedia(const QMediaContent &media, QIODevice *stream);
++
++    void play();
++    void pause();
++    void stop();
++
++    void setVideoControl(BbVideoWindowControl *videoControl);
++    void bpsEventHandler(bps_event_t *event);
++
++private Q_SLOTS:
++    void continueLoadMedia();
++
++private:
++    void openConnection();
++    void closeConnection();
++    void attach();
++    void detach();
++    void updateMetaData();
++
++    void emitMmError(const QString &msg);
++    void emitPError(const QString &msg);
++
++    // All these set the specified value to the backend, but neither emit changed signals
++    // nor change the member value.
++    void setVolumeInternal(int newVolume);
++    void setPlaybackRateInternal(qreal rate);
++    void setPositionInternal(qint64 position);
++
++    void setMediaStatus(QMediaPlayer::MediaStatus status);
++    void setState(QMediaPlayer::State state);
++
++    enum StopCommand { StopMmRenderer, IgnoreMmRenderer };
++    void stopInternal(StopCommand stopCommand);
++
++    QMediaContent m_media;
++    mmr_connection_t *m_connection;
++    mmr_context_t *m_context;
++    QString m_contextName;
++    int m_audioId;
++    QMediaPlayer::State m_state;
++    int m_volume;
++    bool m_muted;
++    qreal m_rate;
++    QPointer<BbVideoWindowControl> m_videoControl;
++    BbMetaData m_metaData;
++    int m_id;
++    mmrenderer_monitor_t *m_eventMonitor;
++    qint64 m_position;
++    QMediaPlayer::MediaStatus m_mediaStatus;
++    bool m_playAfterMediaLoaded;
++    bool m_inputAttached;
++    int m_stopEventsToIgnore;
++    int m_bufferStatus;
++    QString m_tempMediaFileName;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/bbmediaplayerservice.cpp b/src/plugins/blackberry/bbmediaplayerservice.cpp
+new file mode 100644
+index 0000000..13ba174
+--- /dev/null
++++ b/src/plugins/blackberry/bbmediaplayerservice.cpp
+@@ -0,0 +1,96 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbmediaplayerservice.h"
++
++#include "bbmediaplayercontrol.h"
++#include "bbvideowindowcontrol.h"
++
++QT_BEGIN_NAMESPACE
++
++BbMediaPlayerService::BbMediaPlayerService(QObject *parent)
++    : QMediaService(parent),
++      m_videoWindowControl(0),
++      m_mediaPlayerControl(0)
++{
++}
++
++BbMediaPlayerService::~BbMediaPlayerService()
++{
++    // Someone should have called releaseControl(), but better be safe
++    delete m_videoWindowControl;
++    delete m_mediaPlayerControl;
++}
++
++QMediaControl *BbMediaPlayerService::requestControl(const char *name)
++{
++    if (qstrcmp(name, QMediaPlayerControl_iid) == 0) {
++        if (!m_mediaPlayerControl) {
++            m_mediaPlayerControl = new BbMediaPlayerControl();
++            updateControls();
++        }
++        return m_mediaPlayerControl;
++    }
++    else if (qstrcmp(name, QVideoWindowControl_iid) == 0) {
++        if (!m_videoWindowControl) {
++            m_videoWindowControl = new BbVideoWindowControl();
++            updateControls();
++        }
++        return m_videoWindowControl;
++    }
++    return 0;
++}
++
++void BbMediaPlayerService::releaseControl(QMediaControl *control)
++{
++    if (control == m_videoWindowControl)
++        m_videoWindowControl = 0;
++    if (control == m_mediaPlayerControl)
++        m_mediaPlayerControl = 0;
++    delete control;
++}
++
++void BbMediaPlayerService::updateControls()
++{
++    if (m_videoWindowControl && m_mediaPlayerControl)
++        m_mediaPlayerControl->setVideoControl(m_videoWindowControl);
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbmediaplayerservice.h b/src/plugins/blackberry/bbmediaplayerservice.h
+new file mode 100644
+index 0000000..9349d49
+--- /dev/null
++++ b/src/plugins/blackberry/bbmediaplayerservice.h
+@@ -0,0 +1,71 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBMEDIAPLAYERSERVICE_H
++#define BBMEDIAPLAYERSERVICE_H
++
++#include <qmediaservice.h>
++#include <QtCore/qpointer.h>
++
++QT_BEGIN_NAMESPACE
++
++class BbMediaPlayerControl;
++class BbVideoWindowControl;
++
++class BbMediaPlayerService : public QMediaService
++{
++    Q_OBJECT
++public:
++    explicit BbMediaPlayerService(QObject *parent = 0);
++    ~BbMediaPlayerService();
++
++    QMediaControl *requestControl(const char *name);
++    void releaseControl(QMediaControl *control);
++
++private:
++    void updateControls();
++
++    QPointer<BbVideoWindowControl> m_videoWindowControl;
++    QPointer<BbMediaPlayerControl> m_mediaPlayerControl;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/bbmetadata.cpp b/src/plugins/blackberry/bbmetadata.cpp
+new file mode 100644
+index 0000000..1e9a174
+--- /dev/null
++++ b/src/plugins/blackberry/bbmetadata.cpp
+@@ -0,0 +1,159 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbmetadata.h"
++
++#include <QtCore/qdebug.h>
++#include <QtCore/qfile.h>
++#include <QtCore/qstringlist.h>
++
++QT_BEGIN_NAMESPACE
++
++BbMetaData::BbMetaData()
++{
++    clear();
++}
++
++static const char * durationKey = "md_title_duration";
++static const char * widthKey = "md_video_width";
++static const char * heightKey = "md_video_height";
++static const char * mediaTypeKey = "md_title_mediatype";
++static const char * pixelWidthKey = "md_video_pixel_height";
++static const char * pixelHeightKey = "md_video_pixel_width";
++
++static const int mediaTypeAudioFlag = 4;
++static const int mediaTypeVideoFlag = 2;
++
++bool BbMetaData::parse(const QString &contextName)
++{
++    clear();
++    const QString fileName =
++            QString("/pps/services/multimedia/renderer/context/%1/metadata").arg(contextName);
++    QFile metaDataFile(fileName);
++    if (!metaDataFile.open(QFile::ReadOnly)) {
++        qWarning() << "Unable to open media metadata file" << fileName << ":"
++                   << metaDataFile.errorString();
++        return false;
++    }
++
++    const QString separator("::");
++    QTextStream stream(&metaDataFile);
++    Q_FOREVER {
++        const QString line = stream.readLine();
++        if (line.isNull())
++            break;
++
++        const int separatorPos = line.indexOf(separator);
++        if (separatorPos != -1) {
++            const QString key = line.left(separatorPos);
++            const QString value = line.mid(separatorPos + separator.length());
++
++            if (key == durationKey)
++                m_duration = value.toLongLong();
++            else if (key == widthKey)
++                m_width = value.toInt();
++            else if (key == heightKey)
++                m_height = value.toInt();
++            else if (key == mediaTypeKey)
++                m_mediaType = value.toInt();
++            else if (key == pixelWidthKey)
++                m_pixelWidth = value.toFloat();
++            else if (key == pixelHeightKey)
++                m_pixelHeight = value.toFloat();
++        }
++    }
++
++    return true;
++}
++
++void BbMetaData::clear()
++{
++    m_duration = 0;
++    m_height = 0;
++    m_width = 0;
++    m_mediaType = -1;
++    m_pixelWidth = 1;
++    m_pixelHeight = 1;
++}
++
++qlonglong BbMetaData::duration() const
++{
++    return m_duration;
++}
++
++// Handling of pixel aspect ratio
++//
++// If the pixel aspect ratio is different from 1:1, it means the video needs to be stretched in
++// order to look natural.
++// For example, if the pixel width is 2, and the pixel height is 1, it means a video of 300x200
++// pixels needs to be displayed as 600x200 to look correct.
++// In order to support this the easiest way, we simply pretend that the actual size of the video
++// is 600x200, which will cause the video to be displayed in an aspect ratio of 3:1 instead of 3:2,
++// and therefore look correct.
++
++int BbMetaData::height() const
++{
++    return m_height * m_pixelHeight;
++}
++
++int BbMetaData::width() const
++{
++    return m_width * m_pixelWidth;
++}
++
++bool BbMetaData::hasVideo() const
++{
++    // By default, assume no video if we can't extract the information
++    if (m_mediaType == -1)
++        return false;
++
++    return (m_mediaType & mediaTypeVideoFlag);
++}
++
++bool BbMetaData::hasAudio() const
++{
++    // By default, assume audio only if we can't extract the information
++    if (m_mediaType == -1)
++        return true;
++
++    return (m_mediaType & mediaTypeAudioFlag);
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbmetadata.h b/src/plugins/blackberry/bbmetadata.h
+new file mode 100644
+index 0000000..968674f
+--- /dev/null
++++ b/src/plugins/blackberry/bbmetadata.h
+@@ -0,0 +1,74 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBMETADATA_H
++#define BBMETADATA_H
++
++#include <QtCore/qglobal.h>
++
++QT_BEGIN_NAMESPACE
++
++class BbMetaData
++{
++public:
++    BbMetaData();
++    bool parse(const QString &contextName);
++    void clear();
++
++    // Duration in milliseconds
++    qlonglong duration() const;
++
++    int height() const;
++    int width() const;
++    bool hasVideo() const;
++    bool hasAudio() const;
++
++private:
++    qlonglong m_duration;
++    int m_height;
++    int m_width;
++    int m_mediaType;
++    float m_pixelWidth;
++    float m_pixelHeight;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/bbserviceplugin.cpp b/src/plugins/blackberry/bbserviceplugin.cpp
+new file mode 100644
+index 0000000..dda98c4
+--- /dev/null
++++ b/src/plugins/blackberry/bbserviceplugin.cpp
+@@ -0,0 +1,69 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbserviceplugin.h"
++#include "bbmediaplayerservice.h"
++
++QT_BEGIN_NAMESPACE
++
++BbServicePlugin::BbServicePlugin()
++{
++}
++
++QMediaService *BbServicePlugin::create(const QString &key)
++{
++    if (key == QLatin1String(Q_MEDIASERVICE_MEDIAPLAYER))
++        return new BbMediaPlayerService();
++
++    return 0;
++}
++
++void BbServicePlugin::release(QMediaService *service)
++{
++    delete service;
++}
++
++QMediaServiceProviderHint::Features BbServicePlugin::supportedFeatures(const QByteArray &service) const
++{
++    Q_UNUSED(service)
++    return QMediaServiceProviderHint::Features();
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbserviceplugin.h b/src/plugins/blackberry/bbserviceplugin.h
+new file mode 100644
+index 0000000..07ace25
+--- /dev/null
++++ b/src/plugins/blackberry/bbserviceplugin.h
+@@ -0,0 +1,65 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBRSERVICEPLUGIN_H
++#define BBRSERVICEPLUGIN_H
++
++#include <qmediaserviceproviderplugin.h>
++
++QT_BEGIN_NAMESPACE
++
++class BbServicePlugin
++    : public QMediaServiceProviderPlugin,
++      public QMediaServiceFeaturesInterface
++{
++    Q_OBJECT
++    Q_INTERFACES(QMediaServiceFeaturesInterface)
++    Q_PLUGIN_METADATA(IID "org.qt-project.qt.mediaserviceproviderfactory/5.0" FILE "blackberry.json")
++public:
++    BbServicePlugin();
++
++    QMediaService *create(const QString &key);
++    void release(QMediaService *service);
++    QMediaServiceProviderHint::Features supportedFeatures(const QByteArray &service) const;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/bbutil.cpp b/src/plugins/blackberry/bbutil.cpp
+new file mode 100644
+index 0000000..d3f5c6f
+--- /dev/null
++++ b/src/plugins/blackberry/bbutil.cpp
+@@ -0,0 +1,100 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbutil.h"
++
++#include <QtCore/qstring.h>
++#include <mm/renderer.h>
++
++QT_BEGIN_NAMESPACE
++
++struct MmError {
++    int errorCode;
++    const char *name;
++};
++
++#define MM_ERROR_ENTRY(error) { error, #error }
++static const MmError mmErrors[] = {
++    MM_ERROR_ENTRY(MMR_ERROR_NONE),
++    MM_ERROR_ENTRY(MMR_ERROR_UNKNOWN ),
++    MM_ERROR_ENTRY(MMR_ERROR_INVALID_PARAMETER ),
++    MM_ERROR_ENTRY(MMR_ERROR_INVALID_STATE),
++    MM_ERROR_ENTRY(MMR_ERROR_UNSUPPORTED_VALUE),
++    MM_ERROR_ENTRY(MMR_ERROR_UNSUPPORTED_MEDIA_TYPE),
++    MM_ERROR_ENTRY(MMR_ERROR_MEDIA_PROTECTED),
++    MM_ERROR_ENTRY(MMR_ERROR_UNSUPPORTED_OPERATION),
++    MM_ERROR_ENTRY(MMR_ERROR_READ),
++    MM_ERROR_ENTRY(MMR_ERROR_WRITE),
++    MM_ERROR_ENTRY(MMR_ERROR_MEDIA_UNAVAILABLE),
++    MM_ERROR_ENTRY(MMR_ERROR_MEDIA_CORRUPTED),
++    MM_ERROR_ENTRY(MMR_ERROR_OUTPUT_UNAVAILABLE),
++    MM_ERROR_ENTRY(MMR_ERROR_NO_MEMORY),
++    MM_ERROR_ENTRY(MMR_ERROR_RESOURCE_UNAVAILABLE),
++    MM_ERROR_ENTRY(MMR_ERROR_MEDIA_DRM_NO_RIGHTS),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_CORRUPTED_DATA_STORE),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OUTPUT_PROTECTION),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_HDMI),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_DISPLAYPORT),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_DVI),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_ANALOG_VIDEO),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_ANALOG_AUDIO),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_TOSLINK),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_SPDIF),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_BLUETOOTH),
++    MM_ERROR_ENTRY(MMR_ERROR_DRM_OPL_WIRELESSHD),
++};
++static const int numMmErrors = sizeof(mmErrors) / sizeof(MmError);
++
++QString mmErrorMessage(const QString &msg, mmr_context_t *context, int *errorCode)
++{
++    const mmr_error_info_t * const mmError = mmr_error_info(context);
++
++    if (errorCode)
++        *errorCode = mmError->error_code;
++
++    if (mmError->error_code >= 0 && mmError->error_code < numMmErrors) {
++        return QString("%1: %2 (code %3)").arg(msg).arg(mmErrors[mmError->error_code].name)
++                                          .arg(mmError->error_code);
++    } else {
++        return QString("%1: Unknown error code %2").arg(msg).arg(mmError->error_code);
++    }
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbutil.h b/src/plugins/blackberry/bbutil.h
+new file mode 100644
+index 0000000..dc163ad
+--- /dev/null
++++ b/src/plugins/blackberry/bbutil.h
+@@ -0,0 +1,56 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBUTIL_H
++#define BBUTIL_H
++
++#include <QtCore/qglobal.h>
++
++typedef struct mmr_context mmr_context_t;
++
++QT_BEGIN_NAMESPACE
++
++class QString;
++
++QString mmErrorMessage(const QString &msg, mmr_context_t *context, int * errorCode = 0);
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/bbvideowindowcontrol.cpp b/src/plugins/blackberry/bbvideowindowcontrol.cpp
+new file mode 100644
+index 0000000..fe2b633
+--- /dev/null
++++ b/src/plugins/blackberry/bbvideowindowcontrol.cpp
+@@ -0,0 +1,412 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#include "bbvideowindowcontrol.h"
++#include "bbutil.h"
++#include <QtCore/qdebug.h>
++#include <QtGui/qguiapplication.h>
++#include <QtGui/qpa/qplatformnativeinterface.h>
++#include <QtGui/qscreen.h>
++#include <QtGui/qwindow.h>
++#include <mm/renderer.h>
++#include <bps/screen.h>
++
++QT_BEGIN_NAMESPACE
++
++static int winIdCounter = 0;
++
++BbVideoWindowControl::BbVideoWindowControl(QObject *parent)
++    : QVideoWindowControl(parent),
++      m_videoId(-1),
++      m_winId(0),
++      m_context(0),
++      m_fullscreen(false),
++      m_aspectRatioMode(Qt::IgnoreAspectRatio),
++      m_window(0),
++      m_hue(0),
++      m_brightness(0),
++      m_contrast(0),
++      m_saturation(0)
++{
++}
++
++BbVideoWindowControl::~BbVideoWindowControl()
++{
++}
++
++WId BbVideoWindowControl::winId() const
++{
++    return m_winId;
++}
++
++void BbVideoWindowControl::setWinId(WId id)
++{
++    m_winId = id;
++}
++
++QRect BbVideoWindowControl::displayRect() const
++{
++    return m_displayRect ;
++}
++
++void BbVideoWindowControl::setDisplayRect(const QRect &rect)
++{
++    if (m_displayRect != rect) {
++        m_displayRect = rect;
++        updateVideoPosition();
++    }
++}
++
++bool BbVideoWindowControl::isFullScreen() const
++{
++    return m_fullscreen;
++}
++
++void BbVideoWindowControl::setFullScreen(bool fullScreen)
++{
++    if (m_fullscreen != fullScreen) {
++        m_fullscreen = fullScreen;
++        updateVideoPosition();
++        emit fullScreenChanged(m_fullscreen);
++    }
++}
++
++void BbVideoWindowControl::repaint()
++{
++    // Nothing we can or should do here
++}
++
++QSize BbVideoWindowControl::nativeSize() const
++{
++    return QSize(m_metaData.width(), m_metaData.height());
++}
++
++Qt::AspectRatioMode BbVideoWindowControl::aspectRatioMode() const
++{
++    return m_aspectRatioMode;
++}
++
++void BbVideoWindowControl::setAspectRatioMode(Qt::AspectRatioMode mode)
++{
++    m_aspectRatioMode = mode;
++}
++
++int BbVideoWindowControl::brightness() const
++{
++    return m_brightness;
++}
++
++void BbVideoWindowControl::setBrightness(int brightness)
++{
++    if (m_brightness != brightness) {
++        m_brightness = brightness;
++        updateBrightness();
++        emit brightnessChanged(m_brightness);
++    }
++}
++
++int BbVideoWindowControl::contrast() const
++{
++    return m_contrast;
++}
++
++void BbVideoWindowControl::setContrast(int contrast)
++{
++    if (m_contrast != contrast) {
++        m_contrast = contrast;
++        updateContrast();
++        emit contrastChanged(m_contrast);
++    }
++}
++
++int BbVideoWindowControl::hue() const
++{
++    return m_hue;
++}
++
++void BbVideoWindowControl::setHue(int hue)
++{
++    if (m_hue != hue) {
++        m_hue = hue;
++        updateHue();
++        emit hueChanged(m_hue);
++    }
++}
++
++int BbVideoWindowControl::saturation() const
++{
++    return m_saturation;
++}
++
++void BbVideoWindowControl::setSaturation(int saturation)
++{
++    if (m_saturation != saturation) {
++        m_saturation = saturation;
++        updateSaturation();
++        emit saturationChanged(m_saturation);
++    }
++}
++
++void BbVideoWindowControl::attachDisplay(mmr_context_t *context)
++{
++    if (m_videoId != -1) {
++        qDebug() << "BbVideoWindowControl: Video output already attached!";
++        return;
++    }
++
++    if (!context) {
++        qDebug() << "BbVideoWindowControl: No media player context!";
++        return;
++    }
++
++    QWindow * const window = findWindow(m_winId);
++    if (!window) {
++        qDebug() << "BbVideoWindowControl: No video window!";
++        return;
++    }
++
++    QPlatformNativeInterface * const nativeInterface = QGuiApplication::platformNativeInterface();
++    if (!nativeInterface) {
++        qDebug() << "BbVideoWindowControl: Unable to get platform native interface. Qt too old?";
++        return;
++    }
++
++    const char * const groupNameData = static_cast<const char *>(
++        nativeInterface->nativeResourceForWindow("windowGroup", window));
++    if (!groupNameData) {
++        qDebug() << "BbVideoWindowControl: Unable to find window group for window" << window;
++        return;
++    }
++
++    const QString groupName = QString::fromLatin1(groupNameData);
++    m_windowName = QString("BbVideoWindowControl_%1_%2").arg(winIdCounter++)
++                                                        .arg(QCoreApplication::applicationPid());
++    // Start with an invisible window. If it would be visible right away, it would be at the wrong
++    // position, and we can only change the position once we get the window handle.
++    const QString videoDeviceUrl =
++            QString("screen:?winid=%1&wingrp=%2&initflags=invisible").arg(m_windowName).arg(groupName);
++
++    m_videoId = mmr_output_attach(context, videoDeviceUrl.toLatin1(), "video");
++    if (m_videoId == -1) {
++        qDebug() << mmErrorMessage("mmr_output_attach() for video failed", context);
++        return;
++    }
++
++    m_context = context;
++    updateVideoPosition();
++    updateHue();
++    updateContrast();
++    updateBrightness();
++    updateSaturation();
++}
++
++void BbVideoWindowControl::updateVideoPosition()
++{
++    QWindow * const window = findWindow(m_winId);
++    if (m_context && m_videoId != -1 && window) {
++        QPoint topLeft = m_fullscreen ?
++                                   QPoint(0,0) :
++                                   window->mapToGlobal(m_displayRect.topLeft());
++
++        QScreen * const screen = window->screen();
++        int width = m_fullscreen ?
++                        screen->size().width() :
++                        m_displayRect.width();
++        int height = m_fullscreen ?
++                        screen->size().height() :
++                        m_displayRect.height();
++
++        if (m_metaData.hasVideo()) { // We need the source size to do aspect ratio scaling
++            const qreal sourceRatio = m_metaData.width() / static_cast<float>(m_metaData.height());
++            const qreal targetRatio = width / static_cast<float>(height);
++
++            if (m_aspectRatioMode == Qt::KeepAspectRatio) {
++                if (targetRatio < sourceRatio) {
++                    // Need to make height smaller
++                    const int newHeight = width / sourceRatio;
++                    const int heightDiff = height - newHeight;
++                    topLeft.ry() += heightDiff / 2;
++                    height = newHeight;
++                } else {
++                    // Need to make width smaller
++                    const int newWidth = sourceRatio * height;
++                    const int widthDiff = width - newWidth;
++                    topLeft.rx() += widthDiff / 2;
++                    width = newWidth;
++                }
++
++            } else if (m_aspectRatioMode == Qt::KeepAspectRatioByExpanding) {
++                if (targetRatio < sourceRatio) {
++                    // Need to make width larger
++                    const int newWidth = sourceRatio * height;
++                    const int widthDiff = newWidth - width;
++                    topLeft.rx() -= widthDiff / 2;
++                    width = newWidth;
++                } else {
++                    // Need to make height larger
++                    const int newHeight = width / sourceRatio;
++                    const int heightDiff = newHeight - height;
++                    topLeft.ry() -= heightDiff / 2;
++                    height = newHeight;
++                }
++            }
++        }
++
++        if (m_window != 0) {
++            const int position[2] = { topLeft.x(), topLeft.y() };
++            const int size[2] = { width, height };
++            if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_POSITION, position) != 0)
++                perror("Setting video position failed");
++            if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_SIZE, size) != 0)
++                perror("Setting video size failed");
++        }
++    }
++}
++
++void BbVideoWindowControl::updateBrightness()
++{
++    if (m_window != 0) {
++        const int backendValue = m_brightness * 2.55f;
++        if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_BRIGHTNESS, &backendValue) != 0)
++            perror("Setting brightness failed");
++    }
++}
++
++void BbVideoWindowControl::updateContrast()
++{
++    if (m_window != 0) {
++        const int backendValue = m_contrast * 1.27f;
++        if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_CONTRAST, &backendValue) != 0)
++            perror("Setting contrast failed");
++    }
++}
++
++void BbVideoWindowControl::updateHue()
++{
++    if (m_window != 0) {
++        const int backendValue = m_hue * 1.27f;
++        if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_HUE, &backendValue) != 0)
++            perror("Setting hue failed");
++    }
++}
++
++void BbVideoWindowControl::updateSaturation()
++{
++    if (m_window != 0) {
++        const int backendValue = m_saturation * 1.27f;
++        if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_SATURATION, &backendValue) != 0)
++            perror("Setting saturation failed");
++    }
++}
++
++void BbVideoWindowControl::detachDisplay()
++{
++    if (m_context && m_videoId != -1)
++        mmr_output_detach(m_context, m_videoId);
++
++    m_context = 0;
++    m_videoId = -1;
++    m_metaData.clear();
++    m_windowName.clear();
++    m_window = 0;
++    m_hue = 0;
++    m_brightness = 0;
++    m_contrast = 0;
++    m_saturation = 0;
++}
++
++void BbVideoWindowControl::setMetaData(const BbMetaData &metaData)
++{
++    m_metaData = metaData;
++    emit nativeSizeChanged();
++
++    // To handle the updated source size data
++    updateVideoPosition();
++}
++
++void BbVideoWindowControl::bpsEventHandler(bps_event_t *event)
++{
++    if (event && bps_event_get_domain(event) == screen_get_domain()) {
++        const screen_event_t screen_event = screen_event_get_event(event);
++
++        int eventType;
++        if (screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_TYPE, &eventType) != 0) {
++            perror("BbVideoWindowControl: Failed to query screen event type");
++            return;
++        }
++
++        if (eventType != SCREEN_EVENT_CREATE)
++            return;
++
++        screen_window_t window = 0;
++        if (screen_get_event_property_pv(screen_event, SCREEN_PROPERTY_WINDOW, (void**)&window) != 0) {
++            perror("BbVideoWindowControl: Failed to query window property");
++            return;
++        }
++
++        const int maxIdStrLength = 128;
++        char idString[maxIdStrLength];
++        if (screen_get_window_property_cv(window, SCREEN_PROPERTY_ID_STRING, maxIdStrLength, idString) != 0) {
++            perror("BbVideoWindowControl: Failed to query window ID string");
++            return;
++        }
++
++        if (m_windowName == idString) {
++            m_window = window;
++            updateVideoPosition();
++
++            const int visibleFlag = 1;
++            if (screen_set_window_property_iv(m_window, SCREEN_PROPERTY_VISIBLE, &visibleFlag) != 0) {
++                perror("BbVideoWindowControl: Failed to make window visible");
++                return;
++            }
++        }
++    }
++}
++
++QWindow *BbVideoWindowControl::findWindow(WId id) const
++{
++    Q_FOREACH (QWindow *window, QGuiApplication::allWindows())
++        if (window->winId() == id)
++            return window;
++    return 0;
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/blackberry/bbvideowindowcontrol.h b/src/plugins/blackberry/bbvideowindowcontrol.h
+new file mode 100644
+index 0000000..b63736d
+--- /dev/null
++++ b/src/plugins/blackberry/bbvideowindowcontrol.h
+@@ -0,0 +1,121 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Research In Motion
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++#ifndef BBVIDEOWINDOWCONTROL_H
++#define BBVIDEOWINDOWCONTROL_H
++
++#include "bbmetadata.h"
++#include <qvideowindowcontrol.h>
++#include <screen/screen.h>
++
++typedef struct mmr_context mmr_context_t;
++struct bps_event_t;
++
++QT_BEGIN_NAMESPACE
++
++class BbVideoWindowControl : public QVideoWindowControl
++{
++    Q_OBJECT
++public:
++    explicit BbVideoWindowControl(QObject *parent = 0);
++    ~BbVideoWindowControl();
++
++    WId winId() const;
++    void setWinId(WId id);
++
++    QRect displayRect() const;
++    void setDisplayRect(const QRect &rect);
++
++    bool isFullScreen() const;
++    void setFullScreen(bool fullScreen);
++
++    void repaint();
++
++    QSize nativeSize() const;
++
++    Qt::AspectRatioMode aspectRatioMode() const;
++    void setAspectRatioMode(Qt::AspectRatioMode mode);
++
++    int brightness() const;
++    void setBrightness(int brightness);
++
++    int contrast() const;
++    void setContrast(int contrast);
++
++    int hue() const;
++    void setHue(int hue);
++
++    int saturation() const;
++    void setSaturation(int saturation);
++
++    //
++    // Called by media control
++    //
++    void detachDisplay();
++    void attachDisplay(mmr_context_t *context);
++    void setMetaData(const BbMetaData &metaData);
++    void bpsEventHandler(bps_event_t *event);
++
++private:
++    QWindow *findWindow(WId id) const;
++    void updateVideoPosition();
++    void updateBrightness();
++    void updateContrast();
++    void updateHue();
++    void updateSaturation();
++
++    int m_videoId;
++    WId m_winId;
++    QRect m_displayRect;
++    mmr_context_t *m_context;
++    bool m_fullscreen;
++    BbMetaData m_metaData;
++    Qt::AspectRatioMode m_aspectRatioMode;
++    QString m_windowName;
++    screen_window_t m_window;
++    int m_hue;
++    int m_brightness;
++    int m_contrast;
++    int m_saturation;
++};
++
++QT_END_NAMESPACE
++
++#endif
+diff --git a/src/plugins/blackberry/blackberry.json b/src/plugins/blackberry/blackberry.json
+new file mode 100644
+index 0000000..c4a27ea
+--- /dev/null
++++ b/src/plugins/blackberry/blackberry.json
+@@ -0,0 +1,3 @@
++{
++    "Keys": ["org.qt-project.qt.mediaplayer"]
++}
+diff --git a/src/plugins/blackberry/blackberry.pro b/src/plugins/blackberry/blackberry.pro
+new file mode 100644
+index 0000000..cd7f4e6
+--- /dev/null
++++ b/src/plugins/blackberry/blackberry.pro
+@@ -0,0 +1,35 @@
++load(qt_module)
++
++TARGET = qtmedia_blackberry
++QT += multimedia-private gui-private
++CONFIG += no_private_qt_headers_warning
++
++PLUGIN_TYPE=mediaservice
++
++load(qt_plugin)
++DESTDIR = $$QT.multimedia.plugins/$${PLUGIN_TYPE}
++LIBS += -lmmrndclient -lstrm -lscreen
++
++HEADERS += \
++    bbserviceplugin.h \
++    bbmediaplayerservice.h \
++    bbmediaplayercontrol.h \
++    bbmetadata.h \
++    bbutil.h
++
++SOURCES += \
++    bbserviceplugin.cpp \
++    bbmediaplayerservice.cpp \
++    bbmediaplayercontrol.cpp \
++    bbmetadata.cpp \
++    bbutil.cpp
++
++!isEmpty(QT.widgets.name) {
++    HEADERS += bbvideowindowcontrol.h
++    SOURCES += bbvideowindowcontrol.cpp
++}
++
++OTHER_FILES += blackberry.json
++
++target.path += $$[QT_INSTALL_PLUGINS]/$${PLUGIN_TYPE}
++INSTALLS += target
+diff --git a/src/plugins/plugins.pro b/src/plugins/plugins.pro
+index 7d24ec7..951c911 100644
+--- a/src/plugins/plugins.pro
++++ b/src/plugins/plugins.pro
+@@ -8,6 +8,10 @@ TEMPLATE = subdirs
+ 
+ SUBDIRS += m3u
+ 
++blackberry {
++    SUBDIRS += blackberry
++}
++
+ win32 {
+     SUBDIRS += audiocapture
+ }

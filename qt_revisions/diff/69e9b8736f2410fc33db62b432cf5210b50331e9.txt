@@ -1,0 +1,495 @@
+diff --git a/Source/WebKit2/ChangeLog b/Source/WebKit2/ChangeLog
+index afbaeec..64e7283 100644
+--- a/Source/WebKit2/ChangeLog
++++ b/Source/WebKit2/ChangeLog
+@@ -1,3 +1,52 @@
++2012-12-13  Andras Becsi  <andras.becsi@digia.com>
++
++        [Qt][WK2] Fix painting on Mac with retina display
++        https://bugs.webkit.org/show_bug.cgi?id=104574
++
++        Reviewed by Kenneth Rohde Christiansen.
++
++        Since HiDPI support has been added and enabled in Qt we ended up
++        painting incorrectly scaled content on high-resolution screens.
++        Because the intrinsic device pixel ratio is always taken into
++        account by Qt when painting to high-resolution screens we should
++        automatically obtain the scale ratio from the window in which the
++        item is rendered instead of setting it in QML.
++
++        Qt does not make it possible to override the device pixel ratio
++        of the native window, therefore our experimental QML API for setting
++        a custom value is of no use any more and should be removed.
++
++        This patch fixes the scaling issue on Mac retina display by querying
++        the underlying window for the device scale factor and applying it to
++        the backing store and the scene-graph rendering of the content node.
++        Additionally removes the experimental API and related API tests.
++
++        * UIProcess/API/qt/qquickwebpage.cpp:
++        (QQuickWebPage::updatePaintNode):
++        * UIProcess/API/qt/qquickwebview.cpp:
++        (QQuickWebViewPrivate::QQuickWebViewPrivate):
++        (QQuickWebViewLegacyPrivate::updateViewportSize):
++        (QQuickWebViewFlickablePrivate::onComponentComplete):
++        * UIProcess/API/qt/qquickwebview_p.h:
++        * UIProcess/API/qt/tests/qquickwebview/tst_qquickwebview.cpp:
++        (tst_QQuickWebView::newWebView):
++        * UIProcess/CoordinatedGraphics/CoordinatedLayerTreeHostProxy.cpp:
++        (WebKit::CoordinatedLayerTreeHostProxy::setVisibleContentsRect):
++        (WebKit::CoordinatedLayerTreeHostProxy::deviceScaleFactor):
++        * UIProcess/CoordinatedGraphics/CoordinatedLayerTreeHostProxy.h:
++        (CoordinatedLayerTreeHostProxy):
++        * UIProcess/qt/QtWebPageSGNode.cpp:
++        (WebKit::ContentsSGNode::ContentsSGNode):
++        (WebKit::ContentsSGNode::render):
++        (WebKit::ContentsSGNode::clipRect):
++        (ContentsSGNode):
++        (WebKit::QtWebPageSGNode::QtWebPageSGNode):
++        (WebKit::QtWebPageSGNode::devicePixelRatio):
++        (WebKit):
++        (WebKit::QtWebPageSGNode::setRenderer):
++        * UIProcess/qt/QtWebPageSGNode.h:
++        (QtWebPageSGNode):
++
+ 2012-12-10  Simon Hausmann  <simon.hausmann@digia.com>
+ 
+         [Qt] Fix QtWebProcess discovery on Windows
+diff --git a/Source/WebKit2/UIProcess/API/qt/qquickwebpage.cpp b/Source/WebKit2/UIProcess/API/qt/qquickwebpage.cpp
+index e5f3d3e..a1f35ae 100644
+--- a/Source/WebKit2/UIProcess/API/qt/qquickwebpage.cpp
++++ b/Source/WebKit2/UIProcess/API/qt/qquickwebpage.cpp
+@@ -30,6 +30,7 @@
+ #include "qquickwebpage_p_p.h"
+ #include "qquickwebview_p.h"
+ #include "qwebkittest_p.h"
++#include <QQuickWindow>
+ 
+ using namespace WebKit;
+ 
+@@ -84,8 +85,18 @@ QSGNode* QQuickWebPage::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
+     LayerTreeRenderer* renderer = layerTreeCoordinatorProxy->layerTreeRenderer();
+ 
+     QtWebPageSGNode* node = static_cast<QtWebPageSGNode*>(oldNode);
++
++    const QWindow* window = this->window();
++    ASSERT(window);
++
++    if (window && d->webPageProxy->deviceScaleFactor() != window->devicePixelRatio()) {
++        d->webPageProxy->setIntrinsicDeviceScaleFactor(window->devicePixelRatio());
++        d->viewportItem->experimental()->test()->devicePixelRatioChanged();
++    }
++
+     if (!node)
+-        node = new QtWebPageSGNode();
++        node = new QtWebPageSGNode(this);
++
+     node->setRenderer(renderer);
+ 
+     node->setScale(d->contentsScale);
+diff --git a/Source/WebKit2/UIProcess/API/qt/qquickwebview.cpp b/Source/WebKit2/UIProcess/API/qt/qquickwebview.cpp
+index 0e33f11..437d08b 100644
+--- a/Source/WebKit2/UIProcess/API/qt/qquickwebview.cpp
++++ b/Source/WebKit2/UIProcess/API/qt/qquickwebview.cpp
+@@ -826,16 +826,15 @@ void QQuickWebViewLegacyPrivate::updateViewportSize()
+     if (viewportSize.isEmpty())
+         return;
+ 
+-    float devicePixelRatio = webPageProxy->deviceScaleFactor();
+     pageView->setContentsSize(viewportSize);
+-    // Make sure that our scale matches the one passed to setVisibleContentsRect.
+-    pageView->setContentsScale(devicePixelRatio);
+ 
+     // The fixed layout is handled by the FrameView and the drawing area doesn't behave differently
+     // whether its fixed or not. We still need to tell the drawing area which part of it
+     // has to be rendered on tiles, and in desktop mode it's all of it.
+-    webPageProxy->drawingArea()->setSize((viewportSize / devicePixelRatio).toSize(), IntSize());
+-    webPageProxy->drawingArea()->setVisibleContentsRect(FloatRect(FloatPoint(), FloatSize(viewportSize / devicePixelRatio)), devicePixelRatio, FloatPoint());
++    webPageProxy->drawingArea()->setSize(viewportSize.toSize(), IntSize());
++    // The backing store scale factor should already be set to the device pixel ratio
++    // of the underlying window, thus we set the effective scale to 1 here.
++    webPageProxy->drawingArea()->setVisibleContentsRect(FloatRect(FloatPoint(), FloatSize(viewportSize)), 1, FloatPoint());
+ }
+ 
+ qreal QQuickWebViewLegacyPrivate::zoomFactor() const
+@@ -1194,59 +1193,6 @@ void QQuickWebViewExperimental::setUserAgent(const QString& userAgent)
+ /*!
+     \internal
+ 
+-    \qmlproperty real WebViewExperimental::devicePixelRatio
+-    \brief The ratio between the CSS units and device pixels when the content is unscaled.
+-
+-    When designing touch-friendly contents, knowing the approximated target size on a device
+-    is important for contents providers in order to get the intented layout and element
+-    sizes.
+-
+-    As most first generation touch devices had a PPI of approximately 160, this became a
+-    de-facto value, when used in conjunction with the viewport meta tag.
+-
+-    Devices with a higher PPI learning towards 240 or 320, applies a pre-scaling on all
+-    content, of either 1.5 or 2.0, not affecting the CSS scale or pinch zooming.
+-
+-    This value can be set using this property and it is exposed to CSS media queries using
+-    the -webkit-device-pixel-ratio query.
+-
+-    For instance, if you want to load an image without having it upscaled on a web view
+-    using a device pixel ratio of 2.0 it can be done by loading an image of say 100x100
+-    pixels but showing it at half the size.
+-
+-    FIXME: Move documentation example out in separate files
+-
+-    @media (-webkit-min-device-pixel-ratio: 1.5) {
+-        .icon {
+-            width: 50px;
+-            height: 50px;
+-            url: "/images/icon@2x.png"; // This is actually a 100x100 image
+-        }
+-    }
+-
+-    If the above is used on a device with device pixel ratio of 1.5, it will be scaled
+-    down but still provide a better looking image.
+-*/
+-
+-qreal QQuickWebViewExperimental::devicePixelRatio() const
+-{
+-    Q_D(const QQuickWebView);
+-    return d->webPageProxy->deviceScaleFactor();
+-}
+-
+-void QQuickWebViewExperimental::setDevicePixelRatio(qreal devicePixelRatio)
+-{
+-    Q_D(QQuickWebView);
+-    if (0 >= devicePixelRatio || devicePixelRatio == this->devicePixelRatio())
+-        return;
+-
+-    d->webPageProxy->setIntrinsicDeviceScaleFactor(devicePixelRatio);
+-    emit devicePixelRatioChanged();
+-}
+-
+-/*!
+-    \internal
+-
+     \qmlproperty int WebViewExperimental::deviceWidth
+     \brief The device width used by the viewport calculations.
+ 
+diff --git a/Source/WebKit2/UIProcess/API/qt/qquickwebview_p.h b/Source/WebKit2/UIProcess/API/qt/qquickwebview_p.h
+index dfe7ad8..1b372fa 100644
+--- a/Source/WebKit2/UIProcess/API/qt/qquickwebview_p.h
++++ b/Source/WebKit2/UIProcess/API/qt/qquickwebview_p.h
+@@ -256,7 +256,6 @@ class QWEBKIT_EXPORT QQuickWebViewExperimental : public QObject {
+     Q_PROPERTY(int preferredMinimumContentsWidth WRITE setPreferredMinimumContentsWidth READ preferredMinimumContentsWidth NOTIFY preferredMinimumContentsWidthChanged)
+     Q_PROPERTY(int deviceWidth WRITE setDeviceWidth READ deviceWidth NOTIFY deviceWidthChanged)
+     Q_PROPERTY(int deviceHeight WRITE setDeviceHeight READ deviceHeight NOTIFY deviceHeightChanged)
+-    Q_PROPERTY(qreal devicePixelRatio READ devicePixelRatio WRITE setDevicePixelRatio NOTIFY devicePixelRatioChanged)
+ 
+     Q_PROPERTY(QWebNavigationHistory* navigationHistory READ navigationHistory CONSTANT FINAL)
+ 
+@@ -312,8 +311,6 @@ public:
+     void setDeviceWidth(int);
+     int deviceHeight() const;
+     void setDeviceHeight(int);
+-    qreal devicePixelRatio() const;
+-    void setDevicePixelRatio(qreal);
+     QList<QUrl> userScripts() const;
+     void setUserScripts(const QList<QUrl>& userScripts);
+     QUrl remoteInspectorUrl() const;
+@@ -371,7 +368,6 @@ Q_SIGNALS:
+     void userAgentChanged();
+     void deviceWidthChanged();
+     void deviceHeightChanged();
+-    void devicePixelRatioChanged();
+     void enterFullScreenRequested();
+     void exitFullScreenRequested();
+     void userScriptsChanged();
+diff --git a/Source/WebKit2/UIProcess/API/qt/tests/qmltests/WebView/tst_devicePixelRatio.qml b/Source/WebKit2/UIProcess/API/qt/tests/qmltests/WebView/tst_devicePixelRatio.qml
+deleted file mode 100644
+index 0442b53..0000000
+--- a/Source/WebKit2/UIProcess/API/qt/tests/qmltests/WebView/tst_devicePixelRatio.qml
++++ /dev/null
+@@ -1,62 +0,0 @@
+-import QtQuick 2.0
+-import QtTest 1.0
+-import QtWebKit 3.0
+-import QtWebKit.experimental 1.0
+-import "../common"
+-
+-
+-TestWebView {
+-    id: webView
+-    property variant lastResult
+-    width: 400
+-    height: 300
+-    focus: true
+-
+-    SignalSpy {
+-        id: resultSpy
+-        target: webView
+-        signalName: "lastResultChanged"
+-    }
+-
+-    TestCase {
+-        name: "DevicePixelRatio"
+-
+-        function init() {
+-            resultSpy.clear()
+-            webView.lastResult = null
+-        }
+-
+-        function test_devicePixelRatio() {
+-            resultSpy.clear()
+-            webView.url = Qt.resolvedUrl("../common/test1.html");
+-            webView.experimental.devicePixelRatio = 2.0
+-            verify(webView.waitForLoadSucceeded())
+-
+-            webView.experimental.evaluateJavaScript(
+-                "(function() { return window.devicePixelRatio })()",
+-                function(result) {
+-                    webView.lastResult = result
+-                })
+-
+-            resultSpy.wait()
+-            compare(webView.lastResult, 2.0)
+-            compare(webView.lastResult, webView.experimental.devicePixelRatio)
+-        }
+-
+-        function test_devicePixelRatioMediaQuery() {
+-            resultSpy.clear()
+-            webView.url = Qt.resolvedUrl("../common/test2.html");
+-            webView.experimental.devicePixelRatio = 2.0
+-            verify(webView.waitForLoadSucceeded())
+-
+-            webView.experimental.evaluateJavaScript(
+-                "(function() { return window.matchMedia(\"(-webkit-device-pixel-ratio: 2)\").matches })()",
+-                function(result) {
+-                    webView.lastResult = result
+-                })
+-
+-            resultSpy.wait()
+-            verify(webView.lastResult)
+-        }
+-    }
+-}
+diff --git a/Source/WebKit2/UIProcess/API/qt/tests/qquickwebview/tst_qquickwebview.cpp b/Source/WebKit2/UIProcess/API/qt/tests/qquickwebview/tst_qquickwebview.cpp
+index 6e2c342..7cf1ddb 100644
+--- a/Source/WebKit2/UIProcess/API/qt/tests/qquickwebview/tst_qquickwebview.cpp
++++ b/Source/WebKit2/UIProcess/API/qt/tests/qquickwebview/tst_qquickwebview.cpp
+@@ -93,7 +93,6 @@ QQuickWebView* tst_QQuickWebView::newWebView()
+ {
+     QObject* viewInstance = m_component->create();
+     QQuickWebView* webView = qobject_cast<QQuickWebView*>(viewInstance);
+-    webView->experimental()->setDevicePixelRatio(1.5);
+     return webView;
+ }
+ 
+diff --git a/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.cpp b/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.cpp
+index 8fb12b9..9cb2c1b 100644
+--- a/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.cpp
++++ b/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.cpp
+@@ -56,6 +56,11 @@ void LayerTreeCoordinatorProxy::updateViewport()
+     m_drawingAreaProxy->updateViewport();
+ }
+ 
++float LayerTreeCoordinatorProxy::deviceScaleFactor() const
++{
++    return m_drawingAreaProxy->page()->deviceScaleFactor();
++}
++
+ void LayerTreeCoordinatorProxy::dispatchUpdate(const Function<void()>& function)
+ {
+     m_renderer->appendUpdate(function);
+@@ -178,19 +183,20 @@ void LayerTreeCoordinatorProxy::setAnimationsLocked(bool locked)
+     dispatchUpdate(bind(&LayerTreeRenderer::setAnimationsLocked, m_renderer.get(), locked));
+ }
+ 
+-void LayerTreeCoordinatorProxy::setVisibleContentsRect(const FloatRect& rect, float scale, const FloatPoint& trajectoryVector)
++void LayerTreeCoordinatorProxy::setVisibleContentsRect(const FloatRect& rect, float pageScaleFactor, const FloatPoint& trajectoryVector)
+ {
+     // Inform the renderer to adjust viewport-fixed layers.
+     dispatchUpdate(bind(&LayerTreeRenderer::setVisibleContentsRect, m_renderer.get(), rect));
+ 
+     // Round the rect instead of enclosing it to make sure that its size stays the same while panning. This can have nasty effects on layout.
+     IntRect roundedRect = roundedIntRect(rect);
+-    if (roundedRect == m_lastSentVisibleRect && scale == m_lastSentScale && trajectoryVector == m_lastSentTrajectoryVector)
++    const float effectiveScale = deviceScaleFactor() * pageScaleFactor;
++    if (roundedRect == m_lastSentVisibleRect && effectiveScale == m_lastSentScale && trajectoryVector == m_lastSentTrajectoryVector)
+         return;
+ 
+-    m_drawingAreaProxy->page()->process()->send(Messages::LayerTreeCoordinator::SetVisibleContentsRect(roundedRect, scale, trajectoryVector), m_drawingAreaProxy->page()->pageID());
++    m_drawingAreaProxy->page()->process()->send(Messages::LayerTreeCoordinator::SetVisibleContentsRect(roundedRect, effectiveScale, trajectoryVector), m_drawingAreaProxy->page()->pageID());
+     m_lastSentVisibleRect = roundedRect;
+-    m_lastSentScale = scale;
++    m_lastSentScale = effectiveScale;
+     m_lastSentTrajectoryVector = trajectoryVector;
+ }
+ 
+diff --git a/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.h b/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.h
+index fb58b1a..a3961ff 100644
+--- a/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.h
++++ b/Source/WebKit2/UIProcess/CoordinatedGraphics/LayerTreeCoordinatorProxy.h
+@@ -64,7 +64,7 @@ public:
+     void deleteCompositingLayer(WebLayerID);
+     void setRootCompositingLayer(WebLayerID);
+     void setContentsSize(const WebCore::FloatSize&);
+-    void setVisibleContentsRect(const WebCore::FloatRect&, float scale, const WebCore::FloatPoint& trajectoryVector);
++    void setVisibleContentsRect(const WebCore::FloatRect&, float pageScaleFactor, const WebCore::FloatPoint& trajectoryVector);
+     void didRenderFrame(const WebCore::IntSize& contentsSize, const WebCore::IntRect& coveredRect);
+     void createTileForLayer(int layerID, int tileID, const WebCore::IntRect&, const SurfaceUpdateInfo&);
+     void updateTileForLayer(int layerID, int tileID, const WebCore::IntRect&, const SurfaceUpdateInfo&);
+@@ -94,6 +94,8 @@ public:
+ #endif
+     void setBackgroundColor(const WebCore::Color&);
+ 
++    float deviceScaleFactor() const;
++
+ protected:
+     void dispatchUpdate(const Function<void()>&);
+ 
+diff --git a/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.cpp b/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.cpp
+index eb70239..d72980c 100644
+--- a/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.cpp
++++ b/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.cpp
+@@ -23,7 +23,10 @@
+ 
+ #include "LayerTreeRenderer.h"
+ #include <QtGui/QPolygonF>
++#include <QtQuick/QQuickItem>
++#include <QtQuick/QQuickWindow>
+ #include <QtQuick/QSGSimpleRectNode>
++#include <WebCore/TransformationMatrix.h>
+ #include <private/qsgrendernode_p.h>
+ 
+ using namespace WebCore;
+@@ -45,7 +48,13 @@ public:
+ 
+     virtual void render(const RenderState& state)
+     {
+-        QMatrix4x4 renderMatrix = matrix() ? *matrix() : QMatrix4x4();
++        TransformationMatrix renderMatrix;
++        if (pageNode()->devicePixelRatio() != 1.0) {
++            renderMatrix.scale(pageNode()->devicePixelRatio());
++            if (matrix())
++                renderMatrix.multiply(*matrix());
++        } else if (matrix())
++            renderMatrix = *matrix();
+ 
+         // When rendering to an intermediate surface, Qt will
+         // mirror the projection matrix to fit on the destination coordinate system.
+@@ -61,6 +70,13 @@ public:
+         layerTreeRenderer()->purgeGLResources();
+     }
+ 
++    const QtWebPageSGNode* pageNode() const
++    {
++        const QtWebPageSGNode* parent = static_cast<QtWebPageSGNode*>(this->parent());
++        ASSERT(parent);
++        return parent;
++    }
++
+     LayerTreeRenderer* layerTreeRenderer() const { return m_renderer.get(); }
+ 
+ private:
+@@ -73,6 +89,8 @@ private:
+             QMatrix4x4 clipMatrix;
+             if (clip->matrix())
+                 clipMatrix = *clip->matrix();
++            clipMatrix.scale(pageNode()->devicePixelRatio());
++
+             QRectF currentClip;
+ 
+             if (clip->isRectangular())
+@@ -108,9 +126,10 @@ private:
+     RefPtr<LayerTreeRenderer> m_renderer;
+ };
+ 
+-QtWebPageSGNode::QtWebPageSGNode()
++QtWebPageSGNode::QtWebPageSGNode(const QQuickItem* item)
+     : m_contentsNode(0)
+     , m_backgroundNode(new QSGSimpleRectNode)
++    , m_item(item)
+ {
+     appendChildNode(m_backgroundNode);
+ }
+@@ -128,6 +147,13 @@ void QtWebPageSGNode::setScale(float scale)
+     setMatrix(matrix);
+ }
+ 
++qreal QtWebPageSGNode::devicePixelRatio() const
++{
++    if (const QWindow* window = m_item->window())
++        return window->devicePixelRatio();
++    return 1;
++}
++
+ void QtWebPageSGNode::setRenderer(PassRefPtr<LayerTreeRenderer> renderer)
+ {
+     if (m_contentsNode && m_contentsNode->layerTreeRenderer() == renderer)
+@@ -135,6 +161,7 @@ void QtWebPageSGNode::setRenderer(PassRefPtr<LayerTreeRenderer> renderer)
+ 
+     delete m_contentsNode;
+     m_contentsNode = new ContentsSGNode(renderer);
++    // This sets the parent node of the content to QtWebPageSGNode.
+     appendChildNode(m_contentsNode);
+ }
+ 
+diff --git a/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.h b/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.h
+index 11d1898..368df70 100644
+--- a/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.h
++++ b/Source/WebKit2/UIProcess/qt/QtWebPageSGNode.h
+@@ -25,6 +25,7 @@
+ #include <wtf/PassRefPtr.h>
+ 
+ QT_BEGIN_NAMESPACE
++class QQuickItem;
+ class QSGSimpleRectNode;
+ QT_END_NAMESPACE
+ 
+@@ -35,14 +36,16 @@ class LayerTreeRenderer;
+ 
+ class QtWebPageSGNode : public QSGTransformNode {
+     public:
+-        QtWebPageSGNode();
++        QtWebPageSGNode(const QQuickItem*);
+         void setBackground(const QRectF&, const QColor&);
+         void setScale(float);
+         void setRenderer(PassRefPtr<LayerTreeRenderer>);
++        qreal devicePixelRatio() const;
+ 
+     private:
+         ContentsSGNode* m_contentsNode;
+         QSGSimpleRectNode* m_backgroundNode;
++        const QQuickItem* const m_item;
+ };
+ 
+ } // namespace WebKit
+diff --git a/Tools/ChangeLog b/Tools/ChangeLog
+index dec6253..c13b4d5 100644
+--- a/Tools/ChangeLog
++++ b/Tools/ChangeLog
+@@ -1,3 +1,15 @@
++2012-12-13  Andras Becsi  <andras.becsi@digia.com>
++
++        [Qt][WK2] Fix painting on Mac with retina display
++        https://bugs.webkit.org/show_bug.cgi?id=104574
++
++        Reviewed by Kenneth Rohde Christiansen.
++
++        Remove setting the devicePixelRatio experimental property
++        since the value is now automatically picked up from Qt.
++
++        * MiniBrowser/qt/qml/BrowserWindow.qml:
++
+ 2012-12-12  Simon Hausmann  <simon.hausmann@digia.com>
+ 
+         [Qt] Fix build on Mac
+diff --git a/Tools/MiniBrowser/qt/qml/BrowserWindow.qml b/Tools/MiniBrowser/qt/qml/BrowserWindow.qml
+index c73308e..e52b2f4 100644
+--- a/Tools/MiniBrowser/qt/qml/BrowserWindow.qml
++++ b/Tools/MiniBrowser/qt/qml/BrowserWindow.qml
+@@ -354,7 +354,6 @@ Rectangle {
+                 webView.loadHtml("Failed to load " + loadRequest.url, "", loadRequest.url)
+         }
+ 
+-        experimental.devicePixelRatio: 1.5
+         experimental.preferences.fullScreenEnabled: true
+         experimental.preferences.webGLEnabled: true
+         experimental.preferences.webAudioEnabled: true

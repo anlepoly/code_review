@@ -1,0 +1,136 @@
+diff --git a/src/corelib/statemachine/qstatemachine.cpp b/src/corelib/statemachine/qstatemachine.cpp
+index 1fe7f96..b3e91c1 100644
+--- a/src/corelib/statemachine/qstatemachine.cpp
++++ b/src/corelib/statemachine/qstatemachine.cpp
+@@ -1335,6 +1335,28 @@ void QStateMachinePrivate::clearHistory()
+     }
+ }
+ 
++/*!
++  \internal
++
++  Registers all signal transitions whose sender object lives in another thread.
++
++  Normally, signal transitions are lazily registered (when a state becomes
++  active). But if the sender is in a different thread, the transition must be
++  registered early to keep the state machine from "dropping" signals; e.g.,
++  a second (transition-bound) signal could be emitted on the sender thread
++  before the state machine gets to process the first signal.
++*/
++void QStateMachinePrivate::registerMultiThreadedSignalTransitions()
++{
++    Q_Q(QStateMachine);
++    QList<QSignalTransition*> transitions = rootState()->findChildren<QSignalTransition*>();
++    for (int i = 0; i < transitions.size(); ++i) {
++        QSignalTransition *t = transitions.at(i);
++        if ((t->machine() == q) && t->senderObject() && (t->senderObject()->thread() != q->thread()))
++            registerSignalTransition(t);
++    }
++}
++
+ void QStateMachinePrivate::_q_start()
+ {
+     Q_Q(QStateMachine);
+@@ -1346,6 +1368,8 @@ void QStateMachinePrivate::_q_start()
+     externalEventQueue.clear();
+     clearHistory();
+ 
++    registerMultiThreadedSignalTransitions();
++
+ #ifdef QSTATEMACHINE_DEBUG
+     qDebug() << q << ": starting";
+ #endif
+@@ -1703,8 +1727,8 @@ void QStateMachinePrivate::unregisterTransition(QAbstractTransition *transition)
+ void QStateMachinePrivate::maybeRegisterSignalTransition(QSignalTransition *transition)
+ {
+     Q_Q(QStateMachine);
+-    if (((state == Running) && configuration.contains(transition->sourceState()))
+-            || (transition->senderObject() && (transition->senderObject()->thread() != q->thread()))) {
++    if ((state == Running) && (configuration.contains(transition->sourceState())
++            || (transition->senderObject() && (transition->senderObject()->thread() != q->thread())))) {
+         registerSignalTransition(transition);
+     }
+ }
+@@ -1771,14 +1795,10 @@ void QStateMachinePrivate::registerSignalTransition(QSignalTransition *transitio
+ 
+ void QStateMachinePrivate::unregisterSignalTransition(QSignalTransition *transition)
+ {
+-    Q_Q(QStateMachine);
+     int signalIndex = QSignalTransitionPrivate::get(transition)->signalIndex;
+     if (signalIndex == -1)
+         return; // not registered
+     const QObject *sender = QSignalTransitionPrivate::get(transition)->sender;
+-    // Don't unregister if the sender is on another thread
+-    if (!sender || (sender->thread() != q->thread()))
+-        return;
+     QSignalTransitionPrivate::get(transition)->signalIndex = -1;
+ 
+     connectionsMutex.lock();
+diff --git a/src/corelib/statemachine/qstatemachine_p.h b/src/corelib/statemachine/qstatemachine_p.h
+index cf20ee3..c8d0958 100644
+--- a/src/corelib/statemachine/qstatemachine_p.h
++++ b/src/corelib/statemachine/qstatemachine_p.h
+@@ -175,6 +175,7 @@ public:
+     void maybeRegisterSignalTransition(QSignalTransition *transition);
+     void registerSignalTransition(QSignalTransition *transition);
+     void unregisterSignalTransition(QSignalTransition *transition);
++    void registerMultiThreadedSignalTransitions();
+ #ifndef QT_NO_STATEMACHINE_EVENTFILTER
+     void maybeRegisterEventTransition(QEventTransition *transition);
+     void registerEventTransition(QEventTransition *transition);
+diff --git a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+index dd03664..15f23e0 100644
+--- a/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
++++ b/tests/auto/corelib/statemachine/qstatemachine/tst_qstatemachine.cpp
+@@ -209,6 +209,7 @@ private slots:
+     void createSignalTransitionWhenRunning();
+     void createEventTransitionWhenRunning();
+     void signalTransitionSenderInDifferentThread();
++    void signalTransitionSenderInDifferentThread2();
+     void signalTransitionRegistrationThreadSafety();
+     void childModeConstructor();
+ };
+@@ -4895,6 +4896,43 @@ void tst_QStateMachine::signalTransitionSenderInDifferentThread()
+     QTRY_VERIFY(thread.wait());
+ }
+ 
++void tst_QStateMachine::signalTransitionSenderInDifferentThread2()
++{
++    QStateMachine machine;
++    QState *s1 = new QState(&machine);
++    machine.setInitialState(s1);
++
++    QState *s2 = new QState(&machine);
++    SignalEmitter emitter;
++    // At the time of the transition creation, the machine and the emitter
++    // are both in the same thread.
++    s1->addTransition(&emitter, SIGNAL(signalWithNoArg()), s2);
++
++    QFinalState *s3 = new QFinalState(&machine);
++    s2->addTransition(&emitter, SIGNAL(signalWithDefaultArg()), s3);
++
++    QThread thread;
++    // Move the machine and its states to a secondary thread, but let the
++    // SignalEmitter stay in the main thread.
++    machine.moveToThread(&thread);
++
++    thread.start();
++    QTRY_VERIFY(thread.isRunning());
++
++    QSignalSpy startedSpy(&machine, SIGNAL(started()));
++    QSignalSpy finishedSpy(&machine, SIGNAL(finished()));
++    machine.start();
++    QTRY_COMPARE(startedSpy.count(), 1);
++
++    emitter.emitSignalWithNoArg();
++    // The second emission should not get "lost".
++    emitter.emitSignalWithDefaultArg();
++    QTRY_COMPARE(finishedSpy.count(), 1);
++
++    thread.quit();
++    QTRY_VERIFY(thread.wait());
++}
++
+ class SignalTransitionMutatorThread : public QThread
+ {
+ public:

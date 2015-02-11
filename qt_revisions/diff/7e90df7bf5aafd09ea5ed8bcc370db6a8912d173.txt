@@ -1,0 +1,408 @@
+diff --git a/src/corelib/kernel/qcoreevent.h b/src/corelib/kernel/qcoreevent.h
+index 1d54b32..bfd9920 100644
+--- a/src/corelib/kernel/qcoreevent.h
++++ b/src/corelib/kernel/qcoreevent.h
+@@ -75,6 +75,7 @@ public:
+         KeyRelease = 7,                         // key released
+         FocusIn = 8,                            // keyboard focus received
+         FocusOut = 9,                           // keyboard focus lost
++        FocusAboutToChange = 23,                // keyboard focus is about to be lost
+         Enter = 10,                             // mouse enters widget
+         Leave = 11,                             // mouse leaves widget
+         Paint = 12,                             // paint widget
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index 5611296..e121838 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -1155,14 +1155,21 @@ void QGuiApplicationPrivate::processLeaveEvent(QWindowSystemInterfacePrivate::Le
+ void QGuiApplicationPrivate::processActivatedEvent(QWindowSystemInterfacePrivate::ActivatedWindowEvent *e)
+ {
+     QWindow *previous = QGuiApplicationPrivate::focus_window;
+-    QGuiApplicationPrivate::focus_window = e->activated.data();
++    QWindow *newFocus = e->activated.data();
+ 
+-    if (previous == QGuiApplicationPrivate::focus_window)
++    if (previous == newFocus)
+         return;
+ 
+     QObject *previousFocusObject = previous ? previous->focusObject() : 0;
+ 
+     if (previous) {
++        QFocusEvent focusAboutToChange(QEvent::FocusAboutToChange);
++        QCoreApplication::sendSpontaneousEvent(previous, &focusAboutToChange);
++    }
++
++    QGuiApplicationPrivate::focus_window = newFocus;
++
++    if (previous) {
+         QFocusEvent focusOut(QEvent::FocusOut);
+         QCoreApplication::sendSpontaneousEvent(previous, &focusOut);
+         QObject::disconnect(previous, SIGNAL(focusObjectChanged(QObject*)),
+diff --git a/src/widgets/kernel/qapplication.cpp b/src/widgets/kernel/qapplication.cpp
+index 7441d55..ce57e28 100644
+--- a/src/widgets/kernel/qapplication.cpp
++++ b/src/widgets/kernel/qapplication.cpp
+@@ -1760,16 +1760,6 @@ void QApplicationPrivate::setFocusWidget(QWidget *focus, Qt::FocusReason reason)
+         }
+         QWidget *prev = focus_widget;
+         focus_widget = focus;
+-#ifndef QT_NO_IM
+-        if (prev && ((reason != Qt::PopupFocusReason && reason != Qt::MenuBarFocusReason
+-                      && prev->testAttribute(Qt::WA_InputMethodEnabled))
+-                     // Do reset the input context, in case the new focus widget won't accept keyboard input
+-                     // or it is not created fully yet.
+-                     || (focus_widget && (!focus_widget->testAttribute(Qt::WA_InputMethodEnabled)
+-                                          || !focus_widget->testAttribute(Qt::WA_WState_Created))))) {
+-            qApp->inputMethod()->reset();
+-        }
+-#endif //QT_NO_IM
+ 
+         if(focus_widget)
+             focus_widget->d_func()->setFocus_sys();
+@@ -1798,7 +1788,6 @@ void QApplicationPrivate::setFocusWidget(QWidget *focus, Qt::FocusReason reason)
+                     QApplication::sendEvent(that->style(), &in);
+             }
+             emit qApp->focusChanged(prev, focus_widget);
+-            emit qApp->focusObjectChanged(focus_widget);
+         }
+     }
+ }
+@@ -2051,6 +2040,14 @@ void QApplication::setActiveWindow(QWidget* act)
+         }
+     }
+ 
++    if (QApplicationPrivate::focus_widget) {
++        if (QApplicationPrivate::focus_widget->testAttribute(Qt::WA_InputMethodEnabled))
++            qApp->inputMethod()->reset();
++
++        QFocusEvent focusAboutToChange(QEvent::FocusAboutToChange, Qt::ActiveWindowFocusReason);
++        QApplication::sendEvent(QApplicationPrivate::focus_widget, &focusAboutToChange);
++    }
++
+     QApplicationPrivate::active_window = window;
+ 
+     if (QApplicationPrivate::active_window) {
+diff --git a/src/widgets/kernel/qwidget.cpp b/src/widgets/kernel/qwidget.cpp
+index 6418ba6..63eb254 100644
+--- a/src/widgets/kernel/qwidget.cpp
++++ b/src/widgets/kernel/qwidget.cpp
+@@ -5875,9 +5875,10 @@ bool QWidget::hasFocus() const
+     If the window is not active, the widget will be given the focus when
+     the window becomes active.
+ 
+-    First, a focus out event is sent to the focus widget (if any) to
+-    tell it that it is about to lose the focus. Then a focus in event
+-    is sent to this widget to tell it that it just received the focus.
++    First, a focus about to change event is sent to the focus widget (if any) to
++    tell it that it is about to lose the focus. Then focus is changed, a
++    focus out event is sent to the previous focus item and a focus in event is sent
++    to the new item to tell it that it just received the focus.
+     (Nothing happens if the focus in and focus out widgets are the
+     same.)
+ 
+@@ -5930,23 +5931,11 @@ void QWidget::setFocus(Qt::FocusReason reason)
+     }
+ #endif
+ 
+-    QWidget *w = f;
+-    if (isHidden()) {
+-        while (w && w->isHidden()) {
+-            w->d_func()->focus_child = f;
+-            w = w->isWindow() ? 0 : w->parentWidget();
+-        }
+-    } else {
+-        while (w) {
+-            w->d_func()->focus_child = f;
+-            w = w->isWindow() ? 0 : w->parentWidget();
+-        }
+-    }
+-
+ #ifndef QT_NO_GRAPHICSVIEW
+     // Update proxy state
+     if (QWExtra *topData = window()->d_func()->extra) {
+         if (topData->proxyWidget && !topData->proxyWidget->hasFocus()) {
++            f->d_func()->updateFocusChild();
+             topData->proxyWidget->d_func()->focusFromWidgetToProxy = 1;
+             topData->proxyWidget->setFocus(reason);
+             topData->proxyWidget->d_func()->focusFromWidgetToProxy = 0;
+@@ -5955,6 +5944,21 @@ void QWidget::setFocus(Qt::FocusReason reason)
+ #endif
+ 
+     if (f->isActiveWindow()) {
++        QWidget *prev = QApplicationPrivate::focus_widget;
++        if (prev) {
++            if (reason != Qt::PopupFocusReason && reason != Qt::MenuBarFocusReason
++                && prev->testAttribute(Qt::WA_InputMethodEnabled)) {
++                qApp->inputMethod()->reset();
++            }
++
++            if (reason != Qt::NoFocusReason) {
++                QFocusEvent focusAboutToChange(QEvent::FocusAboutToChange, reason);
++                QApplication::sendEvent(prev, &focusAboutToChange);
++            }
++        }
++
++        f->d_func()->updateFocusChild();
++
+         QApplicationPrivate::setFocusWidget(f, reason);
+ #ifndef QT_NO_ACCESSIBILITY
+ # ifdef Q_OS_WIN
+@@ -5999,6 +6003,30 @@ void QWidget::setFocus(Qt::FocusReason reason)
+             }
+         }
+ #endif
++    } else {
++        f->d_func()->updateFocusChild();
++    }
++
++    if (QTLWExtra *extra = f->window()->d_func()->maybeTopData())
++        emit extra->window->focusObjectChanged(f);
++}
++
++// updates focus_child on parent widgets to point into this widget
++void QWidgetPrivate::updateFocusChild()
++{
++    Q_Q(QWidget);
++
++    QWidget *w = q;
++    if (q->isHidden()) {
++        while (w && w->isHidden()) {
++            w->d_func()->focus_child = q;
++            w = w->isWindow() ? 0 : w->parentWidget();
++        }
++    } else {
++        while (w) {
++            w->d_func()->focus_child = q;
++            w = w->isWindow() ? 0 : w->parentWidget();
++        }
+     }
+ }
+ 
+@@ -6015,8 +6043,8 @@ void QWidget::setFocus(Qt::FocusReason reason)
+     Takes keyboard input focus from the widget.
+ 
+     If the widget has active focus, a \link focusOutEvent() focus out
+-    event\endlink is sent to this widget to tell it that it is about
+-    to lose the focus.
++    event\endlink is sent to this widget to tell it that it has
++    lost the focus.
+ 
+     This widget must enable focus setting in order to get the keyboard
+     input focus, i.e. it must call setFocusPolicy().
+@@ -6027,6 +6055,14 @@ void QWidget::setFocus(Qt::FocusReason reason)
+ 
+ void QWidget::clearFocus()
+ {
++    if (hasFocus()) {
++        if (testAttribute(Qt::WA_InputMethodEnabled))
++            qApp->inputMethod()->reset();
++
++        QFocusEvent focusAboutToChange(QEvent::FocusAboutToChange);
++        QApplication::sendEvent(this, &focusAboutToChange);
++    }
++
+     QWidget *w = this;
+     while (w) {
+         if (w->d_func()->focus_child == this)
+diff --git a/src/widgets/kernel/qwidget_p.h b/src/widgets/kernel/qwidget_p.h
+index 38314c2..8107b6c 100644
+--- a/src/widgets/kernel/qwidget_p.h
++++ b/src/widgets/kernel/qwidget_p.h
+@@ -336,6 +336,7 @@ public:
+     void stackUnder_sys(QWidget *);
+ 
+     void setFocus_sys();
++    void updateFocusChild();
+ 
+     void updateFont(const QFont &);
+     inline void setFont_helper(const QFont &font) {
+diff --git a/src/widgets/kernel/qwidgetwindow_qpa.cpp b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+index f58dddb..7a13e20 100644
+--- a/src/widgets/kernel/qwidgetwindow_qpa.cpp
++++ b/src/widgets/kernel/qwidgetwindow_qpa.cpp
+@@ -99,6 +99,15 @@ bool QWidgetWindow::event(QEvent *event)
+     case QEvent::FocusOut:
+         return false;
+ 
++    case QEvent::FocusAboutToChange:
++        if (QApplicationPrivate::focus_widget) {
++            if (QApplicationPrivate::focus_widget->testAttribute(Qt::WA_InputMethodEnabled))
++                qApp->inputMethod()->commit();
++
++            QGuiApplication::sendSpontaneousEvent(QApplicationPrivate::focus_widget, event);
++        }
++        return true;
++
+     case QEvent::KeyPress:
+     case QEvent::KeyRelease:
+         handleKeyEvent(static_cast<QKeyEvent *>(event));
+diff --git a/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp b/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
+index 7664706..0c009ec 100644
+--- a/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
++++ b/tests/auto/gui/kernel/qguiapplication/tst_qguiapplication.cpp
+@@ -54,6 +54,7 @@ private slots:
+     void allWindows();
+     void topLevelWindows();
+     void abortQuitOnShow();
++    void changeFocusWindow();
+ };
+ 
+ class DummyWindow : public QWindow
+@@ -195,5 +196,49 @@ void tst_QGuiApplication::abortQuitOnShow()
+     QCOMPARE(app.exec(), 1);
+ }
+ 
++
++class FocusChangeWindow: public QWindow
++{
++protected:
++    virtual bool event(QEvent *ev)
++    {
++        if (ev->type() == QEvent::FocusAboutToChange)
++            windowDuringFocusAboutToChange = qGuiApp->focusWindow();
++        return QWindow::event(ev);
++    }
++
++    virtual void focusOutEvent(QFocusEvent *)
++    {
++        windowDuringFocusOut = qGuiApp->focusWindow();
++    }
++
++public:
++    FocusChangeWindow() : QWindow(), windowDuringFocusAboutToChange(0), windowDuringFocusOut(0) {}
++
++    QWindow *windowDuringFocusAboutToChange;
++    QWindow *windowDuringFocusOut;
++};
++
++void tst_QGuiApplication::changeFocusWindow()
++{
++    int argc = 0;
++    QGuiApplication app(argc, 0);
++
++    // focus is changed between FocusAboutToChange and FocusChanged
++    FocusChangeWindow window1, window2;
++    window1.show();
++    window2.show();
++    QTest::qWaitForWindowShown(&window1);
++    QTest::qWaitForWindowShown(&window2);
++    window1.requestActivateWindow();
++    QTRY_COMPARE(app.focusWindow(), &window1);
++
++    window2.requestActivateWindow();
++    QTRY_COMPARE(app.focusWindow(), &window2);
++    QCOMPARE(window1.windowDuringFocusAboutToChange, &window1);
++    QCOMPARE(window1.windowDuringFocusOut, &window2);
++}
++
++
+ QTEST_APPLESS_MAIN(tst_QGuiApplication)
+ #include "tst_qguiapplication.moc"
+diff --git a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+index 49c93f8..975c88d 100644
+--- a/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
++++ b/tests/auto/widgets/kernel/qwidget/tst_qwidget.cpp
+@@ -5103,6 +5103,27 @@ void tst_QWidget::multipleToplevelFocusCheck()
+     QTRY_COMPARE(QApplication::focusWidget(), (QWidget *)0);
+ }
+ 
++class FocusWidget: public QWidget
++{
++protected:
++    virtual bool event(QEvent *ev)
++    {
++        if (ev->type() == QEvent::FocusAboutToChange)
++            widgetDuringFocusAboutToChange = qApp->focusWidget();
++        return QWidget::event(ev);
++    }
++    virtual void focusOutEvent(QFocusEvent *)
++    {
++        widgetDuringFocusOut = qApp->focusWidget();
++    }
++
++public:
++    FocusWidget(QWidget *parent) : QWidget(parent), widgetDuringFocusAboutToChange(0), widgetDuringFocusOut(0) {}
++
++    QWidget *widgetDuringFocusAboutToChange;
++    QWidget *widgetDuringFocusOut;
++};
++
+ void tst_QWidget::setFocus()
+ {
+     {
+@@ -5169,20 +5190,16 @@ void tst_QWidget::setFocus()
+         // window and children show, but window *is* active, children get focus
+         QWidget window;
+ 
+-        QWidget child1(&window);
++        FocusWidget child1(&window);
+         child1.setFocusPolicy(Qt::StrongFocus);
+ 
+         QWidget child2(&window);
+         child2.setFocusPolicy(Qt::StrongFocus);
+ 
+         window.show();
+-#ifdef Q_WS_X11
+-        QApplication::setActiveWindow(&window);
+-        QTest::qWaitForWindowShown(&window);
+-#else
+         window.activateWindow();
+-        QApplication::processEvents();
+-#endif
++        QTest::qWaitForWindowShown(&window);
++        QTRY_VERIFY(qGuiApp->focusWindow());
+ 
+         child1.setFocus();
+         QTRY_VERIFY(child1.hasFocus());
+@@ -5193,6 +5210,10 @@ void tst_QWidget::setFocus()
+         QVERIFY(child2.hasFocus());
+         QCOMPARE(window.focusWidget(), &child2);
+         QCOMPARE(QApplication::focusWidget(), &child2);
++
++        // focus changed in between the events
++        QCOMPARE(child1.widgetDuringFocusAboutToChange, &child1);
++        QCOMPARE(child1.widgetDuringFocusOut, &child2);
+     }
+ 
+     {
+@@ -5200,12 +5221,9 @@ void tst_QWidget::setFocus()
+         QWidget window;
+ 
+         window.show();
+-#ifdef Q_WS_X11
+-        QApplication::setActiveWindow(&window);
+-        QTest::qWaitForWindowShown(&window);
+-#else
+         window.activateWindow();
+-#endif
++        QTest::qWaitForWindowShown(&window);
++        QTRY_VERIFY(qGuiApp->focusWindow());
+ 
+         QWidget child1(&window);
+         child1.setFocusPolicy(Qt::StrongFocus);
+@@ -5219,10 +5237,6 @@ void tst_QWidget::setFocus()
+         QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(0));
+ 
+         child1.show();
+-#ifdef Q_WS_X11
+-        QApplication::setActiveWindow(&child1);
+-        child1.activateWindow();
+-#endif
+         QApplication::processEvents();
+         QTRY_VERIFY(child1.hasFocus());
+         QCOMPARE(window.focusWidget(), &child1);
+@@ -5245,12 +5259,9 @@ void tst_QWidget::setFocus()
+         QWidget window;
+ 
+         window.show();
+-#ifdef Q_WS_X11
+-        QApplication::setActiveWindow(&window);
+-        QTest::qWaitForWindowShown(&window);
+-#else
+         window.activateWindow();
+-#endif
++        QTest::qWaitForWindowShown(&window);
++        QTRY_VERIFY(qGuiApp->focusWindow());
+ 
+         QWidget child1(&window);
+         child1.setFocusPolicy(Qt::StrongFocus);

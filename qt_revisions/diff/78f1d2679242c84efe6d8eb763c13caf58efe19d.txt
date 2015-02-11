@@ -1,0 +1,173 @@
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index 2e46192..e5c498a 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -836,6 +836,7 @@ QQmlComponentPrivate::beginCreate(QQmlContextData *context)
+         //if JS ownership is needed this needs to be explicitly undone (like in component.createObject())
+         ddata->indestructible = true;
+         ddata->explicitIndestructibleSet = true;
++        ddata->inCreation = false;
+     }
+ 
+     if (enginePriv->isDebugging && rv) {
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 1a188f9..ffaa7e2 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -79,7 +79,7 @@ class Q_QML_EXPORT QQmlData : public QAbstractDeclarativeData
+ public:
+     QQmlData()
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+-          hasTaintedV8Object(false), isQueuedForDeletion(false), notifyList(0), context(0), outerContext(0),
++          hasTaintedV8Object(false), isQueuedForDeletion(false), inCreation(false), notifyList(0), context(0), outerContext(0),
+           bindings(0), signalHandlers(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+           lineNumber(0), columnNumber(0), deferredComponent(0), deferredIdx(0), v8objectid(0), 
+           propertyCache(0), guards(0), extendedData(0) {
+@@ -114,7 +114,12 @@ public:
+     quint32 explicitIndestructibleSet:1;
+     quint32 hasTaintedV8Object:1;
+     quint32 isQueuedForDeletion:1;
+-    quint32 dummy:26;
++    /*
++     * inCreation should be true only when creating top level CPP and QML objects,
++     * v8 GC will check this flag, only deletes the objects when inCreation is false.
++     */
++    quint32 inCreation:1;
++    quint32 dummy:25;
+ 
+     struct NotifyList {
+         quint64 connectionMask;
+diff --git a/src/qml/qml/qqmlincubator.cpp b/src/qml/qml/qqmlincubator.cpp
+index fad2ae2..817e7b8 100644
+--- a/src/qml/qml/qqmlincubator.cpp
++++ b/src/qml/qml/qqmlincubator.cpp
+@@ -296,6 +296,7 @@ void QQmlIncubatorPrivate::incubate(QQmlVME::Interrupt &i)
+             //see QQmlComponent::beginCreate for explanation of indestructible
+             ddata->indestructible = true;
+             ddata->explicitIndestructibleSet = true;
++            ddata->inCreation = false;
+             q->setInitialState(result);
+         }
+ 
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 985d291..47ea690 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -513,6 +513,9 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             QQmlData *ddata = QQmlData::get(o);
+             Q_ASSERT(ddata);
+ 
++            if (states.count() == 1)
++                ddata->inCreation = true;
++
+             if (instr.isRoot) {
+                 if (ddata->context) {
+                     Q_ASSERT(ddata->context != CTXT);
+@@ -547,6 +550,9 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             ddata->ownMemory = false;
+             QObjectPrivate::get(o)->declarativeData = ddata;
+ 
++            if (states.count() == 1)
++                ddata->inCreation = true;
++
+             if (type.typePropertyCache && !ddata->propertyCache) {
+                 ddata->propertyCache = type.typePropertyCache;
+                 ddata->propertyCache->addref();
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 2d6c5ec..f2acac5 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -1153,6 +1153,11 @@ void QV8QObjectWrapper::deleteWeakQObject(QV8QObjectResource *resource)
+     if (object) {
+         QQmlData *ddata = QQmlData::get(object, false);
+         if (ddata) {
++            if (ddata->inCreation) {
++                ddata->v8object.MakeWeak(0, WeakQObjectReferenceCallback);
++                return;
++            }
++
+             ddata->v8object.Clear();
+             if (!object->parent() && !ddata->indestructible) {
+                 ddata->isQueuedForDeletion = true;
+@@ -1888,7 +1893,7 @@ static v8::Handle<v8::Value> ToString(QV8Engine *engine, QObject *object, int, v
+ static v8::Handle<v8::Value> Destroy(QV8Engine *, QObject *object, int argCount, v8::Handle<v8::Object> args)
+ {
+     QQmlData *ddata = QQmlData::get(object, false);
+-    if (!ddata || ddata->indestructible) {
++    if (!ddata || ddata->indestructible || ddata->inCreation) {
+         const char *error = "Invalid attempt to destroy() an indestructible object";
+         v8::ThrowException(v8::Exception::Error(v8::String::New(error)));
+         return v8::Undefined();
+diff --git a/tests/auto/qml/qqmlecmascript/data/RootObject.qml b/tests/auto/qml/qqmlecmascript/data/RootObject.qml
+new file mode 100644
+index 0000000..bf46155
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/RootObject.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++
++Rectangle {
++    id: root
++    color:"red"
++    property bool rootIndestructible:false
++    property bool childDestructible:child === null
++    onColorChanged: {
++      try {
++        root.destroy();
++        gc();
++      } catch(e) {
++         rootIndestructible = true;
++      }
++    }
++
++    QtObject {
++      id:child
++    }
++    Component.onCompleted: child.destroy();
++}
+\ No newline at end of file
+diff --git a/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.qml b/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.qml
+new file mode 100644
+index 0000000..fbb7d24
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/deleteRootObjectInCreation.qml
+@@ -0,0 +1,5 @@
++import QtQuick 2.0
++
++RootObject {
++  color:"black"
++}
+\ No newline at end of file
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index cb56948..3091497 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -256,7 +256,7 @@ private slots:
+     void withStatement();
+     void tryStatement();
+     void replaceBinding();
+-
++    void deleteRootObjectInCreation();
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+     QQmlEngine engine;
+@@ -6619,6 +6619,19 @@ void tst_qqmlecmascript::replaceBinding()
+     delete obj;
+ }
+ 
++void tst_qqmlecmascript::deleteRootObjectInCreation()
++{
++    QQmlEngine engine;
++    QQmlComponent c(&engine, testFileUrl("deleteRootObjectInCreation.qml"));
++    QObject *obj = c.create();
++    QVERIFY(obj != 0);
++    QVERIFY(obj->property("rootIndestructible").toBool());
++    QVERIFY(!obj->property("childDestructible").toBool());
++    QTest::qWait(1);
++    QVERIFY(obj->property("childDestructible").toBool());
++    delete obj;
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

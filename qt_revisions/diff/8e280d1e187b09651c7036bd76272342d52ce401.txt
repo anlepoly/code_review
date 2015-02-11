@@ -1,0 +1,299 @@
+diff --git a/src/gui/kernel/qplatformintegration.h b/src/gui/kernel/qplatformintegration.h
+index 3990adb..ea13a25 100644
+--- a/src/gui/kernel/qplatformintegration.h
++++ b/src/gui/kernel/qplatformintegration.h
+@@ -85,8 +85,8 @@ public:
+         OpenGL = 2,
+         ThreadedOpenGL = 3,
+         SharedGraphicsCache = 4,
+-        BufferQueueingOpenGL = 5
+-
++        BufferQueueingOpenGL = 5,
++        WindowMasks = 6
+     };
+ 
+     virtual ~QPlatformIntegration() { }
+diff --git a/src/gui/kernel/qplatformwindow.h b/src/gui/kernel/qplatformwindow.h
+index 6043989..d9f79f2 100644
+--- a/src/gui/kernel/qplatformwindow.h
++++ b/src/gui/kernel/qplatformwindow.h
+@@ -68,6 +68,7 @@ class QPlatformScreen;
+ class QPlatformWindowPrivate;
+ class QWindow;
+ class QIcon;
++class QRegion;
+ 
+ class Q_GUI_EXPORT QPlatformWindow : public QPlatformSurface
+ {
+@@ -105,6 +106,7 @@ public:
+     virtual void propagateSizeHints();
+ 
+     virtual void setOpacity(qreal level);
++    virtual void setMask(const QRegion &region);
+     virtual void requestActivateWindow();
+ 
+     virtual void handleContentOrientationChange(Qt::ScreenOrientation orientation);
+diff --git a/src/gui/kernel/qplatformwindow_qpa.cpp b/src/gui/kernel/qplatformwindow_qpa.cpp
+index 2380c6d..88f2a64 100644
+--- a/src/gui/kernel/qplatformwindow_qpa.cpp
++++ b/src/gui/kernel/qplatformwindow_qpa.cpp
+@@ -242,6 +242,16 @@ void QPlatformWindow::setOpacity(qreal level)
+ }
+ 
+ /*!
++  Reimplement to  be able to let Qt set the mask of a window
++*/
++
++void QPlatformWindow::setMask(const QRegion &region)
++{
++    Q_UNUSED(region);
++    qWarning("This plugin does not support setting window masks");
++}
++
++/*!
+   Reimplement to let Qt be able to request activation/focus for a window
+ 
+   Some window systems will probably not have callbacks for this functionality,
+diff --git a/src/plugins/platforms/windows/qwindowsintegration.cpp b/src/plugins/platforms/windows/qwindowsintegration.cpp
+index 52950ec..7d4308d 100644
+--- a/src/plugins/platforms/windows/qwindowsintegration.cpp
++++ b/src/plugins/platforms/windows/qwindowsintegration.cpp
+@@ -265,6 +265,8 @@ bool QWindowsIntegration::hasCapability(QPlatformIntegration::Capability cap) co
+         return true;
+ #  endif // QT_OPENGL_ES_2
+ #endif // !QT_NO_OPENGL
++    case WindowMasks:
++        return true;
+     default:
+         return QPlatformIntegration::hasCapability(cap);
+     }
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index e49b215..aabea04 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -53,6 +53,7 @@
+ #include <QtGui/QGuiApplication>
+ #include <QtGui/QScreen>
+ #include <QtGui/QWindow>
++#include <QtGui/QRegion>
+ #include <private/qwindow_p.h>
+ #include <QtGui/QWindowSystemInterface>
+ 
+@@ -1344,6 +1345,49 @@ void QWindowsWindow::setOpacity(qreal level)
+     }
+ }
+ 
++static inline HRGN createRectRegion(const QRect &r)
++{
++    return CreateRectRgn(r.left(), r.top(), r.x() + r.width(), r.y() + r.height());
++}
++
++static inline void addRectToWinRegion(const QRect &rect, HRGN *winRegion)
++{
++    if (const HRGN rectRegion = createRectRegion(rect)) {
++        HRGN result = CreateRectRgn(0, 0, 0, 0);
++        if (CombineRgn(result, *winRegion, rectRegion, RGN_OR)) {
++            DeleteObject(winRegion);
++            *winRegion = result;
++        }
++        DeleteObject(rectRegion);
++    }
++}
++
++static HRGN qRegionToWinRegion(const QRegion &region)
++{
++    const QVector<QRect> rects = region.rects();
++    if (rects.isEmpty())
++        return NULL;
++    const int rectCount = rects.size();
++    if (rectCount == 1)
++        return createRectRegion(region.boundingRect());
++    HRGN hRegion = createRectRegion(rects.front());
++    for (int i = 1; i < rectCount; ++i)
++        addRectToWinRegion(rects.at(i), &hRegion);
++    return hRegion;
++}
++
++void QWindowsWindow::setMask(const QRegion &region)
++{
++    if (region.isEmpty()) {
++         SetWindowRgn(m_data.hwnd, 0, true);
++         return;
++    }
++    const HRGN winRegion = qRegionToWinRegion(region);
++    // SetWindowRgn takes ownership.
++    if (!SetWindowRgn(m_data.hwnd, winRegion, true))
++        DeleteObject(winRegion);
++}
++
+ void QWindowsWindow::requestActivateWindow()
+ {
+     if (QWindowsContext::verboseWindows)
+diff --git a/src/plugins/platforms/windows/qwindowswindow.h b/src/plugins/platforms/windows/qwindowswindow.h
+index 2fd4010..743e10d 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.h
++++ b/src/plugins/platforms/windows/qwindowswindow.h
+@@ -168,6 +168,7 @@ public:
+     virtual QMargins frameMargins() const;
+ 
+     virtual void setOpacity(qreal level);
++    virtual void setMask(const QRegion &region);
+     qreal opacity() const { return m_opacity; }
+     virtual void requestActivateWindow();
+ 
+diff --git a/src/plugins/platforms/xcb/qxcbintegration.cpp b/src/plugins/platforms/xcb/qxcbintegration.cpp
+index c40ebe4..f7576fe 100644
+--- a/src/plugins/platforms/xcb/qxcbintegration.cpp
++++ b/src/plugins/platforms/xcb/qxcbintegration.cpp
+@@ -203,6 +203,7 @@ bool QXcbIntegration::hasCapability(QPlatformIntegration::Capability cap) const
+     case ThreadedPixmaps: return true;
+     case OpenGL: return true;
+     case ThreadedOpenGL: return false;
++    case WindowMasks: return true;
+     default: return QPlatformIntegration::hasCapability(cap);
+     }
+ }
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.cpp b/src/plugins/platforms/xcb/qxcbwindow.cpp
+index 59e805f..a4ee2a4 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.cpp
++++ b/src/plugins/platforms/xcb/qxcbwindow.cpp
+@@ -44,6 +44,7 @@
+ #include <QtDebug>
+ #include <QScreen>
+ #include <QtGui/QIcon>
++#include <QtGui/QRegion>
+ 
+ #include "qxcbconnection.h"
+ #include "qxcbscreen.h"
+@@ -97,6 +98,9 @@
+ #ifdef XCB_USE_XLIB
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
++#ifndef QT_NO_SHAPE
++#  include <X11/extensions/shape.h>
++#endif // QT_NO_SHAPE
+ #endif
+ 
+ #ifdef XCB_USE_XINPUT2_MAEMO
+@@ -1698,4 +1702,54 @@ bool QXcbWindow::startSystemResize(const QPoint &pos, Qt::Corner corner)
+     return true;
+ }
+ 
++#if defined(XCB_USE_XLIB) && !defined(QT_NO_SHAPE)
++
++static inline XRectangle qRectToX11Rectangle(const QRect &r)
++{
++    XRectangle result;
++    result.x = qMax(SHRT_MIN, r.x());
++    result.y = qMax(SHRT_MIN, r.y());
++    result.width = qMin((int)USHRT_MAX, r.width());
++    result.height = qMin((int)USHRT_MAX, r.height());
++    return result;
++}
++
++static inline Region qRegionToX11Region(const QRegion &region)
++{
++    if (region.isEmpty())
++        return None;
++    Region result = XCreateRegion();
++    if (!result)
++        return None;
++    const QVector<QRect> rects = region.rects();
++    if (rects.size() == 1) {
++        XRectangle xrect = qRectToX11Rectangle(region.boundingRect());
++        XUnionRectWithRegion(&xrect, result, result);
++    } else {
++        foreach (const QRect &r, rects) {
++            XRectangle xrect = qRectToX11Rectangle(r);
++            XUnionRectWithRegion(&xrect, result, result);
++        }
++    }
++    return result;
++}
++
++
++void QXcbWindow::setMask(const QRegion &region)
++{
++
++    Display *display = (Display *)connection()->xlib_display();
++    if (region.isEmpty()) {
++        XShapeCombineMask(display, xcb_window(),
++                          ShapeBounding, 0, 0,
++                          None, ShapeSet);
++    } else {
++        XShapeCombineRegion(display, xcb_window(),
++                            ShapeBounding, 0, 0,
++                            qRegionToX11Region(region), ShapeSet);
++    }
++}
++
++#endif // XCB_USE_XLIB && !QT_NO_SHAPE
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/xcb/qxcbwindow.h b/src/plugins/platforms/xcb/qxcbwindow.h
+index d383248..0c4ec34 100644
+--- a/src/plugins/platforms/xcb/qxcbwindow.h
++++ b/src/plugins/platforms/xcb/qxcbwindow.h
+@@ -109,6 +109,10 @@ public:
+ 
+     bool startSystemResize(const QPoint &pos, Qt::Corner corner);
+ 
++#if defined(XCB_USE_XLIB) && !defined(QT_NO_SHAPE)
++    void setMask(const QRegion &region);
++#endif // XCB_USE_XLIB && !QT_NO_SHAPE
++
+     xcb_window_t xcb_window() const { return m_window; }
+     uint depth() const { return m_depth; }
+     QImage::Format imageFormat() const { return m_imageFormat; }
+diff --git a/src/plugins/platforms/xcb/xcb.pro b/src/plugins/platforms/xcb/xcb.pro
+index 210b770..8e6fbc6 100644
+--- a/src/plugins/platforms/xcb/xcb.pro
++++ b/src/plugins/platforms/xcb/xcb.pro
+@@ -45,6 +45,7 @@ contains(QT_CONFIG, xcb-poll-for-queued-event) {
+ # needed by GLX, Xcursor, XLookupString, ...
+ contains(QT_CONFIG, xcb-xlib) {
+     DEFINES += XCB_USE_XLIB
++    !contains(DEFINES, QT_NO_SHAPE):LIBS += -lXext
+     LIBS += -lX11 -lX11-xcb
+ 
+     linux-g++-maemo {
+diff --git a/src/widgets/kernel/qwidget_qpa.cpp b/src/widgets/kernel/qwidget_qpa.cpp
+index 04bf0be..387ed2e 100644
+--- a/src/widgets/kernel/qwidget_qpa.cpp
++++ b/src/widgets/kernel/qwidget_qpa.cpp
+@@ -50,6 +50,7 @@
+ #include <qpa/qplatformwindow.h>
+ #include "QtGui/qsurfaceformat.h"
+ #include <qpa/qplatformopenglcontext.h>
++#include <qpa/qplatformintegration.h>
+ #include "QtGui/private/qwindow_p.h"
+ 
+ #include <qpa/qplatformcursor.h>
+@@ -929,10 +930,24 @@ void QWidgetPrivate::registerDropSite(bool on)
+     Q_UNUSED(on);
+ }
+ 
+-void QWidgetPrivate::setMask_sys(const QRegion &region)
++void QWidgetPrivate::setMask_sys(const QRegion &regionIn)
+ {
+-    Q_UNUSED(region);
+-    // XXX
++    if (!QGuiApplicationPrivate::platformIntegration()->hasCapability(QPlatformIntegration::WindowMasks)) {
++        qWarning("%s: Not supported on %s.", Q_FUNC_INFO, qPrintable(QGuiApplication::platformName()));
++        return;
++    }
++    Q_Q(QWidget);
++    QRegion region = regionIn;
++    QWindow *window = q->windowHandle();
++    if (!window) {
++        if (QWidget *nativeParent = q->nativeParentWidget()) {
++            window = nativeParent->windowHandle();
++            region.translate(q->mapTo(nativeParent, QPoint(0, 0)));
++        }
++    }
++    if (window)
++        if (QPlatformWindow *platformWindow = window->handle())
++            platformWindow->setMask(region);
+ }
+ 
+ void QWidgetPrivate::updateFrameStrut()

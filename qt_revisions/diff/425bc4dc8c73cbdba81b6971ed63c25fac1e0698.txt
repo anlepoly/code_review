@@ -1,0 +1,410 @@
+diff --git a/src/multimedia/video/qabstractvideobuffer.cpp b/src/multimedia/video/qabstractvideobuffer.cpp
+index 0257228..ee64aeb 100644
+--- a/src/multimedia/video/qabstractvideobuffer.cpp
++++ b/src/multimedia/video/qabstractvideobuffer.cpp
+@@ -68,11 +68,16 @@ namespace
+     \inmodule QtMultimedia
+ 
+     The QVideoFrame class makes use of a QAbstractVideoBuffer internally to reference a buffer of
+-    video data.  Creating a subclass of QAbstractVideoBuffer will allow you to construct video
+-    frames from preallocated or static buffers.
++    video data.  Quite often video data buffers may reside in video memory rather than system
++    memory, and this class provides an abstraction of the location.
++
++    In addition, creating a subclass of QAbstractVideoBuffer will allow you to construct video
++    frames from preallocated or static buffers, in cases where the QVideoFrame constructors
++    taking a QByteArray or a QImage do not suffice.  This may be necessary when implementing
++    a new hardware accelerated video system, for example.
+ 
+     The contents of a buffer can be accessed by mapping the buffer to memory using the map()
+-    function which returns a pointer to memory containing the contents of the the video buffer.
++    function, which returns a pointer to memory containing the contents of the the video buffer.
+     The memory returned by map() is released by calling the unmap() function.
+ 
+     The handle() of a buffer may also be used to manipulate its contents using type specific APIs.
+@@ -99,15 +104,15 @@ namespace
+ /*!
+     \enum QAbstractVideoBuffer::MapMode
+ 
+-    Enumerates how a video buffer's data is mapped to memory.
++    Enumerates how a video buffer's data is mapped to system memory.
+ 
+-    \value NotMapped The video buffer has is not mapped to memory.
++    \value NotMapped The video buffer is not mapped to memory.
+     \value ReadOnly The mapped memory is populated with data from the video buffer when mapped, but
+     the content of the mapped memory may be discarded when unmapped.
+-    \value WriteOnly The mapped memory is uninitialized when mapped, and the content will be used to
+-    populate the video buffer when unmapped.
++    \value WriteOnly The mapped memory is uninitialized when mapped, but the possibly modified content
++    will be used to populate the video buffer when unmapped.
+     \value ReadWrite The mapped memory is populated with data from the video buffer, and the
+-    video buffer is repopulated with the content of the mapped memory.
++    video buffer is repopulated with the content of the mapped memory when it is unmapped.
+ 
+     \sa mapMode(), map()
+ */
+@@ -167,23 +172,25 @@ QAbstractVideoBuffer::HandleType QAbstractVideoBuffer::handleType() const
+ 
+     Maps the contents of a video buffer to memory.
+ 
++    In some cases the video buffer might be stored in video memory or otherwise inaccessible
++    memory, so it is necessary to map the buffer before accessing the pixel data.  This may involve
++    copying the contents around, so avoid mapping and unmapping unless required.
++
+     The map \a mode indicates whether the contents of the mapped memory should be read from and/or
+-    written to the buffer.  If the map mode includes the QAbstractVideoBuffer::ReadOnly flag the
+-    mapped memory will be populated with the content of the video buffer when mapped.  If the map
+-    mode includes the QAbstractVideoBuffer::WriteOnly flag the content of the mapped memory will be
+-    persisted in the buffer when unmapped.
++    written to the buffer.  If the map mode includes the \c QAbstractVideoBuffer::ReadOnly flag the
++    mapped memory will be populated with the content of the buffer when initially mapped.  If the map
++    mode includes the \c QAbstractVideoBuffer::WriteOnly flag the content of the possibly modified
++    mapped memory will be written back to the buffer when unmapped.
+ 
+     When access to the data is no longer needed be sure to call the unmap() function to release the
+-    mapped memory.
++    mapped memory and possibly update the buffer contents.
+ 
+     Returns a pointer to the mapped memory region, or a null pointer if the mapping failed.  The
+     size in bytes of the mapped memory region is returned in \a numBytes, and the line stride in \a
+     bytesPerLine.
+ 
+-    When access to the data is no longer needed be sure to unmap() the buffer.
+-
+     \note Writing to memory that is mapped as read-only is undefined, and may result in changes
+-    to shared data.
++    to shared data or crashes.
+ 
+     \since 1.0
+     \sa unmap(), mapMode()
+@@ -192,10 +199,10 @@ QAbstractVideoBuffer::HandleType QAbstractVideoBuffer::handleType() const
+ /*!
+     \fn QAbstractVideoBuffer::unmap()
+ 
+-    Releases the memory mapped by the map() function
++    Releases the memory mapped by the map() function.
+ 
+-    If the \l {QAbstractVideoBuffer::MapMode}{MapMode} included the QAbstractVideoBuffer::WriteOnly
+-    flag this will persist the current content of the mapped memory to the video frame.
++    If the \l {QAbstractVideoBuffer::MapMode}{MapMode} included the \c QAbstractVideoBuffer::WriteOnly
++    flag this will write the current content of the mapped memory back to the video frame.
+ 
+     \since 1.0
+     \sa map()
+diff --git a/src/multimedia/video/qabstractvideosurface.cpp b/src/multimedia/video/qabstractvideosurface.cpp
+index 31fd9c1..63ffc14 100644
+--- a/src/multimedia/video/qabstractvideosurface.cpp
++++ b/src/multimedia/video/qabstractvideosurface.cpp
+@@ -84,12 +84,15 @@ public:
+     \since 1.0
+     \inmodule QtMultimedia
+ 
+-    A video surface presents a continuous stream of identically formatted frames, where the format
+-    of each frame is compatible with a stream format supplied when starting a presentation.
+-
+     The QAbstractVideoSurface class defines the standard interface that video producers use to
+-    inter-operate with video presentation surfaces.  It is not supposed to be instantiated directly.
+-    Instead, you should subclass it to create new video surfaces.
++    inter-operate with video presentation surfaces.  You can subclass this interface to receive
++    video frames from sources like \l {QMediaPlayer}{decoded media} or \l {QCamera}{cameras} to
++    perform your own processing.
++
++    A video surface presents a continuous stream of identically formatted QVideoFrame instances, where the format
++    of each frame is compatible with a stream format supplied when starting a presentation.  Each frame
++    may have timestamp information that can be used by the surface to decide when to display that
++    frame.
+ 
+     A list of pixel formats a surface can present is given by the supportedPixelFormats() function,
+     and the isFormatSupported() function will test if a video surface format is supported.  If a
+@@ -100,8 +103,25 @@ public:
+     The start() function takes a supported format and enables a video surface.  Once started a
+     surface will begin displaying the frames it receives in the present() function.  Surfaces may
+     hold a reference to the buffer of a presented video frame until a new frame is presented or
+-    streaming is stopped. The stop() function will disable a surface and a release any video
+-    buffers it holds references to.
++    streaming is stopped.  In addition, a video surface may hold a reference to a video frame
++    until the \l {QVideoFrame::endTime()}{end timestamp} has passed.  The stop() function will
++    disable a surface and release any video buffers it holds references to.
++
++    \section2 Implementing a subclass of QAbstractVideoSurface
++
++    When implementing a subclass of this interface, there are only a handful of functions to
++    implement, broken down into two classes:
++
++    \list
++    \o Format related
++    \o Presentation related
++    \endlist
++
++    For format related functionality, you just have to describe the pixel formats that you
++    support (and the nearestFormat() function).  For presentation related functionality, you
++    have to implement the present() function, and the start() and stop() functions.
++
++    \note You must call the base class implementation of start() and stop() in your implementation.
+ */
+ 
+ /*!
+@@ -207,6 +227,7 @@ QVideoSurfaceFormat QAbstractVideoSurface::surfaceFormat() const
+ 
+     Returns true if the surface was started, and false if an error occurred.
+ 
++    \note You must call the base class implementation of start() at the end of your implementation.
+     \since 1.0
+     \sa isActive(), stop()
+ */
+@@ -230,6 +251,7 @@ bool QAbstractVideoSurface::start(const QVideoSurfaceFormat &format)
+ /*!
+     Stops a video surface presenting frames and releases any resources acquired in start().
+ 
++    \note You must call the base class implementation of stop() at the start of your implementation.
+     \since 1.0
+     \sa isActive(), start()
+ */
+@@ -278,7 +300,7 @@ bool QAbstractVideoSurface::isActive() const
+     completed.  In such cases the surface may not return to a ready state until it has had an
+     opportunity to process events.
+ 
+-    If present() fails for any other reason the surface will immediately enter the stopped state
++    If present() fails for any other reason the surface should immediately enter the stopped state
+     and an error() value will be set.
+ 
+     A video surface must be in the started state for present() to succeed, and the format of the
+@@ -304,6 +326,9 @@ QAbstractVideoSurface::Error QAbstractVideoSurface::error() const
+ 
+ /*!
+     Sets the value of error() to \a error.
++
++    This can be called by implementors of this interface to communicate
++    what the most recent error was.
+     \since 1.0
+ */
+ void QAbstractVideoSurface::setError(Error error)
+@@ -330,6 +355,9 @@ QSize QAbstractVideoSurface::nativeResolution() const
+ 
+ /*!
+     Set the video surface native \a resolution.
++
++    This function can be called by implementors of this interface to specify
++    to frame producers what the native resolution of this surface is.
+     \since 1.1
+  */
+ void QAbstractVideoSurface::setNativeResolution(const QSize &resolution)
+diff --git a/src/multimedia/video/qimagevideobuffer.cpp b/src/multimedia/video/qimagevideobuffer.cpp
+index 7fdaaab..a79396c 100644
+--- a/src/multimedia/video/qimagevideobuffer.cpp
++++ b/src/multimedia/video/qimagevideobuffer.cpp
+@@ -48,6 +48,12 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++/*!
++ * \class QImageVideoBuffer
++ * \internal
++ *
++ * A video buffer class for a QImage.
++ */
+ class QImageVideoBufferPrivate : public QAbstractVideoBufferPrivate
+ {
+ public:
+diff --git a/src/multimedia/video/qvideoframe.cpp b/src/multimedia/video/qvideoframe.cpp
+index a498140..687716a 100644
+--- a/src/multimedia/video/qvideoframe.cpp
++++ b/src/multimedia/video/qvideoframe.cpp
+@@ -122,23 +122,33 @@ private:
+ 
+ /*!
+     \class QVideoFrame
+-    \brief The QVideoFrame class provides a representation of a frame of video data.
++    \brief The QVideoFrame class represents a frame of video data.
+     \since 1.0
+     \inmodule QtMultimedia
+ 
+-    A QVideoFrame encapsulates the data of a video frame, and information about the frame.
++    A QVideoFrame encapsulates the pixel data of a video frame, and information about the frame.
+ 
+-    The contents of a video frame can be mapped to memory using the map() function.  While
++    Video frames can come from several places - decoded \l {QMediaPlayer}{media}, a
++    \l {QCamera}{camera}, or generated programmatically.  The way pixels are described in these
++    frames can vary greatly, and some pixel formats offer greater compression opportunities at
++    the expense of ease of use.
++
++    The pixel contents of a video frame can be mapped to memory using the map() function.  While
+     mapped, the video data can accessed using the bits() function, which returns a pointer to a
+-    buffer.  The total size of this buffer is given by the mappedBytes() function, and the size of each line is given
+-    by bytesPerLine().  The return value of the handle() function may be used to access frame data
+-    using the internal buffer's native APIs.
++    buffer.  The total size of this buffer is given by the mappedBytes() function, and the size of
++    each line is given by bytesPerLine().  The return value of the handle() function may also be
++    used to access frame data using the internal buffer's native APIs (for example - an OpenGL
++    texture handle).
++
++    A video frame can also have timestamp information associated with it.  These timestamps can be
++    used by an implementation of \l QAbstractVideoSurface to determine when to start and stop
++    displaying the frame, but not all surfaces might respect this setting.
+ 
+-    The video data in a QVideoFrame is encapsulated in a QAbstractVideoBuffer.  A QVideoFrame
++    The video pixel data in a QVideoFrame is encapsulated in a QAbstractVideoBuffer.  A QVideoFrame
+     may be constructed from any buffer type by subclassing the QAbstractVideoBuffer class.
+ 
+-    \note QVideoFrame is explicitly shared, any change made to video frame will also apply to any
+-    copies.
++    \note Since video frames can be expensive to copy, QVideoFrame is explicitly shared, so any
++    change made to a video frame will also apply to any copies.
+ */
+ 
+ /*!
+@@ -174,10 +184,10 @@ private:
+     QImage::Format_RGB555.
+ 
+     \value Format_ARGB8565_Premultiplied
+-    The frame is stored using a 24-bit premultiplied ARGB format (8-6-6-5).
++    The frame is stored using a 24-bit premultiplied ARGB format (8-5-6-5).
+ 
+     \value Format_BGRA32
+-    The frame is stored using a 32-bit ARGB format (0xBBGGRRAA).
++    The frame is stored using a 32-bit BGRA format (0xBBGGRRAA).
+ 
+     \value Format_BGRA32_Premultiplied
+     The frame is stored using a premultiplied 32bit BGRA format.
+@@ -345,7 +355,8 @@ QVideoFrame::QVideoFrame(const QImage &image)
+ }
+ 
+ /*!
+-    Constructs a copy of \a other.
++    Constructs a shallow copy of \a other.  Since QVideoFrame is
++    explicitly shared, these two instances will reflect the same frame.
+ 
+     \since 1.0
+ */
+@@ -355,7 +366,9 @@ QVideoFrame::QVideoFrame(const QVideoFrame &other)
+ }
+ 
+ /*!
+-    Assigns the contents of \a other to a video frame.
++    Assigns the contents of \a other to this video frame.  Since QVideoFrame is
++    explicitly shared, these two instances will reflect the same frame.
++
+     \since 1.0
+ */
+ QVideoFrame &QVideoFrame::operator =(const QVideoFrame &other)
+@@ -518,24 +531,32 @@ QAbstractVideoBuffer::MapMode QVideoFrame::mapMode() const
+ }
+ 
+ /*!
+-    Maps the contents of a video frame to memory.
++    Maps the contents of a video frame to system (CPU addressable) memory.
++
++    In some cases the video frame data might be stored in video memory or otherwise inaccessible
++    memory, so it is necessary to map a frame before accessing the pixel data.  This may involve
++    copying the contents around, so avoid mapping and unmapping unless required.
+ 
+     The map \a mode indicates whether the contents of the mapped memory should be read from and/or
+-    written to the frame.  If the map mode includes the QAbstractVideoBuffer::ReadOnly flag the
+-    mapped memory will be populated with the content of the video frame when mapped.  If the map
+-    mode inclues the QAbstractVideoBuffer::WriteOnly flag the content of the mapped memory will be
+-    persisted in the frame when unmapped.
++    written to the frame.  If the map mode includes the \c QAbstractVideoBuffer::ReadOnly flag the
++    mapped memory will be populated with the content of the video frame when initially mapped.  If the map
++    mode includes the \c QAbstractVideoBuffer::WriteOnly flag the content of the possibly modified
++    mapped memory will be written back to the frame when unmapped.
+ 
+     While mapped the contents of a video frame can be accessed directly through the pointer returned
+     by the bits() function.
+ 
+-    When access to the data is no longer needed be sure to call the unmap() function to release the
++    When access to the data is no longer needed, be sure to call the unmap() function to release the
+     mapped memory and possibly update the video frame contents.
+ 
+-    If the video frame is mapped in read only mode, it's allowed to map it for reading again,
+-    in all the other cases it's necessary to unmap the frame first.
++    If the video frame has been mapped in read only mode, it is permissible to map it
++    multiple times in read only mode (and unmap it a corresponding number of times). In all
++    other cases it is necessary to unmap the frame first before mapping a second time.
++
++    \note Writing to memory that is mapped as read-only is undefined, and may result in changes
++    to shared data or crashes.
+ 
+-    Returns true if the buffer was mapped to memory in the given \a mode and false otherwise.
++    Returns true if the frame was mapped to memory in the given \a mode and false otherwise.
+ 
+     \since 1.0
+     \sa unmap(), mapMode(), bits()
+@@ -612,8 +633,8 @@ void QVideoFrame::unmap()
+ /*!
+     Returns the number of bytes in a scan line.
+ 
+-    \note This is the bytes per line of the first plane only.  The bytes per line of subsequent
+-    planes should be calculated as per the frame type.
++    \note For planar formats this is the bytes per line of the first plane only.  The bytes per line of subsequent
++    planes should be calculated as per the frame \l{QVideoFrame::PixelFormat}{pixel format}.
+ 
+     This value is only valid while the frame data is \l {map()}{mapped}.
+ 
+@@ -631,7 +652,8 @@ int QVideoFrame::bytesPerLine() const
+     This value is only valid while the frame data is \l {map()}{mapped}.
+ 
+     Changes made to data accessed via this pointer (when mapped with write access)
+-    are only guaranteed to have been persisted when unmap() is called.
++    are only guaranteed to have been persisted when unmap() is called and when the
++    buffer has been mapped for writing.
+ 
+     \since 1.0
+     \sa map(), mappedBytes(), bytesPerLine()
+@@ -734,6 +756,9 @@ void QVideoFrame::setEndTime(qint64 time)
+ /*!
+     Returns a video pixel format equivalent to an image \a format.  If there is no equivalent
+     format QVideoFrame::InvalidType is returned instead.
++
++    \note In general \l QImage does not handle YUV formats.
++
+     \since 1.0
+ */
+ QVideoFrame::PixelFormat QVideoFrame::pixelFormatFromImageFormat(QImage::Format format)
+@@ -761,6 +786,9 @@ QVideoFrame::PixelFormat QVideoFrame::pixelFormatFromImageFormat(QImage::Format
+ /*!
+     Returns an image format equivalent to a video frame pixel \a format.  If there is no equivalent
+     format QImage::Format_Invalid is returned instead.
++
++    \note In general \l QImage does not handle YUV formats.
++
+     \since 1.0
+ */
+ QImage::Format QVideoFrame::imageFormatFromPixelFormat(PixelFormat format)
+diff --git a/src/multimedia/video/qvideosurfaceformat.cpp b/src/multimedia/video/qvideosurfaceformat.cpp
+index c557857..e93c4d9 100644
+--- a/src/multimedia/video/qvideosurfaceformat.cpp
++++ b/src/multimedia/video/qvideosurfaceformat.cpp
+@@ -279,7 +279,7 @@ bool QVideoSurfaceFormat::operator ==(const QVideoSurfaceFormat &other) const
+ }
+ 
+ /*!
+-    Returns true if \a other is different to a video format, and false if they are the same.
++    Returns true if \a other is different to this video format, and false if they are the same.
+     \since 1.0
+ */
+ bool QVideoSurfaceFormat::operator !=(const QVideoSurfaceFormat &other) const
+@@ -299,7 +299,7 @@ QVideoFrame::PixelFormat QVideoSurfaceFormat::pixelFormat() const
+ /*!
+     Returns the type of handle the surface uses to present the frame data.
+ 
+-    If the handle type is QAbstractVideoBuffer::NoHandle buffers with any handle type are valid
++    If the handle type is \c QAbstractVideoBuffer::NoHandle, buffers with any handle type are valid
+     provided they can be \l {QAbstractVideoBuffer::map()}{mapped} with the
+     QAbstractVideoBuffer::ReadOnly flag.  If the handleType() is not QAbstractVideoBuffer::NoHandle
+     then the handle type of the buffer must be the same as that of the surface format.
+diff --git a/src/multimedia/video/qvideosurfaceoutput.cpp b/src/multimedia/video/qvideosurfaceoutput.cpp
+index 1436f45..e5e5243 100644
+--- a/src/multimedia/video/qvideosurfaceoutput.cpp
++++ b/src/multimedia/video/qvideosurfaceoutput.cpp
+@@ -45,7 +45,10 @@
+ #include <qmediaservice.h>
+ #include <qvideorenderercontrol.h>
+ 
+-
++/*!
++ * \class QVideoSurfaceOutput
++ * \internal
++ */
+ QVideoSurfaceOutput::QVideoSurfaceOutput(QObject*parent)
+     :  QObject(parent)
+ {

@@ -1,0 +1,449 @@
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index 50fda6d..2434ef0 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -515,6 +515,9 @@ QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
+ 
+     aConnected.resize(metaData->aliasCount);
+     int list_type = qMetaTypeId<QQmlListProperty<QObject> >();
++    int qobject_type = qMetaTypeId<QObject*>();
++    int variant_type = qMetaTypeId<QVariant>();
++    bool needsGcCallback = (metaData->varPropertyCount > 0);
+ 
+     // ### Optimize
+     for (int ii = 0; ii < metaData->propertyCount - metaData->varPropertyCount; ++ii) {
+@@ -522,12 +525,20 @@ QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
+         if (t == list_type) {
+             listProperties.append(List(methodOffset() + ii, this));
+             data[ii].setValue(listProperties.count() - 1);
+-        } 
++        } else if (!needsGcCallback && (t == qobject_type || t == variant_type)) {
++            needsGcCallback = true;
++        }
+     }
+ 
+     firstVarPropertyIndex = metaData->propertyCount - metaData->varPropertyCount;
+-    if (metaData->varPropertyCount)
++
++    // both var properties and variant properties can keep references to
++    // other QObjects, and var properties can also keep references to
++    // JavaScript objects.  If we have any properties, we need to hook
++    // the gc() to ensure that references keep objects alive as needed.
++    if (needsGcCallback) {
+         QV8GCCallback::addGcCallbackNode(this);
++    }
+ }
+ 
+ QQmlVMEMetaObject::~QQmlVMEMetaObject()
+@@ -1121,9 +1132,26 @@ void QQmlVMEMetaObject::GcPrologueCallback(QV8GCCallback::Node *node)
+ {
+     QQmlVMEMetaObject *vmemo = static_cast<QQmlVMEMetaObject*>(node);
+     Q_ASSERT(vmemo);
+-    if (!vmemo->varPropertiesInitialized || vmemo->varProperties.IsEmpty() || !vmemo->ctxt || !vmemo->ctxt->engine)
++
++    if (!vmemo->ctxt || !vmemo->ctxt->engine)
+         return;
+     QQmlEnginePrivate *ep = QQmlEnginePrivate::get(vmemo->ctxt->engine);
++
++    // add references created by VMEVariant properties
++    int maxDataIdx = vmemo->metaData->propertyCount - vmemo->metaData->varPropertyCount;
++    for (int ii = 0; ii < maxDataIdx; ++ii) { // XXX TODO: optimise?
++        if (vmemo->data[ii].dataType() == QMetaType::QObjectStar) {
++            // possible QObject reference.
++            QObject *ref = vmemo->data[ii].asQObject();
++            if (ref) {
++                ep->v8engine()->addRelationshipForGC(vmemo->object, ref);
++            }
++        }
++    }
++
++    // add references created by var properties
++    if (!vmemo->varPropertiesInitialized || vmemo->varProperties.IsEmpty())
++        return;
+     ep->v8engine()->addRelationshipForGC(vmemo->object, vmemo->varProperties);
+ }
+ 
+diff --git a/src/qml/qml/v8/qv8engine.cpp b/src/qml/qml/v8/qv8engine.cpp
+index 85a2f1b..732a04d 100644
+--- a/src/qml/qml/v8/qv8engine.cpp
++++ b/src/qml/qml/v8/qv8engine.cpp
+@@ -836,7 +836,7 @@ v8::Persistent<v8::Object> *QV8Engine::findOwnerAndStrength(QObject *object, boo
+ 
+ void QV8Engine::addRelationshipForGC(QObject *object, v8::Persistent<v8::Value> handle)
+ {
+-    if (handle.IsEmpty())
++    if (!object || handle.IsEmpty())
+         return;
+ 
+     bool handleShouldBeStrong = false;
+@@ -850,14 +850,18 @@ void QV8Engine::addRelationshipForGC(QObject *object, v8::Persistent<v8::Value>
+ 
+ void QV8Engine::addRelationshipForGC(QObject *object, QObject *other)
+ {
++    if (!object || !other)
++        return;
++
+     bool handleShouldBeStrong = false;
+     v8::Persistent<v8::Object> *implicitOwner = findOwnerAndStrength(object, &handleShouldBeStrong);
+     v8::Persistent<v8::Value> handle = QQmlData::get(other, true)->v8object;
+-    if (handleShouldBeStrong) {
++    if (handle.IsEmpty()) // no JS data to keep alive.
++        return;
++    else if (handleShouldBeStrong)
+         v8::V8::AddImplicitReferences(m_strongReferencer, &handle, 1);
+-    } else if (!implicitOwner->IsEmpty()) {
++    else if (!implicitOwner->IsEmpty())
+         v8::V8::AddImplicitReferences(*implicitOwner, &handle, 1);
+-    }
+ }
+ 
+ static QThreadStorage<QV8Engine::ThreadData*> perThreadEngineData;
+diff --git a/tests/auto/qml/qqmlecmascript/data/HRMDPComponent.qml b/tests/auto/qml/qqmlecmascript/data/HRMDPComponent.qml
+new file mode 100644
+index 0000000..897fd99
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/HRMDPComponent.qml
+@@ -0,0 +1,15 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as QObjectApi
++
++Item {
++    property int variantCanary: 5
++    property var varCanary: 12
++
++    Component.onCompleted: {
++        QObjectApi.qobjectTestWritableProperty = 42;
++    }
++
++    Component.onDestruction: {
++        QObjectApi.qobjectTestWritableProperty = 43;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.2.qml b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.2.qml
+new file mode 100644
+index 0000000..00f09e1
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.2.qml
+@@ -0,0 +1,31 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as QObjectApi
++
++Item {
++    property bool success: true
++    property Item testProp: null
++
++    // first we create an object and reference it via a dynamic variant property
++    function createReference() {
++        var c = Qt.createComponent("HRMDPComponent.qml");
++        testProp = c.createObject(null); // QML ownership.
++    }
++
++    // after a gc, it should not have been collected.
++    function ensureReference() {
++        if (testProp == null) success = false;            // should not have triggered delete notify / zeroed testProp value
++        if (testProp.variantCanary != 5) success = false; // should not have deleted vmemo of object referenced by testProp
++        if (testProp.varCanary != 12) success = false;    // should not have collected vmemo vmeProperties
++        if (QObjectApi.qobjectTestWritableProperty != 42) success = false; // should not have been set to 43.
++    }
++
++    // then we remove the reference.
++    function removeReference() {
++        testProp = null; // allow original object to be released.
++    }
++
++    // after a gc (and deferred deletion process) the object should be gone
++    function ensureDeletion() {
++        if (QObjectApi.qobjectTestWritableProperty != 43) success = false; // should have been set to 43.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.3.qml b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.3.qml
+new file mode 100644
+index 0000000..57fee63
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.3.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as QObjectApi
++
++Item {
++    property bool success: true
++    property Item testProp: null
++
++    // first we create an object and reference it via a dynamic variant property
++    function createReference() {
++        var c = Qt.createComponent("HRMDPComponent.qml");
++        testProp = c.createObject(null); // QML ownership.
++    }
++
++    // after a gc, it should not have been collected.
++    function ensureReference() {
++        if (testProp == null) success = false;            // should not have triggered delete notify / zeroed testProp value
++        if (testProp.variantCanary != 5) success = false; // should not have deleted vmemo of object referenced by testProp
++        if (testProp.varCanary != 12) success = false;    // should not have collected vmemo vmeProperties
++        if (QObjectApi.qobjectTestWritableProperty != 42) success = false; // should not have been set to 43.
++    }
++
++    // then we manually delete the item being referenced
++    function manuallyDelete() {
++        QObjectApi.deleteQObject(testProp);
++        if (QObjectApi.qobjectTestWritableProperty != 43) success = false; // should have been set to 43.
++    }
++
++    // after a gc (and deferred deletion process) the object should be gone
++    function ensureDeleted() {
++        // a crash should not have occurred during the previous gc due to the
++        // VMEMO attempting to keep a previously deleted QObject alive.
++        if (testProp != null) success = false; // delete notify should have zeroed testProp value.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.qml b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.qml
+new file mode 100644
+index 0000000..30dd4bc
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.dynprop.qml
+@@ -0,0 +1,31 @@
++import QtQuick 2.0
++import Qt.test.qobjectApi 1.0 as QObjectApi
++
++Item {
++    property bool success: true
++    property variant testProp: null
++
++    // first we create an object and reference it via a dynamic variant property
++    function createReference() {
++        var c = Qt.createComponent("HRMDPComponent.qml");
++        testProp = c.createObject(null); // QML ownership.
++    }
++
++    // after a gc, it should not have been collected.
++    function ensureReference() {
++        if (testProp == null) success = false;            // should not have triggered delete notify / zeroed testProp value
++        if (testProp.variantCanary != 5) success = false; // should not have deleted vmemo of object referenced by testProp
++        if (testProp.varCanary != 12) success = false;    // should not have collected vmemo vmeProperties
++        if (QObjectApi.qobjectTestWritableProperty != 42) success = false; // should not have been set to 43.
++    }
++
++    // then we remove the reference.
++    function removeReference() {
++        testProp = null; // allow original object to be released.
++    }
++
++    // after a gc (and deferred deletion process) the object should be gone
++    function ensureDeletion() {
++        if (QObjectApi.qobjectTestWritableProperty != 43) success = false; // should have been set to 43.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.handle.2.qml b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.handle.2.qml
+index 91edc44..d099913 100644
+--- a/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.handle.2.qml
++++ b/tests/auto/qml/qqmlecmascript/data/handleReferenceManagement.handle.2.qml
+@@ -17,6 +17,9 @@ Item {
+         first = crh.generate(crh);
+         second = crh.generate(crh);
+         // note: must manually reparent in unit test
+-        // after setting the handle references.
++        // after setting the handle references, and
++        // then set the "first" and "second" property
++        // values to null (removing references from obj
++        // to the generated objects).
+     }
+ }
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml
+index 0cae5c0..8a09414 100644
+--- a/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml
+@@ -7,16 +7,16 @@ Item {
+     property bool success: false
+     property bool c1HasBeenDestroyed: false
+ 
+-    property Item c1 // not a js reference, so won't keep it alive
+-
+     SignalEmittedComponent {
+         id: c2
+-        property int c1a: if (root.c1) root.c1.a; else 0; // will change during onDestruction handler of c1.
+         function c1aChangedHandler() {
+             // this should still be called, after c1 has been destroyed by gc,
+             // because the onDestruction handler of c1 will be triggered prior
+             // to when c1 will be invalidated.
+-            if (root.c1HasBeenDestroyed && c1a == 20) root.c1.setSuccessPropertyOf(root, true);
++            if (root.c1HasBeenDestroyed)
++                root.success = true;
++            // note: cannot call c1::setSuccessPropertyOf(root, true), since any
++            // reference to c1 would have kept c1 alive.  So, set it directly.
+         }
+     }
+ 
+@@ -24,11 +24,10 @@ Item {
+         // dynamically construct sibling.  When it goes out of scope, it should be gc'd.
+         // note that the gc() will call weakqobjectcallback which will set queued for
+         // deletion flag -- thus QQmlData::wasDeleted() will return true for that object..
+-        var c = Qt.createComponent("SignalEmittedComponent.qml", root);
+-        var o = c.createObject(null); // JS ownership
+-        o.onAChanged.connect(c2.c1aChangedHandler);
+-        c1 = o;
+-        c1HasBeenDestroyed = true;
++        var comp = Qt.createComponent("SignalEmittedComponent.qml", root);
++        var c1 = comp.createObject(null); // JS ownership
++        c1.onAChanged.connect(c2.c1aChangedHandler);
++        c1HasBeenDestroyed = true; // gc will collect c1.
+         // return to event loop.
+     }
+ }
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml
+index e7dc024..764ed6e 100644
+--- a/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml
+@@ -7,16 +7,14 @@ Item {
+     property bool success: false
+     property bool c1HasBeenDestroyed: false
+ 
+-    property Item c1 // not a js reference, so won't keep it alive
+-
+     SignalEmittedComponent {
+         id: c2
+-        property int c1a: if (root.c1) root.c1.a; else 0; // will change during onDestruction handler of c1.
+         function c1aChangedHandler() {
+             // this should still be called, after c1 has been destroyed by gc,
+             // because the onDestruction handler of c1 will be triggered prior
+             // to when c1 will be invalidated.
+-            if (root.c1HasBeenDestroyed && c1a == 20) root.c1.setSuccessPropertyOf(root, true);
++            if (root.c1HasBeenDestroyed)
++                root.success = true;
+         }
+     }
+ 
+@@ -24,11 +22,10 @@ Item {
+         // dynamically construct sibling.  When it goes out of scope, it should be gc'd.
+         // note that the gc() will call weakqobjectcallback which will set queued for
+         // deletion flag -- thus QQmlData::wasDeleted() will return true for that object..
+-        var c = Qt.createComponent("SignalEmittedComponent.qml", root);
+-        var o = c.createObject(null); // JS ownership
+-        o.onAChanged.connect(c2.c1aChangedHandler);
+-        c1 = o;
+-        c1HasBeenDestroyed = true;
++        var comp = Qt.createComponent("SignalEmittedComponent.qml", root);
++        var c1 = comp.createObject(null); // JS ownership
++        c1.onAChanged.connect(c2.c1aChangedHandler);
++        c1HasBeenDestroyed = true; // gc will collect c1.
+         // return to event loop.
+     }
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index 8e2b68f..3c12264 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1052,6 +1052,8 @@ public:
+             return ddata->indestructible?false:true;
+     }
+ 
++    Q_INVOKABLE void deleteQObject(QObject *obj) { delete obj; }
++
+ signals:
+     void qobjectTestPropertyChanged(int testProperty);
+     void qobjectTestWritablePropertyChanged(int testWritableProperty);
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index a460206..ff23826 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -4819,11 +4819,13 @@ void tst_qqmlecmascript::handleReferenceManagement()
+         QVERIFY(second != 0);
+         first->addReference(QQmlData::get(second)->v8object); // create circular reference
+         second->addReference(QQmlData::get(first)->v8object); // note: must be weak.
+-        // now we have to reparent and change ownership.
++        // now we have to reparent and change ownership, and unset the property references.
+         first->setParent(0);
+         second->setParent(0);
+         QQmlEngine::setObjectOwnership(first, QQmlEngine::JavaScriptOwnership);
+         QQmlEngine::setObjectOwnership(second, QQmlEngine::JavaScriptOwnership);
++        object->setProperty("first", QVariant::fromValue<QObject*>(0));
++        object->setProperty("second", QVariant::fromValue<QObject*>(0));
+         gc(engine);
+         QCOMPARE(dtorCount, 2); // despite circular references, both will be collected.
+         delete object;
+@@ -4912,7 +4914,7 @@ void tst_qqmlecmascript::handleReferenceManagement()
+         second1->addReference(QQmlData::get(second2)->v8object); // create linear reference across engines
+         second2->addReference(QQmlData::get(first2)->v8object);  // create linear reference within engine2
+         first2->addReference(QQmlData::get(first1)->v8object);   // close the loop - circular ref across engines
+-        // now we have to reparent and change ownership to JS.
++        // now we have to reparent and change ownership to JS, and remove property references.
+         first1->setParent(0);
+         second1->setParent(0);
+         first2->setParent(0);
+@@ -4921,6 +4923,10 @@ void tst_qqmlecmascript::handleReferenceManagement()
+         QQmlEngine::setObjectOwnership(second1, QQmlEngine::JavaScriptOwnership);
+         QQmlEngine::setObjectOwnership(first2, QQmlEngine::JavaScriptOwnership);
+         QQmlEngine::setObjectOwnership(second2, QQmlEngine::JavaScriptOwnership);
++        object1->setProperty("first", QVariant::fromValue<QObject*>(0));
++        object1->setProperty("second", QVariant::fromValue<QObject*>(0));
++        object2->setProperty("first", QVariant::fromValue<QObject*>(0));
++        object2->setProperty("second", QVariant::fromValue<QObject*>(0));
+         gc(engine);
+         QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
+         QCoreApplication::processEvents();
+@@ -4989,6 +4995,57 @@ void tst_qqmlecmascript::handleReferenceManagement()
+         QCoreApplication::processEvents();
+         QCOMPARE(dtorCount, 6); // all objects should have been cleaned up prior to deleting hrmEngine1.
+     }
++
++    {
++        // Dynamic variant property reference keeps target alive
++        QQmlEngine hrmEngine;
++        QQmlComponent component(&hrmEngine, testFileUrl("handleReferenceManagement.dynprop.qml"));
++        QObject *object = component.create();
++        QVERIFY(object != 0);
++        QMetaObject::invokeMethod(object, "createReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "removeReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureDeletion");
++        QCOMPARE(object->property("success").toBool(), true);
++        delete object;
++    }
++
++    {
++        // Dynamic Item property reference keeps target alive
++        QQmlEngine hrmEngine;
++        QQmlComponent component(&hrmEngine, testFileUrl("handleReferenceManagement.dynprop.2.qml"));
++        QObject *object = component.create();
++        QVERIFY(object != 0);
++        QMetaObject::invokeMethod(object, "createReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "removeReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureDeletion");
++        QCOMPARE(object->property("success").toBool(), true);
++        delete object;
++    }
++
++    {
++        // Item property reference to deleted item doesn't crash
++        QQmlEngine hrmEngine;
++        QQmlComponent component(&hrmEngine, testFileUrl("handleReferenceManagement.dynprop.3.qml"));
++        QObject *object = component.create();
++        QVERIFY(object != 0);
++        QMetaObject::invokeMethod(object, "createReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureReference");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "manuallyDelete");
++        gc(engine);
++        QMetaObject::invokeMethod(object, "ensureDeleted");
++        QCOMPARE(object->property("success").toBool(), true);
++        delete object;
++    }
+ }
+ 
+ void tst_qqmlecmascript::stringArg()
+@@ -6828,7 +6885,7 @@ void tst_qqmlecmascript::signalEmitted()
+         QVERIFY(obj != 0);
+         gc(engine); // should collect c1.
+         QMetaObject::invokeMethod(obj, "destroyC2");
+-        QTRY_VERIFY(obj->property("success").toBool());
++        QTRY_VERIFY(obj->property("success").toBool()); // handles events (incl. delete later).
+         delete obj;
+     }
+ }

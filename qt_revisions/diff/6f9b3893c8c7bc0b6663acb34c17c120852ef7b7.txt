@@ -1,0 +1,352 @@
+diff --git a/src/qml/debugger/qqmldebugservice.cpp b/src/qml/debugger/qqmldebugservice.cpp
+index 76847e5..57d5a71 100644
+--- a/src/qml/debugger/qqmldebugservice.cpp
++++ b/src/qml/debugger/qqmldebugservice.cpp
+@@ -42,9 +42,12 @@
+ #include "qqmldebugservice_p.h"
+ #include "qqmldebugservice_p_p.h"
+ #include "qqmldebugserver_p.h"
++#include <private/qqmldata_p.h>
++#include <private/qqmlcontext_p.h>
+ 
+ #include <QtCore/QDebug>
+ #include <QtCore/QStringList>
++#include <QtCore/QFileInfo>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -202,6 +205,38 @@ QObject *QQmlDebugService::objectForId(int id)
+     }
+ }
+ 
++/*!
++    Returns a list of objects matching the given filename, line and column.
++*/
++QList<QObject*> QQmlDebugService::objectForLocationInfo(const QString &filename,
++                                                 int lineNumber, int columnNumber)
++{
++    ObjectReferenceHash *hash = objectReferenceHash();
++    QList<QObject*> objects;
++    QHash<int, QObject *>::Iterator iter;
++    for (iter = hash->ids.begin(); iter != hash->ids.end(); ++iter) {
++        QQmlData *ddata = QQmlData::get(iter.value());
++        if (!ddata || !ddata->outerContext)
++            continue;
++        //column number may be different due to qmlrewriter
++        if (QFileInfo(ddata->outerContext->urlString).fileName() == filename &&
++                ddata->lineNumber == lineNumber &&
++                ddata->columnNumber >= columnNumber) {
++            QHash<QObject *, ObjectReference>::Iterator objIter =
++                    hash->objects.find(*iter);
++            Q_ASSERT(objIter != hash->objects.end());
++
++            if (objIter->object == 0) {
++                hash->ids.erase(iter);
++                hash->objects.erase(objIter);
++            } else {
++                objects << *iter;
++            }
++        }
++    }
++    return objects;
++}
++
+ bool QQmlDebugService::isDebuggingEnabled()
+ {
+     return QQmlDebugServer::instance() != 0;
+diff --git a/src/qml/debugger/qqmldebugservice_p.h b/src/qml/debugger/qqmldebugservice_p.h
+index f092b6c..6e99f93 100644
+--- a/src/qml/debugger/qqmldebugservice_p.h
++++ b/src/qml/debugger/qqmldebugservice_p.h
+@@ -85,6 +85,8 @@ public:
+ 
+     static int idForObject(QObject *);
+     static QObject *objectForId(int);
++    static QList<QObject*> objectForLocationInfo(const QString &filename,
++                                          int lineNumber, int columnNumber);
+ 
+     static QString objectToString(QObject *obj);
+ 
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 21e9d67..f948c04 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -305,6 +305,14 @@ void QQmlEngineDebugService::prepareDeferredObjects(QObject *obj)
+ 
+ }
+ 
++void QQmlEngineDebugService::storeObjectIds(QObject *co)
++{
++    QQmlDebugService::idForObject(co);
++    QObjectList children = co->children();
++    for (int ii = 0; ii < children.count(); ++ii)
++        storeObjectIds(children.at(ii));
++}
++
+ void QQmlEngineDebugService::buildObjectList(QDataStream &message,
+                                              QQmlContext *ctxt,
+                                              const QList<QPointer<QObject> > &instances)
+@@ -313,6 +321,8 @@ void QQmlEngineDebugService::buildObjectList(QDataStream &message,
+ 
+     QString ctxtName = ctxt->objectName();
+     int ctxtId = QQmlDebugService::idForObject(ctxt);
++    if (ctxt->contextObject())
++        storeObjectIds(ctxt->contextObject());
+ 
+     message << ctxtName << ctxtId;
+ 
+@@ -463,6 +473,27 @@ void QQmlEngineDebugService::processMessage(const QByteArray &message)
+             buildObjectDump(rs, object, recurse, dumpProperties);
+         }
+ 
++    } else if (type == "FETCH_OBJECTS_FOR_LOCATION") {
++        QString file;
++        int lineNumber;
++        int columnNumber;
++        bool recurse;
++        bool dumpProperties = true;
++
++        ds >> file >> lineNumber >> columnNumber >> recurse >> dumpProperties;
++
++        QList<QObject*> objects = QQmlDebugService::objectForLocationInfo(
++                                file, lineNumber, columnNumber);
++
++        rs << QByteArray("FETCH_OBJECTS_FOR_LOCATION_R") << queryId
++           << objects.count();
++
++        foreach (QObject *object, objects) {
++            if (recurse)
++                prepareDeferredObjects(object);
++            buildObjectDump(rs, object, recurse, dumpProperties);
++        }
++
+     } else if (type == "WATCH_OBJECT") {
+         int objectId;
+ 
+diff --git a/src/qml/debugger/qqmlenginedebugservice_p.h b/src/qml/debugger/qqmlenginedebugservice_p.h
+index 3b855cb..7ece25b 100644
+--- a/src/qml/debugger/qqmlenginedebugservice_p.h
++++ b/src/qml/debugger/qqmlenginedebugservice_p.h
+@@ -123,6 +123,7 @@ private:
+     bool setBinding(int objectId, const QString &propertyName, const QVariant &expression, bool isLiteralValue, QString filename = QString(), int line = -1, int column = 0);
+     bool resetBinding(int objectId, const QString &propertyName);
+     bool setMethodBody(int objectId, const QString &method, const QString &body);
++    void storeObjectIds(QObject *co);
+ 
+     QList<QQmlEngine *> m_engines;
+     QQmlWatcher *m_watch;
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.cpp b/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.cpp
+index eb04fb2..3807cf5 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.cpp
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.cpp
+@@ -217,6 +217,24 @@ quint32 QQmlEngineDebugClient::queryObject(
+     return id;
+ }
+ 
++quint32 QQmlEngineDebugClient::queryObjectsForLocation(
++        const QString &file, int lineNumber, int columnNumber, bool *success)
++{
++    m_objects.clear();
++    quint32 id;
++    *success = false;
++    if (state() == QQmlDebugClient::Enabled) {
++        id = getId();
++        QByteArray message;
++        QDataStream ds(&message, QIODevice::WriteOnly);
++        ds << QByteArray("FETCH_OBJECTS_FOR_LOCATION") << id << file << lineNumber
++           << columnNumber << false << true;
++        sendMessage(message);
++        *success = true;
++    }
++    return id;
++}
++
+ quint32 QQmlEngineDebugClient::queryObjectRecursive(
+         const QmlDebugObjectReference &object, bool *success)
+ {
+@@ -235,6 +253,24 @@ quint32 QQmlEngineDebugClient::queryObjectRecursive(
+     return id;
+ }
+ 
++quint32 QQmlEngineDebugClient::queryObjectsForLocationRecursive(const QString &file,
++        int lineNumber, int columnNumber, bool *success)
++{
++     m_objects.clear();
++    quint32 id;
++    *success = false;
++    if (state() == QQmlDebugClient::Enabled) {
++        id = getId();
++        QByteArray message;
++        QDataStream ds(&message, QIODevice::WriteOnly);
++        ds << QByteArray("FETCH_OBJECTS_FOR_LOCATION") << id << file << lineNumber
++           << columnNumber << true << true;
++        sendMessage(message);
++        *success = true;
++    }
++    return id;
++}
++
+ quint32 QQmlEngineDebugClient::queryExpressionResult(
+         int objectDebugId, const QString &expr, bool *success)
+ {
+@@ -390,6 +426,19 @@ void QQmlEngineDebugClient::decode(QDataStream &ds,
+ }
+ 
+ void QQmlEngineDebugClient::decode(QDataStream &ds,
++                                   QList<QmlDebugObjectReference> &o,
++                                   bool simple)
++{
++    int count;
++    ds >> count;
++    for (int i = 0; i < count; i++) {
++        QmlDebugObjectReference obj;
++        decode(ds, obj, simple);
++        o << obj;
++    }
++}
++
++void QQmlEngineDebugClient::decode(QDataStream &ds,
+                                    QmlDebugContextReference &c)
+ {
+     ds >> c.name >> c.debugId;
+@@ -443,6 +492,10 @@ void QQmlEngineDebugClient::messageReceived(const QByteArray &data)
+         if (!ds.atEnd())
+             decode(ds, m_object, false);
+ 
++    } else if (type == "FETCH_OBJECTS_FOR_LOCATION_R") {
++        if (!ds.atEnd())
++            decode(ds, m_objects, false);
++
+     } else if (type == "EVAL_EXPRESSION_R") {;
+         ds >> m_exprResult;
+ 
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.h b/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.h
+index 34d4e97..be96575 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.h
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/qqmlenginedebugclient.h
+@@ -192,8 +192,12 @@ public:
+                               bool *success);
+     quint32 queryObject(const QmlDebugObjectReference &,
+                         bool *success);
++    quint32 queryObjectsForLocation(const QString &file,
++            int lineNumber, int columnNumber, bool *success);
+     quint32 queryObjectRecursive(const QmlDebugObjectReference &,
+                                  bool *success);
++    quint32 queryObjectsForLocationRecursive(const QString &file,
++            int lineNumber, int columnNumber, bool *success);
+     quint32 queryExpressionResult(int objectDebugId,
+                                   const QString &expr,
+                                   bool *success);
+@@ -213,10 +217,12 @@ public:
+ 
+     void decode(QDataStream &, QmlDebugContextReference &);
+     void decode(QDataStream &, QmlDebugObjectReference &, bool simple);
++    void decode(QDataStream &ds, QList<QmlDebugObjectReference> &o, bool simple);
+ 
+     QList<QmlDebugEngineReference> engines() { return m_engines; }
+     QmlDebugContextReference rootContext() { return m_rootContext; }
+     QmlDebugObjectReference object() { return m_object; }
++    QList<QmlDebugObjectReference> objects() { return m_objects; }
+     QVariant resultExpr() { return m_exprResult; }
+     bool valid() { return m_valid; }
+ 
+@@ -234,6 +240,7 @@ private:
+     QList<QmlDebugEngineReference> m_engines;
+     QmlDebugContextReference m_rootContext;
+     QmlDebugObjectReference m_object;
++    QList<QmlDebugObjectReference> m_objects;
+     QVariant m_exprResult;
+ };
+ 
+diff --git a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+index 17b22b4..3c57c36 100644
+--- a/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
++++ b/tests/auto/qml/debugger/qqmlenginedebugservice/tst_qqmlenginedebugservice.cpp
+@@ -118,6 +118,8 @@ private slots:
+     void queryRootContexts();
+     void queryObject();
+     void queryObject_data();
++    void queryObjectsForLocation();
++    void queryObjectsForLocation_data();
+     void queryExpressionResult();
+     void queryExpressionResult_data();
+     void queryExpressionResultInRootContext();
+@@ -688,6 +690,78 @@ void tst_QQmlEngineDebugService::queryObject_data()
+     QTest::newRow("recursive") << true;
+ }
+ 
++void tst_QQmlEngineDebugService::queryObjectsForLocation()
++{
++    QFETCH(bool, recursive);
++
++    bool success;
++
++    QmlDebugObjectReference rootObject = findRootObject();
++
++    const QString fileName = QFileInfo(rootObject.source.url.toString()).fileName();
++    int lineNumber = rootObject.source.lineNumber;
++    int columnNumber = rootObject.source.columnNumber;
++
++    QQmlEngineDebugClient *unconnected = new QQmlEngineDebugClient(0);
++    recursive ? unconnected->queryObjectsForLocationRecursive(fileName, lineNumber,
++                                                              columnNumber, &success)
++              : unconnected->queryObjectsForLocation(fileName, lineNumber,
++                                                     columnNumber, &success);
++    QVERIFY(!success);
++    delete unconnected;
++
++    recursive ? m_dbg->queryObjectsForLocationRecursive(fileName, lineNumber,
++                                                      columnNumber, &success)
++              : m_dbg->queryObjectsForLocation(fileName, lineNumber,
++                                             columnNumber, &success);
++    QVERIFY(success);
++    QVERIFY(QQmlDebugTest::waitForSignal(m_dbg, SIGNAL(result())));
++
++    QVERIFY(m_dbg->objects().count() == 1);
++    QmlDebugObjectReference obj = m_dbg->objects().first();
++
++    // check source as defined in main()
++    QmlDebugFileReference source = obj.source;
++    QCOMPARE(source.url, QUrl(fileName));
++    QCOMPARE(source.lineNumber, lineNumber);
++    QCOMPARE(source.columnNumber, columnNumber);
++
++    // generically test all properties, children and childrens' properties
++    recursiveObjectTest(m_rootItem, obj, recursive);
++
++    if (recursive) {
++        foreach (const QmlDebugObjectReference &child, obj.children)
++            QVERIFY(child.properties.count() > 0);
++
++        QmlDebugObjectReference rect;
++        QmlDebugObjectReference text;
++        foreach (const QmlDebugObjectReference &child, obj.children) {
++            if (child.className == "Rectangle")
++                rect = child;
++            else if (child.className == "Text")
++                text = child;
++        }
++
++        // test specific property values
++        QCOMPARE(findProperty(rect.properties, "width").value, qVariantFromValue(500));
++        QCOMPARE(findProperty(rect.properties, "height").value, qVariantFromValue(600));
++        QCOMPARE(findProperty(rect.properties, "color").value, qVariantFromValue(QColor("blue")));
++
++        QCOMPARE(findProperty(text.properties, "color").value, qVariantFromValue(QColor("blue")));
++    } else {
++        foreach (const QmlDebugObjectReference &child, obj.children)
++            QCOMPARE(child.properties.count(), 0);
++    }
++}
++
++void tst_QQmlEngineDebugService::queryObjectsForLocation_data()
++{
++    QTest::addColumn<bool>("recursive");
++
++    QTest::newRow("non-recursive") << false;
++    QTest::newRow("recursive") << true;
++}
++
+ void tst_QQmlEngineDebugService::queryExpressionResult()
+ {
+     QFETCH(QString, expr);

@@ -1,0 +1,541 @@
+diff --git a/src/network/socket/qabstractsocket.cpp b/src/network/socket/qabstractsocket.cpp
+index 0c5deb5..b20b229 100644
+--- a/src/network/socket/qabstractsocket.cpp
++++ b/src/network/socket/qabstractsocket.cpp
+@@ -425,6 +425,19 @@
+     + ReuseAddressHint), and on Windows, its equivalent to ShareAddress.
+ */
+ 
++/*! \enum QAbstractSocket::PauseMode
++    \since 5.0
++
++    This enum describes the behavior of when the socket should hold
++    back with continuing data transfer.
++
++    \value PauseNever Do not pause data transfer on the socket. This is the
++    default and matches the behaviour of Qt 4.
++    \value PauseOnNotify Pause data transfer on the socket upon receiving a
++    notification. The only notification currently supported is
++    QSslSocket::sslErrors().
++*/
++
+ #include "qabstractsocket.h"
+ #include "qabstractsocket_p.h"
+ 
+@@ -529,6 +542,7 @@ QAbstractSocketPrivate::QAbstractSocketPrivate()
+       abortCalled(false),
+       closeCalled(false),
+       pendingClose(false),
++      pauseMode(QAbstractSocket::PauseNever),
+       port(0),
+       localPort(0),
+       peerPort(0),
+@@ -1354,6 +1368,55 @@ QAbstractSocket::~QAbstractSocket()
+ /*!
+     \since 5.0
+ 
++    Continues data transfer on the socket. This method should only be used
++    after the socket has been set to pause upon notifications and a
++    notification has been received.
++    The only notification currently supported is QSslSocket::sslErrors().
++    Calling this method if the socket is not paused results in undefined
++    behavior.
++
++    \sa pauseMode(), setPauseMode()
++*/
++void QAbstractSocket::resume()
++{
++    Q_D(QAbstractSocket);
++    d->resumeSocketNotifiers(this);
++}
++
++/*!
++    \since 5.0
++
++    Returns the pause mode of this socket.
++
++    \sa setPauseMode(), resume()
++*/
++QAbstractSocket::PauseMode QAbstractSocket::pauseMode() const
++{
++    return d_func()->pauseMode;
++}
++
++
++/*!
++    \since 5.0
++
++    Controls whether to pause upon receiving a notification. The only notification
++    currently supported is QSslSocket::sslErrors(). If set to PauseOnNotify,
++    data transfer on the socket will be paused and needs to be enabled explicitly
++    again by calling resume().
++    By default this option is set to PauseNever.
++    This option must be called before connecting to the server, otherwise it will
++    result in undefined behavior.
++
++    \sa pauseMode(), resume()
++*/
++void QAbstractSocket::setPauseMode(PauseMode pauseMode)
++{
++    d_func()->pauseMode = pauseMode;
++}
++
++/*!
++    \since 5.0
++
+     Binds to \a address on port \a port, using the BindMode \a mode.
+ 
+     Binds this socket to the address \a address and the port \a port.
+diff --git a/src/network/socket/qabstractsocket.h b/src/network/socket/qabstractsocket.h
+index 6b85bd9..f1d26c2 100644
+--- a/src/network/socket/qabstractsocket.h
++++ b/src/network/socket/qabstractsocket.h
+@@ -123,10 +123,18 @@ public:
+         ReuseAddressHint = 0x4
+     };
+     Q_DECLARE_FLAGS(BindMode, BindFlag)
++    enum PauseMode {
++        PauseNever,
++        PauseOnNotify
++    };
+ 
+     QAbstractSocket(SocketType socketType, QObject *parent);
+     virtual ~QAbstractSocket();
+ 
++    virtual void resume(); // to continue after proxy authentication required, SSL errors etc.
++    PauseMode pauseMode() const;
++    void setPauseMode(PauseMode pauseMode);
++
+     bool bind(const QHostAddress &address, quint16 port = 0, BindMode mode = DefaultForPlatform);
+     bool bind(quint16 port = 0, BindMode mode = DefaultForPlatform);
+ 
+diff --git a/src/network/socket/qabstractsocket_p.h b/src/network/socket/qabstractsocket_p.h
+index 4423c02..b0cf890 100644
+--- a/src/network/socket/qabstractsocket_p.h
++++ b/src/network/socket/qabstractsocket_p.h
+@@ -106,6 +106,8 @@ public:
+     bool closeCalled;
+     bool pendingClose;
+ 
++    QAbstractSocket::PauseMode pauseMode;
++
+     QString hostName;
+     quint16 port;
+     QHostAddress host;
+diff --git a/src/network/ssl/qsslsocket.cpp b/src/network/ssl/qsslsocket.cpp
+index 77eab19..7240444 100644
+--- a/src/network/ssl/qsslsocket.cpp
++++ b/src/network/ssl/qsslsocket.cpp
+@@ -356,6 +356,24 @@ QSslSocket::~QSslSocket()
+ }
+ 
+ /*!
++    \reimp
++
++    \since 5.0
++
++    Continues data transfer on the socket after it has been paused. If
++    "setPauseMode(QAbstractSocket::PauseOnNotify);" has been called on
++    this socket and a sslErrors() signal is received, calling this method
++    is necessary for the socket to continue.
++
++    \sa QAbstractSocket::pauseMode(), QAbstractSocket::setPauseMode()
++*/
++void QSslSocket::resume()
++{
++    // continuing might emit signals, rather do this through the event loop
++    QMetaObject::invokeMethod(this, "_q_resumeImplementation", Qt::QueuedConnection);
++}
++
++/*!
+     Starts an encrypted connection to the device \a hostName on \a
+     port, using \a mode as the \l OpenMode. This is equivalent to
+     calling connectToHost() to establish the connection, followed by a
+@@ -1860,6 +1878,7 @@ QSslSocketPrivate::QSslSocketPrivate()
+     , readyReadEmittedPointer(0)
+     , allowRootCertOnDemandLoading(true)
+     , plainSocket(0)
++    , paused(false)
+ {
+     QSslConfigurationPrivate::deepCopyDefaultConfiguration(&configuration);
+ }
+@@ -2114,6 +2133,11 @@ void QSslSocketPrivate::resumeSocketNotifiers(QSslSocket *socket)
+     QAbstractSocketPrivate::resumeSocketNotifiers(socket->d_func()->plainSocket);
+ }
+ 
++bool QSslSocketPrivate::isPaused() const
++{
++    return paused;
++}
++
+ /*!
+     \internal
+ */
+@@ -2260,6 +2284,55 @@ void QSslSocketPrivate::_q_flushReadBuffer()
+ /*!
+     \internal
+ */
++void QSslSocketPrivate::_q_resumeImplementation()
++{
++    Q_Q(QSslSocket);
++    if (plainSocket)
++        plainSocket->resume();
++    paused = false;
++    if (!connectionEncrypted) {
++        if (verifyErrorsHaveBeenIgnored()) {
++            continueHandshake();
++        } else {
++            q->setErrorString(sslErrors.first().errorString());
++            q->setSocketError(QAbstractSocket::SslHandshakeFailedError);
++            emit q->error(QAbstractSocket::SslHandshakeFailedError);
++            plainSocket->disconnectFromHost();
++            return;
++        }
++    }
++    transmit();
++}
++
++/*!
++    \internal
++*/
++bool QSslSocketPrivate::verifyErrorsHaveBeenIgnored()
++{
++    bool doEmitSslError;
++    if (!ignoreErrorsList.empty()) {
++        // check whether the errors we got are all in the list of expected errors
++        // (applies only if the method QSslSocket::ignoreSslErrors(const QList<QSslError> &errors)
++        // was called)
++        doEmitSslError = false;
++        for (int a = 0; a < sslErrors.count(); a++) {
++            if (!ignoreErrorsList.contains(sslErrors.at(a))) {
++                doEmitSslError = true;
++                break;
++            }
++        }
++    } else {
++        // if QSslSocket::ignoreSslErrors(const QList<QSslError> &errors) was not called and
++        // we get an SSL error, emit a signal unless we ignored all errors (by calling
++        // QSslSocket::ignoreSslErrors() )
++        doEmitSslError = !ignoreAllSslErrors;
++    }
++    return !doEmitSslError;
++}
++
++/*!
++    \internal
++*/
+ QList<QByteArray> QSslSocketPrivate::unixRootCertDirectories()
+ {
+     return QList<QByteArray>() <<  "/etc/ssl/certs/" // (K)ubuntu, OpenSUSE, Mandriva, MeeGo ...
+diff --git a/src/network/ssl/qsslsocket.h b/src/network/ssl/qsslsocket.h
+index cdd1e10..27cdbde 100644
+--- a/src/network/ssl/qsslsocket.h
++++ b/src/network/ssl/qsslsocket.h
+@@ -82,6 +82,7 @@ public:
+ 
+     QSslSocket(QObject *parent = 0);
+     ~QSslSocket();
++    void resume(); // to continue after proxy authentication required, SSL errors etc.
+ 
+     // Autostarting the SSL client handshake.
+     void connectToHostEncrypted(const QString &hostName, quint16 port, OpenMode mode = ReadWrite, NetworkLayerProtocol protocol = AnyIPProtocol);
+@@ -211,6 +212,7 @@ private:
+     Q_PRIVATE_SLOT(d_func(), void _q_bytesWrittenSlot(qint64))
+     Q_PRIVATE_SLOT(d_func(), void _q_flushWriteBuffer())
+     Q_PRIVATE_SLOT(d_func(), void _q_flushReadBuffer())
++    Q_PRIVATE_SLOT(d_func(), void _q_resumeImplementation())
+     friend class QSslSocketBackendPrivate;
+ };
+ 
+diff --git a/src/network/ssl/qsslsocket_openssl.cpp b/src/network/ssl/qsslsocket_openssl.cpp
+index 48b5905..f262c01 100644
+--- a/src/network/ssl/qsslsocket_openssl.cpp
++++ b/src/network/ssl/qsslsocket_openssl.cpp
+@@ -295,6 +295,7 @@ bool QSslSocketBackendPrivate::initSslContext()
+     bool client = (mode == QSslSocket::SslClientMode);
+ 
+     bool reinitialized = false;
++
+ init_context:
+     switch (configuration.protocol) {
+     case QSsl::SslV2:
+@@ -950,6 +951,9 @@ void QSslSocketBackendPrivate::transmit()
+                 qDebug() << "QSslSocketBackendPrivate::transmit: connection lost";
+ #endif
+                 break;
++            } else if (paused) {
++                // just wait until the user continues
++                return;
+             } else {
+ #ifdef QSSLSOCKET_DEBUG
+                 qDebug() << "QSslSocketBackendPrivate::transmit: encryption not done yet";
+@@ -1188,46 +1192,25 @@ bool QSslSocketBackendPrivate::startHandshake()
+         sslErrors = errors;
+         emit q->sslErrors(errors);
+ 
+-        bool doEmitSslError;
+-        if (!ignoreErrorsList.empty()) {
+-            // check whether the errors we got are all in the list of expected errors
+-            // (applies only if the method QSslSocket::ignoreSslErrors(const QList<QSslError> &errors)
+-            // was called)
+-            doEmitSslError = false;
+-            for (int a = 0; a < errors.count(); a++) {
+-                if (!ignoreErrorsList.contains(errors.at(a))) {
+-                    doEmitSslError = true;
+-                    break;
+-                }
+-            }
+-        } else {
+-            // if QSslSocket::ignoreSslErrors(const QList<QSslError> &errors) was not called and
+-            // we get an SSL error, emit a signal unless we ignored all errors (by calling
+-            // QSslSocket::ignoreSslErrors() )
+-            doEmitSslError = !ignoreAllSslErrors;
+-        }
++        bool doEmitSslError = !verifyErrorsHaveBeenIgnored();
+         // check whether we need to emit an SSL handshake error
+         if (doVerifyPeer && doEmitSslError) {
+-            q->setErrorString(sslErrors.first().errorString());
+-            q->setSocketError(QAbstractSocket::SslHandshakeFailedError);
+-            emit q->error(QAbstractSocket::SslHandshakeFailedError);
+-            plainSocket->disconnectFromHost();
++            if (q->pauseMode() == QAbstractSocket::PauseOnNotify) {
++                pauseSocketNotifiers(q);
++                paused = true;
++            } else {
++                q->setErrorString(sslErrors.first().errorString());
++                q->setSocketError(QAbstractSocket::SslHandshakeFailedError);
++                emit q->error(QAbstractSocket::SslHandshakeFailedError);
++                plainSocket->disconnectFromHost();
++            }
+             return false;
+         }
+     } else {
+         sslErrors.clear();
+     }
+ 
+-    // if we have a max read buffer size, reset the plain socket's to 1k
+-    if (readBufferMaxSize)
+-        plainSocket->setReadBufferSize(1024);
+-
+-    connectionEncrypted = true;
+-    emit q->encrypted();
+-    if (autoStartHandshake && pendingClose) {
+-        pendingClose = false;
+-        q->disconnectFromHost();
+-    }
++    continueHandshake();
+     return true;
+ }
+ 
+@@ -1271,6 +1254,21 @@ QSslCipher QSslSocketBackendPrivate::sessionCipher() const
+     return sessionCipher ? QSslCipher_from_SSL_CIPHER(sessionCipher) : QSslCipher();
+ }
+ 
++void QSslSocketBackendPrivate::continueHandshake()
++{
++    Q_Q(QSslSocket);
++    // if we have a max read buffer size, reset the plain socket's to match
++    if (readBufferMaxSize)
++        plainSocket->setReadBufferSize(readBufferMaxSize);
++
++    connectionEncrypted = true;
++    emit q->encrypted();
++    if (autoStartHandshake && pendingClose) {
++        pendingClose = false;
++        q->disconnectFromHost();
++    }
++}
++
+ QList<QSslCertificate> QSslSocketBackendPrivate::STACKOFX509_to_QSslCertificates(STACK_OF(X509) *x509)
+ {
+     ensureInitialized();
+diff --git a/src/network/ssl/qsslsocket_openssl_p.h b/src/network/ssl/qsslsocket_openssl_p.h
+index 78d385a..f44ff82 100644
+--- a/src/network/ssl/qsslsocket_openssl_p.h
++++ b/src/network/ssl/qsslsocket_openssl_p.h
+@@ -115,6 +115,7 @@ public:
+     void disconnectFromHost();
+     void disconnected();
+     QSslCipher sessionCipher() const;
++    void continueHandshake();
+ 
+     Q_AUTOTEST_EXPORT static long setupOpenSslOptions(QSsl::SslProtocol protocol, QSsl::SslOptions sslOptions);
+     static QSslCipher QSslCipher_from_SSL_CIPHER(SSL_CIPHER *cipher);
+diff --git a/src/network/ssl/qsslsocket_p.h b/src/network/ssl/qsslsocket_p.h
+index c9be2cd..f424f29 100644
+--- a/src/network/ssl/qsslsocket_p.h
++++ b/src/network/ssl/qsslsocket_p.h
+@@ -149,6 +149,7 @@ public:
+     void createPlainSocket(QIODevice::OpenMode openMode);
+     static void pauseSocketNotifiers(QSslSocket*);
+     static void resumeSocketNotifiers(QSslSocket*);
++    bool isPaused() const;
+     void _q_connectedSlot();
+     void _q_hostFoundSlot();
+     void _q_disconnectedSlot();
+@@ -158,6 +159,7 @@ public:
+     void _q_bytesWrittenSlot(qint64);
+     void _q_flushWriteBuffer();
+     void _q_flushReadBuffer();
++    void _q_resumeImplementation();
+ 
+     // Platform specific functions
+     virtual void startClientEncryption() = 0;
+@@ -166,6 +168,7 @@ public:
+     virtual void disconnectFromHost() = 0;
+     virtual void disconnected() = 0;
+     virtual QSslCipher sessionCipher() const = 0;
++    virtual void continueHandshake() = 0;
+ 
+ private:
+     static bool ensureLibraryLoaded();
+@@ -174,8 +177,10 @@ private:
+     static bool s_libraryLoaded;
+     static bool s_loadedCiphersAndCerts;
+ protected:
++    bool verifyErrorsHaveBeenIgnored();
+     static bool s_loadRootCertsOnDemand;
+     static QList<QByteArray> unixRootCertDirectories();
++    bool paused;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/tests/auto/network/ssl/qsslsocket/tst_qsslsocket.cpp b/tests/auto/network/ssl/qsslsocket/tst_qsslsocket.cpp
+index 41896b4..c019619 100644
+--- a/tests/auto/network/ssl/qsslsocket/tst_qsslsocket.cpp
++++ b/tests/auto/network/ssl/qsslsocket/tst_qsslsocket.cpp
+@@ -192,10 +192,12 @@ private slots:
+     void readFromClosedSocket();
+     void writeBigChunk();
+     void blacklistedCertificates();
+-    void setEmptyDefaultConfiguration();
+     void versionAccessors();
+     void sslOptions();
+     void encryptWithoutConnecting();
++    void resume_data();
++    void resume();
++    void setEmptyDefaultConfiguration(); // this test should be last
+ 
+     static void exitLoop()
+     {
+@@ -2058,22 +2060,6 @@ void tst_QSslSocket::blacklistedCertificates()
+     QCOMPARE(sslErrors.at(0).error(), QSslError::CertificateBlacklisted);
+ }
+ 
+-void tst_QSslSocket::setEmptyDefaultConfiguration()
+-{
+-    // used to produce a crash in QSslConfigurationPrivate::deepCopyDefaultConfiguration, QTBUG-13265
+-
+-    if (!QSslSocket::supportsSsl())
+-        return;
+-
+-    QSslConfiguration emptyConf;
+-    QSslConfiguration::setDefaultConfiguration(emptyConf);
+-
+-    QSslSocketPtr socket = newSocket();
+-    connect(socket, SIGNAL(sslErrors(const QList<QSslError> &)), this, SLOT(ignoreErrorSlot()));
+-    socket->connectToHostEncrypted(QtNetworkSettings::serverName(), 443);
+-    QVERIFY2(!socket->waitForEncrypted(4000), qPrintable(socket->errorString()));
+-}
+-
+ void tst_QSslSocket::versionAccessors()
+ {
+     if (!QSslSocket::supportsSsl())
+@@ -2141,7 +2127,97 @@ void tst_QSslSocket::encryptWithoutConnecting()
+     sock.startClientEncryption();
+ }
+ 
++void tst_QSslSocket::resume_data()
++{
++    QTest::addColumn<bool>("ignoreErrorsAfterPause");
++    QTest::addColumn<QList<QSslError> >("errorsToIgnore");
++    QTest::addColumn<bool>("expectSuccess");
++
++    QList<QSslError> errorsList;
++    QTest::newRow("DoNotIgnoreErrors") << false << QList<QSslError>() << false;
++    QTest::newRow("ignoreAllErrors") << true << QList<QSslError>() << true;
++
++    QList<QSslCertificate> certs = QSslCertificate::fromPath(QLatin1String(SRCDIR "certs/qt-test-server-cacert.pem"));
++    QSslError rightError(QSslError::SelfSignedCertificate, certs.at(0));
++    QSslError wrongError(QSslError::SelfSignedCertificate);
++    errorsList.append(wrongError);
++    QTest::newRow("ignoreSpecificErrors-Wrong") << true << errorsList << false;
++    errorsList.clear();
++    errorsList.append(rightError);
++    QTest::newRow("ignoreSpecificErrors-Right") << true << errorsList << true;
++}
++
++void tst_QSslSocket::resume()
++{
++    // make sure the server certificate is not in the list of accepted certificates,
++    // we want to trigger the sslErrors signal
++    QSslSocket::setDefaultCaCertificates(QSslSocket::systemCaCertificates());
++
++    QFETCH(bool, ignoreErrorsAfterPause);
++    QFETCH(QList<QSslError>, errorsToIgnore);
++    QFETCH(bool, expectSuccess);
++
++    QSslSocket socket;
++    socket.setPauseMode(QAbstractSocket::PauseOnNotify);
++
++    QSignalSpy sslErrorSpy(&socket, SIGNAL(sslErrors(QList<QSslError>)));
++    QSignalSpy encryptedSpy(&socket, SIGNAL(encrypted()));
++    QSignalSpy errorSpy(&socket, SIGNAL(error(QAbstractSocket::SocketError)));
++
++    connect(&socket, SIGNAL(sslErrors(QList<QSslError>)), &QTestEventLoop::instance(), SLOT(exitLoop()));
++    connect(&socket, SIGNAL(encrypted()), &QTestEventLoop::instance(), SLOT(exitLoop()));
++    connect(&socket, SIGNAL(proxyAuthenticationRequired(QNetworkProxy,QAuthenticator*)),
++            this, SLOT(proxyAuthenticationRequired(QNetworkProxy,QAuthenticator*)));
++    connect(&socket, SIGNAL(error(QAbstractSocket::SocketError)), &QTestEventLoop::instance(), SLOT(exitLoop()));
++
++    socket.connectToHostEncrypted(QtNetworkSettings::serverName(), 993);
++    QTestEventLoop::instance().enterLoop(10);
++    QVERIFY(!QTestEventLoop::instance().timeout());
++    QCOMPARE(sslErrorSpy.count(), 1);
++    QCOMPARE(errorSpy.count(), 0);
++    QCOMPARE(encryptedSpy.count(), 0);
++    QVERIFY(!socket.isEncrypted());
++    if (ignoreErrorsAfterPause) {
++        if (errorsToIgnore.empty())
++            socket.ignoreSslErrors();
++        else
++            socket.ignoreSslErrors(errorsToIgnore);
++    }
++    socket.resume();
++    QTestEventLoop::instance().enterLoop(10);
++    QVERIFY(!QTestEventLoop::instance().timeout()); // quit by encrypted() or error() signal
++    if (expectSuccess) {
++        QCOMPARE(encryptedSpy.count(), 1);
++        QVERIFY(socket.isEncrypted());
++        QCOMPARE(errorSpy.count(), 0);
++        socket.disconnectFromHost();
++        QVERIFY(socket.waitForDisconnected(10000));
++    } else {
++        QCOMPARE(encryptedSpy.count(), 0);
++        QVERIFY(!socket.isEncrypted());
++        QCOMPARE(errorSpy.count(), 1);
++        QCOMPARE(socket.error(), QAbstractSocket::SslHandshakeFailedError);
++    }
++}
++
++void tst_QSslSocket::setEmptyDefaultConfiguration() // this test should be last, as it has some side effects
++{
++    // used to produce a crash in QSslConfigurationPrivate::deepCopyDefaultConfiguration, QTBUG-13265
++
++    if (!QSslSocket::supportsSsl())
++        return;
++
++    QSslConfiguration emptyConf;
++    QSslConfiguration::setDefaultConfiguration(emptyConf);
++
++    QSslSocketPtr socket = newSocket();
++    connect(socket, SIGNAL(sslErrors(const QList<QSslError> &)), this, SLOT(ignoreErrorSlot()));
++    socket->connectToHostEncrypted(QtNetworkSettings::serverName(), 443);
++    QVERIFY2(!socket->waitForEncrypted(4000), qPrintable(socket->errorString()));
++}
++
+ #endif // QT_NO_OPENSSL
+ 
+ QTEST_MAIN(tst_QSslSocket)
++
+ #include "tst_qsslsocket.moc"

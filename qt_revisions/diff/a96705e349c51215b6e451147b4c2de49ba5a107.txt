@@ -1,0 +1,215 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index f948c04..068bc36 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -721,8 +721,7 @@ bool QQmlEngineDebugService::setMethodBody(int objectId, const QString &method,
+     jsfunction += body;
+     jsfunction += QLatin1String("\n})");
+ 
+-    QQmlVMEMetaObject *vmeMetaObject =
+-            static_cast<QQmlVMEMetaObject*>(QObjectPrivate::get(object)->metaObject);
++    QQmlVMEMetaObject *vmeMetaObject = QQmlVMEMetaObject::get(object);
+     Q_ASSERT(vmeMetaObject); // the fact we found the property above should guarentee this
+ 
+     int lineNumber = vmeMetaObject->vmeMethodLineNumber(prop->coreIndex);
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 6547e19..eba2f4d 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -79,7 +79,8 @@ class Q_QML_PRIVATE_EXPORT QQmlData : public QAbstractDeclarativeData
+ public:
+     QQmlData()
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+-          hasTaintedV8Object(false), isQueuedForDeletion(false), rootObjectInCreation(false), notifyList(0), context(0), outerContext(0),
++          hasTaintedV8Object(false), isQueuedForDeletion(false), rootObjectInCreation(false),
++          hasVMEMetaObject(false), notifyList(0), context(0), outerContext(0),
+           bindings(0), signalHandlers(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+           lineNumber(0), columnNumber(0), compiledData(0), deferredIdx(0), v8objectid(0),
+           propertyCache(0), guards(0), extendedData(0) {
+@@ -120,7 +121,8 @@ public:
+      * v8 GC will check this flag, only deletes the objects when rootObjectInCreation is false.
+      */
+     quint32 rootObjectInCreation:1;
+-    quint32 dummy:25;
++    quint32 hasVMEMetaObject:1;
++    quint32 dummy:24;
+ 
+     struct NotifyList {
+         quint64 connectionMask;
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index 224d6a6..d68d8a9 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -1496,7 +1496,6 @@ bool QQmlPropertyPrivate::writeBinding(QObject *object,
+     if (expression->hasError()) {
+         return false;
+     } else if (isVmeProperty) {
+-        typedef QQmlVMEMetaObject VMEMO;
+         if (!result.IsEmpty() && result->IsFunction()
+                 && !result->ToObject()->GetHiddenValue(v8engine->bindingFlagKey()).IsEmpty()) {
+             // we explicitly disallow this case to avoid confusion.  Users can still store one
+@@ -1504,7 +1503,8 @@ bool QQmlPropertyPrivate::writeBinding(QObject *object,
+             expression->delayedError()->error.setDescription(QLatin1String("Invalid use of Qt.binding() in a binding declaration."));
+             return false;
+         }
+-        VMEMO *vmemo = static_cast<VMEMO *>(const_cast<QMetaObject *>(object->metaObject()));
++        QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(object);
++        Q_ASSERT(vmemo);
+         vmemo->setVMEProperty(core.coreIndex, result);
+     } else if (isUndefined && core.isResettable()) {
+         void *args[] = { 0 };
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index ba0f202..08ab494 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -298,8 +298,8 @@ static QVariant variantFromString(const QString &string)
+         v8::Handle<v8::Value> v8value = value; \
+         QObject *target = objects.top(); \
+         CLEAN_PROPERTY(target, instr.propertyIndex); \
+-        QMetaObject *mo = const_cast<QMetaObject *>(target->metaObject()); \
+-        QQmlVMEMetaObject *vmemo = static_cast<QQmlVMEMetaObject *>(mo); \
++        QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(target); \
++        Q_ASSERT(vmemo); \
+         vmemo->setVMEProperty(instr.propertyIndex, v8value); \
+     QML_END_INSTR(name)
+ 
+@@ -920,7 +920,8 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 QQmlPropertyPrivate::restore(target, instr.property, CTXT);
+             obj->setParent(target);
+             vi->setTarget(prop);
+-            QQmlVMEMetaObject *mo = static_cast<QQmlVMEMetaObject *>((QMetaObject*)target->metaObject());
++            QQmlVMEMetaObject *mo = QQmlVMEMetaObject::get(target);
++            Q_ASSERT(mo);
+             mo->registerInterceptor(prop.index(), QQmlPropertyPrivate::valueTypeCoreIndex(prop), vi);
+         QML_END_INSTR(StoreValueInterceptor)
+ 
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index 4d531b3..77a0482 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -493,6 +493,7 @@ QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj, const QMetaObject *other, con
+     if (op->metaObject)
+         parent = static_cast<QAbstractDynamicMetaObject*>(op->metaObject);
+     op->metaObject = this;
++    QQmlData::get(obj)->hasVMEMetaObject = true;
+ 
+     propOffset = QAbstractDynamicMetaObject::propertyOffset();
+     methodOffset = QAbstractDynamicMetaObject::methodOffset();
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 1f44c63..c999247 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -169,6 +169,8 @@ public:
+ 
+     void connectAliasSignal(int index);
+ 
++    static inline QQmlVMEMetaObject *get(const QObject *obj);
++
+ protected:
+     virtual int metaCall(QMetaObject::Call _c, int _id, void **_a);
+ 
+@@ -227,6 +229,18 @@ private:
+     friend class QV8QObjectWrapper;
+ };
+ 
++QQmlVMEMetaObject *QQmlVMEMetaObject::get(const QObject *obj)
++{
++    if (obj) {
++        if (QQmlData *data = QQmlData::get(obj)) {
++            if (data->hasVMEMetaObject)
++                return const_cast<QQmlVMEMetaObject *>(static_cast<const QQmlVMEMetaObject *>(obj->metaObject()));
++        }
++    }
++
++    return 0;
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QQMLVMEMETAOBJECT_P_H
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 6ab1e00..f25bfcc 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -1949,7 +1949,8 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+ 
+         if (data.gettype() == V8HandleType) {
+             // This property must be a VME var property
+-            QQmlVMEMetaObject *vmemo = static_cast<QQmlVMEMetaObject *>(const_cast<QMetaObject *>(output->metaObject()));
++            QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(output);
++            Q_ASSERT(vmemo);
+             vmemo->setVMEProperty(instr->store.index, *data.gethandleptr());
+         } else {
+             int status = -1;
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 15d7b1f..95e2be7 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -533,7 +533,9 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+ 
+     if (result->isFunction() && !result->isVMEProperty()) {
+         if (result->isVMEFunction()) {
+-            return ((QQmlVMEMetaObject *)(object->metaObject()))->vmeMethod(result->coreIndex);
++            QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(object);
++            Q_ASSERT(vmemo);
++            return vmemo->vmeMethod(result->coreIndex);
+         } else if (result->isV8Function()) {
+             return MethodClosure::createWithGlobal(engine, object, objectHandle, result->coreIndex);
+         } else if (result->isSignalHandler()) {
+@@ -571,8 +573,8 @@ v8::Handle<v8::Value> QV8QObjectWrapper::GetProperty(QV8Engine *engine, QObject
+         ep->captureProperty(object, result->coreIndex, result->notifyIndex);
+ 
+     if (result->isVMEProperty()) {
+-        typedef QQmlVMEMetaObject VMEMO;
+-        VMEMO *vmemo = const_cast<VMEMO *>(static_cast<const VMEMO *>(object->metaObject()));
++        QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(object);
++        Q_ASSERT(vmemo);
+         return vmemo->vmeProperty(result->coreIndex);
+     } else if (result->isDirect())  {
+         return LoadProperty<ReadAccessor::Direct>(engine, object, *result, 0);
+@@ -622,7 +624,9 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+ 
+     if (!newBinding && property->isVMEProperty()) {
+         // allow assignment of "special" values (null, undefined, function) to var properties
+-        static_cast<QQmlVMEMetaObject *>(const_cast<QMetaObject *>(object->metaObject()))->setVMEProperty(property->coreIndex, value);
++        QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(object);
++        Q_ASSERT(vmemo);
++        vmemo->setVMEProperty(property->coreIndex, value);
+         return;
+     }
+ 
+@@ -660,7 +664,9 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+     } else if (property->propType == QMetaType::QString && value->IsString()) {
+         PROPERTY_STORE(QString, engine->toString(value->ToString()));
+     } else if (property->isVMEProperty()) {
+-        static_cast<QQmlVMEMetaObject *>(const_cast<QMetaObject *>(object->metaObject()))->setVMEProperty(property->coreIndex, value);
++        QQmlVMEMetaObject *vmemo = QQmlVMEMetaObject::get(object);
++        Q_ASSERT(vmemo);
++        vmemo->setVMEProperty(property->coreIndex, value);
+     } else {
+         QVariant v;
+         if (property->isQList()) 
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 0ea4e2a..26bf918 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -4540,8 +4540,8 @@ void tst_qqmlecmascript::propertyVarInheritance()
+     // we want to be able to track when the varProperties array of the last metaobject is disposed
+     QObject *cco5 = object->property("varProperty").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>();
+     QObject *ico5 = object->property("varProperty").value<QObject*>()->property("inheritanceVarProperty").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>()->property("vp").value<QObject*>();
+-    QQmlVMEMetaObject *icovmemo = ((QQmlVMEMetaObject *)(ico5->metaObject()));
+-    QQmlVMEMetaObject *ccovmemo = ((QQmlVMEMetaObject *)(cco5->metaObject()));
++    QQmlVMEMetaObject *icovmemo = QQmlVMEMetaObject::get(ico5);
++    QQmlVMEMetaObject *ccovmemo = QQmlVMEMetaObject::get(cco5);
+     v8::Persistent<v8::Value> icoCanaryHandle;
+     v8::Persistent<v8::Value> ccoCanaryHandle;
+     {
+@@ -4591,7 +4591,7 @@ void tst_qqmlecmascript::propertyVarInheritance2()
+     {
+         v8::HandleScope hs;
+         propertyVarWeakRefCallbackCount = 0;                           // reset callback count.
+-        childObjectVarArrayValueHandle = qPersistentNew(((QQmlVMEMetaObject *)(childObject->metaObject()))->vmeProperty(childObject->metaObject()->indexOfProperty("vp")));
++        childObjectVarArrayValueHandle = qPersistentNew(QQmlVMEMetaObject::get(childObject)->vmeProperty(childObject->metaObject()->indexOfProperty("vp")));
+         childObjectVarArrayValueHandle.MakeWeak(&propertyVarWeakRefCallbackCount, propertyVarWeakRefCallback);
+         gc(engine);
+         QVERIFY(propertyVarWeakRefCallbackCount == 0);                 // should not have been collected yet.

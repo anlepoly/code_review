@@ -1,0 +1,575 @@
+diff --git a/src/quick/items/qquickshadereffectsource.cpp b/src/quick/items/qquickshadereffectsource.cpp
+index 4819665..c55b1ca 100644
+--- a/src/quick/items/qquickshadereffectsource.cpp
++++ b/src/quick/items/qquickshadereffectsource.cpp
+@@ -54,6 +54,39 @@ QT_BEGIN_NAMESPACE
+ 
+ DEFINE_BOOL_CONFIG_OPTION(qmlFboOverlay, QML_FBO_OVERLAY)
+ 
++namespace
++{
++    class BindableFbo : public QSGBindable
++    {
++    public:
++        BindableFbo(QOpenGLFramebufferObject *fbo, QSGDepthStencilBuffer *depthStencil);
++        virtual ~BindableFbo();
++        virtual void bind() const;
++    private:
++        QOpenGLFramebufferObject *m_fbo;
++        QSGDepthStencilBuffer *m_depthStencil;
++    };
++
++    BindableFbo::BindableFbo(QOpenGLFramebufferObject *fbo, QSGDepthStencilBuffer *depthStencil)
++        : m_fbo(fbo)
++        , m_depthStencil(depthStencil)
++    {
++    }
++
++    BindableFbo::~BindableFbo()
++    {
++        if (m_depthStencil)
++            m_depthStencil->detach();
++    }
++
++    void BindableFbo::bind() const
++    {
++        m_fbo->bind();
++        if (m_depthStencil)
++            m_depthStencil->attach();
++    }
++}
++
+ class QQuickShaderEffectSourceTextureProvider : public QSGTextureProvider
+ {
+     Q_OBJECT
+@@ -239,6 +272,7 @@ void QQuickShaderEffectTexture::grab()
+         delete m_fbo;
+         delete m_secondaryFbo;
+         m_fbo = m_secondaryFbo = 0;
++        m_depthStencilBuffer.clear();
+         m_dirtyTexture = false;
+         if (m_grab)
+             emit scheduledUpdateCompleted();
+@@ -272,13 +306,12 @@ void QQuickShaderEffectTexture::grab()
+             delete m_secondaryFbo;
+             QOpenGLFramebufferObjectFormat format;
+ 
+-            format.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+             format.setInternalTextureFormat(m_format);
+             format.setSamples(8);
+             m_secondaryFbo = new QOpenGLFramebufferObject(m_size, format);
++            m_depthStencilBuffer = m_context->depthStencilBufferForFbo(m_secondaryFbo);
+         } else {
+             QOpenGLFramebufferObjectFormat format;
+-            format.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+             format.setInternalTextureFormat(m_format);
+             format.setMipmap(m_mipmap);
+             if (m_recursive) {
+@@ -287,6 +320,7 @@ void QQuickShaderEffectTexture::grab()
+                 m_secondaryFbo = new QOpenGLFramebufferObject(m_size, format);
+                 glBindTexture(GL_TEXTURE_2D, m_secondaryFbo->texture());
+                 updateBindOptions(true);
++                m_depthStencilBuffer = m_context->depthStencilBufferForFbo(m_secondaryFbo);
+             } else {
+                 delete m_fbo;
+                 delete m_secondaryFbo;
+@@ -294,6 +328,7 @@ void QQuickShaderEffectTexture::grab()
+                 m_secondaryFbo = 0;
+                 glBindTexture(GL_TEXTURE_2D, m_fbo->texture());
+                 updateBindOptions(true);
++                m_depthStencilBuffer = m_context->depthStencilBufferForFbo(m_fbo);
+             }
+         }
+     }
+@@ -336,7 +371,7 @@ void QQuickShaderEffectTexture::grab()
+     m_renderer->setClearColor(Qt::transparent);
+ 
+     if (m_multisampling) {
+-        m_renderer->renderScene(QSGBindableFbo(m_secondaryFbo));
++        m_renderer->renderScene(BindableFbo(m_secondaryFbo, m_depthStencilBuffer.data()));
+ 
+         if (deleteFboLater) {
+             delete m_fbo;
+@@ -354,7 +389,7 @@ void QQuickShaderEffectTexture::grab()
+         QOpenGLFramebufferObject::blitFramebuffer(m_fbo, r, m_secondaryFbo, r);
+     } else {
+         if (m_recursive) {
+-            m_renderer->renderScene(QSGBindableFbo(m_secondaryFbo));
++            m_renderer->renderScene(BindableFbo(m_secondaryFbo, m_depthStencilBuffer.data()));
+ 
+             if (deleteFboLater) {
+                 delete m_fbo;
+@@ -368,7 +403,7 @@ void QQuickShaderEffectTexture::grab()
+             }
+             qSwap(m_fbo, m_secondaryFbo);
+         } else {
+-            m_renderer->renderScene(QSGBindableFbo(m_fbo));
++            m_renderer->renderScene(BindableFbo(m_fbo, m_depthStencilBuffer.data()));
+         }
+     }
+ 
+diff --git a/src/quick/items/qquickshadereffectsource_p.h b/src/quick/items/qquickshadereffectsource_p.h
+index a9d9aa8..0853394 100644
+--- a/src/quick/items/qquickshadereffectsource_p.h
++++ b/src/quick/items/qquickshadereffectsource_p.h
+@@ -136,6 +136,7 @@ private:
+     QSGRenderer *m_renderer;
+     QOpenGLFramebufferObject *m_fbo;
+     QOpenGLFramebufferObject *m_secondaryFbo;
++    QSharedPointer<QSGDepthStencilBuffer> m_depthStencilBuffer;
+ 
+ #ifdef QSG_DEBUG_FBO_OVERLAY
+     QSGRectangleNode *m_debugOverlay;
+diff --git a/src/quick/scenegraph/qsgcontext.cpp b/src/quick/scenegraph/qsgcontext.cpp
+index 37a49f9..8b63266 100644
+--- a/src/quick/scenegraph/qsgcontext.cpp
++++ b/src/quick/scenegraph/qsgcontext.cpp
+@@ -54,6 +54,7 @@
+ 
+ #include <QGuiApplication>
+ #include <QOpenGLContext>
++#include <QtGui/qopenglframebufferobject.h>
+ 
+ #include <QQmlImageProvider>
+ #include <private/qqmlglobal_p.h>
+@@ -96,6 +97,7 @@ class QSGContextPrivate : public QObjectPrivate
+ public:
+     QSGContextPrivate()
+         : gl(0)
++        , depthStencilBufferManager(0)
+         , distanceFieldCacheManager(0)
+     #ifndef QT_OPENGL_ES
+         , distanceFieldAntialiasing(QSGGlyphNode::HighQualitySubPixelAntialiasing)
+@@ -117,7 +119,7 @@ public:
+     QHash<QSGMaterialType *, QSGMaterialShader *> materials;
+     QMutex textureMutex;
+     QHash<QQuickTextureFactory *, QSGTexture *> textures;
+-
++    QSGDepthStencilBufferManager *depthStencilBufferManager;
+     QSGDistanceFieldGlyphCacheManager *distanceFieldCacheManager;
+ 
+     QSGDistanceFieldGlyphNode::AntialiasingMode distanceFieldAntialiasing;
+@@ -179,6 +181,8 @@ void QSGContext::invalidate()
+     d->textureMutex.unlock();
+     qDeleteAll(d->materials.values());
+     d->materials.clear();
++    delete d->depthStencilBufferManager;
++    d->depthStencilBufferManager = 0;
+     delete d->distanceFieldCacheManager;
+     d->distanceFieldCacheManager = 0;
+ 
+@@ -412,6 +416,42 @@ QSize QSGContext::minimumFBOSize() const
+ 
+ 
+ /*!
++    Returns a shared pointer to a depth stencil buffer that can be used with \a fbo.
++  */
++QSharedPointer<QSGDepthStencilBuffer> QSGContext::depthStencilBufferForFbo(QOpenGLFramebufferObject *fbo)
++{
++    Q_D(QSGContext);
++    if (!d->gl)
++        return QSharedPointer<QSGDepthStencilBuffer>();
++    QSGDepthStencilBufferManager *manager = depthStencilBufferManager();
++    QSGDepthStencilBuffer::Format format;
++    format.size = fbo->size();
++    format.samples = fbo->format().samples();
++    format.attachments = QSGDepthStencilBuffer::DepthAttachment | QSGDepthStencilBuffer::StencilAttachment;
++    QSharedPointer<QSGDepthStencilBuffer> buffer = manager->bufferForFormat(format);
++    if (buffer.isNull()) {
++        buffer = QSharedPointer<QSGDepthStencilBuffer>(new QSGDefaultDepthStencilBuffer(d->gl, format));
++        manager->insertBuffer(buffer);
++    }
++    return buffer;
++}
++
++/*!
++    Returns a pointer to the context's depth/stencil buffer manager. This is useful for custom
++    implementations of \l depthStencilBufferForFbo().
++  */
++QSGDepthStencilBufferManager *QSGContext::depthStencilBufferManager()
++{
++    Q_D(QSGContext);
++    if (!d->gl)
++        return 0;
++    if (!d->depthStencilBufferManager)
++        d->depthStencilBufferManager = new QSGDepthStencilBufferManager(d->gl);
++    return d->depthStencilBufferManager;
++}
++
++
++/*!
+     Returns a material shader for the given material.
+  */
+ 
+diff --git a/src/quick/scenegraph/qsgcontext_p.h b/src/quick/scenegraph/qsgcontext_p.h
+index 7ca3406..7cbff40 100644
+--- a/src/quick/scenegraph/qsgcontext_p.h
++++ b/src/quick/scenegraph/qsgcontext_p.h
+@@ -51,6 +51,7 @@
+ #include <private/qrawfont_p.h>
+ 
+ #include <QtQuick/qsgnode.h>
++#include <QtQuick/private/qsgdepthstencilbuffer_p.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -104,6 +105,8 @@ public:
+ 
+     virtual QSGTexture *createTexture(const QImage &image = QImage()) const;
+     virtual QSize minimumFBOSize() const;
++    virtual QSharedPointer<QSGDepthStencilBuffer> depthStencilBufferForFbo(QOpenGLFramebufferObject *fbo);
++    QSGDepthStencilBufferManager *depthStencilBufferManager();
+ 
+     virtual QSurfaceFormat defaultSurfaceFormat() const;
+ 
+diff --git a/src/quick/scenegraph/scenegraph.pri b/src/quick/scenegraph/scenegraph.pri
+index f5fa18f..b6f7a22 100644
+--- a/src/quick/scenegraph/scenegraph.pri
++++ b/src/quick/scenegraph/scenegraph.pri
+@@ -23,6 +23,7 @@ SOURCES += \
+ # Util API
+ HEADERS += \
+     $$PWD/util/qsgareaallocator_p.h \
++    $$PWD/util/qsgdepthstencilbuffer_p.h \
+     $$PWD/util/qsgengine.h \
+     $$PWD/util/qsgflatcolormaterial.h \
+     $$PWD/util/qsgsimplematerial.h \
+@@ -39,6 +40,7 @@ HEADERS += \
+ 
+ SOURCES += \
+     $$PWD/util/qsgareaallocator.cpp \
++    $$PWD/util/qsgdepthstencilbuffer.cpp \
+     $$PWD/util/qsgengine.cpp \
+     $$PWD/util/qsgflatcolormaterial.cpp \
+     $$PWD/util/qsgsimplerectnode.cpp \
+diff --git a/src/quick/scenegraph/util/qsgdepthstencilbuffer.cpp b/src/quick/scenegraph/util/qsgdepthstencilbuffer.cpp
+new file mode 100644
+index 0000000..bca57a3
+--- /dev/null
++++ b/src/quick/scenegraph/util/qsgdepthstencilbuffer.cpp
+@@ -0,0 +1,177 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qsgdepthstencilbuffer_p.h"
++
++QT_BEGIN_NAMESPACE
++
++QSGDepthStencilBuffer::QSGDepthStencilBuffer(QOpenGLContext *context, const Format &format)
++    : m_functions(context)
++    , m_manager(0)
++    , m_format(format)
++    , m_depthBuffer(0)
++    , m_stencilBuffer(0)
++{
++    // 'm_manager' is set by QSGDepthStencilBufferManager::insertBuffer().
++}
++
++QSGDepthStencilBuffer::~QSGDepthStencilBuffer()
++{
++    if (m_manager)
++        m_manager->m_buffers.remove(m_format);
++}
++
++void QSGDepthStencilBuffer::attach()
++{
++    m_functions.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                                          GL_RENDERBUFFER, m_depthBuffer);
++    m_functions.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
++                                          GL_RENDERBUFFER, m_stencilBuffer);
++}
++
++void QSGDepthStencilBuffer::detach()
++{
++    m_functions.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                                          GL_RENDERBUFFER, 0);
++    m_functions.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
++                                          GL_RENDERBUFFER, 0);
++}
++
++
++QSGDefaultDepthStencilBuffer::QSGDefaultDepthStencilBuffer(QOpenGLContext *context, const Format &format)
++    : QSGDepthStencilBuffer(context, format)
++{
++    const GLsizei width = format.size.width();
++    const GLsizei height = format.size.height();
++
++    if (format.attachments == (DepthAttachment | StencilAttachment)
++            && m_functions.hasOpenGLExtension(QOpenGLExtensions::PackedDepthStencil))
++    {
++        m_functions.glGenRenderbuffers(1, &m_depthBuffer);
++        m_functions.glBindRenderbuffer(GL_RENDERBUFFER, m_depthBuffer);
++        if (format.samples && m_functions.hasOpenGLExtension(QOpenGLExtensions::FramebufferMultisample)) {
++            m_functions.glRenderbufferStorageMultisample(GL_RENDERBUFFER, format.samples,
++                GL_DEPTH24_STENCIL8, width, height);
++        } else {
++            m_functions.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
++        }
++        m_stencilBuffer = m_depthBuffer;
++    }
++    if (!m_depthBuffer && (format.attachments & DepthAttachment)) {
++        m_functions.glGenRenderbuffers(1, &m_depthBuffer);
++        m_functions.glBindRenderbuffer(GL_RENDERBUFFER, m_depthBuffer);
++#ifdef QT_OPENGL_ES
++        const GLenum internalFormat = m_functions.hasOpenGLExtension(QOpenGLExtensions::Depth24)
++                ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT16;
++#else
++        const GLenum internalFormat = GL_DEPTH_COMPONENT;
++#endif
++        if (format.samples && m_functions.hasOpenGLExtension(QOpenGLExtensions::FramebufferMultisample)) {
++            m_functions.glRenderbufferStorageMultisample(GL_RENDERBUFFER, format.samples,
++                internalFormat, width, height);
++        } else {
++            m_functions.glRenderbufferStorage(GL_RENDERBUFFER, internalFormat, width, height);
++        }
++    }
++    if (!m_stencilBuffer && (format.attachments & StencilAttachment)) {
++        m_functions.glGenRenderbuffers(1, &m_stencilBuffer);
++        m_functions.glBindRenderbuffer(GL_RENDERBUFFER, m_stencilBuffer);
++#ifdef QT_OPENGL_ES
++        const GLenum internalFormat = GL_STENCIL_INDEX8;
++#else
++        const GLenum internalFormat = GL_STENCIL_INDEX;
++#endif
++        if (format.samples && m_functions.hasOpenGLExtension(QOpenGLExtensions::FramebufferMultisample)) {
++            m_functions.glRenderbufferStorageMultisample(GL_RENDERBUFFER, format.samples,
++                internalFormat, width, height);
++        } else {
++            m_functions.glRenderbufferStorage(GL_RENDERBUFFER, internalFormat, width, height);
++        }
++    }
++}
++
++QSGDefaultDepthStencilBuffer::~QSGDefaultDepthStencilBuffer()
++{
++    free();
++}
++
++void QSGDefaultDepthStencilBuffer::free()
++{
++    if (m_depthBuffer)
++        m_functions.glDeleteRenderbuffers(1, &m_depthBuffer);
++    if (m_stencilBuffer && m_stencilBuffer != m_depthBuffer)
++        m_functions.glDeleteRenderbuffers(1, &m_stencilBuffer);
++    m_depthBuffer = m_stencilBuffer = 0;
++}
++
++
++QSGDepthStencilBufferManager::~QSGDepthStencilBufferManager()
++{
++    for (Hash::const_iterator it = m_buffers.constBegin(); it != m_buffers.constEnd(); ++it) {
++        QSGDepthStencilBuffer *buffer = it.value().data();
++        buffer->free();
++        buffer->m_manager = 0;
++    }
++}
++
++QSharedPointer<QSGDepthStencilBuffer> QSGDepthStencilBufferManager::bufferForFormat(const QSGDepthStencilBuffer::Format &fmt)
++{
++    Hash::const_iterator it = m_buffers.constFind(fmt);
++    if (it != m_buffers.constEnd())
++        return it.value().toStrongRef();
++    return QSharedPointer<QSGDepthStencilBuffer>();
++}
++
++void QSGDepthStencilBufferManager::insertBuffer(const QSharedPointer<QSGDepthStencilBuffer> &buffer)
++{
++    Q_ASSERT(buffer->m_manager == 0);
++    Q_ASSERT(!m_buffers.contains(buffer->m_format));
++    buffer->m_manager = this;
++    m_buffers.insert(buffer->m_format, buffer.toWeakRef());
++}
++
++uint qHash(const QSGDepthStencilBuffer::Format &format)
++{
++    return qHash(qMakePair(format.size.width(), format.size.height()))
++            ^ (uint(format.samples) << 12) ^ (uint(format.attachments) << 28);
++}
++
++QT_END_NAMESPACE
+diff --git a/src/quick/scenegraph/util/qsgdepthstencilbuffer_p.h b/src/quick/scenegraph/util/qsgdepthstencilbuffer_p.h
+new file mode 100644
+index 0000000..0d8847f
+--- /dev/null
++++ b/src/quick/scenegraph/util/qsgdepthstencilbuffer_p.h
+@@ -0,0 +1,142 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QSGDEPTHSTENCILBUFFER_P_H
++#define QSGDEPTHSTENCILBUFFER_P_H
++
++#include <QtCore/qsize.h>
++#include <QtGui/private/qopenglcontext_p.h>
++#include <QtGui/private/qopenglextensions_p.h>
++#include <QtCore/qsharedpointer.h>
++#include <QtCore/qhash.h>
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++class QSGDepthStencilBufferManager;
++
++class QSGDepthStencilBuffer
++{
++public:
++    enum Attachment
++    {
++        NoAttachment = 0x00,
++        DepthAttachment = 0x01,
++        StencilAttachment = 0x02
++    };
++    Q_DECLARE_FLAGS(Attachments, Attachment)
++
++    struct Format
++    {
++        QSize size;
++        int samples;
++        QSGDepthStencilBuffer::Attachments attachments;
++        bool operator == (const Format &other) const;
++    };
++
++    QSGDepthStencilBuffer(QOpenGLContext *context, const Format &format);
++    virtual ~QSGDepthStencilBuffer();
++
++    // Attaches this depth stencil buffer to the currently bound FBO.
++    void attach();
++    // Detaches this depth stencil buffer from the currently bound FBO.
++    void detach();
++
++    QSize size() const { return m_format.size; }
++    int samples() const { return m_format.samples; }
++    Attachments attachments() const { return m_format.attachments; }
++
++protected:
++    virtual void free() = 0;
++
++    QOpenGLExtensions m_functions;
++    QSGDepthStencilBufferManager *m_manager;
++    Format m_format;
++    GLuint m_depthBuffer;
++    GLuint m_stencilBuffer;
++
++    friend class QSGDepthStencilBufferManager;
++};
++
++Q_DECLARE_OPERATORS_FOR_FLAGS(QSGDepthStencilBuffer::Attachments)
++
++inline bool QSGDepthStencilBuffer::Format::operator == (const Format &other) const
++{
++    return size == other.size && samples == other.samples && attachments == other.attachments;
++}
++
++
++class QSGDefaultDepthStencilBuffer : public QSGDepthStencilBuffer
++{
++public:
++    QSGDefaultDepthStencilBuffer(QOpenGLContext *context, const Format &format);
++    virtual ~QSGDefaultDepthStencilBuffer();
++
++protected:
++    virtual void free();
++};
++
++
++class QSGDepthStencilBufferManager
++{
++public:
++    QSGDepthStencilBufferManager(QOpenGLContext *ctx) : m_context(ctx) { }
++    ~QSGDepthStencilBufferManager();
++    QOpenGLContext *context() const { return m_context; }
++    QSharedPointer<QSGDepthStencilBuffer> bufferForFormat(const QSGDepthStencilBuffer::Format &fmt);
++    void insertBuffer(const QSharedPointer<QSGDepthStencilBuffer> &buffer);
++
++private:
++    typedef QHash<QSGDepthStencilBuffer::Format, QWeakPointer<QSGDepthStencilBuffer> > Hash;
++    QOpenGLContext *m_context;
++    Hash m_buffers;
++
++    friend class QSGDepthStencilBuffer;
++};
++
++extern uint qHash(const QSGDepthStencilBuffer::Format &format);
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif

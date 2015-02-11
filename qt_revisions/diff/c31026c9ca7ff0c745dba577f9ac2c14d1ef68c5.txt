@@ -1,0 +1,351 @@
+diff --git a/src/qml/qml/qqmlcontext.cpp b/src/qml/qml/qqmlcontext.cpp
+index cbb8430..7e15993 100644
+--- a/src/qml/qml/qqmlcontext.cpp
++++ b/src/qml/qml/qqmlcontext.cpp
+@@ -513,7 +513,8 @@ QObject *QQmlContextPrivate::context_at(QQmlListProperty<QObject> *prop, int ind
+ 
+ QQmlContextData::QQmlContextData()
+ : parent(0), engine(0), isInternal(false), ownedByParent(false), isJSContext(false), 
+-  isPragmaLibraryContext(false), unresolvedNames(false), publicContext(0), activeVMEData(0),
++  isPragmaLibraryContext(false), unresolvedNames(false), hasEmittedDestruction(false),
++  publicContext(0), activeVMEData(0),
+   propertyNames(0), contextObject(0), imports(0), childContexts(0), nextChild(0), prevChild(0),
+   expressions(0), contextObjects(0), contextGuards(0), idValues(0), idValueCount(0), linkedContext(0),
+   componentAttached(0), v4bindings(0), v8bindings(0)
+@@ -522,25 +523,45 @@ QQmlContextData::QQmlContextData()
+ 
+ QQmlContextData::QQmlContextData(QQmlContext *ctxt)
+ : parent(0), engine(0), isInternal(false), ownedByParent(false), isJSContext(false), 
+-  isPragmaLibraryContext(false), unresolvedNames(false), publicContext(ctxt), activeVMEData(0),
++  isPragmaLibraryContext(false), unresolvedNames(false), hasEmittedDestruction(false),
++  publicContext(ctxt), activeVMEData(0),
+   propertyNames(0), contextObject(0), imports(0), childContexts(0), nextChild(0), prevChild(0),
+   expressions(0), contextObjects(0), contextGuards(0), idValues(0), idValueCount(0), linkedContext(0),
+   componentAttached(0), v4bindings(0), v8bindings(0)
+ {
+ }
+ 
+-void QQmlContextData::invalidate()
++void QQmlContextData::emitDestruction()
+ {
+-    while (componentAttached) {
+-        QQmlComponentAttached *a = componentAttached;
+-        componentAttached = a->next;
+-        if (componentAttached) componentAttached->prev = &componentAttached;
++    if (!hasEmittedDestruction) {
++        hasEmittedDestruction = true;
++
++        // Emit the destruction signal - must be emitted before invalidate so that the
++        // context is still valid if bindings or resultant expression evaluation requires it
++        if (engine) {
++            while (componentAttached) {
++                QQmlComponentAttached *a = componentAttached;
++                componentAttached = a->next;
++                if (componentAttached) componentAttached->prev = &componentAttached;
+ 
+-        a->next = 0;
+-        a->prev = 0;
++                a->next = 0;
++                a->prev = 0;
++
++                emit a->destruction();
++            }
+ 
+-        emit a->destruction();
++            QQmlContextData * child = childContexts;
++            while (child) {
++                child->emitDestruction();
++                child = child->nextChild;
++            }
++        }
+     }
++}
++
++void QQmlContextData::invalidate()
++{
++    emitDestruction();
+ 
+     while (childContexts) {
+         if (childContexts->ownedByParent) {
+@@ -563,18 +584,7 @@ void QQmlContextData::invalidate()
+ 
+ void QQmlContextData::clearContext()
+ {
+-    if (engine) {
+-        while (componentAttached) {
+-            QQmlComponentAttached *a = componentAttached;
+-            componentAttached = a->next;
+-            if (componentAttached) componentAttached->prev = &componentAttached;
+-
+-            a->next = 0;
+-            a->prev = 0;
+-
+-            emit a->destruction();
+-        }
+-    }
++    emitDestruction();
+ 
+     QQmlAbstractExpression *expression = expressions;
+     while (expression) {
+diff --git a/src/qml/qml/qqmlcontext_p.h b/src/qml/qml/qqmlcontext_p.h
+index 97bc04b..1f1c601 100644
+--- a/src/qml/qml/qqmlcontext_p.h
++++ b/src/qml/qml/qqmlcontext_p.h
+@@ -118,6 +118,7 @@ class Q_QML_EXPORT QQmlContextData
+ public:
+     QQmlContextData();
+     QQmlContextData(QQmlContext *);
++    void emitDestruction();
+     void clearContext();
+     void destroy();
+     void invalidate();
+@@ -146,7 +147,8 @@ public:
+     quint32 isJSContext:1;
+     quint32 isPragmaLibraryContext:1;
+     quint32 unresolvedNames:1; // True if expressions in this context failed to resolve a toplevel name
+-    quint32 dummy:27;
++    quint32 hasEmittedDestruction:1;
++    quint32 dummy:26;
+     QQmlContext *publicContext;
+ 
+     // VME data that is constructing this context if any
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index c79e756..2717ed3 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -575,6 +575,11 @@ QQmlEngine::~QQmlEngine()
+         QQmlEngineDebugService::instance()->remEngine(this);
+     }
+ 
++    // Emit onDestruction signals for the root context before
++    // we destroy the contexts, engine, Module APIs etc. that
++    // may be required to handle the destruction signal.
++    QQmlContextData::get(rootContext())->emitDestruction();
++
+     // if we are the parent of any of the qobject module api instances,
+     // we need to remove them from our internal list, in order to prevent
+     // a segfault in engine private dtor.
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index f2acac5..7e7b6eb 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -1160,6 +1160,9 @@ void QV8QObjectWrapper::deleteWeakQObject(QV8QObjectResource *resource)
+ 
+             ddata->v8object.Clear();
+             if (!object->parent() && !ddata->indestructible) {
++                // This object is notionally destroyed now
++                if (ddata->ownContext && ddata->context)
++                    ddata->context->emitDestruction();
+                 ddata->isQueuedForDeletion = true;
+                 object->deleteLater();
+             }
+diff --git a/tests/auto/qml/qqmlcomponent/data/onDestructionCount.qml b/tests/auto/qml/qqmlcomponent/data/onDestructionCount.qml
+new file mode 100644
+index 0000000..3938acf
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/onDestructionCount.qml
+@@ -0,0 +1,16 @@
++import QtQuick 2.0
++
++Item {
++    Component {
++        id: internalComponent
++
++        Item {
++            Component.onDestruction: console.warn('Component.onDestruction')
++        }
++    }
++
++    Component.onCompleted: {
++        internalComponent.createObject()
++        gc()
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/data/onDestructionLookup.qml b/tests/auto/qml/qqmlcomponent/data/onDestructionLookup.qml
+new file mode 100644
+index 0000000..a49a86e
+--- /dev/null
++++ b/tests/auto/qml/qqmlcomponent/data/onDestructionLookup.qml
+@@ -0,0 +1,25 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    property bool success: false
++
++    Component {
++        id: internalComponent
++
++        Item {
++            id: internalRoot
++
++            property string foo: ''
++
++            Component.onCompleted: { internalRoot.foo = 'bar' }
++            Component.onDestruction: { root.success = (internalRoot.foo == 'bar') }
++        }
++    }
++
++    Component.onCompleted: {
++        internalComponent.createObject()
++        gc()
++    }
++}
+diff --git a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+index b534d0c..bf76ed9 100644
+--- a/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
++++ b/tests/auto/qml/qqmlcomponent/tst_qqmlcomponent.cpp
+@@ -112,6 +112,8 @@ private slots:
+     void async();
+     void asyncHierarchy();
+     void componentUrlCanonicalization();
++    void onDestructionLookup();
++    void onDestructionCount();
+ 
+ private:
+     QQmlEngine engine;
+@@ -366,6 +368,47 @@ void tst_qqmlcomponent::componentUrlCanonicalization()
+     }
+ }
+ 
++void tst_qqmlcomponent::onDestructionLookup()
++{
++    QQmlEngine engine;
++    QQmlComponent component(&engine, testFileUrl("onDestructionLookup.qml"));
++    QScopedPointer<QObject> object(component.create());
++    QVERIFY(object != 0);
++    QVERIFY(object->property("success").toBool());
++}
++
++void tst_qqmlcomponent::onDestructionCount()
++{
++    QQmlEngine engine;
++    QQmlComponent component(&engine, testFileUrl("onDestructionCount.qml"));
++
++    QLatin1String warning("Component.onDestruction");
++
++    {
++        // Warning should be emitted during create()
++        QTest::ignoreMessage(QtWarningMsg, warning.data());
++
++        QScopedPointer<QObject> object(component.create());
++        QVERIFY(object != 0);
++    }
++
++    // Warning should not be emitted any further
++    QCOMPARE(engine.outputWarningsToStandardError(), true);
++
++    warnings.clear();
++    QtMsgHandler old = qInstallMsgHandler(msgHandler);
++
++    QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++    QCoreApplication::processEvents();
++
++    qInstallMsgHandler(old);
++
++    engine.setOutputWarningsToStandardError(false);
++    QCOMPARE(engine.outputWarningsToStandardError(), false);
++
++    QCOMPARE(warnings.count(), 0);
++}
++
+ QTEST_MAIN(tst_qqmlcomponent)
+ 
+ #include "tst_qqmlcomponent.moc"
+diff --git a/tests/auto/qml/qqmlecmascript/data/OnDestructionComponent.qml b/tests/auto/qml/qqmlecmascript/data/OnDestructionComponent.qml
+new file mode 100644
+index 0000000..dcf4672
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/OnDestructionComponent.qml
+@@ -0,0 +1,9 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: sec
++
++    property int a: 10
++    Component.onDestruction: ModApi.setSpecificProperty(sec, "a", 20);
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/onDestruction.qml b/tests/auto/qml/qqmlecmascript/data/onDestruction.qml
+new file mode 100644
+index 0000000..b2963a1
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/onDestruction.qml
+@@ -0,0 +1,18 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    property Component comp: OnDestructionComponent {
++        property int b: 50
++        onParentChanged: b += a
++    }
++
++    property Item compInstance
++
++    Component.onCompleted: {
++        compInstance = comp.createObject(root);
++        compInstance.destroy();
++    }
++}
++
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index f39d5d9..a289d97 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1021,6 +1021,8 @@ public:
+     Q_INVOKABLE void setTrackedObjectProperty(const QString &propName) const { m_trackedObject->setProperty(qPrintable(propName), QVariant(5)); }
+     Q_INVOKABLE QVariant trackedObjectProperty(const QString &propName) const { return m_trackedObject->property(qPrintable(propName)); }
+ 
++    Q_INVOKABLE void setSpecificProperty(QObject *obj, const QString & propName, const QVariant & v) const { obj->setProperty(qPrintable(propName), v); }
++
+     int qobjectTestProperty() const { return m_testProperty; }
+     void setQObjectTestProperty(int tp) { m_testProperty = tp; emit qobjectTestPropertyChanged(tp); }
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 4e7f1a2..11819c5 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -257,6 +257,8 @@ private slots:
+     void tryStatement();
+     void replaceBinding();
+     void deleteRootObjectInCreation();
++    void onDestruction();
++
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+     QQmlEngine engine;
+@@ -6632,6 +6634,30 @@ void tst_qqmlecmascript::deleteRootObjectInCreation()
+     delete obj;
+ }
+ 
++void tst_qqmlecmascript::onDestruction()
++{
++    {
++        // Delete object manually to invoke the associated handlers,
++        // prior to engine destruction.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("onDestruction.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++        delete obj;
++    }
++
++    {
++        // In this case, the teardown of the engine causes deletion
++        // of contexts and child items.  This triggers the
++        // onDestruction handler of a (previously .destroy()ed)
++        // component instance.  This shouldn't crash.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("onDestruction.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++    }
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

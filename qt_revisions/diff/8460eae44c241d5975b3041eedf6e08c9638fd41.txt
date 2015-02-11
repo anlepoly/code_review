@@ -1,0 +1,182 @@
+diff --git a/src/declarative/qml/qdeclarativeproperty.cpp b/src/declarative/qml/qdeclarativeproperty.cpp
+index 1e0b14e..9941342 100644
+--- a/src/declarative/qml/qdeclarativeproperty.cpp
++++ b/src/declarative/qml/qdeclarativeproperty.cpp
+@@ -1052,6 +1052,39 @@ QVariant QDeclarativePropertyPrivate::readValueProperty()
+     }
+ }
+ 
++// helper function to allow assignment / binding to QList<QUrl> properties.
++static QVariant resolvedUrlSequence(const QVariant &value, QDeclarativeContextData *context)
++{
++    QList<QUrl> urls;
++    if (value.userType() == qMetaTypeId<QUrl>()) {
++        urls.append(value.toUrl());
++    } else if (value.userType() == qMetaTypeId<QString>()) {
++        urls.append(QUrl(value.toString()));
++    } else if (value.userType() == qMetaTypeId<QByteArray>()) {
++        urls.append(QUrl(QString::fromUtf8(value.toByteArray())));
++    } else if (value.userType() == qMetaTypeId<QList<QUrl> >()) {
++        urls = value.value<QList<QUrl> >();
++    } else if (value.userType() == qMetaTypeId<QStringList>()) {
++        QStringList urlStrings = value.value<QStringList>();
++        for (int i = 0; i < urlStrings.size(); ++i)
++            urls.append(QUrl(urlStrings.at(i)));
++    } else if (value.userType() == qMetaTypeId<QList<QString> >()) {
++        QList<QString> urlStrings = value.value<QList<QString> >();
++        for (int i = 0; i < urlStrings.size(); ++i)
++            urls.append(QUrl(urlStrings.at(i)));
++    } // note: QList<QByteArray> is not currently supported.
++
++    QList<QUrl> resolvedUrls;
++    for (int i = 0; i < urls.size(); ++i) {
++        QUrl u = urls.at(i);
++        if (context && u.isRelative() && !u.isEmpty())
++            u = context->resolvedUrl(u);
++        resolvedUrls.append(u);
++    }
++
++    return QVariant::fromValue<QList<QUrl> >(resolvedUrls);
++}
++
+ //writeEnumProperty MIRRORS the relelvant bit of QMetaProperty::write AND MUST BE KEPT IN SYNC!
+ bool QDeclarativePropertyPrivate::writeEnumProperty(const QMetaProperty &prop, int idx, QObject *object, const QVariant &value, int flags)
+ {
+@@ -1194,6 +1227,11 @@ bool QDeclarativePropertyPrivate::write(QObject *object,
+         void *argv[] = { &u, 0, &status, &flags };
+         QMetaObject::metacall(object, QMetaObject::WriteProperty, coreIdx, argv);
+ 
++    } else if (propertyType == qMetaTypeId<QList<QUrl> >()) {
++        QList<QUrl> urlSeq = resolvedUrlSequence(value, context).value<QList<QUrl> >();
++        int status = -1;
++        void *argv[] = { &urlSeq, 0, &status, &flags };
++        QMetaObject::metacall(object, QMetaObject::WriteProperty, coreIdx, argv);
+     } else if (variantType == propertyType) {
+ 
+         void *a[] = { (void *)value.constData(), 0, &status, &flags };
+@@ -1299,6 +1337,7 @@ bool QDeclarativePropertyPrivate::write(QObject *object,
+         if (!ok) {
+             // the only other option is that they are assigning a single value
+             // to a sequence type property (eg, an int to a QList<int> property).
++            // Note that we've already handled single-value assignment to QList<QUrl> properties.
+             if (variantType == QVariant::Int && propertyType == qMetaTypeId<QList<int> >()) {
+                 QList<int> list;
+                 list << value.toInt();
+@@ -1314,28 +1353,6 @@ bool QDeclarativePropertyPrivate::write(QObject *object,
+                 list << value.toBool();
+                 v = QVariant::fromValue<QList<bool> >(list);
+                 ok = true;
+-            } else if ((variantType == QVariant::Url || variantType == QVariant::String || variantType == QVariant::ByteArray)
+-                       && propertyType == qMetaTypeId<QList<QUrl> >()) {
+-                QUrl u;
+-                bool found = false;
+-                if (variantType == QVariant::Url) {
+-                    u = value.toUrl();
+-                    found = true;
+-                } else if (variantType == QVariant::ByteArray) {
+-                    u = QUrl(QString::fromUtf8(value.toByteArray()));
+-                    found = true;
+-                } else if (variantType == QVariant::String) {
+-                    u = QUrl(value.toString());
+-                    found = true;
+-                }
+-                if (!found)
+-                    return false;
+-                if (context && u.isRelative() && !u.isEmpty())
+-                    u = context->resolvedUrl(u);
+-                QList<QUrl> list;
+-                list << u;
+-                v = QVariant::fromValue<QList<QUrl> >(list);
+-                ok = true;
+             } else if (variantType == QVariant::String && propertyType == qMetaTypeId<QList<QString> >()) {
+                 QList<QString> list;
+                 list << value.toString();
+@@ -1423,9 +1440,7 @@ bool QDeclarativePropertyPrivate::writeBinding(QObject *object,
+     } else if (result->IsNull() && core.isQObject()) {
+         value = QVariant::fromValue((QObject *)0);
+     } else if (core.propType == qMetaTypeId<QList<QUrl> >()) {
+-        value = v8engine->toVariant(result, qMetaTypeId<QList<QUrl> >());
+-        if (value.userType() == qMetaTypeId<QString>())
+-            value = QVariant(QUrl(value.toString()));
++        value = resolvedUrlSequence(v8engine->toVariant(result, qMetaTypeId<QList<QUrl> >()), context);
+     } else if (!isVmeProperty) {
+         value = v8engine->toVariant(result, type);
+     }
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/data/assignSequenceTypes.7.qml b/tests/auto/declarative/qdeclarativeecmascript/data/assignSequenceTypes.7.qml
+new file mode 100644
+index 0000000..96c0684
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativeecmascript/data/assignSequenceTypes.7.qml
+@@ -0,0 +1,42 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    // single url assignment to url list property
++    MySequenceConversionObject {
++        id: msco1
++        objectName: "msco1"
++    }
++
++    // single url binding to url list property
++    MySequenceConversionObject {
++        id: msco2
++        objectName: "msco2"
++        urlListProperty: "example.html"
++    }
++
++    // multiple url assignment to url list property
++    MySequenceConversionObject {
++        id: msco3
++        objectName: "msco3"
++    }
++
++    // multiple url binding to url list property
++    MySequenceConversionObject {
++        id: msco4
++        objectName: "msco4"
++        urlListProperty: [ "example.html", "example2.html" ]
++    }
++
++    // multiple url binding to url list property - already resolved
++    MySequenceConversionObject {
++        id: msco5
++        objectName: "msco5"
++        urlListProperty: [ Qt.resolvedUrl("example.html"), Qt.resolvedUrl("example2.html") ]
++    }
++
++    Component.onCompleted: {
++        msco1.urlListProperty = "example.html";
++        msco3.urlListProperty = [ "example.html", "example2.html" ];
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+index 10ae0cc..251b89d 100644
+--- a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
++++ b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+@@ -4709,6 +4709,25 @@ void tst_qdeclarativeecmascript::assignSequenceTypes()
+     QCOMPARE(object->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html"))));
+     delete object;
+     }
++
++    // test QList<QUrl> literal assignment and binding assignment causes url resolution when required
++    {
++    QDeclarativeComponent component(&engine, TEST_FILE("assignSequenceTypes.7.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    MySequenceConversionObject *msco1 = object->findChild<MySequenceConversionObject *>(QLatin1String("msco1"));
++    MySequenceConversionObject *msco2 = object->findChild<MySequenceConversionObject *>(QLatin1String("msco2"));
++    MySequenceConversionObject *msco3 = object->findChild<MySequenceConversionObject *>(QLatin1String("msco3"));
++    MySequenceConversionObject *msco4 = object->findChild<MySequenceConversionObject *>(QLatin1String("msco4"));
++    MySequenceConversionObject *msco5 = object->findChild<MySequenceConversionObject *>(QLatin1String("msco5"));
++    QVERIFY(msco1 != 0 && msco2 != 0 && msco3 != 0 && msco4 != 0 && msco5 != 0);
++    QCOMPARE(msco1->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html"))));
++    QCOMPARE(msco2->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html"))));
++    QCOMPARE(msco3->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html")) << QUrl(TEST_FILE("example2.html"))));
++    QCOMPARE(msco4->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html")) << QUrl(TEST_FILE("example2.html"))));
++    QCOMPARE(msco5->urlListProperty(), (QList<QUrl>() << QUrl(TEST_FILE("example.html")) << QUrl(TEST_FILE("example2.html"))));
++    delete object;
++    }
+ }
+ 
+ // Test that assigning a null object works

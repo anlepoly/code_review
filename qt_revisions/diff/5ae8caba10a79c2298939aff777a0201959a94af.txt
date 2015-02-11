@@ -1,0 +1,1555 @@
+diff --git a/src/qml/debugger/qqmlenginedebugservice.cpp b/src/qml/debugger/qqmlenginedebugservice.cpp
+index 9653cf6..892098b 100644
+--- a/src/qml/debugger/qqmlenginedebugservice.cpp
++++ b/src/qml/debugger/qqmlenginedebugservice.cpp
+@@ -577,10 +577,8 @@ void QQmlEngineDebugService::setBinding(int objectId,
+                     QQmlPropertyPrivate::setSignalExpression(property, qmlExpression);
+                     qmlExpression->setSourceLocation(filename, line, column);
+                 } else if (property.isProperty()) {
+-                    QQmlBinding *binding = new QQmlBinding(expression.toString(), object, context);
++                    QQmlBinding *binding = new QQmlBinding(expression.toString(), false, object, QQmlContextData::get(context), filename, line, column);;
+                     binding->setTarget(property);
+-                    binding->setSourceLocation(filename, line, column);
+-                    binding->setNotifyOnValueChanged(true);
+                     QQmlAbstractBinding *oldBinding = QQmlPropertyPrivate::setBinding(property, binding);
+                     if (oldBinding)
+                         oldBinding->destroy();
+diff --git a/src/qml/qml/qml.pri b/src/qml/qml/qml.pri
+index 763a260..c75e4c9 100644
+--- a/src/qml/qml/qml.pri
++++ b/src/qml/qml/qml.pri
+@@ -64,7 +64,6 @@ HEADERS += \
+     $$PWD/qqml.h \
+     $$PWD/qquickapplication_p.h \
+     $$PWD/qqmlbinding_p.h \
+-    $$PWD/qqmlbinding_p_p.h \
+     $$PWD/qqmlproperty.h \
+     $$PWD/qqmlcomponent.h \
+     $$PWD/qqmlcomponent_p.h \
+diff --git a/src/qml/qml/qqmlabstractbinding.cpp b/src/qml/qml/qqmlabstractbinding.cpp
+index 11e4ed2..acc207e 100644
+--- a/src/qml/qml/qqmlabstractbinding.cpp
++++ b/src/qml/qml/qqmlabstractbinding.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include "qqmlabstractbinding_p.h"
+ 
++#include <QtQml/qqmlinfo.h>
+ #include <private/qqmlbinding_p.h>
+ #include <private/qqmlvaluetypeproxybinding_p.h>
+ 
+@@ -154,6 +155,12 @@ void QQmlAbstractBinding::removeFromObject()
+     }
+ }
+ 
++void QQmlAbstractBinding::printBindingLoopError(QQmlProperty &prop)
++{
++    qmlInfo(prop.object()) << QString(QLatin1String("Binding loop detected for property \"%1\"")).arg(prop.name());
++}
++
++
+ static void bindingDummyDeleter(QQmlAbstractBinding *)
+ {
+ }
+diff --git a/src/qml/qml/qqmlabstractbinding_p.h b/src/qml/qml/qqmlabstractbinding_p.h
+index d226e17..8c4aa4a 100644
+--- a/src/qml/qml/qqmlabstractbinding_p.h
++++ b/src/qml/qml/qqmlabstractbinding_p.h
+@@ -92,6 +92,7 @@ public:
+     void removeFromObject();
+ 
+     static inline Pointer getPointer(QQmlAbstractBinding *p);
++    static void printBindingLoopError(QQmlProperty &prop);
+ 
+ protected:
+     virtual ~QQmlAbstractBinding();
+diff --git a/src/qml/qml/qqmlbinding.cpp b/src/qml/qml/qqmlbinding.cpp
+index 23f5abf..f43822e 100644
+--- a/src/qml/qml/qqmlbinding.cpp
++++ b/src/qml/qml/qqmlbinding.cpp
+@@ -40,7 +40,6 @@
+ ****************************************************************************/
+ 
+ #include "qqmlbinding_p.h"
+-#include "qqmlbinding_p_p.h"
+ 
+ #include "qqml.h"
+ #include "qqmlcontext.h"
+@@ -49,6 +48,8 @@
+ #include "qqmldata_p.h"
+ #include <private/qqmlprofilerservice_p.h>
+ #include <private/qqmltrace_p.h>
++#include <private/qqmlexpression_p.h>
++#include <private/qqmlrewrite_p.h>
+ 
+ #include <QVariant>
+ #include <QtCore/qdebug.h>
+@@ -57,24 +58,9 @@ QT_BEGIN_NAMESPACE
+ 
+ QQmlBinding::Identifier QQmlBinding::Invalid = -1;
+ 
+-void QQmlBindingPrivate::refresh()
+-{
+-    Q_Q(QQmlBinding);
+-    q->update();
+-}
+-
+-QQmlBindingPrivate::QQmlBindingPrivate()
+-: updating(false), enabled(false), target(), targetProperty(0)
+-{
+-}
+-
+-QQmlBindingPrivate::~QQmlBindingPrivate()
+-{
+-}
+-
+ QQmlBinding *
+ QQmlBinding::createBinding(Identifier id, QObject *obj, QQmlContext *ctxt,
+-                                   const QString &url, int lineNumber, QObject *parent)
++                                   const QString &url, int lineNumber)
+ {
+     if (id < 0)
+         return 0;
+@@ -88,7 +74,8 @@ QQmlBinding::createBinding(Identifier id, QObject *obj, QQmlContext *ctxt,
+         typeData = engine->typeLoader.get(ctxtdata->url);
+         cdata = typeData->compiledData();
+     }
+-    QQmlBinding *rv = cdata ? new QQmlBinding(cdata->primitives.at(id), true, obj, ctxtdata, url, lineNumber, 0, parent) : 0;
++    QQmlBinding *rv = cdata ? new QQmlBinding(cdata->primitives.at(id), true, obj, ctxtdata,
++                                              url, lineNumber, 0) : 0;
+     if (cdata)
+         cdata->release();
+     if (typeData)
+@@ -96,30 +83,62 @@ QQmlBinding::createBinding(Identifier id, QObject *obj, QQmlContext *ctxt,
+     return rv;
+ }
+ 
+-QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContext *ctxt, 
+-                                         QObject *parent)
+-: QQmlExpression(QQmlContextData::get(ctxt), obj, str, *new QQmlBindingPrivate)
++static QQmlJavaScriptExpression::VTable QQmlBinding_jsvtable = {
++    QQmlBinding::expressionIdentifier,
++    QQmlBinding::expressionChanged
++};
++
++QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContext *ctxt)
++: QQmlJavaScriptExpression(&QQmlBinding_jsvtable), m_lineNumber(-1), m_columnNumber(-1)
+ {
+-    setParent(parent);
+     setNotifyOnValueChanged(true);
++    QQmlAbstractExpression::setContext(QQmlContextData::get(ctxt));
++    setScopeObject(obj);
++
++    QQmlRewrite::RewriteBinding rewriteBinding;
++    QString code = rewriteBinding(str);
++
++    m_expression = str.toUtf8();
++    v8function = evalFunction(context(), obj, code, QString(), 0);
+ }
+ 
+-QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContextData *ctxt, 
+-                                         QObject *parent)
+-: QQmlExpression(ctxt, obj, str, *new QQmlBindingPrivate)
++QQmlBinding::QQmlBinding(const QString &str, QObject *obj, QQmlContextData *ctxt)
++: QQmlJavaScriptExpression(&QQmlBinding_jsvtable), m_lineNumber(-1), m_columnNumber(-1)
+ {
+-    setParent(parent);
+     setNotifyOnValueChanged(true);
++    QQmlAbstractExpression::setContext(ctxt);
++    setScopeObject(obj);
++
++    QQmlRewrite::RewriteBinding rewriteBinding;
++    QString code = rewriteBinding(str);
++
++    m_expression = str.toUtf8();
++    v8function = evalFunction(ctxt, obj, code, QString(), 0);
+ }
+ 
+ QQmlBinding::QQmlBinding(const QString &str, bool isRewritten, QObject *obj, 
+-                                         QQmlContextData *ctxt, 
+-                                         const QString &url, int lineNumber, int columnNumber,
+-                                         QObject *parent)
+-: QQmlExpression(ctxt, obj, str, isRewritten, url, lineNumber, columnNumber, *new QQmlBindingPrivate)
++                         QQmlContextData *ctxt,
++                         const QString &url, int lineNumber, int columnNumber)
++: QQmlJavaScriptExpression(&QQmlBinding_jsvtable), m_lineNumber(-1), m_columnNumber(-1)
+ {
+-    setParent(parent);
+     setNotifyOnValueChanged(true);
++    QQmlAbstractExpression::setContext(ctxt);
++    setScopeObject(obj);
++
++    QString code;
++    if (isRewritten) {
++        code = str;
++    } else {
++        QQmlRewrite::RewriteBinding rewriteBinding;
++        code = rewriteBinding(str);
++    }
++
++    m_url = url;
++    m_lineNumber = lineNumber;
++    m_columnNumber = columnNumber;
++    m_expression = str.toUtf8();
++
++    v8function = evalFunction(ctxt, obj, code, url, lineNumber);
+ }
+ 
+ /*!  
+@@ -130,124 +149,100 @@ QQmlBinding::QQmlBinding(const QString &str, bool isRewritten, QObject *obj,
+         v8::Handle<v8::Function> function;
+         new QQmlBinding(&function, scope, ctxt);
+  */
+-QQmlBinding::QQmlBinding(void *functionPtr, QObject *obj, QQmlContextData *ctxt, 
+-                                         QObject *parent)
+-: QQmlExpression(ctxt, obj, functionPtr, *new QQmlBindingPrivate)
++QQmlBinding::QQmlBinding(void *functionPtr, QObject *obj, QQmlContextData *ctxt,
++                         const QString &url, int lineNumber, int columnNumber)
++: QQmlJavaScriptExpression(&QQmlBinding_jsvtable),
++  m_url(url), m_lineNumber(lineNumber), m_columnNumber(columnNumber)
+ {
+-    setParent(parent);
+     setNotifyOnValueChanged(true);
+-}
+-
+-QQmlBinding::~QQmlBinding()
+-{
+-}
++    QQmlAbstractExpression::setContext(ctxt);
++    setScopeObject(obj);
+ 
+-void QQmlBinding::setTarget(const QQmlProperty &prop)
+-{
+-    Q_D(QQmlBinding);
+-    d->property = prop;
+-    d->target = d->property.object();
+-    d->targetProperty = QQmlPropertyPrivate::get(d->property)->core.encodedIndex();
+-
+-    update();
++    v8function = qPersistentNew<v8::Function>(*(v8::Handle<v8::Function> *)functionPtr);
+ }
+ 
+-void QQmlBinding::setTarget(QObject *object,
+-                                    const QQmlPropertyData &core,
+-                                    QQmlContextData *ctxt)
++QQmlBinding::~QQmlBinding()
+ {
+-    Q_D(QQmlBinding);
+-    d->property = QQmlPropertyPrivate::restore(object, core, ctxt);
+-    d->target = d->property.object();
+-    d->targetProperty = QQmlPropertyPrivate::get(d->property)->core.encodedIndex();
+-
+-    update();
++    qPersistentDispose(v8function);
+ }
+ 
+-QQmlProperty QQmlBinding::property() const 
++void QQmlBinding::setEvaluateFlags(EvaluateFlags flags)
+ {
+-   Q_D(const QQmlBinding);
+-   return d->property; 
++    setRequiresThisObject(flags & RequiresThisObject);
+ }
+ 
+-void QQmlBinding::setEvaluateFlags(EvaluateFlags flags)
++QQmlBinding::EvaluateFlags QQmlBinding::evaluateFlags() const
+ {
+-    Q_D(QQmlBinding);
+-    d->setRequiresThisObject(flags & RequiresThisObject);
++    return requiresThisObject()?RequiresThisObject:None;
+ }
+ 
+-QQmlBinding::EvaluateFlags QQmlBinding::evaluateFlags() const
++void QQmlBinding::setNotifyOnValueChanged(bool v)
+ {
+-    Q_D(const QQmlBinding);
+-    return d->requiresThisObject()?RequiresThisObject:None;
++    QQmlJavaScriptExpression::setNotifyOnValueChanged(v);
+ }
+ 
+ void QQmlBinding::update(QQmlPropertyPrivate::WriteFlags flags)
+ {
+-    Q_D(QQmlBinding);
+-
+-    if (!d->enabled || !d->context() || !d->context()->isValid()) 
++    if (!enabledFlag() || !context() || !context()->isValid())
+         return;
+ 
+     QQmlTrace trace("General Binding Update");
+-    trace.addDetail("URL", d->url);
+-    trace.addDetail("Line", d->line);
+-    trace.addDetail("Column", d->columnNumber);
++    trace.addDetail("URL", m_url);
++    trace.addDetail("Line", m_lineNumber);
++    trace.addDetail("Column", m_columnNumber);
+ 
+-    if (!d->updating) {
+-        QQmlBindingProfiler prof(d->url, d->line, d->column);
++    if (!updatingFlag()) {
++        QQmlBindingProfiler prof(m_url, m_lineNumber, m_columnNumber);
+         if (prof.enabled)
+             prof.addDetail(expression());
+-        d->updating = true;
++        setUpdatingFlag(true);
+ 
+-        QQmlAbstractExpression::DeleteWatcher watcher(d);
++        QQmlAbstractExpression::DeleteWatcher watcher(this);
+ 
+-        if (d->property.propertyType() == qMetaTypeId<QQmlBinding *>()) {
++        if (m_core.propType == qMetaTypeId<QQmlBinding *>()) {
+ 
+-            int idx = d->property.index();
++            int idx = m_core.coreIndex;
+             Q_ASSERT(idx != -1);
+ 
+             QQmlBinding *t = this;
+             int status = -1;
+             void *a[] = { &t, 0, &status, &flags };
+-            QMetaObject::metacall(d->property.object(),
+-                                  QMetaObject::WriteProperty,
+-                                  idx, a);
++            QMetaObject::metacall(*m_coreObject, QMetaObject::WriteProperty, idx, a);
+ 
+         } else {
+-            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(d->context()->engine);
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context()->engine);
+             ep->referenceScarceResources(); 
+ 
+             bool isUndefined = false;
+ 
+             v8::HandleScope handle_scope;
+             v8::Context::Scope scope(ep->v8engine()->context());
+-            v8::Local<v8::Value> result = d->v8value(0, &isUndefined);
++            v8::Local<v8::Value> result =
++                QQmlJavaScriptExpression::evaluate(context(), v8function, &isUndefined);
+ 
+             trace.event("writing binding result");
+ 
+             bool needsErrorData = false;
+-            if (!watcher.wasDeleted() && !d->hasError())
+-                needsErrorData = !QQmlPropertyPrivate::writeBinding(d->property, d->context(),
+-                                                                            d, result,
+-                                                                            isUndefined, flags);
++            if (!watcher.wasDeleted() && !hasError())
++                needsErrorData = !QQmlPropertyPrivate::writeBinding(*m_coreObject, m_core, context(),
++                                                                    this, result, isUndefined, flags);
+ 
+             if (!watcher.wasDeleted()) {
+                
+                 if (needsErrorData) {
+-                    QUrl url = QUrl(d->url);
+-                    int line = d->line;
++                    QUrl url = QUrl(m_url);
++
+                     if (url.isEmpty()) url = QUrl(QLatin1String("<Unknown File>"));
+ 
+-                    d->delayedError()->error.setUrl(url);
+-                    d->delayedError()->error.setLine(line);
+-                    d->delayedError()->error.setColumn(-1);
++                    delayedError()->error.setUrl(url);
++                    delayedError()->error.setLine(m_lineNumber);
++                    delayedError()->error.setColumn(m_columnNumber);
+                 }
+ 
+-                if (d->hasError()) {
+-                    if (!d->delayedError()->addError(ep)) ep->warning(this->error());
++                if (hasError()) {
++                    if (!delayedError()->addError(ep)) ep->warning(this->error());
+                 } else {
+-                    d->clearError();
++                    clearError();
+                 }
+ 
+             }
+@@ -256,62 +251,96 @@ void QQmlBinding::update(QQmlPropertyPrivate::WriteFlags flags)
+         }
+ 
+         if (!watcher.wasDeleted())
+-            d->updating = false;
++            setUpdatingFlag(false);
+     } else {
+-        QQmlBindingPrivate::printBindingLoopError(d->property);
++        QQmlProperty p = property();
++        QQmlAbstractBinding::printBindingLoopError(p);
+     }
+ }
+ 
+-void QQmlBindingPrivate::printBindingLoopError(QQmlProperty &prop)
++QVariant QQmlBinding::evaluate()
++{
++    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context()->engine);
++    ep->referenceScarceResources();
++
++    bool isUndefined = false;
++
++    v8::HandleScope handle_scope;
++    v8::Context::Scope scope(ep->v8engine()->context());
++    v8::Local<v8::Value> result =
++        QQmlJavaScriptExpression::evaluate(context(), v8function, &isUndefined);
++
++    ep->dereferenceScarceResources();
++
++    return ep->v8engine()->toVariant(result, qMetaTypeId<QList<QObject*> >());
++}
++
++QString QQmlBinding::expressionIdentifier(QQmlJavaScriptExpression *e)
+ {
+-    qmlInfo(prop.object()) << QQmlBinding::tr("Binding loop detected for property \"%1\"").arg(prop.name());
++    QQmlBinding *This = static_cast<QQmlBinding *>(e);
++
++    return QLatin1String("\"") + QString::fromUtf8(This->m_expression) + QLatin1String("\"");
+ }
+ 
+-void QQmlBindingPrivate::expressionChanged()
++void QQmlBinding::expressionChanged(QQmlJavaScriptExpression *e)
+ {
+-    Q_Q(QQmlBinding);
+-    q->update();
++    QQmlBinding *This = static_cast<QQmlBinding *>(e);
++    This->update();
++}
++
++void QQmlBinding::refresh()
++{
++    update();
+ }
+ 
+ void QQmlBinding::setEnabled(bool e, QQmlPropertyPrivate::WriteFlags flags)
+ {
+-    Q_D(QQmlBinding);
+-    d->enabled = e;
++    setEnabledFlag(e);
+     setNotifyOnValueChanged(e);
+ 
+     if (e) 
+         update(flags);
+ }
+ 
+-bool QQmlBinding::enabled() const
++QString QQmlBinding::expression() const
+ {
+-    Q_D(const QQmlBinding);
+-
+-    return d->enabled;
++    return QString::fromUtf8(m_expression);
+ }
+ 
+-QString QQmlBinding::expression() const
++QObject *QQmlBinding::object() const
+ {
+-    return QQmlExpression::expression();
++    if (m_coreObject.hasValue()) return m_coreObject.constValue()->target;
++    else return *m_coreObject;
+ }
+ 
+ int QQmlBinding::propertyIndex() const
+ {
+-    Q_D(const QQmlBinding);
+-    return d->targetProperty;
++    if (m_coreObject.hasValue()) return m_coreObject.constValue()->targetProperty;
++    else return m_core.encodedIndex();
+ }
+ 
+-QObject *QQmlBinding::object() const
++void QQmlBinding::retargetBinding(QObject *t, int i)
+ {
+-    Q_D(const QQmlBinding);
+-    return d->target;
++    m_coreObject.value().target = t;
++    m_coreObject.value().targetProperty = i;
+ }
+ 
+-void QQmlBinding::retargetBinding(QObject *t, int i)
++void QQmlBinding::setTarget(const QQmlProperty &prop)
++{
++    setTarget(prop.object(), QQmlPropertyPrivate::get(prop)->core,
++              QQmlPropertyPrivate::get(prop)->context);
++}
++
++void QQmlBinding::setTarget(QObject *object, const QQmlPropertyData &core, QQmlContextData *ctxt)
++{
++    m_coreObject = object;
++    m_core = core;
++    m_ctxt = ctxt;
++}
++
++QQmlProperty QQmlBinding::property() const
+ {
+-    Q_D(QQmlBinding);
+-    d->target = t;
+-    d->targetProperty = i;
++    return QQmlPropertyPrivate::restore(object(), m_core, *m_ctxt);
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlbinding_p.h b/src/qml/qml/qqmlbinding_p.h
+index 785c96f..2cf7b80 100644
+--- a/src/qml/qml/qqmlbinding_p.h
++++ b/src/qml/qml/qqmlbinding_p.h
+@@ -64,23 +64,26 @@
+ 
+ #include <private/qpointervaluepair_p.h>
+ #include <private/qqmlabstractbinding_p.h>
++#include <private/qqmlabstractexpression_p.h>
++#include <private/qqmljavascriptexpression_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ class QQmlContext;
+-class QQmlBindingPrivate;
+-class Q_QML_PRIVATE_EXPORT QQmlBinding : public QQmlExpression, public QQmlAbstractBinding
++class Q_QML_PRIVATE_EXPORT QQmlBinding : public QQmlJavaScriptExpression,
++                                         public QQmlAbstractExpression,
++                                         public QQmlAbstractBinding
+ {
+-Q_OBJECT
+ public:
+     enum EvaluateFlag { None = 0x00, RequiresThisObject = 0x01 };
+     Q_DECLARE_FLAGS(EvaluateFlags, EvaluateFlag)
+ 
+-    QQmlBinding(const QString &, QObject *, QQmlContext *, QObject *parent=0);
+-    QQmlBinding(const QString &, QObject *, QQmlContextData *, QObject *parent=0);
++    QQmlBinding(const QString &, QObject *, QQmlContext *);
++    QQmlBinding(const QString &, QObject *, QQmlContextData *);
+     QQmlBinding(const QString &, bool isRewritten, QObject *, QQmlContextData *, 
+-                        const QString &url, int lineNumber, int columnNumber = 0, QObject *parent=0);
+-    QQmlBinding(void *, QObject *, QQmlContextData *, QObject *parent=0);
++                const QString &url, int lineNumber, int columnNumber);
++    QQmlBinding(void *, QObject *, QQmlContextData *,
++                const QString &url, int lineNumber, int columnNumber);
+ 
+     void setTarget(const QQmlProperty &);
+     void setTarget(QObject *, const QQmlPropertyData &, QQmlContextData *);
+@@ -89,32 +92,80 @@ public:
+     void setEvaluateFlags(EvaluateFlags flags);
+     EvaluateFlags evaluateFlags() const;
+ 
+-    bool enabled() const;
++    void setNotifyOnValueChanged(bool);
++
++    // Inherited from  QQmlAbstractExpression
++    virtual void refresh();
+ 
+     // Inherited from  QQmlAbstractBinding
+     virtual void setEnabled(bool, QQmlPropertyPrivate::WriteFlags flags);
+     virtual void update(QQmlPropertyPrivate::WriteFlags flags);
+     virtual QString expression() const;
+-    virtual int propertyIndex() const;
+     virtual QObject *object() const;
++    virtual int propertyIndex() const;
+     virtual void retargetBinding(QObject *, int);
+ 
+     typedef int Identifier;
+     static Identifier Invalid;
+-    static QQmlBinding *createBinding(Identifier, QObject *, QQmlContext *,
+-                                              const QString &, int, QObject *parent=0);
+ 
++    static QQmlBinding *createBinding(Identifier, QObject *, QQmlContext *, const QString &, int);
+ 
+-public Q_SLOTS:
++    QVariant evaluate();
+     void update() { update(QQmlPropertyPrivate::DontRemoveBinding); }
+ 
++    static QString expressionIdentifier(QQmlJavaScriptExpression *);
++    static void expressionChanged(QQmlJavaScriptExpression *);
++
+ protected:
+     ~QQmlBinding();
+ 
+ private:
+-    Q_DECLARE_PRIVATE(QQmlBinding)
++    v8::Persistent<v8::Function> v8function;
++
++    inline bool updatingFlag() const;
++    inline void setUpdatingFlag(bool);
++    inline bool enabledFlag() const;
++    inline void setEnabledFlag(bool);
++
++    struct Retarget {
++        QObject *target;
++        int targetProperty;
++    };
++
++    QPointerValuePair<QObject, Retarget> m_coreObject;
++    QQmlPropertyData m_core;
++    // We store some flag bits in the following flag pointers.
++    //    m_ctxt:flag1 - updatingFlag
++    //    m_ctxt:flag2 - enabledFlag
++    QFlagPointer<QQmlContextData> m_ctxt;
++
++    // XXX It would be good if we could get rid of these in most circumstances
++    QString m_url;
++    int m_lineNumber;
++    int m_columnNumber;
++    QByteArray m_expression;
+ };
+ 
++bool QQmlBinding::updatingFlag() const
++{
++    return m_ctxt.flag();
++}
++
++void QQmlBinding::setUpdatingFlag(bool v)
++{
++    m_ctxt.setFlagValue(v);
++}
++
++bool QQmlBinding::enabledFlag() const
++{
++    return m_ctxt.flag2();
++}
++
++void QQmlBinding::setEnabledFlag(bool v)
++{
++    m_ctxt.setFlag2Value(v);
++}
++
+ Q_DECLARE_OPERATORS_FOR_FLAGS(QQmlBinding::EvaluateFlags)
+ 
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlbinding_p_p.h b/src/qml/qml/qqmlbinding_p_p.h
+deleted file mode 100644
+index b53c903..0000000
+--- a/src/qml/qml/qqmlbinding_p_p.h
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/
+-**
+-** This file is part of the QtQml module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QQMLBINDING_P_P_H
+-#define QQMLBINDING_P_P_H
+-
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists purely as an
+-// implementation detail.  This header file may change from version to
+-// version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+-#include "qqmlbinding_p.h"
+-
+-#include "qqmlproperty.h"
+-#include "qqmlexpression_p.h"
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QQmlBindingPrivate : public QQmlExpressionPrivate
+-{
+-    Q_DECLARE_PUBLIC(QQmlBinding)
+-public:
+-    QQmlBindingPrivate();
+-    ~QQmlBindingPrivate();
+-
+-    virtual void expressionChanged();
+-
+-    static void printBindingLoopError(QQmlProperty &prop);
+-
+-protected:
+-    virtual void refresh();
+-
+-private:
+-    bool updating:1;
+-    bool enabled:1;
+-    int columnNumber;
+-    QQmlProperty property; 
+-
+-    QObject *target;
+-    int targetProperty;
+-};
+-
+-QT_END_NAMESPACE
+-
+-#endif // QQMLBINDING_P_P_H
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index 79100c4..a73fe7c 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -50,13 +50,13 @@
+ #include "qqml.h"
+ #include "qqmlengine.h"
+ #include "qqmlbinding_p.h"
+-#include "qqmlbinding_p_p.h"
+ #include "qqmlglobal_p.h"
+ #include "qqmlscript_p.h"
+ #include <private/qqmlprofilerservice_p.h>
+ #include <private/qqmlenginedebugservice_p.h>
+ #include "qqmlincubator.h"
+ #include "qqmlincubator_p.h"
++#include <private/qqmljavascriptexpression_p.h>
+ 
+ #include <private/qv8engine_p.h>
+ #include <private/qv8include_p.h>
+@@ -1337,9 +1337,8 @@ void QV8IncubatorResource::statusChanged(Status s)
+                 f->Call(me, 1, args);
+                 if (tc.HasCaught()) {
+                     QQmlError error;
+-                    QQmlExpressionPrivate::exceptionToError(tc.Message(), error);
+-                    QQmlEnginePrivate::warning(QQmlEnginePrivate::get(engine->engine()),
+-                                                       error);
++                    QQmlJavaScriptExpression::exceptionToError(tc.Message(), error);
++                    QQmlEnginePrivate::warning(QQmlEnginePrivate::get(engine->engine()), error);
+                 }
+             }
+         }
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 0c8ff6a..489b4f8 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -49,7 +49,6 @@
+ #include "qqmlcontext.h"
+ #include "qqmlexpression.h"
+ #include "qqmlcomponent.h"
+-#include "qqmlbinding_p_p.h"
+ #include "qqmlvme_p.h"
+ #include <private/qqmlenginedebugservice_p.h>
+ #include "qqmlstringconverters_p.h"
+@@ -176,7 +175,6 @@ void QQmlEnginePrivate::registerBaseTypes(const char *uri, int versionMajor, int
+ void QQmlEnginePrivate::defineModule()
+ {
+     registerBaseTypes("QtQuick", 2, 0);
+-    qmlRegisterType<QQmlBinding>();
+     qmlRegisterUncreatableType<QQuickApplication>("QtQuick",2,0,"Application", QQuickApplication::tr("Application is an abstract class"));
+     qmlRegisterUncreatableType<QQmlLocale>("QtQuick",2,0,"Locale",QQmlEngine::tr("Locale cannot be instantiated.  Use Qt.locale()"));
+ }
+diff --git a/src/qml/qml/qqmlexpression.cpp b/src/qml/qml/qqmlexpression.cpp
+index cefde1d..60a0fe1 100644
+--- a/src/qml/qml/qqmlexpression.cpp
++++ b/src/qml/qml/qqmlexpression.cpp
+@@ -72,8 +72,7 @@ QQmlExpressionPrivate::~QQmlExpressionPrivate()
+     dataRef = 0;
+ }
+ 
+-void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QString &expr, 
+-                                         QObject *me)
++void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QString &expr, QObject *me)
+ {
+     expression = expr;
+ 
+@@ -83,22 +82,9 @@ void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QString &expr,
+     expressionFunctionRewritten = false;
+ }
+ 
+-void QQmlExpressionPrivate::init(QQmlContextData *ctxt, v8::Handle<v8::Function> func,
+-                                         QObject *me)
+-{
+-    QQmlAbstractExpression::setContext(ctxt);
+-    setScopeObject(me);
+-
+-    v8function = qPersistentNew<v8::Function>(func);
+-    setUseSharedContext(false);
+-    expressionFunctionValid = true;
+-    expressionFunctionRewritten = false;
+-    extractExpressionFromFunction = true;
+-}
+-
+ void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QString &expr,
+-                                         bool isRewritten, QObject *me, const QString &srcUrl,
+-                                         int lineNumber, int columnNumber)
++                                 bool isRewritten, QObject *me, const QString &srcUrl,
++                                 int lineNumber, int columnNumber)
+ {
+     url = srcUrl;
+     line = lineNumber;
+@@ -114,8 +100,8 @@ void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QString &expr,
+ }
+ 
+ void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QByteArray &expr,
+-                                         bool isRewritten, QObject *me, const QString &srcUrl,
+-                                         int lineNumber, int columnNumber)
++                                 bool isRewritten, QObject *me, const QString &srcUrl,
++                                 int lineNumber, int columnNumber)
+ {
+     url = srcUrl;
+     line = lineNumber;
+@@ -140,97 +126,13 @@ void QQmlExpressionPrivate::init(QQmlContextData *ctxt, const QByteArray &expr,
+     setScopeObject(me);
+ }
+ 
+-// Callee owns the persistent handle
+-v8::Persistent<v8::Function>
+-QQmlExpressionPrivate::evalFunction(QQmlContextData *ctxt, QObject *scope,
+-                                            const char *code, int codeLength,
+-                                            const QString &filename, int line,
+-                                            v8::Persistent<v8::Object> *qmlscope)
+-{
+-    QQmlEngine *engine = ctxt->engine;
+-    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
+-
+-    v8::HandleScope handle_scope;
+-    v8::Context::Scope ctxtscope(ep->v8engine()->context());
+-
+-    v8::TryCatch tc;
+-    v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
+-    v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, codeLength, filename, line);
+-    if (tc.HasCaught()) {
+-        QQmlError error;
+-        error.setDescription(QLatin1String("Exception occurred during function compilation"));
+-        error.setLine(line);
+-        error.setUrl(QUrl::fromLocalFile(filename));
+-        v8::Local<v8::Message> message = tc.Message();
+-        if (!message.IsEmpty())
+-            QQmlExpressionPrivate::exceptionToError(message, error);
+-        ep->warning(error);
+-        return v8::Persistent<v8::Function>();
+-    }
+-    v8::Local<v8::Value> result = script->Run(scopeobject);
+-    if (tc.HasCaught()) {
+-        QQmlError error;
+-        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
+-        error.setLine(line);
+-        error.setUrl(QUrl::fromLocalFile(filename));
+-        v8::Local<v8::Message> message = tc.Message();
+-        if (!message.IsEmpty())
+-            QQmlExpressionPrivate::exceptionToError(message, error);
+-        ep->warning(error);
+-        return v8::Persistent<v8::Function>();
+-    }
+-    if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
+-    return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
+-}
+-
+-// Callee owns the persistent handle
+-v8::Persistent<v8::Function> 
+-QQmlExpressionPrivate::evalFunction(QQmlContextData *ctxt, QObject *scope, 
+-                                            const QString &code, const QString &filename, int line,
+-                                            v8::Persistent<v8::Object> *qmlscope)
+-{
+-    QQmlEngine *engine = ctxt->engine;
+-    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
+-
+-    v8::HandleScope handle_scope;
+-    v8::Context::Scope ctxtscope(ep->v8engine()->context());
+-
+-    v8::TryCatch tc;
+-    v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
+-    v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, filename, line);
+-    if (tc.HasCaught()) {
+-        QQmlError error;
+-        error.setDescription(QLatin1String("Exception occurred during function compilation"));
+-        error.setLine(line);
+-        error.setUrl(QUrl::fromLocalFile(filename));
+-        v8::Local<v8::Message> message = tc.Message();
+-        if (!message.IsEmpty())
+-            QQmlExpressionPrivate::exceptionToError(message, error);
+-        ep->warning(error);
+-        return v8::Persistent<v8::Function>();
+-    }
+-    v8::Local<v8::Value> result = script->Run(scopeobject);
+-    if (tc.HasCaught()) {
+-        QQmlError error;
+-        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
+-        error.setLine(line);
+-        error.setUrl(QUrl::fromLocalFile(filename));
+-        v8::Local<v8::Message> message = tc.Message();
+-        if (!message.IsEmpty())
+-            QQmlExpressionPrivate::exceptionToError(message, error);
+-        ep->warning(error);
+-        return v8::Persistent<v8::Function>();
+-    }
+-    if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
+-    return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
+-}
+-
+ QQmlExpression *
+ QQmlExpressionPrivate::create(QQmlContextData *ctxt, QObject *object,
+-                                      const QString &expr, bool isRewritten,
+-                                      const QString &url, int lineNumber, int columnNumber)
++                              const QString &expr, bool isRewritten,
++                              const QString &url, int lineNumber, int columnNumber)
+ {
+-    return new QQmlExpression(ctxt, object, expr, isRewritten, url, lineNumber, columnNumber, *new QQmlExpressionPrivate);
++    return new QQmlExpression(ctxt, object, expr, isRewritten, url, lineNumber, columnNumber,
++                              *new QQmlExpressionPrivate);
+ }
+ 
+ /*!
+@@ -382,24 +284,6 @@ QQmlExpression::QQmlExpression(QQmlContextData *ctxt, QObject *scope,
+     d->init(ctxt, expression, scope);
+ }
+ 
+-/*!  
+-    \internal 
+-
+-    To avoid exposing v8 in the public API, functionPtr must be a pointer to a v8::Handle<v8::Function>.  
+-    For example:
+-        v8::Handle<v8::Function> function;
+-        new QQmlExpression(ctxt, scope, &function, ...);
+- */
+-QQmlExpression::QQmlExpression(QQmlContextData *ctxt, QObject *scope, void *functionPtr,
+-                                               QQmlExpressionPrivate &dd)
+-: QObject(dd, 0)
+-{
+-    v8::Handle<v8::Function> function = *(v8::Handle<v8::Function> *)functionPtr;
+-
+-    Q_D(QQmlExpression);
+-    d->init(ctxt, function, scope);
+-}
+-
+ /*!
+     Destroy the QQmlExpression instance.
+ */
+@@ -463,31 +347,6 @@ void QQmlExpression::setExpression(const QString &expression)
+     qPersistentDispose(d->v8qmlscope);
+ }
+ 
+-void QQmlExpressionPrivate::exceptionToError(v8::Handle<v8::Message> message, 
+-                                                     QQmlError &error)
+-{
+-    Q_ASSERT(!message.IsEmpty());
+-
+-    v8::Handle<v8::Value> name = message->GetScriptResourceName();
+-    v8::Handle<v8::String> description = message->Get();
+-    int lineNumber = message->GetLineNumber();
+-
+-    v8::Local<v8::String> file = name->IsString()?name->ToString():v8::Local<v8::String>();
+-    if (file.IsEmpty() || file->Length() == 0) 
+-        error.setUrl(QUrl(QLatin1String("<Unknown File>")));
+-    else 
+-        error.setUrl(QUrl(QV8Engine::toStringStatic(file)));
+-
+-    error.setLine(lineNumber);
+-    error.setColumn(-1);
+-
+-    QString qDescription = QV8Engine::toStringStatic(description);
+-    if (qDescription.startsWith(QLatin1String("Uncaught ")))
+-        qDescription = qDescription.mid(9 /* strlen("Uncaught ") */);
+-
+-    error.setDescription(qDescription);
+-}
+-
+ // Must be called with a valid handle scope
+ v8::Local<v8::Value> QQmlExpressionPrivate::v8value(QObject *secondaryScope, bool *isUndefined)
+ {
+diff --git a/src/qml/qml/qqmlexpression.h b/src/qml/qml/qqmlexpression.h
+index 4044546..b60d9f1 100644
+--- a/src/qml/qml/qqmlexpression.h
++++ b/src/qml/qml/qqmlexpression.h
+@@ -96,8 +96,6 @@ Q_SIGNALS:
+ protected:
+     QQmlExpression(QQmlContextData *, QObject *, const QString &,
+                            QQmlExpressionPrivate &dd);
+-    QQmlExpression(QQmlContextData *, QObject *, void *, 
+-                           QQmlExpressionPrivate &dd);
+     QQmlExpression(QQmlContextData *, QObject *, const QString &, bool,
+                            const QString &, int, int, QQmlExpressionPrivate &dd);
+     QQmlExpression(QQmlContextData *, QObject *, const QByteArray &, bool,
+diff --git a/src/qml/qml/qqmlexpression_p.h b/src/qml/qml/qqmlexpression_p.h
+index 3b335ba..186e3ae 100644
+--- a/src/qml/qml/qqmlexpression_p.h
++++ b/src/qml/qml/qqmlexpression_p.h
+@@ -79,7 +79,6 @@ public:
+     ~QQmlExpressionPrivate();
+ 
+     void init(QQmlContextData *, const QString &, QObject *);
+-    void init(QQmlContextData *, v8::Handle<v8::Function>, QObject *);
+     void init(QQmlContextData *, const QString &, bool, QObject *, const QString &, int, int);
+     void init(QQmlContextData *, const QByteArray &, bool, QObject *, const QString &, int, int);
+ 
+@@ -92,18 +91,8 @@ public:
+ 
+     void _q_notify();
+ 
+-    static void exceptionToError(v8::Handle<v8::Message>, QQmlError &);
+-    static v8::Persistent<v8::Function> evalFunction(QQmlContextData *ctxt, QObject *scope, 
+-                                                     const QString &code, const QString &filename,
+-                                                     int line,
+-                                                     v8::Persistent<v8::Object> *qmlscope = 0);
+-    static v8::Persistent<v8::Function> evalFunction(QQmlContextData *ctxt, QObject *scope,
+-                                                     const char *code, int codeLength,
+-                                                     const QString &filename, int line,
+-                                                     v8::Persistent<v8::Object> *qmlscope = 0);
+-
+     static QQmlExpression *create(QQmlContextData *, QObject *, const QString &, bool,
+-                                          const QString &, int, int);
++                                  const QString &, int, int);
+ 
+     bool expressionFunctionValid:1;
+     bool expressionFunctionRewritten:1;
+diff --git a/src/qml/qml/qqmljavascriptexpression.cpp b/src/qml/qml/qqmljavascriptexpression.cpp
+index 4186b5b..560e0f1 100644
+--- a/src/qml/qml/qqmljavascriptexpression.cpp
++++ b/src/qml/qml/qqmljavascriptexpression.cpp
+@@ -251,6 +251,115 @@ QQmlDelayedError *QQmlJavaScriptExpression::delayedError()
+     return &m_vtable.value();
+ }
+ 
++void QQmlJavaScriptExpression::exceptionToError(v8::Handle<v8::Message> message, QQmlError &error)
++{
++    Q_ASSERT(!message.IsEmpty());
++
++    v8::Handle<v8::Value> name = message->GetScriptResourceName();
++    v8::Handle<v8::String> description = message->Get();
++    int lineNumber = message->GetLineNumber();
++
++    v8::Local<v8::String> file = name->IsString()?name->ToString():v8::Local<v8::String>();
++    if (file.IsEmpty() || file->Length() == 0)
++        error.setUrl(QUrl(QLatin1String("<Unknown File>")));
++    else
++        error.setUrl(QUrl(QV8Engine::toStringStatic(file)));
++
++    error.setLine(lineNumber);
++    error.setColumn(-1);
++
++    QString qDescription = QV8Engine::toStringStatic(description);
++    if (qDescription.startsWith(QLatin1String("Uncaught ")))
++        qDescription = qDescription.mid(9 /* strlen("Uncaught ") */);
++
++    error.setDescription(qDescription);
++}
++
++// Callee owns the persistent handle
++v8::Persistent<v8::Function>
++QQmlJavaScriptExpression::evalFunction(QQmlContextData *ctxt, QObject *scope,
++                                       const char *code, int codeLength,
++                                       const QString &filename, int line,
++                                       v8::Persistent<v8::Object> *qmlscope)
++{
++    QQmlEngine *engine = ctxt->engine;
++    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
++
++    v8::HandleScope handle_scope;
++    v8::Context::Scope ctxtscope(ep->v8engine()->context());
++
++    v8::TryCatch tc;
++    v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
++    v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, codeLength, filename, line);
++    if (tc.HasCaught()) {
++        QQmlError error;
++        error.setDescription(QLatin1String("Exception occurred during function compilation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QQmlExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    v8::Local<v8::Value> result = script->Run(scopeobject);
++    if (tc.HasCaught()) {
++        QQmlError error;
++        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QQmlExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
++    return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
++}
++
++// Callee owns the persistent handle
++v8::Persistent<v8::Function>
++QQmlJavaScriptExpression::evalFunction(QQmlContextData *ctxt, QObject *scope,
++                                       const QString &code, const QString &filename, int line,
++                                       v8::Persistent<v8::Object> *qmlscope)
++{
++    QQmlEngine *engine = ctxt->engine;
++    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
++
++    v8::HandleScope handle_scope;
++    v8::Context::Scope ctxtscope(ep->v8engine()->context());
++
++    v8::TryCatch tc;
++    v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
++    v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, filename, line);
++    if (tc.HasCaught()) {
++        QQmlError error;
++        error.setDescription(QLatin1String("Exception occurred during function compilation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QQmlExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    v8::Local<v8::Value> result = script->Run(scopeobject);
++    if (tc.HasCaught()) {
++        QQmlError error;
++        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QQmlExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
++    return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
++}
++
+ void QQmlJavaScriptExpression::clearGuards()
+ {
+     while (Guard *g = activeGuards.takeFirst())
+diff --git a/src/qml/qml/qqmljavascriptexpression_p.h b/src/qml/qml/qqmljavascriptexpression_p.h
+index 1da1e12..5d790e4 100644
+--- a/src/qml/qml/qqmljavascriptexpression_p.h
++++ b/src/qml/qml/qqmljavascriptexpression_p.h
+@@ -132,6 +132,15 @@ public:
+     void clearError();
+     QQmlDelayedError *delayedError();
+ 
++    static void exceptionToError(v8::Handle<v8::Message>, QQmlError &);
++    static v8::Persistent<v8::Function> evalFunction(QQmlContextData *ctxt, QObject *scope,
++                                                     const QString &code, const QString &filename,
++                                                     int line,
++                                                     v8::Persistent<v8::Object> *qmlscope = 0);
++    static v8::Persistent<v8::Function> evalFunction(QQmlContextData *ctxt, QObject *scope,
++                                                     const char *code, int codeLength,
++                                                     const QString &filename, int line,
++                                                     v8::Persistent<v8::Object> *qmlscope = 0);
+ protected:
+     ~QQmlJavaScriptExpression();
+ 
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index 8d5d83e..14778ce 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -1521,24 +1521,6 @@ bool QQmlPropertyPrivate::writeBinding(QObject *object,
+     return true;
+ }
+ 
+-bool QQmlPropertyPrivate::writeBinding(const QQmlProperty &that, 
+-                                               QQmlContextData *context,
+-                                               QQmlJavaScriptExpression *expression, 
+-                                               v8::Handle<v8::Value> result, bool isUndefined,
+-                                               WriteFlags flags)
+-{
+-    QQmlPropertyPrivate *pp = that.d;
+-
+-    if (!pp)
+-        return true;
+-
+-    QObject *object = that.object();
+-    if (!object)
+-        return true;
+-
+-    return writeBinding(object, pp->core, context, expression, result, isUndefined, flags);
+-}
+-
+ const QMetaObject *QQmlPropertyPrivate::rawMetaObjectForType(QQmlEnginePrivate *engine, int userType)
+ {
+     if (engine) {
+diff --git a/src/qml/qml/qqmlproperty_p.h b/src/qml/qml/qqmlproperty_p.h
+index dc02355..f4a9ced 100644
+--- a/src/qml/qml/qqmlproperty_p.h
++++ b/src/qml/qml/qqmlproperty_p.h
+@@ -144,11 +144,6 @@ public:
+     static QQmlExpression *setSignalExpression(const QQmlProperty &that, 
+                                                        QQmlExpression *) ;
+     static bool write(const QQmlProperty &that, const QVariant &, WriteFlags);
+-    static bool writeBinding(const QQmlProperty &that, 
+-                             QQmlContextData *context,
+-                             QQmlJavaScriptExpression *expression, 
+-                             v8::Handle<v8::Value> result, bool isUndefined,
+-                             WriteFlags flags);
+     static bool writeBinding(QObject *, const QQmlPropertyData &,
+                              QQmlContextData *context,
+                              QQmlJavaScriptExpression *expression, 
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 99979ab..2a7ea45 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -57,7 +57,6 @@
+ #include "qqmlengine_p.h"
+ #include "qqmlcomponent_p.h"
+ #include "qqmlvmemetaobject_p.h"
+-#include "qqmlbinding_p_p.h"
+ #include "qqmlcontext_p.h"
+ #include <private/qv4bindings_p.h>
+ #include <private/qv8bindings_p.h>
+@@ -765,8 +764,8 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 QML_NEXT_INSTR(StoreBinding);
+ 
+             QQmlBinding *bind = new QQmlBinding(PRIMITIVES.at(instr.value), true, 
+-                                                                context, CTXT, COMP->name, instr.line,
+-                                                                instr.column);
++                                                context, CTXT, COMP->name, instr.line,
++                                                instr.column);
+             bindValues.push(bind);
+             bind->m_mePtr = &bindValues.top();
+             bind->setTarget(target, instr.property, CTXT);
+@@ -788,8 +787,8 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 QML_NEXT_INSTR(StoreBindingOnAlias);
+ 
+             QQmlBinding *bind = new QQmlBinding(PRIMITIVES.at(instr.value), true,
+-                                                                context, CTXT, COMP->name, instr.line,
+-                                                                instr.column);
++                                                context, CTXT, COMP->name, instr.line,
++                                                instr.column);
+             bindValues.push(bind);
+             bind->m_mePtr = &bindValues.top();
+             bind->setTarget(target, instr.property, CTXT);
+diff --git a/src/qml/qml/v8/qv8bindings.cpp b/src/qml/qml/v8/qv8bindings.cpp
+index 76fbea1..4b96679 100644
+--- a/src/qml/qml/v8/qv8bindings.cpp
++++ b/src/qml/qml/v8/qv8bindings.cpp
+@@ -45,7 +45,6 @@
+ #include <private/qqmlbinding_p.h>
+ #include <private/qqmlcompiler_p.h>
+ #include <private/qqmlproperty_p.h>
+-#include <private/qqmlbinding_p_p.h>
+ #include <private/qqmlexpression_p.h>
+ #include <private/qobject_p.h>
+ #include <private/qqmltrace_p.h>
+@@ -157,9 +156,8 @@ void QV8Bindings::Binding::update(QQmlPropertyPrivate::WriteFlags flags)
+         ep->dereferenceScarceResources(); 
+ 
+     } else {
+-        QQmlProperty p = QQmlPropertyPrivate::restore(target, instruction->property,
+-                                                                      context);
+-        QQmlBindingPrivate::printBindingLoopError(p);
++        QQmlProperty p = QQmlPropertyPrivate::restore(target, instruction->property, context);
++        QQmlAbstractBinding::printBindingLoopError(p);
+     }
+ }
+ 
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 5842e29..a483346 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -589,11 +589,10 @@ static inline void StoreProperty(QV8Engine *engine, QObject *object, QQmlPropert
+                                                                                      v8::StackTrace::kScriptName));
+         v8::Local<v8::StackFrame> frame = trace->GetFrame(0);
+         int lineNumber = frame->GetLineNumber();
+-        int columNumber = frame->GetColumn();
++        int columnNumber = frame->GetColumn();
+         QString url = engine->toString(frame->GetScriptName());
+ 
+-        newBinding = new QQmlBinding(&function, object, context);
+-        newBinding->setSourceLocation(url, lineNumber, columNumber);
++        newBinding = new QQmlBinding(&function, object, context, url, lineNumber, columnNumber);
+         newBinding->setTarget(object, *property, context);
+         newBinding->setEvaluateFlags(newBinding->evaluateFlags() |
+                                      QQmlBinding::RequiresThisObject);
+diff --git a/src/qml/qml/v8/qv8valuetypewrapper.cpp b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+index 54d871d..7a3c675 100644
+--- a/src/qml/qml/v8/qv8valuetypewrapper.cpp
++++ b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+@@ -345,8 +345,8 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Setter(v8::Local<v8::String> property
+             int columnNumber = frame->GetColumn();
+             QString url = r->engine->toString(frame->GetScriptName());
+ 
+-            newBinding = new QQmlBinding(&function, reference->object, context);
+-            newBinding->setSourceLocation(url, lineNumber, columnNumber);
++            newBinding = new QQmlBinding(&function, reference->object, context,
++                                         url, lineNumber, columnNumber);
+             newBinding->setTarget(reference->object, cacheData, context);
+             newBinding->setEvaluateFlags(newBinding->evaluateFlags() |
+                                          QQmlBinding::RequiresThisObject);
+diff --git a/src/quick/items/qquickstateoperations.cpp b/src/quick/items/qquickstateoperations.cpp
+index 668c7c0..a6a4e31 100644
+--- a/src/quick/items/qquickstateoperations.cpp
++++ b/src/quick/items/qquickstateoperations.cpp
+@@ -318,7 +318,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction xa;
+             xa.property = property;
+-            xa.toBinding = newBinding;
++            xa.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             xa.fromValue = xa.property.read();
+             xa.deletableToBinding = true;
+             actions << xa;
+@@ -338,7 +338,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction ya;
+             ya.property = property;
+-            ya.toBinding = newBinding;
++            ya.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             ya.fromValue = ya.property.read();
+             ya.deletableToBinding = true;
+             actions << ya;
+@@ -358,7 +358,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction sa;
+             sa.property = property;
+-            sa.toBinding = newBinding;
++            sa.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             sa.fromValue = sa.property.read();
+             sa.deletableToBinding = true;
+             actions << sa;
+@@ -378,7 +378,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction ra;
+             ra.property = property;
+-            ra.toBinding = newBinding;
++            ra.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             ra.fromValue = ra.property.read();
+             ra.deletableToBinding = true;
+             actions << ra;
+@@ -398,7 +398,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction wa;
+             wa.property = property;
+-            wa.toBinding = newBinding;
++            wa.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             wa.fromValue = wa.property.read();
+             wa.deletableToBinding = true;
+             actions << wa;
+@@ -418,7 +418,7 @@ QQuickStateOperation::ActionList QQuickParentChange::actions()
+             newBinding->setTarget(property);
+             QQuickAction ha;
+             ha.property = property;
+-            ha.toBinding = newBinding;
++            ha.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+             ha.fromValue = ha.property.read();
+             ha.deletableToBinding = true;
+             actions << ha;
+diff --git a/src/quick/qtquick2.cpp b/src/quick/qtquick2.cpp
+index 621c3ff..32a9d38 100644
+--- a/src/quick/qtquick2.cpp
++++ b/src/quick/qtquick2.cpp
+@@ -135,10 +135,11 @@ void QQmlQtQuick2DebugStatesDelegate::updateBinding(QQmlContext *context,
+ 
+                 QQmlBinding *newBinding = 0;
+                 if (!isLiteralValue) {
+-                    newBinding = new QQmlBinding(expression.toString(), object, context);
++                    newBinding = new QQmlBinding(expression.toString(), false, object,
++                                                 QQmlContextData::get(context), fileName,
++                                                 line, column);
+                     newBinding->setTarget(property);
+                     newBinding->setNotifyOnValueChanged(true);
+-                    newBinding->setSourceLocation(fileName, line, column);
+                 }
+ 
+                 state->changeBindingInRevertList(object, propertyName, newBinding);
+diff --git a/src/quick/util/qquickpropertychanges.cpp b/src/quick/util/qquickpropertychanges.cpp
+index 83ddb25..8b0818c 100644
+--- a/src/quick/util/qquickpropertychanges.cpp
++++ b/src/quick/util/qquickpropertychanges.cpp
+@@ -478,12 +478,11 @@ QQuickPropertyChanges::ActionList QQuickPropertyChanges::actions()
+ 
+                 QQmlBinding::Identifier id = d->expressions.at(ii).id;
+                 QQmlBinding *newBinding = id != QQmlBinding::Invalid ? QQmlBinding::createBinding(id, object(), qmlContext(this), e->sourceFile(), e->lineNumber()) : 0;
+-                if (!newBinding) {
+-                    newBinding = new QQmlBinding(e->expression(), object(), qmlContext(this));
+-                    newBinding->setSourceLocation(e->sourceFile(), e->lineNumber(), e->columnNumber());
+-                }
++                if (!newBinding)
++                    newBinding = new QQmlBinding(e->expression(), false, object(), QQmlContextData::get(qmlContext(this)),
++                                                 e->sourceFile(), e->lineNumber(), e->columnNumber());
+                 newBinding->setTarget(prop);
+-                a.toBinding = newBinding;
++                a.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+                 a.deletableToBinding = true;
+             }
+ 
+@@ -682,7 +681,7 @@ void QQuickPropertyChanges::changeExpression(const QString &name, const QString
+             } else {
+                 QQmlBinding *newBinding = new QQmlBinding(newExpression->expression(), object(), qmlContext(this));
+                 newBinding->setTarget(d->property(name));
+-                action.toBinding = newBinding;
++                action.toBinding = QQmlAbstractBinding::getPointer(newBinding);
+                 action.deletableToBinding = true;
+ 
+                 state()->addEntryToRevertList(action);
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index e3ad1e7..cca008e 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -5045,7 +5045,7 @@ void tst_qqmlecmascript::functionAssignment_fromBinding()
+     QQmlComponent component(&engine, testFileUrl("functionAssignment.1.qml"));
+ 
+     QString url = component.url().toString();
+-    QString warning = url + ":4: Unable to assign a function to a property.";
++    QString warning = url + ":4:25: Unable to assign a function to a property.";
+     QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
+     
+     MyQmlObject *o = qobject_cast<MyQmlObject *>(component.create());
+@@ -5103,11 +5103,11 @@ void tst_qqmlecmascript::functionAssignmentfromJS_invalid()
+     QVERIFY(!o->property("a").isValid());
+ 
+     QString url = component.url().toString();
+-    QString warning = url + ":67: Unable to assign QString to int";
++    QString warning = url + ":67:17: Unable to assign QString to int";
+     QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
+     o->setProperty("assignWrongType", true);
+ 
+-    warning = url + ":71: Unable to assign QString to int";
++    warning = url + ":71:29: Unable to assign QString to int";
+     QTest::ignoreMessage(QtWarningMsg, warning.toLatin1().constData());
+     o->setProperty("assignWrongTypeToValueType", true);
+ 
+diff --git a/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp b/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
+index ae30090..5ef8937 100644
+--- a/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
++++ b/tests/auto/qml/qqmlproperty/tst_qqmlproperty.cpp
+@@ -143,7 +143,7 @@ void tst_qqmlproperty::qmlmetaproperty()
+ {
+     QQmlProperty prop;
+ 
+-    QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
++    QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+     QVERIFY(binding != 0);
+     QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+     QVERIFY(expression != 0);
+@@ -246,7 +246,7 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+     {
+         QQmlProperty prop(&object);
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -292,8 +292,8 @@ void tst_qqmlproperty::qmlmetaproperty_object()
+     {
+         QQmlProperty prop(&dobject);
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -347,7 +347,7 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+     {
+         QQmlProperty prop(&object, QString("defaultProperty"));
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -393,8 +393,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+     {
+         QQmlProperty prop(&dobject, QString("defaultProperty"));
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -442,8 +442,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+     {
+         QQmlProperty prop(&dobject, QString("onClicked"));
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -490,8 +490,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string()
+     {
+         QQmlProperty prop(&dobject, QString("onPropertyWithNotifyChanged"));
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -544,7 +544,7 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+     {
+         QQmlProperty prop(&object, engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -590,8 +590,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_context()
+     {
+         QQmlProperty prop(&dobject, engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -645,7 +645,7 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+     {
+         QQmlProperty prop(&object, QString("defaultProperty"), engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -691,8 +691,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+     {
+         QQmlProperty prop(&dobject, QString("defaultProperty"), engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -740,8 +740,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+     {
+         QQmlProperty prop(&dobject, QString("onClicked"), engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);
+@@ -788,8 +788,8 @@ void tst_qqmlproperty::qmlmetaproperty_object_string_context()
+     {
+         QQmlProperty prop(&dobject, QString("onPropertyWithNotifyChanged"), engine.rootContext());
+ 
+-        QWeakPointer<QQmlBinding> binding(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext()));
+-        binding.data()->setTarget(prop);
++        QWeakPointer<QQmlAbstractBinding> binding(QQmlAbstractBinding::getPointer(new QQmlBinding(QLatin1String("null"), 0, engine.rootContext())));
++        static_cast<QQmlBinding *>(binding.data())->setTarget(prop);
+         QVERIFY(binding != 0);
+         QWeakPointer<QQmlExpression> expression(new QQmlExpression());
+         QVERIFY(expression != 0);

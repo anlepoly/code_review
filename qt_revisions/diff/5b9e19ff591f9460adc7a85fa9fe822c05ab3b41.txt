@@ -1,0 +1,1520 @@
+diff --git a/src/quick/items/qquicktext.cpp b/src/quick/items/qquicktext.cpp
+index 00a40ab..704dfc9 100644
+--- a/src/quick/items/qquicktext.cpp
++++ b/src/quick/items/qquicktext.cpp
+@@ -58,6 +58,8 @@
+ #include <QtGui/qguiapplication.h>
+ #include <QtGui/qinputpanel.h>
+ 
++#include <private/qtextengine_p.h>
++#include <private/qdeclarativestyledtext_p.h>
+ #include <QtQuick/private/qdeclarativepixmapcache_p.h>
+ 
+ #include <qmath.h>
+@@ -70,21 +72,21 @@ extern Q_GUI_EXPORT bool qt_applefontsmoothing_enabled;
+ DEFINE_BOOL_CONFIG_OPTION(qmlDisableDistanceField, QML_DISABLE_DISTANCEFIELD)
+ DEFINE_BOOL_CONFIG_OPTION(enableImageCache, QML_ENABLE_TEXT_IMAGE_CACHE);
+ 
+-QString QQuickTextPrivate::elideChar = QString(0x2026);
++const QChar QQuickTextPrivate::elideChar = QChar(0x2026);
+ 
+ QQuickTextPrivate::QQuickTextPrivate()
+ : color((QRgb)0), style(QQuickText::Normal), hAlign(QQuickText::AlignLeft),
+   vAlign(QQuickText::AlignTop), elideMode(QQuickText::ElideNone),
+   format(QQuickText::AutoText), wrapMode(QQuickText::NoWrap), lineHeight(1),
+   lineHeightMode(QQuickText::ProportionalHeight), lineCount(1), maximumLineCount(INT_MAX),
+-  maximumLineCountValid(false),
+-  imageCache(0), texture(0),
++  maximumLineCountValid(false), fontSizeMode(QQuickText::FixedSize), minimumPixelSize(12),
++  minimumPointSize(12), imageCache(0), texture(0),
+   imageCacheDirty(false), updateOnComponentComplete(true),
+   richText(false), styledText(false), singleline(false), cacheAllTextAsImage(true),
+   disableDistanceField(false), internalWidthUpdate(false),
+   requireImplicitWidth(false), truncated(false), hAlignImplicit(true), rightToLeftText(false),
+   layoutTextElided(false), richTextAsImage(false), textureImageCacheDirty(false), textHasChanged(true),
+-  needToUpdateLayout(false), naturalWidth(0), doc(0), elipsisLayout(0), textLine(0), nodeType(NodeIsNull),
++  needToUpdateLayout(false), naturalWidth(0), doc(0), elideLayout(0), textLine(0), nodeType(NodeIsNull),
+   updateType(UpdatePaintNode), nbActiveDownloads(0)
+ 
+ #if defined(Q_OS_MAC)
+@@ -262,7 +264,7 @@ QSet<QUrl> QQuickTextDocumentWithImageResources::errors;
+ 
+ QQuickTextPrivate::~QQuickTextPrivate()
+ {
+-    delete elipsisLayout;
++    delete elideLayout;
+     delete textLine; textLine = 0;
+     delete imageCache;
+     qDeleteAll(imgTags);
+@@ -303,41 +305,16 @@ void QQuickTextPrivate::updateLayout()
+ 
+     // Setup instance of QTextLayout for all cases other than richtext
+     if (!richText) {
+-        if (elipsisLayout) {
+-            delete elipsisLayout;
+-            elipsisLayout = 0;
+-        }
+-        layout.setFont(font);
+-        if (text.isEmpty()) {
+-            if (!layout.text().isEmpty())
+-                layout.setText(text);
+-        } else if (!styledText) {
+-            layout.clearAdditionalFormats();
+-            QString tmp = text;
+-            tmp.replace(QLatin1Char('\n'), QChar::LineSeparator);
+-            singleline = !tmp.contains(QChar::LineSeparator);
+-            if (singleline && !maximumLineCountValid && elideMode != QQuickText::ElideNone && q->widthValid() && wrapMode == QQuickText::NoWrap) {
+-                if (q->width() <= 0) {
+-                    tmp = QString();
+-                } else {
+-                    QFontMetrics fm(font);
+-                    tmp = fm.elidedText(tmp,(Qt::TextElideMode)elideMode,q->width());
+-                }
+-                if (tmp != text) {
+-                    layoutTextElided = true;
+-                    if (!truncated) {
+-                        truncated = true;
+-                        emit q->truncatedChanged();
+-                    }
+-                }
+-            }
+-            layout.setText(tmp);
+-        } else {
+-            singleline = false;
+-            if (textHasChanged) {
++        if (textHasChanged) {
++            if (styledText && !text.isEmpty()) {
+                 QDeclarativeStyledText::parse(text, layout, imgTags, qmlContext(q), !maximumLineCountValid);
+-                textHasChanged = false;
++            } else {
++                layout.clearAdditionalFormats();
++                QString tmp = text;
++                tmp.replace(QLatin1Char('\n'), QChar::LineSeparator);
++                layout.setText(tmp);
+             }
++            textHasChanged = false;
+         }
+     } else {
+         ensureDoc();
+@@ -502,10 +479,15 @@ void QQuickTextLine::setLine(QTextLine *line)
+     m_line = line;
+ }
+ 
++void QQuickTextLine::setLineOffset(int offset)
++{
++    m_lineOffset = offset;
++}
++
+ int QQuickTextLine::number() const
+ {
+     if (m_line)
+-        return m_line->lineNumber();
++        return m_line->lineNumber() + m_lineOffset;
+     return 0;
+ }
+ 
+@@ -576,7 +558,7 @@ bool QQuickTextPrivate::isLineLaidOutConnected()
+     return this->isSignalConnected(idx);
+ }
+ 
+-void QQuickTextPrivate::setupCustomLineGeometry(QTextLine &line, qreal &height, qreal elideWidth = 0)
++void QQuickTextPrivate::setupCustomLineGeometry(QTextLine &line, qreal &height, int lineOffset)
+ {
+     Q_Q(QQuickText);
+ 
+@@ -591,10 +573,11 @@ void QQuickTextPrivate::setupCustomLineGeometry(QTextLine &line, qreal &height,
+         textLine->setLine(&line);
+         textLine->setY(height);
+         textLine->setHeight(0);
++        textLine->setLineOffset(lineOffset);
+ 
+         // use the text item's width by default if it has one and wrap is on
+         if (q->widthValid() && q->wrapMode() != QQuickText::NoWrap)
+-            textLine->setWidth(q->width() - elideWidth);
++            textLine->setWidth(q->width());
+         else
+             textLine->setWidth(INT_MAX);
+         if (lineHeight != 1.0)
+@@ -623,54 +606,19 @@ void QQuickTextPrivate::setupCustomLineGeometry(QTextLine &line, qreal &height,
+     Returns the size of the final text.  This can be used to position the text vertically (the text is
+     already absolutely positioned horizontally).
+ */
++
+ QRect QQuickTextPrivate::setupTextLayout()
+ {
+-    // ### text layout handling should be profiled and optimized as needed
+-    // what about QStackTextEngine engine(tmp, d->font.font()); QTextLayout textLayout(&engine);
+     Q_Q(QQuickText);
+     layout.setCacheEnabled(true);
+ 
+-    qreal lineWidth = 0;
+-    int visibleCount = 0;
+-
+-    //set manual width
+-    if (q->widthValid())
+-        lineWidth = q->width();
+-
+     QTextOption textOption = layout.textOption();
+     textOption.setAlignment(Qt::Alignment(q->effectiveHAlign()));
+     textOption.setWrapMode(QTextOption::WrapMode(wrapMode));
+     if (!cacheAllTextAsImage && !richTextAsImage && !disableDistanceField)
+         textOption.setUseDesignMetrics(true);
+     layout.setTextOption(textOption);
+-
+-    QFontMetrics fm(layout.font());
+-    elidePos = QPointF();
+-
+-    if (requireImplicitWidth && q->widthValid()) {
+-        // requires an extra layout
+-        QString elidedText;
+-        if (layoutTextElided) {
+-            // We have provided elided text to the layout, but we must calculate unelided width.
+-            elidedText = layout.text();
+-            layout.setText(text);
+-        }
+-        layout.beginLayout();
+-        forever {
+-            QTextLine line = layout.createLine();
+-            if (!line.isValid())
+-                break;
+-        }
+-        layout.endLayout();
+-        QRectF br;
+-        for (int i = 0; i < layout.lineCount(); ++i) {
+-            QTextLine line = layout.lineAt(i);
+-            br = br.united(line.naturalTextRect());
+-        }
+-        naturalWidth = br.width();
+-        if (layoutTextElided)
+-            layout.setText(elidedText);
+-    }
++    layout.setFont(font);
+ 
+     if ((q->widthValid() && q->width() <= 0. && elideMode != QQuickText::ElideNone)
+             || (q->heightValid() && q->height() <= 0. && wrapMode != QQuickText::NoWrap && elideMode == QQuickText::ElideRight)) {
+@@ -684,103 +632,255 @@ QRect QQuickTextPrivate::setupTextLayout()
+             emit q->lineCountChanged();
+         }
+ 
++        if (requireImplicitWidth) {
++            // Layout to determine the implicit width.
++            layout.beginLayout();
++
++            for (int i = 0; i < maximumLineCount; ++i) {
++                QTextLine line = layout.createLine();
++                if (!line.isValid())
++                    break;
++            }
++            layout.endLayout();
++            naturalWidth = layout.maximumWidth();
++            layout.clearLayout();
++        }
++
++        QFontMetrics fm(font);
+         qreal height = (lineHeightMode == QQuickText::FixedHeight) ? lineHeight : fm.height() * lineHeight;
+         return QRect(0, 0, 0, height);
+     }
+ 
+-    qreal height = 0;
++    const int lineWidth = q->widthValid() ? q->width() : INT_MAX;
++    const bool customLayout = isLineLaidOutConnected();
++    const bool wasTruncated = truncated;
++
++    const bool singlelineElide = !styledText && elideMode != QQuickText::ElideNone && q->widthValid();
++    const bool multilineElide = !styledText
++            && elideMode == QQuickText::ElideRight
++            && q->widthValid()
++            && (q->heightValid() || maximumLineCountValid);
++    const bool canWrap = wrapMode != QQuickText::NoWrap && q->widthValid();
++
++    const bool horizontalFit = fontSizeMode & QQuickText::HorizontalFit && q->widthValid();
++    const bool verticalFit = fontSizeMode & QQuickText::VerticalFit
++            && (q->heightValid() || (maximumLineCountValid && canWrap));
++    const bool pixelSize = font.pixelSize() != -1;
++    const QString layoutText = layout.text();
++
++    int largeFont = pixelSize ? font.pixelSize() : font.pointSize();
++    int smallFont = fontSizeMode != QQuickText::FixedSize
++            ? qMin(pixelSize ? minimumPixelSize : minimumPointSize, largeFont)
++            : largeFont;
++    int scaledFontSize = largeFont;
++
+     QRectF br;
+ 
+-    bool truncate = layoutTextElided;
+-    bool customLayout = isLineLaidOutConnected();
+-    bool multilineElideEnabled = elideMode == QQuickText::ElideRight && q->widthValid() && wrapMode != QQuickText::NoWrap;
++    QFont scaledFont = font;
+ 
+-    layout.beginLayout();
+-    if (!lineWidth)
+-        lineWidth = INT_MAX;
+-    int linesLeft = maximumLineCount;
+-    int visibleTextLength = 0;
++    QTextLine line;
++    int visibleCount = 0;
++    bool elide;
++    qreal height = 0;
++    QString elideText;
++    bool once = true;
+ 
+-    forever {
+-        QTextLine line = layout.createLine();
+-        if (!line.isValid())
+-            break;
++    naturalWidth = 0;
+ 
+-        visibleCount++;
++    do {
++        if (!once) {
++            if (pixelSize)
++                scaledFont.setPixelSize(scaledFontSize);
++            else
++                scaledFont.setPointSize(scaledFontSize);
++            layout.setFont(scaledFont);
++        }
++        layout.beginLayout();
+ 
+-        qreal preLayoutHeight = height;
+-        if (customLayout)
+-            setupCustomLineGeometry(line, height);
+-        else if (lineWidth)
+-            setLineGeometry(line, lineWidth, height);
++        bool wrapped = false;
++        bool truncateHeight = false;
++        truncated = false;
++        elide = false;
++        int characterCount = 0;
++        int unwrappedLineCount = 1;
++        height = 0;
++        br = QRectF();
++        line = layout.createLine();
++        for (visibleCount = 1; ; ++visibleCount) {
++            qreal preLayoutHeight = height;
++
++            if (customLayout) {
++                setupCustomLineGeometry(line, height);
++            } else {
++                setLineGeometry(line, lineWidth, height);
++            }
+ 
+-        bool elide = false;
+-        if (multilineElideEnabled && q->heightValid() && height > q->height()) {
+-            // This line does not fit in the remaining area.
+-            elide = true;
+-            if (visibleCount > 1) {
+-                --visibleCount;
++            if (multilineElide && height > q->height() && visibleCount > 1) {
++                truncated = true;
++                truncateHeight = true;
+                 height = preLayoutHeight;
+-                setLineGeometry(line, 0.0, height);
+-                line.setPosition(QPointF(FLT_MAX,FLT_MAX));
+-                line = layout.lineAt(visibleCount-1);
++
++                elide = true;
++                characterCount = line.textStart() + line.textLength();
++
++                QTextLine previousLine = layout.lineAt(visibleCount - 2);
++                elideText = layoutText.mid(previousLine.textStart(), previousLine.textLength());
++                if (layoutText.at(line.textStart() - 1) != QChar::LineSeparator) {
++                    line.setLineWidth(INT_MAX);
++                    elideText += layoutText.mid(line.textStart(), line.textLength());
++                } else {
++                    elideText[elideText.length() - 1] = elideChar;
++                }
++                line.setLineWidth(0);
++                line.setPosition(QPointF(FLT_MAX, FLT_MAX));
++                line = previousLine;
++                --visibleCount;
++                height -= (lineHeightMode == QQuickText::FixedHeight) ? lineHeight : previousLine.height() * lineHeight;
++                break;
+             }
+-        } else {
+-            visibleTextLength += line.textLength();
+-        }
+ 
+-        if (elide || (maximumLineCountValid && --linesLeft == 0)) {
+-            if (visibleTextLength < text.length()) {
+-                truncate = true;
+-                height = preLayoutHeight;
+-                if (multilineElideEnabled) {
+-                    qreal elideWidth = fm.width(elideChar);
+-                    // Need to correct for alignment
+-                    if (customLayout)
+-                        setupCustomLineGeometry(line, height, elideWidth);
+-                    else
+-                        setLineGeometry(line, lineWidth - elideWidth, height);
+-                    if (layout.text().mid(line.textStart(), line.textLength()).isRightToLeft()) {
+-                        line.setPosition(QPointF(line.position().x() + elideWidth, line.position().y()));
+-                        elidePos.setX(line.naturalTextRect().left() - elideWidth);
++            QTextLine nextLine = layout.createLine();
++            if (!nextLine.isValid()) {
++                characterCount = line.textStart() + line.textLength();
++                if (singlelineElide && visibleCount == 1 && line.naturalTextWidth() > lineWidth) {
++                    truncated = true;
++                    height = preLayoutHeight;
++                    elide = true;
++                    elideText = layoutText.mid(line.textStart(), line.textLength());
++                } else {
++                    br = br.united(line.naturalTextRect());
++                }
++                break;
++            } else {
++                const bool wrappedLine = layoutText.at(nextLine.textStart() - 1) != QChar::LineSeparator;
++                wrapped |= wrappedLine;
++
++                if (!wrappedLine)
++                    ++unwrappedLineCount;
++
++                if (visibleCount == maximumLineCount) {
++                    truncated = true;
++                    characterCount = nextLine.textStart() + nextLine.textLength();
++
++                    if (multilineElide) {
++                        height = preLayoutHeight;
++                        elide = true;
++                        elideText = layoutText.mid(line.textStart(), line.textLength());
++                        if (wrappedLine) {
++                            nextLine.setLineWidth(INT_MAX);
++                            elideText += layoutText.mid(nextLine.textStart(), nextLine.textLength());
++                        } else {
++                            elideText[elideText.length() - 1] = elideChar;
++                        }
++                        elideText += elideChar;
+                     } else {
+-                        elidePos.setX(line.naturalTextRect().right());
++                        br = br.united(line.naturalTextRect());
+                     }
+-                    elidePos.setY(line.position().y());
+-                    if (!elipsisLayout)
+-                        elipsisLayout = new QTextLayout(elideChar, layout.font());
+-                    elipsisLayout->beginLayout();
+-                    QTextLine el = elipsisLayout->createLine();
+-                    el.setPosition(elidePos);
+-                    elipsisLayout->endLayout();
+-                    br = br.united(el.naturalTextRect());
++                    nextLine.setLineWidth(0);
++                    nextLine.setPosition(QPointF(FLT_MAX, FLT_MAX));
++                    break;
+                 }
+-                br = br.united(line.naturalTextRect());
+-                break;
+             }
++            br = br.united(line.naturalTextRect());
++            line = nextLine;
+         }
+-        br = br.united(line.naturalTextRect());
+-    }
+-    layout.endLayout();
+-    br.moveTop(0);
+ 
+-    //Update truncated
+-    if (truncated != truncate) {
+-        truncated = truncate;
+-        emit q->truncatedChanged();
++        layout.endLayout();
++
++        if (once) {
++            naturalWidth = layout.maximumWidth();
++            once = false;
++
++            if (requireImplicitWidth
++                    && characterCount < layoutText.length()
++                    && unwrappedLineCount < maximumLineCount) {
++                // Use a new layout to get the maximum width for the remaining text.  Using a
++                // different layout excludes the truncated text from rendering.
++                QTextLayout widthLayout(layoutText.mid(characterCount), scaledFont);
++                widthLayout.setTextOption(layout.textOption());
++
++                for (; unwrappedLineCount <= maximumLineCount; ++unwrappedLineCount) {
++                    QTextLine line = widthLayout.createLine();
++                    if (!line.isValid())
++                        break;
++                }
++                naturalWidth = qMax(naturalWidth, widthLayout.maximumWidth());
++            }
++        }
++
++        QRectF unelidedRect = br.united(line.naturalTextRect());
++
++        if (horizontalFit) {
++            if (unelidedRect.width() > lineWidth || (!verticalFit && wrapped)) {
++                largeFont = scaledFontSize - 1;
++                scaledFontSize = (smallFont + largeFont) / 2;
++                if (smallFont > largeFont)
++                    break;
++                continue;
++            } else if (!verticalFit) {
++                smallFont = scaledFontSize;
++                scaledFontSize = (smallFont + largeFont + 1) / 2;
++                if (smallFont == largeFont)
++                    break;
++            }
++        }
++
++        if (verticalFit) {
++            if (truncateHeight || (q->heightValid() && unelidedRect.height() > q->height())) {
++                largeFont = scaledFontSize - 1;
++                scaledFontSize = (smallFont + largeFont + 1) / 2;
++                if (smallFont > largeFont)
++                    break;
++            } else {
++                smallFont = scaledFontSize;
++                scaledFontSize = (smallFont + largeFont + 1) / 2;
++                if (smallFont == largeFont)
++                    break;
++            }
++        }
++    } while (horizontalFit || verticalFit);
++
++    if (elide) {
++        if (!elideLayout)
++            elideLayout = new QTextLayout;
++        elideLayout->setFont(layout.font());
++        elideLayout->setTextOption(layout.textOption());
++        elideLayout->setText(elideText);
++        elideLayout->setText(elideLayout->engine()->elidedText(Qt::TextElideMode(elideMode), lineWidth));
++        elideLayout->beginLayout();
++
++        QTextLine elidedLine = elideLayout->createLine();
++        elidedLine.setPosition(QPointF(0, height));
++        if (customLayout) {
++            setupCustomLineGeometry(elidedLine, height, line.lineNumber());
++        } else {
++            setLineGeometry(elidedLine, lineWidth, height);
++        }
++        elideLayout->endLayout();
++
++        br = br.united(elidedLine.naturalTextRect());
++
++        if (visibleCount > 1)
++            line.setPosition(QPointF(FLT_MAX, FLT_MAX));
++        else
++            layout.clearLayout();
++    } else {
++        delete elideLayout;
++        elideLayout = 0;
+     }
+ 
+     if (!customLayout)
+         br.setHeight(height);
+ 
+-    if (!q->widthValid())
+-        naturalWidth = br.width();
+-
+     //Update the number of visible lines
+     if (lineCount != visibleCount) {
+         lineCount = visibleCount;
+         emit q->lineCountChanged();
+     }
++
++    if (truncated != wasTruncated)
++        emit q->truncatedChanged();
++
+     return QRect(qRound(br.x()), qRound(br.y()), qCeil(br.width()), qCeil(br.height()));
+ }
+ 
+@@ -1921,31 +2021,32 @@ void QQuickText::geometryChanged(const QRectF &newGeometry, const QRectF &oldGeo
+     bool leftAligned = effectiveHAlign() == QQuickText::AlignLeft;
+     bool wrapped = d->wrapMode != QQuickText::NoWrap;
+     bool elide = d->elideMode != QQuickText::ElideNone;
++    bool scaleFont = d->fontSizeMode != QQuickText::FixedSize && (widthValid() || heightValid());
+ 
+     if ((!widthChanged && !heightChanged) || d->internalWidthUpdate)
+         goto geomChangeDone;
+ 
+-    if (leftAligned && !wrapped && !elide)
++    if (leftAligned && !wrapped && !elide && !scaleFont)
+         goto geomChangeDone; // left aligned unwrapped text without eliding never needs relayout
+ 
+-    if (!widthChanged && !wrapped && d->singleline)
++    if (!widthChanged && !wrapped && d->singleline && !scaleFont)
+         goto geomChangeDone; // only height has changed which doesn't affect single line unwrapped text
+ 
+-    if (!widthChanged && wrapped && d->elideMode != QQuickText::ElideRight)
++    if (!widthChanged && wrapped && d->elideMode != QQuickText::ElideRight && !scaleFont)
+         goto geomChangeDone; // only height changed and no multiline eliding.
+ 
+     if (leftAligned && d->elideMode == QQuickText::ElideRight && !d->truncated && d->singleline
+-            && !wrapped && newGeometry.width() > oldGeometry.width())
++            && !wrapped && newGeometry.width() > oldGeometry.width() && !scaleFont)
+         goto geomChangeDone; // Eliding not affected if we're not currently truncated and we get wider.
+ 
+-    if (d->elideMode == QQuickText::ElideRight && wrapped && newGeometry.height() > oldGeometry.height()) {
++    if (d->elideMode == QQuickText::ElideRight && wrapped && newGeometry.height() > oldGeometry.height() && !scaleFont) {
+         if (!d->truncated)
+             goto geomChangeDone; // Multiline eliding not affected if we're not currently truncated and we get higher.
+         if (d->maximumLineCountValid && d->lineCount == d->maximumLineCount)
+             goto geomChangeDone; // Multiline eliding not affected if we're already at max line count and we get higher.
+     }
+ 
+-    if (d->updateOnComponentComplete || (elide && widthValid())) {
++    if (d->updateOnComponentComplete) {
+         // We need to re-elide
+         d->updateLayout();
+     } else {
+@@ -2048,8 +2149,8 @@ QSGNode *QQuickText::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data
+ 
+         } else if (d->elideMode == QQuickText::ElideNone || bounds.width() > 0.) {
+             node->addTextLayout(QPoint(0, bounds.y()), &d->layout, d->color, d->style, d->styleColor);
+-            if (d->elipsisLayout)
+-                node->addTextLayout(QPoint(0, bounds.y()), d->elipsisLayout, d->color, d->style, d->styleColor);
++            if (d->elideLayout)
++                node->addTextLayout(QPoint(0, bounds.y()), d->elideLayout, d->color, d->style, d->styleColor);
+         }
+ 
+         foreach (QDeclarativeStyledTextImgTag *img, d->visibleImgTags) {
+@@ -2072,6 +2173,15 @@ bool QQuickText::event(QEvent *e)
+     }
+ }
+ 
++void QQuickText::updatePolish()
++{
++    Q_D(QQuickText);
++    if (d->updateLayoutOnPolish)
++        d->updateLayout();
++    else
++        d->updateSize();
++}
++
+ /*!
+     \qmlproperty real QtQuick2::Text::paintedWidth
+ 
+@@ -2154,6 +2264,105 @@ void QQuickText::setLineHeightMode(LineHeightMode mode)
+ }
+ 
+ /*!
++    \qmlproperty enumeration QtQuick2::Text::fontSizeMode
++
++    This property specifies how the font size of the displayed text is determined.
++    The possible values are:
++
++    \list
++    \o Text.FixedSize (default) - The size specified by \l font.pixelSize
++    or \l font.pointSize is used.
++    \o Text.HorizontalFit - The largest size up to the size specified that fits
++    within the width of the item without wrapping is used.
++    \o Text.VerticalFit - The largest size up to the size specified that fits
++    the height of the item is used.
++    \o Text.Fit - The largest size up to the size specified the fits within the
++    width and height of the item is used.
++    \endlist
++
++    The font size of fitted text has a minimum bound specified by the
++    minimumPointSize or minimumPixelSize property and maximum bound specified
++    by either the \l font.pointSize or \l font.pixelSize properties.
++
++    If the text does not fit within the item bounds with the minimum font size
++    the text will be elided as per the \l elide property.
++*/
++
++QQuickText::FontSizeMode QQuickText::fontSizeMode() const
++{
++    Q_D(const QQuickText);
++    return d->fontSizeMode;
++}
++
++void QQuickText::setFontSizeMode(FontSizeMode mode)
++{
++    Q_D(QQuickText);
++    if (d->fontSizeMode == mode)
++        return;
++
++    polish();
++
++    d->fontSizeMode = mode;
++    emit fontSizeModeChanged();
++}
++
++/*!
++    \qmlproperty int QtQuick2::Text::minimumPixelSize
++
++    This property specifies the minimum font pixel size of text scaled by the
++    fontSizeMode property.
++
++    If the fontSizeMode is Text.FixedSize or the \l font.pixelSize is -1 this
++    property is ignored.
++*/
++
++int QQuickText::minimumPixelSize() const
++{
++    Q_D(const QQuickText);
++    return d->minimumPixelSize;
++}
++
++void QQuickText::setMinimumPixelSize(int size)
++{
++    Q_D(QQuickText);
++    if (d->minimumPixelSize == size)
++        return;
++
++    if (d->fontSizeMode != FixedSize && (widthValid() || heightValid()))
++        polish();
++    d->minimumPixelSize = size;
++    emit minimumPixelSizeChanged();
++}
++
++/*!
++    \qmlproperty int QtQuick2::Text::minimumPointSize
++
++    This property specifies the minimum font point \l size of text scaled by
++    the fontSizeMode property.
++
++    If the fontSizeMode is Text.FixedSize or the \l font.pointSize is -1 this
++    property is ignored.
++*/
++
++int QQuickText::minimumPointSize() const
++{
++    Q_D(const QQuickText);
++    return d->minimumPointSize;
++}
++
++void QQuickText::setMinimumPointSize(int size)
++{
++    Q_D(QQuickText);
++    if (d->minimumPointSize == size)
++        return;
++
++    if (d->fontSizeMode != FixedSize && (widthValid() || heightValid()))
++        polish();
++    d->minimumPointSize = size;
++    emit minimumPointSizeChanged();
++}
++
++/*!
+     Returns the number of resources (images) that are being loaded asynchronously.
+ */
+ int QQuickText::resourcesLoading() const
+diff --git a/src/quick/items/qquicktext_p.h b/src/quick/items/qquicktext_p.h
+index ddc9d38..0630fe4 100644
+--- a/src/quick/items/qquicktext_p.h
++++ b/src/quick/items/qquicktext_p.h
+@@ -63,6 +63,7 @@ class Q_QUICK_PRIVATE_EXPORT QQuickText : public QQuickImplicitSizeItem
+     Q_ENUMS(TextElideMode)
+     Q_ENUMS(WrapMode)
+     Q_ENUMS(LineHeightMode)
++    Q_ENUMS(FontSizeMode)
+ 
+     Q_PROPERTY(QString text READ text WRITE setText NOTIFY textChanged)
+     Q_PROPERTY(QFont font READ font WRITE setFont NOTIFY fontChanged)
+@@ -84,6 +85,9 @@ class Q_QUICK_PRIVATE_EXPORT QQuickText : public QQuickImplicitSizeItem
+     Q_PROPERTY(qreal lineHeight READ lineHeight WRITE setLineHeight NOTIFY lineHeightChanged)
+     Q_PROPERTY(LineHeightMode lineHeightMode READ lineHeightMode WRITE setLineHeightMode NOTIFY lineHeightModeChanged)
+     Q_PROPERTY(QUrl baseUrl READ baseUrl WRITE setBaseUrl RESET resetBaseUrl NOTIFY baseUrlChanged)
++    Q_PROPERTY(int minimumPixelSize READ minimumPixelSize WRITE setMinimumPixelSize NOTIFY minimumPixelSizeChanged)
++    Q_PROPERTY(int minimumPointSize READ minimumPointSize WRITE setMinimumPointSize NOTIFY minimumPointSizeChanged)
++    Q_PROPERTY(FontSizeMode fontSizeMode READ fontSizeMode WRITE setFontSizeMode NOTIFY fontSizeModeChanged)
+ 
+ public:
+     QQuickText(QQuickItem *parent=0);
+@@ -118,6 +122,9 @@ public:
+ 
+     enum LineHeightMode { ProportionalHeight, FixedHeight };
+ 
++    enum FontSizeMode { FixedSize = 0x0, HorizontalFit = 0x01, VerticalFit = 0x02,
++                        Fit = HorizontalFit | VerticalFit };
++
+     QString text() const;
+     void setText(const QString &);
+ 
+@@ -163,10 +170,20 @@ public:
+     LineHeightMode lineHeightMode() const;
+     void setLineHeightMode(LineHeightMode);
+ 
++
+     QUrl baseUrl() const;
+     void setBaseUrl(const QUrl &url);
+     void resetBaseUrl();
+ 
++    int minimumPixelSize() const;
++    void setMinimumPixelSize(int size);
++
++    int minimumPointSize() const;
++    void setMinimumPointSize(int size);
++
++    FontSizeMode fontSizeMode() const;
++    void setFontSizeMode(FontSizeMode mode);
++
+     virtual void componentComplete();
+ 
+     int resourcesLoading() const; // mainly for testing
+@@ -195,6 +212,9 @@ Q_SIGNALS:
+     void paintedSizeChanged();
+     void lineHeightChanged(qreal lineHeight);
+     void lineHeightModeChanged(LineHeightMode mode);
++    void fontSizeModeChanged();
++    void minimumPixelSizeChanged();
++    void minimumPointSizeChanged();
+     void effectiveHorizontalAlignmentChanged();
+     void lineLaidOut(QQuickTextLine *line);
+     void baseUrlChanged();
+@@ -207,6 +227,8 @@ protected:
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
+     virtual bool event(QEvent *);
+ 
++    void updatePolish();
++
+ private Q_SLOTS:
+     void q_imagesLoaded();
+     void triggerPreprocess();
+@@ -231,6 +253,7 @@ public:
+     QQuickTextLine();
+ 
+     void setLine(QTextLine* line);
++    void setLineOffset(int offset);
+     int number() const;
+ 
+     qreal width() const;
+@@ -248,6 +271,7 @@ public:
+ private:
+     QTextLine *m_line;
+     qreal m_height;
++    int m_lineOffset;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquicktext_p_p.h b/src/quick/items/qquicktext_p_p.h
+index e7b0478..7585026 100644
+--- a/src/quick/items/qquicktext_p_p.h
++++ b/src/quick/items/qquicktext_p_p.h
+@@ -103,9 +103,12 @@ public:
+     int lineCount;
+     int maximumLineCount;
+     int maximumLineCountValid;
++    QQuickText::FontSizeMode fontSizeMode;
++    int minimumPixelSize;
++    int minimumPointSize;
+     QPointF elidePos;
+ 
+-    static QString elideChar;
++    static const QChar elideChar;
+ 
+     void markDirty();
+     bool invalidateImageCache();
+@@ -115,6 +118,7 @@ public:
+ 
+     bool imageCacheDirty:1;
+     bool updateOnComponentComplete:1;
++    bool updateLayoutOnPolish:1;
+     bool richText:1;
+     bool styledText:1;
+     bool singleline:1;
+@@ -141,13 +145,13 @@ public:
+     QQuickTextDocumentWithImageResources *doc;
+ 
+     QRect setupTextLayout();
+-    void setupCustomLineGeometry(QTextLine &line, qreal &height, qreal elideWidth);
++    void setupCustomLineGeometry(QTextLine &line, qreal &height, int lineOffset = 0);
+     QPixmap textLayoutImage(bool drawStyle);
+     void drawTextLayout(QPainter *p, const QPointF &pos, bool drawStyle);
+     bool isLinkActivatedConnected();
+     QString anchorAt(const QPointF &pos);
+     QTextLayout layout;
+-    QTextLayout *elipsisLayout;
++    QTextLayout *elideLayout;
+     QQuickTextLine *textLine;
+ 
+     static QPixmap drawOutline(const QPixmap &source, const QPixmap &styleSource);
+diff --git a/tests/auto/qtquick2/qquicktext/data/fontSizeMode.qml b/tests/auto/qtquick2/qquicktext/data/fontSizeMode.qml
+new file mode 100644
+index 0000000..20f7535
+--- /dev/null
++++ b/tests/auto/qtquick2/qquicktext/data/fontSizeMode.qml
+@@ -0,0 +1,24 @@
++import QtQuick 2.0
++
++Item {
++    width: 300
++    height: 200
++
++    Rectangle {
++        anchors.fill: myText
++        border.width: 1
++    }
++
++    Text {
++        id: myText
++        objectName: "myText"
++        width: 250
++        height: 41
++        minimumPointSize: 8
++        minimumPixelSize: 8
++        font.pixelSize: 30
++        font.family: "Helvetica"
++    }
++
++    TextInput { focus: true; objectName: "input" }
++}
+diff --git a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+index cac6519..f59df3d 100644
+--- a/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
++++ b/tests/auto/qtquick2/qquicktext/tst_qquicktext.cpp
+@@ -113,6 +113,10 @@ private slots:
+     void imgTagsElide();
+     void imgTagsUpdates();
+     void imgTagsError();
++    void fontSizeMode_data();
++    void fontSizeMode();
++    void fontSizeModeMultiline_data();
++    void fontSizeModeMultiline();
+ 
+ private:
+     QStringList standard;
+@@ -1403,7 +1407,7 @@ void tst_qquicktext::lineHeight()
+ 
+     qreal h = myText->height();
+     myText->setLineHeight(1.5);
+-    QVERIFY(myText->height() == qCeil(h * 1.5));
++    QCOMPARE(myText->height(), qreal(qCeil(h * 1.5)));
+ 
+     myText->setLineHeightMode(QQuickText::FixedHeight);
+     myText->setLineHeight(20);
+@@ -1427,18 +1431,35 @@ void tst_qquicktext::lineHeight()
+ void tst_qquicktext::implicitSize_data()
+ {
+     QTest::addColumn<QString>("text");
++    QTest::addColumn<QString>("width");
+     QTest::addColumn<QString>("wrap");
+-    QTest::newRow("plain") << "The quick red fox jumped over the lazy brown dog" << "Text.NoWrap";
+-    QTest::newRow("richtext") << "<b>The quick red fox jumped over the lazy brown dog</b>" << "Text.NoWrap";
+-    QTest::newRow("plain_wrap") << "The quick red fox jumped over the lazy brown dog" << "Text.Wrap";
+-    QTest::newRow("richtext_wrap") << "<b>The quick red fox jumped over the lazy brown dog</b>" << "Text.Wrap";
++    QTest::addColumn<QString>("elide");
++    QTest::newRow("plain") << "The quick red fox jumped over the lazy brown dog" << "50" << "Text.NoWrap" << "Text.ElideNone";
++    QTest::newRow("richtext") << "<b>The quick red fox jumped over the lazy brown dog</b>" <<" 50" << "Text.NoWrap" << "Text.ElideNone";
++    QTest::newRow("plain, 0 width") << "The quick red fox jumped over the lazy brown dog" << "0" << "Text.NoWrap" << "Text.ElideNone";
++    QTest::newRow("plain, elide") << "The quick red fox jumped over the lazy brown dog" << "50" << "Text.NoWrap" << "Text.ElideRight";
++    QTest::newRow("plain, 0 width, elide") << "The quick red fox jumped over the lazy brown dog" << "0" << "Text.NoWrap" << "Text.ElideRight";
++    QTest::newRow("richtext, 0 width") << "<b>The quick red fox jumped over the lazy brown dog</b>" <<" 0" << "Text.NoWrap" << "Text.ElideNone";
++    QTest::newRow("plain_wrap") << "The quick red fox jumped over the lazy brown dog" << "50" << "Text.Wrap" << "Text.ElideNone";
++    QTest::newRow("richtext_wrap") << "<b>The quick red fox jumped over the lazy brown dog</b>" << "50" << "Text.Wrap" << "Text.ElideNone";
++    QTest::newRow("plain_wrap, 0 width") << "The quick red fox jumped over the lazy brown dog" << "0" << "Text.Wrap" << "Text.ElideNone";
++    QTest::newRow("plain_wrap, elide") << "The quick red fox jumped over the lazy brown dog" << "50" << "Text.Wrap" << "Text.ElideRight";
++    QTest::newRow("plain_wrap, 0 width, elide") << "The quick red fox jumped over the lazy brown dog" << "0" << "Text.Wrap" << "Text.ElideRight";
++    QTest::newRow("richtext_wrap, 0 width") << "<b>The quick red fox jumped over the lazy brown dog</b>" << "0" << "Text.Wrap" << "Text.ElideNone";
+ }
+ 
+ void tst_qquicktext::implicitSize()
+ {
+     QFETCH(QString, text);
++    QFETCH(QString, width);
+     QFETCH(QString, wrap);
+-    QString componentStr = "import QtQuick 2.0\nText { text: \"" + text + "\"; width: 50; wrapMode: " + wrap + " }";
++    QFETCH(QString, elide);
++    QString componentStr = "import QtQuick 2.0\nText { "
++            "text: \"" + text + "\"; "
++            "width: " + width + "; "
++            "wrapMode: " + wrap + "; "
++            "elide: " + elide + "; "
++            "maximumLineCount: 1 }";
+     QDeclarativeComponent textComponent(&engine);
+     textComponent.setData(componentStr.toLatin1(), QUrl::fromLocalFile(""));
+     QQuickText *textObject = qobject_cast<QQuickText*>(textComponent.create());
+@@ -1598,6 +1619,537 @@ void tst_qquicktext::imgTagsError()
+     delete textObject;
+ }
+ 
++void tst_qquicktext::fontSizeMode_data()
++{
++    QTest::addColumn<QString>("text");
++    QTest::addColumn<bool>("canElide");
++    QTest::newRow("plain") << "The quick red fox jumped over the lazy brown dog" << true;
++    QTest::newRow("richtext") << "<b>The quick red fox jumped over the lazy brown dog</b>" << false;
++}
++
++void tst_qquicktext::fontSizeMode()
++{
++    QFETCH(QString, text);
++    QFETCH(bool, canElide);
++
++    QQuickView *canvas = createView(testFile("fontSizeMode.qml"));
++    canvas->show();
++
++    QQuickText *myText = canvas->rootObject()->findChild<QQuickText*>("myText");
++    QVERIFY(myText != 0);
++
++    myText->setText(text);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    qreal originalWidth = myText->paintedWidth();
++    qreal originalHeight = myText->paintedHeight();
++
++    // The original text unwrapped should exceed the width of the item.
++    QVERIFY(originalWidth > myText->width());
++    QVERIFY(originalHeight < myText->height());
++
++    QFont font = myText->font();
++    font.setPixelSize(64);
++
++    myText->setFont(font);
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Font size reduced to fit within the width of the item.
++    qreal horizontalFitWidth = myText->paintedWidth();
++    qreal horizontalFitHeight = myText->paintedHeight();
++    QVERIFY(horizontalFitWidth <= myText->width() + 2); // rounding
++    QVERIFY(horizontalFitHeight <= myText->height() + 2);
++
++    if (canElide) {
++        // Elide won't affect the size with HorizontalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Font size increased to fill the height of the item.
++    qreal verticalFitHeight = myText->paintedHeight();
++    QVERIFY(myText->paintedWidth() > myText->width());
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++    QVERIFY(verticalFitHeight > originalHeight);
++
++    if (canElide) {
++        // Elide won't affect the height of a single line with VerticalFit but will crop the width.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as HorizontalFit with no wrapping.
++    QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++    QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::FixedSize);
++    myText->setWrapMode(QQuickText::Wrap);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    originalWidth = myText->paintedWidth();
++    originalHeight = myText->paintedHeight();
++
++    // The original text wrapped should exceed the height of the item.
++    QVERIFY(originalWidth <= myText->width() + 2);
++    QVERIFY(originalHeight > myText->height());
++
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // HorizontalFit should reduce the font size to minimize wrapping, which brings it back to the
++    // same size as without text wrapping.
++    QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++    QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with HorizontalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // VerticalFit should reduce the size to the wrapped text within the vertical height.
++    verticalFitHeight = myText->paintedHeight();
++    qreal verticalFitWidth = myText->paintedWidth();
++    QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++    QVERIFY(verticalFitHeight < originalHeight);
++
++    if (canElide) {
++        // Elide won't affect the height or width of a wrapped text with VerticalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as VerticalFit with wrapping.
++    QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++    QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::FixedSize);
++    myText->setMaximumLineCount(2);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    // The original text wrapped should exceed the height of the item.
++    QVERIFY(originalWidth <= myText->width() + 2);
++    QVERIFY(originalHeight > myText->height());
++
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // HorizontalFit should reduce the font size to minimize wrapping, which brings it back to the
++    // same size as without text wrapping.
++    QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++    QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with HorizontalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // VerticalFit should reduce the size to the wrapped text within the vertical height.
++    verticalFitHeight = myText->paintedHeight();
++    verticalFitWidth = myText->paintedWidth();
++    QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++    QVERIFY(verticalFitHeight < originalHeight);
++
++    if (canElide) {
++        // Elide won't affect the height or width of a wrapped text with VerticalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as VerticalFit with wrapping.
++    QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++    QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++}
++
++void tst_qquicktext::fontSizeModeMultiline_data()
++{
++    QTest::addColumn<QString>("text");
++    QTest::addColumn<bool>("canElide");
++    QTest::newRow("plain") << "The quick red fox jumped\n over the lazy brown dog" << true;
++    QTest::newRow("richtext") << "<b>The quick red fox jumped<br/> over the lazy brown dog</b>" << false;
++}
++
++void tst_qquicktext::fontSizeModeMultiline()
++{
++    QFETCH(QString, text);
++    QFETCH(bool, canElide);
++
++    QQuickView *canvas = createView(testFile("fontSizeMode.qml"));
++    canvas->show();
++
++    QQuickText *myText = canvas->rootObject()->findChild<QQuickText*>("myText");
++    QVERIFY(myText != 0);
++
++    myText->setText(text);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    qreal originalWidth = myText->paintedWidth();
++    qreal originalHeight = myText->paintedHeight();
++    QCOMPARE(myText->lineCount(), 2);
++
++    // The original text unwrapped should exceed the width and height of the item.
++    QVERIFY(originalWidth > myText->width());
++    QVERIFY(originalHeight > myText->height());
++
++    QFont font = myText->font();
++    font.setPixelSize(64);
++
++    myText->setFont(font);
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Font size reduced to fit within the width of the item.
++    QCOMPARE(myText->lineCount(), 2);
++    qreal horizontalFitWidth = myText->paintedWidth();
++    qreal horizontalFitHeight = myText->paintedHeight();
++    QVERIFY(horizontalFitWidth <= myText->width() + 2); // rounding
++    QVERIFY(horizontalFitHeight > myText->height());
++
++    if (canElide) {
++        // Right eliding will remove the last line
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QCOMPARE(myText->lineCount(), 1);
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QVERIFY(myText->paintedHeight() <= myText->height() + 2);
++
++        // Left or middle eliding wont have any effect.
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++        QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Font size reduced to fit within the height of the item.
++    qreal verticalFitWidth = myText->paintedWidth();
++    qreal verticalFitHeight = myText->paintedHeight();
++    QVERIFY(verticalFitWidth <= myText->width() + 2);
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++
++    if (canElide) {
++        // Elide will have no effect.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as VerticalFit with no wrapping.
++    QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++    QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideLeft);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideMiddle);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::FixedSize);
++    myText->setWrapMode(QQuickText::Wrap);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    originalWidth = myText->paintedWidth();
++    originalHeight = myText->paintedHeight();
++
++    // The original text wrapped should exceed the height of the item.
++    QVERIFY(originalWidth <= myText->width() + 2);
++    QVERIFY(originalHeight > myText->height());
++
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // HorizontalFit should reduce the font size to minimize wrapping, which brings it back to the
++    // same size as without text wrapping.
++    QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++    QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++    if (canElide) {
++        // Text will be elided vertically with HorizontalFit
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QVERIFY(myText->paintedHeight() <= myText->height() + 2);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // VerticalFit should reduce the size to the wrapped text within the vertical height.
++    verticalFitHeight = myText->paintedHeight();
++    verticalFitWidth = myText->paintedWidth();
++    QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++    QVERIFY(verticalFitHeight < originalHeight);
++
++    if (canElide) {
++        // Elide won't affect the height or width of a wrapped text with VerticalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as VerticalFit with wrapping.
++    QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++    QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::FixedSize);
++    myText->setMaximumLineCount(2);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++
++    // The original text wrapped should exceed the height of the item.
++    QVERIFY(originalWidth <= myText->width() + 2);
++    QVERIFY(originalHeight > myText->height());
++
++    myText->setFontSizeMode(QQuickText::HorizontalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // HorizontalFit should reduce the font size to minimize wrapping, which brings it back to the
++    // same size as without text wrapping.
++    QCOMPARE(myText->paintedWidth(), horizontalFitWidth);
++    QCOMPARE(myText->paintedHeight(), horizontalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with HorizontalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(myText->truncated());
++        QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++        QVERIFY(myText->paintedHeight() <= myText->height() + 2);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::VerticalFit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // VerticalFit should reduce the size to the wrapped text within the vertical height.
++    verticalFitHeight = myText->paintedHeight();
++    verticalFitWidth = myText->paintedWidth();
++    QVERIFY(myText->paintedWidth() <= myText->width() + 2);
++    QVERIFY(verticalFitHeight <= myText->height() + 2);
++    QVERIFY(verticalFitHeight < originalHeight);
++
++    if (canElide) {
++        // Elide won't affect the height or width of a wrapped text with VerticalFit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++
++    myText->setFontSizeMode(QQuickText::Fit);
++    QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    // Should be the same as VerticalFit with wrapping.
++    QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++    QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++    if (canElide) {
++        // Elide won't affect the size with Fit.
++        myText->setElideMode(QQuickText::ElideRight);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++        QVERIFY(!myText->truncated());
++        QCOMPARE(myText->paintedWidth(), verticalFitWidth);
++        QCOMPARE(myText->paintedHeight(), verticalFitHeight);
++
++        myText->setElideMode(QQuickText::ElideNone);
++        QTRY_COMPARE(QQuickItemPrivate::get(myText)->polishScheduled, false);
++    }
++}
++
+ QTEST_MAIN(tst_qquicktext)
+ 
+ #include "tst_qquicktext.moc"
+diff --git a/tests/testapplications/text/text.qml b/tests/testapplications/text/text.qml
+index 7f3574e..4f4aa89 100644
+--- a/tests/testapplications/text/text.qml
++++ b/tests/testapplications/text/text.qml
+@@ -48,12 +48,16 @@ Rectangle {
+ 
+     Item {
+         id: textpanel
+-        height: 360
+-        width: 440
++
++        anchors.fill: parent
++        anchors.rightMargin: controlpanel.width
++
+         Text {
+             id: textelement
+             height: parent.height - 20; width: parent.width - 20
+             anchors.centerIn: parent
++            anchors.fill: parent;
++            anchors.margins: 10
+ 
+             text: { textvalue.model.get(textvalue.currentIndex).value }
+             textFormat: { formatvalue.model.get(formatvalue.currentIndex).value }
+@@ -79,6 +83,8 @@ Rectangle {
+             smooth: { smoothvalue.model.get(smoothvalue.currentIndex).value }
+             style: { stylevalue.model.get(stylevalue.currentIndex).value }
+             styleColor: { stylecolorvalue.model.get(stylecolorvalue.currentIndex).value }
++            fontSizeMode : { fontsizemodevalue.model.get(fontsizemodevalue.currentIndex).value }
++            minimumPointSize : { minimumpointsizevalue.model.get(minimumpointsizevalue.currentIndex).value }
+ 
+             Rectangle{ color: "transparent"; border.color: "green"; anchors.fill: parent }
+         }
+@@ -204,11 +210,11 @@ Rectangle {
+             ControlView {
+                 id: pixelvalue
+                 controlname: "Pixel"
+-                model: ListModel { ListElement { name: "-1"; value: -1 } ListElement { name: "8"; value: 8 } ListElement { name: "20"; value: 20 } } }
++                model: ListModel { ListElement { name: "-1"; value: -1 } ListElement { name: "8"; value: 8 } ListElement { name: "20"; value: 20 } ListElement { name: "50"; value: 20 } } }
+             ControlView {
+                 id: pointvalue
+                 controlname: "Point"
+-                model: ListModel { ListElement { name: "-1"; value: -1 } ListElement { name: "8"; value: 8 } ListElement { name: "20"; value: 20 } } }
++                model: ListModel { ListElement { name: "-1"; value: -1 } ListElement { name: "8"; value: 8 } ListElement { name: "20"; value: 20 } ListElement { name: "50"; value: 20 } } }
+             ControlView {
+                 id: strikeoutvalue
+                 controlname: "Strike"
+@@ -267,6 +273,21 @@ Rectangle {
+                 controlname: "Wrap"
+                 model: ListModel { ListElement { name: "None"; value: Text.NoWrap } ListElement { name: "Word"; value: Text.WordWrap }
+                     ListElement { name: "Anywhere"; value: Text.WrapAnywhere } ListElement { name: "Wrap"; value: Text.Wrap } } }
++            ControlView {
++                id: fontsizemodevalue
++                controlname: "FontSize"
++                model: ListModel { ListElement { name: "FixedSize"; value: Text.FixedSize } ListElement { name: "Horizontal"; value: Text.HorizontalFit }
++                    ListElement { name: "Vertical"; value: Text.VerticalFit } ListElement { name: "Fit"; value: Text.Fit } } }
++            ControlView {
++                id: minimumpixelsizevalue
++                controlname: "MinPixelSize"
++                model: ListModel { ListElement { name: "8"; value: 8 } ListElement { name: "12"; value: 12 }
++                    ListElement { name: "24"; value: 24 } ListElement { name: "32"; value: 32 } } }
++            ControlView {
++                id: minimumpointsizevalue
++                controlname: "MinPointSize"
++                model: ListModel { ListElement { name: "8"; value: 8 } ListElement { name: "12"; value: 12 }
++                    ListElement { name: "24"; value: 24 } ListElement { name: "32"; value: 32 } } }
+         }
+     }
+ }

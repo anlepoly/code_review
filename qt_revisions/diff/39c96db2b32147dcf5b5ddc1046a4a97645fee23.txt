@@ -1,0 +1,362 @@
+diff --git a/src/gsttools/qvideosurfacegstsink.cpp b/src/gsttools/qvideosurfacegstsink.cpp
+index 53b790e..da11ac7 100644
+--- a/src/gsttools/qvideosurfacegstsink.cpp
++++ b/src/gsttools/qvideosurfacegstsink.cpp
+@@ -66,6 +66,7 @@ QVideoSurfaceGstDelegate::QVideoSurfaceGstDelegate(
+     : m_surface(surface)
+     , m_pool(0)
+     , m_renderReturn(GST_FLOW_ERROR)
++    , m_lastPrerolledBuffer(0)
+     , m_bytesPerLine(0)
+     , m_startCanceled(false)
+ {
+@@ -87,6 +88,7 @@ QVideoSurfaceGstDelegate::QVideoSurfaceGstDelegate(
+ QVideoSurfaceGstDelegate::~QVideoSurfaceGstDelegate()
+ {
+     qDeleteAll(m_pools);
++    setLastPrerolledBuffer(0);
+ }
+ 
+ QList<QVideoFrame::PixelFormat> QVideoSurfaceGstDelegate::supportedPixelFormats(QAbstractVideoBuffer::HandleType handleType) const
+@@ -222,6 +224,23 @@ GstFlowReturn QVideoSurfaceGstDelegate::render(GstBuffer *buffer)
+     return m_renderReturn;
+ }
+ 
++void QVideoSurfaceGstDelegate::setLastPrerolledBuffer(GstBuffer *prerolledBuffer)
++{
++    // discard previously stored buffer
++    if (m_lastPrerolledBuffer) {
++        gst_buffer_unref(m_lastPrerolledBuffer);
++        m_lastPrerolledBuffer = 0;
++    }
++
++    if (!prerolledBuffer)
++        return;
++
++    // store a reference to the buffer
++    Q_ASSERT(!m_lastPrerolledBuffer);
++    m_lastPrerolledBuffer = prerolledBuffer;
++    gst_buffer_ref(m_lastPrerolledBuffer);
++}
++
+ void QVideoSurfaceGstDelegate::queuedStart()
+ {
+     if (!m_startCanceled) {
+@@ -393,6 +412,8 @@ QVideoSurfaceGstSink *QVideoSurfaceGstSink::createSink(QAbstractVideoSurface *su
+ 
+     sink->delegate = new QVideoSurfaceGstDelegate(surface);
+ 
++    g_signal_connect(G_OBJECT(sink), "notify::show-preroll-frame", G_CALLBACK(handleShowPrerollChange), sink);
++
+     return sink;
+ }
+ 
+@@ -435,7 +456,7 @@ void QVideoSurfaceGstSink::class_init(gpointer g_class, gpointer class_data)
+     base_sink_class->start = QVideoSurfaceGstSink::start;
+     base_sink_class->stop = QVideoSurfaceGstSink::stop;
+     // base_sink_class->unlock = QVideoSurfaceGstSink::unlock; // Not implemented.
+-    // base_sink_class->event = QVideoSurfaceGstSink::event; // Not implemented.
++    base_sink_class->event = QVideoSurfaceGstSink::event;
+     base_sink_class->preroll = QVideoSurfaceGstSink::preroll;
+     base_sink_class->render = QVideoSurfaceGstSink::render;
+ 
+@@ -664,6 +685,26 @@ QVideoSurfaceFormat QVideoSurfaceGstSink::formatForCaps(GstCaps *caps, int *byte
+     return QVideoSurfaceFormat();
+ }
+ 
++void QVideoSurfaceGstSink::handleShowPrerollChange(GObject *o, GParamSpec *p, gpointer d)
++{
++    Q_UNUSED(o);
++    Q_UNUSED(p);
++    QVideoSurfaceGstSink *sink = reinterpret_cast<QVideoSurfaceGstSink *>(d);
++
++    gboolean value = true; // "show-preroll-frame" property is true by default
++    g_object_get(G_OBJECT(sink), "show-preroll-frame", &value, NULL);
++
++    GstBuffer *buffer = sink->delegate->lastPrerolledBuffer();
++    // Render the stored prerolled buffer if requested.
++    // e.g. player is in stopped mode, then seek operation is requested,
++    // surface now stores a prerolled frame, but doesn't display it until
++    // "show-preroll-frame" property is set to "true"
++    // when switching to pause or playing state.
++    if (value && buffer) {
++        sink->delegate->render(buffer);
++        sink->delegate->setLastPrerolledBuffer(0);
++    }
++}
+ 
+ GstFlowReturn QVideoSurfaceGstSink::buffer_alloc(
+         GstBaseSink *base, guint64 offset, guint size, GstCaps *caps, GstBuffer **buffer)
+@@ -781,8 +822,11 @@ gboolean QVideoSurfaceGstSink::unlock(GstBaseSink *base)
+ 
+ gboolean QVideoSurfaceGstSink::event(GstBaseSink *base, GstEvent *event)
+ {
+-    Q_UNUSED(base);
+-    Q_UNUSED(event);
++    // discard prerolled frame
++    if (event->type == GST_EVENT_FLUSH_START) {
++        VO_SINK(base);
++        sink->delegate->setLastPrerolledBuffer(0);
++    }
+ 
+     return TRUE;
+ }
+@@ -790,12 +834,23 @@ gboolean QVideoSurfaceGstSink::event(GstBaseSink *base, GstEvent *event)
+ GstFlowReturn QVideoSurfaceGstSink::preroll(GstBaseSink *base, GstBuffer *buffer)
+ {
+     VO_SINK(base);
+-    return sink->delegate->render(buffer);
++
++    gboolean value = true; // "show-preroll-frame" property is true by default
++    g_object_get(G_OBJECT(base), "show-preroll-frame", &value, NULL);
++    if (value) {
++        sink->delegate->setLastPrerolledBuffer(0); // discard prerolled buffer
++        return sink->delegate->render(buffer); // display frame
++    }
++
++    // otherwise keep a reference to the buffer to display it later
++    sink->delegate->setLastPrerolledBuffer(buffer);
++    return GST_FLOW_OK;
+ }
+ 
+ GstFlowReturn QVideoSurfaceGstSink::render(GstBaseSink *base, GstBuffer *buffer)
+ {
+     VO_SINK(base);
++    sink->delegate->setLastPrerolledBuffer(0); // discard prerolled buffer
+     return sink->delegate->render(buffer);
+ }
+ 
+diff --git a/src/multimedia/gsttools_headers/qvideosurfacegstsink_p.h b/src/multimedia/gsttools_headers/qvideosurfacegstsink_p.h
+index b145d35..9dc57bb 100644
+--- a/src/multimedia/gsttools_headers/qvideosurfacegstsink_p.h
++++ b/src/multimedia/gsttools_headers/qvideosurfacegstsink_p.h
+@@ -97,6 +97,9 @@ public:
+ 
+     GstFlowReturn render(GstBuffer *buffer);
+ 
++    GstBuffer *lastPrerolledBuffer() const { return m_lastPrerolledBuffer; }
++    void setLastPrerolledBuffer(GstBuffer *lastPrerolledBuffer); // set prerolledBuffer to 0 to discard prerolled buffer
++
+ private slots:
+     void queuedStart();
+     void queuedStop();
+@@ -118,6 +121,8 @@ private:
+     QVideoSurfaceFormat m_format;
+     QVideoFrame m_frame;
+     GstFlowReturn m_renderReturn;
++    // this pointer is not 0 when there is a prerolled buffer waiting to be displayed
++    GstBuffer *m_lastPrerolledBuffer;
+     int m_bytesPerLine;
+     bool m_started;
+     bool m_startCanceled;
+@@ -131,6 +136,8 @@ public:
+     static QVideoSurfaceGstSink *createSink(QAbstractVideoSurface *surface);
+     static QVideoSurfaceFormat formatForCaps(GstCaps *caps, int *bytesPerLine = 0);
+ 
++    static void handleShowPrerollChange(GObject *o, GParamSpec *p, gpointer d);
++
+ private:
+     static GType get_type();
+     static void class_init(gpointer g_class, gpointer class_data);
+diff --git a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
+index 3ce1e9c..ec3e5dd 100644
+--- a/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
++++ b/src/plugins/gstreamer/mediaplayer/qgstreamerplayercontrol.cpp
+@@ -259,6 +259,10 @@ void QGstreamerPlayerControl::playOrPause(QMediaPlayer::State newState)
+ 
+         bool ok = false;
+ 
++        // show prerolled frame if switching from stopped state
++        if (newState != QMediaPlayer::StoppedState && m_state == QMediaPlayer::StoppedState && m_pendingSeekPosition == -1)
++            m_session->showPrerollFrames(true);
++
+         //To prevent displaying the first video frame when playback is resumed
+         //the pipeline is paused instead of playing, seeked to requested position,
+         //and after seeking is finished (position updated) playback is restarted
+@@ -299,6 +303,7 @@ void QGstreamerPlayerControl::stop()
+ 
+     if (m_state != QMediaPlayer::StoppedState) {
+         m_state = QMediaPlayer::StoppedState;
++        m_session->showPrerollFrames(false); // stop showing prerolled frames in stop state
+         if (m_resources->isGranted())
+             m_session->pause();
+ 
+@@ -342,7 +347,7 @@ void QGstreamerPlayerControl::setMedia(const QMediaContent &content, QIODevice *
+     m_state = QMediaPlayer::StoppedState;
+     QMediaContent oldMedia = m_currentResource;
+     m_pendingSeekPosition = -1;
+-    m_session->showPrerollFrames(true);
++    m_session->showPrerollFrames(false); // do not show prerolled frames until pause() or play() explicitly called
+ 
+     if (!content.isNull() || stream) {
+         if (!m_resources->isRequested() && !m_resources->isGranted())
+@@ -767,7 +772,8 @@ void QGstreamerPlayerControl::updatePosition(qint64 pos)
+         //seek request is complete, it's safe to resume playback
+         //with prerolled frame displayed
+         m_pendingSeekPosition = -1;
+-        m_session->showPrerollFrames(true);
++        if (m_state != QMediaPlayer::StoppedState)
++            m_session->showPrerollFrames(true);
+         if (m_state == QMediaPlayer::PlayingState) {
+             m_session->play();
+         }
+diff --git a/tests/auto/integration/qmediaplayerbackend/testdata/colors.mp4 b/tests/auto/integration/qmediaplayerbackend/testdata/colors.mp4
+new file mode 100644
+index 0000000..30ddda8
+Binary files /dev/null and b/tests/auto/integration/qmediaplayerbackend/testdata/colors.mp4 differ
+diff --git a/tests/auto/integration/qmediaplayerbackend/tst_qmediaplayerbackend.cpp b/tests/auto/integration/qmediaplayerbackend/tst_qmediaplayerbackend.cpp
+index e13c4d6..ac44b66 100644
+--- a/tests/auto/integration/qmediaplayerbackend/tst_qmediaplayerbackend.cpp
++++ b/tests/auto/integration/qmediaplayerbackend/tst_qmediaplayerbackend.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include <QtTest/QtTest>
+ #include <QDebug>
++#include <qabstractvideosurface.h>
+ #include "qmediaservice.h"
+ #include "qmediaplayer.h"
+ 
+@@ -76,12 +77,38 @@ private slots:
+     void volumeAndMuted();
+     void volumeAcrossFiles_data();
+     void volumeAcrossFiles();
++    void seekPauseSeek();
+ 
+ private:
+     //one second local wav file
+     QMediaContent localWavFile;
+ };
+ 
++/*
++    This is a simple video surface which records all presented frames.
++*/
++
++class TestVideoSurface : public QAbstractVideoSurface
++{
++    Q_OBJECT
++public:
++    explicit TestVideoSurface() { }
++
++    //video surface
++    QList<QVideoFrame::PixelFormat> supportedPixelFormats(
++            QAbstractVideoBuffer::HandleType handleType = QAbstractVideoBuffer::NoHandle) const;
++
++    bool start(const QVideoSurfaceFormat &format);
++    void stop();
++    bool present(const QVideoFrame &frame);
++
++    QList<QVideoFrame>& frameList() { return m_frameList; }
++
++private:
++    QList<QVideoFrame> m_frameList;
++};
++
++
+ void tst_QMediaPlayerBackend::init()
+ {
+ }
+@@ -409,6 +436,104 @@ void tst_QMediaPlayerBackend::volumeAcrossFiles()
+     QCOMPARE(player.isMuted(), muted);
+ }
+ 
++void tst_QMediaPlayerBackend::seekPauseSeek()
++{
++    QMediaPlayer player;
++
++    QSignalSpy positionSpy(&player, SIGNAL(positionChanged(qint64)));
++
++    TestVideoSurface *surface = new TestVideoSurface;
++    player.setVideoOutput(surface);
++
++    QFileInfo videoFile(QLatin1String(TESTDATA_DIR "testdata/colors.mp4"));
++    QVERIFY(videoFile.exists());
++
++    player.setMedia(QUrl::fromLocalFile(videoFile.absoluteFilePath()));
++    QCOMPARE(player.state(), QMediaPlayer::StoppedState);
++    QVERIFY(surface->frameList().isEmpty()); // frame must not appear until we call pause() or play()
++
++    positionSpy.clear();
++    player.setPosition((qint64)7000);
++    QTRY_VERIFY(!positionSpy.isEmpty() && qAbs(player.position() - (qint64)7000) < (qint64)500);
++    QCOMPARE(player.state(), QMediaPlayer::StoppedState);
++    QTest::qWait(250); // wait a bit to ensure the frame is not rendered
++    QVERIFY(surface->frameList().isEmpty()); // still no frame, we must call pause() or play() to see a frame
++
++    player.pause();
++    QTRY_COMPARE(player.state(), QMediaPlayer::PausedState); // it might take some time for the operation to be completed
++    QTRY_COMPARE(surface->frameList().size(), 1); // we must see a frame at position 7000 here
++
++    {
++        QVideoFrame frame = surface->frameList().back();
++        QVERIFY(qAbs(frame.startTime() - (qint64)7000) < (qint64)500);
++        QCOMPARE(frame.width(), 160);
++        QCOMPARE(frame.height(), 120);
++
++        // create QImage for QVideoFrame to verify RGB pixel colors
++        QVERIFY(frame.map(QAbstractVideoBuffer::ReadOnly));
++        QImage image(frame.bits(), frame.width(), frame.height(), QVideoFrame::imageFormatFromPixelFormat(frame.pixelFormat()));
++        QVERIFY(!image.isNull());
++        QVERIFY(qRed(image.pixel(0, 0)) >= 240); // conversion from YUV => RGB, that's why it's not 255
++        QCOMPARE(qGreen(image.pixel(0, 0)), 0);
++        QCOMPARE(qBlue(image.pixel(0, 0)), 0);
++        frame.unmap();
++    }
++
++    positionSpy.clear();
++    player.setPosition((qint64)12000);
++    QTRY_VERIFY(!positionSpy.isEmpty() && qAbs(player.position() - (qint64)12000) < (qint64)500);
++    QCOMPARE(player.state(), QMediaPlayer::PausedState);
++    QCOMPARE(surface->frameList().size(), 2);
++
++    {
++        QVideoFrame frame = surface->frameList().back();
++        QVERIFY(qAbs(frame.startTime() - (qint64)12000) < (qint64)500);
++        QCOMPARE(frame.width(), 160);
++        QCOMPARE(frame.height(), 120);
++
++        QVERIFY(frame.map(QAbstractVideoBuffer::ReadOnly));
++        QImage image(frame.bits(), frame.width(), frame.height(), QVideoFrame::imageFormatFromPixelFormat(frame.pixelFormat()));
++        QVERIFY(!image.isNull());
++        QCOMPARE(qRed(image.pixel(0, 0)), 0);
++        QVERIFY(qGreen(image.pixel(0, 0)) >= 240);
++        QCOMPARE(qBlue(image.pixel(0, 0)), 0);
++        frame.unmap();
++    }
++}
++
++QList<QVideoFrame::PixelFormat> TestVideoSurface::supportedPixelFormats(
++        QAbstractVideoBuffer::HandleType handleType) const
++{
++    if (handleType == QAbstractVideoBuffer::NoHandle) {
++        return QList<QVideoFrame::PixelFormat>()
++                << QVideoFrame::Format_RGB32
++                << QVideoFrame::Format_ARGB32
++                << QVideoFrame::Format_ARGB32_Premultiplied
++                << QVideoFrame::Format_RGB565
++                << QVideoFrame::Format_RGB555;
++    } else {
++        return QList<QVideoFrame::PixelFormat>();
++    }
++}
++
++bool TestVideoSurface::start(const QVideoSurfaceFormat &format)
++{
++    if (!isFormatSupported(format)) return false;
++
++    return QAbstractVideoSurface::start(format);
++}
++
++void TestVideoSurface::stop()
++{
++    QAbstractVideoSurface::stop();
++}
++
++bool TestVideoSurface::present(const QVideoFrame &frame)
++{
++    m_frameList.push_back(frame);
++    return true;
++}
++
+ 
+ QTEST_MAIN(tst_QMediaPlayerBackend)
+ #include "tst_qmediaplayerbackend.moc"

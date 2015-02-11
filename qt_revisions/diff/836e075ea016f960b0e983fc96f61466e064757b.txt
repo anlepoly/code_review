@@ -1,0 +1,913 @@
+diff --git a/src/quick/doc/images/flickable-rebound.gif b/src/quick/doc/images/flickable-rebound.gif
+new file mode 100644
+index 0000000..c2076ce
+Binary files /dev/null and b/src/quick/doc/images/flickable-rebound.gif differ
+diff --git a/src/quick/items/qquickflickable.cpp b/src/quick/items/qquickflickable.cpp
+index c207c77..57fb712 100644
+--- a/src/quick/items/qquickflickable.cpp
++++ b/src/quick/items/qquickflickable.cpp
+@@ -45,6 +45,7 @@
+ #include "qquickcanvas_p.h"
+ #include "qquickevents_p_p.h"
+ 
++#include <QtQuick/private/qquicktransition_p.h>
+ #include <private/qqmlglobal_p.h>
+ 
+ #include <QtQml/qqmlinfo.h>
+@@ -185,6 +186,78 @@ void QQuickFlickableVisibleArea::updateVisible()
+ }
+ 
+ 
++class QQuickFlickableReboundTransition : public QQuickTransitionManager
++{
++public:
++    QQuickFlickableReboundTransition(QQuickFlickable *f, const QString &name)
++        : flickable(f), axisData(0), propName(name), active(false)
++    {
++    }
++
++    ~QQuickFlickableReboundTransition()
++    {
++        flickable = 0;
++    }
++
++    bool startTransition(QQuickFlickablePrivate::AxisData *data, qreal toPos) {
++        QQuickFlickablePrivate *fp = QQuickFlickablePrivate::get(flickable);
++        if (!fp->rebound || !fp->rebound->enabled())
++            return false;
++        active = true;
++        axisData = data;
++        axisData->transitionTo = toPos;
++        axisData->transitionToSet = true;
++
++        actions.clear();
++        actions << QQuickAction(fp->contentItem, propName, toPos);
++        QQuickTransitionManager::transition(actions, fp->rebound, fp->contentItem);
++        return true;
++    }
++
++    bool isActive() const {
++        return active;
++    }
++
++    void stopTransition() {
++        if (!flickable || !isRunning())
++            return;
++        QQuickFlickablePrivate *fp = QQuickFlickablePrivate::get(flickable);
++        if (axisData == &fp->hData)
++            axisData->move.setValue(-flickable->contentX());
++        else
++            axisData->move.setValue(-flickable->contentY());
++        cancel();
++        active = false;
++    }
++
++protected:
++    virtual void finished() {
++        if (!flickable)
++            return;
++        axisData->move.setValue(axisData->transitionTo);
++        QQuickFlickablePrivate *fp = QQuickFlickablePrivate::get(flickable);
++        active = false;
++
++        if (!fp->hData.transitionToBounds->isActive()
++                && !fp->vData.transitionToBounds->isActive()) {
++            flickable->movementEnding();
++        }
++    }
++
++private:
++    QQuickStateOperation::ActionList actions;
++    QQuickFlickable *flickable;
++    QQuickFlickablePrivate::AxisData *axisData;
++    QString propName;
++    bool active;
++};
++
++QQuickFlickablePrivate::AxisData::~AxisData()
++{
++    delete transitionToBounds;
++}
++
++
+ QQuickFlickablePrivate::QQuickFlickablePrivate()
+   : contentItem(new QQuickItem)
+     , hData(this, &QQuickFlickablePrivate::setViewportX)
+@@ -200,6 +273,7 @@ QQuickFlickablePrivate::QQuickFlickablePrivate()
+     , flickBoost(1.0), fixupMode(Normal), vTime(0), visibleArea(0)
+     , flickableDirection(QQuickFlickable::AutoFlickDirection)
+     , boundsBehavior(QQuickFlickable::DragAndOvershootBounds)
++    , rebound(0)
+ {
+ }
+ 
+@@ -209,7 +283,7 @@ void QQuickFlickablePrivate::init()
+     QQml_setParent_noEvent(contentItem, q);
+     contentItem->setParentItem(q);
+     qmlobject_connect(&timeline, QQuickTimeLine, SIGNAL(completed()),
+-                      q, QQuickFlickable, SLOT(movementEnding()))
++                      q, QQuickFlickable, SLOT(timelineCompleted()))
+     q->setAcceptedMouseButtons(Qt::LeftButton);
+     q->setFiltersChildMouseEvents(true);
+     QQuickItemPrivate *viewportPrivate = QQuickItemPrivate::get(contentItem);
+@@ -312,7 +386,7 @@ bool QQuickFlickablePrivate::flick(AxisData &data, qreal minExtent, qreal maxExt
+         dist = -target + data.move.value();
+         accel = v2 / (2.0f * qAbs(dist));
+ 
+-        timeline.reset(data.move);
++        resetTimeline(data);
+         if (boundsBehavior == QQuickFlickable::DragAndOvershootBounds)
+             timeline.accel(data.move, v, accel);
+         else
+@@ -325,7 +399,7 @@ bool QQuickFlickablePrivate::flick(AxisData &data, qreal minExtent, qreal maxExt
+             return !vData.flicking && q->yflick();
+         return false;
+     } else {
+-        timeline.reset(data.move);
++        resetTimeline(data);
+         fixup(data, minExtent, maxExtent);
+         return false;
+     }
+@@ -353,51 +427,62 @@ void QQuickFlickablePrivate::fixupY()
+     fixup(vData, q->minYExtent(), q->maxYExtent());
+ }
+ 
++void QQuickFlickablePrivate::adjustContentPos(AxisData &data, qreal toPos)
++{
++    Q_Q(QQuickFlickable);
++    switch (fixupMode) {
++    case Immediate:
++        timeline.set(data.move, toPos);
++        break;
++    case ExtentChanged:
++        // The target has changed. Don't start from the beginning; just complete the
++        // second half of the animation using the new extent.
++        timeline.move(data.move, toPos, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
++        data.fixingUp = true;
++        break;
++    default: {
++            if (data.transitionToBounds && data.transitionToBounds->startTransition(&data, toPos)) {
++                q->movementStarting();
++                data.fixingUp = true;
++            } else {
++                qreal dist = toPos - data.move;
++                timeline.move(data.move, toPos - dist/2, QEasingCurve(QEasingCurve::InQuad), fixupDuration/4);
++                timeline.move(data.move, toPos, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
++                data.fixingUp = true;
++            }
++        }
++    }
++}
++
++void QQuickFlickablePrivate::resetTimeline(AxisData &data)
++{
++    timeline.reset(data.move);
++    if (data.transitionToBounds)
++        data.transitionToBounds->stopTransition();
++}
++
++void QQuickFlickablePrivate::clearTimeline()
++{
++    timeline.clear();
++    if (hData.transitionToBounds)
++        hData.transitionToBounds->stopTransition();
++    if (vData.transitionToBounds)
++        vData.transitionToBounds->stopTransition();
++}
++
+ void QQuickFlickablePrivate::fixup(AxisData &data, qreal minExtent, qreal maxExtent)
+ {
+     if (data.move.value() > minExtent || maxExtent > minExtent) {
+-        timeline.reset(data.move);
++        resetTimeline(data);
+         if (data.move.value() != minExtent) {
+-            switch (fixupMode) {
+-            case Immediate:
+-                timeline.set(data.move, minExtent);
+-                break;
+-            case ExtentChanged:
+-                // The target has changed. Don't start from the beginning; just complete the
+-                // second half of the animation using the new extent.
+-                timeline.move(data.move, minExtent, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
+-                data.fixingUp = true;
+-                break;
+-            default: {
+-                    qreal dist = minExtent - data.move;
+-                    timeline.move(data.move, minExtent - dist/2, QEasingCurve(QEasingCurve::InQuad), fixupDuration/4);
+-                    timeline.move(data.move, minExtent, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
+-                    data.fixingUp = true;
+-                }
+-            }
++            adjustContentPos(data, minExtent);
+         }
+     } else if (data.move.value() < maxExtent) {
+-        timeline.reset(data.move);
+-        switch (fixupMode) {
+-        case Immediate:
+-            timeline.set(data.move, maxExtent);
+-            break;
+-        case ExtentChanged:
+-            // The target has changed. Don't start from the beginning; just complete the
+-            // second half of the animation using the new extent.
+-            timeline.move(data.move, maxExtent, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
+-            data.fixingUp = true;
+-            break;
+-        default: {
+-                qreal dist = maxExtent - data.move;
+-                timeline.move(data.move, maxExtent - dist/2, QEasingCurve(QEasingCurve::InQuad), fixupDuration/4);
+-                timeline.move(data.move, maxExtent, QEasingCurve(QEasingCurve::OutExpo), 3*fixupDuration/4);
+-                data.fixingUp = true;
+-            }
+-        }
++        resetTimeline(data);
++        adjustContentPos(data, maxExtent);
+     } else if (qRound(data.move.value()) != data.move.value()) {
+         // We could animate, but since it is less than 0.5 pixel it's probably not worthwhile.
+-        timeline.reset(data.move);
++        resetTimeline(data);
+         qreal val = data.move.value();
+         if (qAbs(qRound(val) - val) < 0.25) // round small differences
+             val = qRound(val);
+@@ -632,7 +717,7 @@ void QQuickFlickable::setContentX(qreal pos)
+ {
+     Q_D(QQuickFlickable);
+     d->hData.explicitValue = true;
+-    d->timeline.reset(d->hData.move);
++    d->resetTimeline(d->hData);
+     d->vTime = d->timeline.time();
+     movementEnding(true, false);
+     if (-pos != d->hData.move.value())
+@@ -649,7 +734,7 @@ void QQuickFlickable::setContentY(qreal pos)
+ {
+     Q_D(QQuickFlickable);
+     d->vData.explicitValue = true;
+-    d->timeline.reset(d->vData.move);
++    d->resetTimeline(d->vData);
+     d->vTime = d->timeline.time();
+     movementEnding(false, true);
+     if (-pos != d->vData.move.value())
+@@ -681,7 +766,7 @@ void QQuickFlickable::setInteractive(bool interactive)
+     if (interactive != d->interactive) {
+         d->interactive = interactive;
+         if (!interactive && (d->hData.flicking || d->vData.flicking)) {
+-            d->timeline.clear();
++            d->clearTimeline();
+             d->vTime = d->timeline.time();
+             d->hData.flicking = false;
+             d->vData.flicking = false;
+@@ -865,10 +950,15 @@ void QQuickFlickablePrivate::handleMousePressEvent(QMouseEvent *event)
+     }
+     q->setKeepMouseGrab(stealMouse);
+     pressed = true;
++    if (hData.transitionToBounds)
++        hData.transitionToBounds->stopTransition();
++    if (vData.transitionToBounds)
++        vData.transitionToBounds->stopTransition();
+     if (!hData.fixingUp)
+-        timeline.reset(hData.move);
++        resetTimeline(hData);
+     if (!vData.fixingUp)
+-        timeline.reset(vData.move);
++        resetTimeline(vData);
++
+     hData.reset();
+     vData.reset();
+     hData.dragMinBound = q->minXExtent();
+@@ -906,6 +996,9 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+     bool stealY = stealMouse;
+     bool stealX = stealMouse;
+ 
++    bool prevHMoved = hMoved;
++    bool prevVMoved = vMoved;
++
+     qint64 elapsedSincePress = computeCurrentTime(event) - lastPressTime;
+     if (q->yflick()) {
+         qreal dy = event->localPos().y() - pressPos.y();
+@@ -932,7 +1025,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+                 }
+             }
+             if (!rejectY && stealMouse && dy != 0.0) {
+-                timeline.clear();
++                clearTimeline();
+                 vData.move.setValue(newY);
+                 vMoved = true;
+             }
+@@ -966,7 +1059,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+                 }
+             }
+             if (!rejectX && stealMouse && dx != 0.0) {
+-                timeline.clear();
++                clearTimeline();
+                 hData.move.setValue(newX);
+                 hMoved = true;
+             }
+@@ -989,7 +1082,7 @@ void QQuickFlickablePrivate::handleMouseMoveEvent(QMouseEvent *event)
+         hData.velocity = 0;
+     }
+ 
+-    if (hMoved || vMoved) {
++    if ((hMoved && !prevHMoved) || (vMoved && !prevVMoved)) {
+         draggingStarting();
+         q->movementStarting();
+     }
+@@ -1097,7 +1190,7 @@ void QQuickFlickablePrivate::handleMouseReleaseEvent(QMouseEvent *event)
+     }
+ 
+     flickingStarted(flickedH, flickedV);
+-    if (!timeline.isActive())
++    if (!isViewMoving())
+         q->movementEnding();
+ }
+ 
+@@ -1336,7 +1429,7 @@ void QQuickFlickable::viewportMoved()
+                 : maxYExtent() - d->vData.move.value();
+         d->vData.inOvershoot = true;
+         qreal maxDistance = d->overShootDistance(height()) - overBound;
+-        d->timeline.reset(d->vData.move);
++        d->resetTimeline(d->vData);
+         if (maxDistance > 0)
+             d->timeline.accel(d->vData.move, -d->vData.smoothVelocity.value(), d->deceleration*QML_FLICK_OVERSHOOTFRICTION, maxDistance);
+         d->timeline.callback(QQuickTimeLineCallback(&d->vData.move, d->fixupY_callback, d));
+@@ -1350,7 +1443,7 @@ void QQuickFlickable::viewportMoved()
+                 : maxXExtent() - d->hData.move.value();
+         d->hData.inOvershoot = true;
+         qreal maxDistance = d->overShootDistance(width()) - overBound;
+-        d->timeline.reset(d->hData.move);
++        d->resetTimeline(d->hData);
+         if (maxDistance > 0)
+             d->timeline.accel(d->hData.move, -d->hData.smoothVelocity.value(), d->deceleration*QML_FLICK_OVERSHOOTFRICTION, maxDistance);
+         d->timeline.callback(QQuickTimeLineCallback(&d->hData.move, d->fixupX_callback, d));
+@@ -1444,8 +1537,8 @@ void QQuickFlickablePrivate::flickingStarted(bool flickingH, bool flickingV)
+ void QQuickFlickable::cancelFlick()
+ {
+     Q_D(QQuickFlickable);
+-    d->timeline.reset(d->hData.move);
+-    d->timeline.reset(d->vData.move);
++    d->resetTimeline(d->hData);
++    d->resetTimeline(d->vData);
+     movementEnding();
+ }
+ 
+@@ -1527,6 +1620,67 @@ void QQuickFlickable::setBoundsBehavior(BoundsBehavior b)
+ }
+ 
+ /*!
++    \qmlproperty Transition QtQuick2::Flickable::rebound
++
++    This holds the transition to be applied to the content view when
++    it snaps back to the bounds of the flickable. The transition is
++    triggered when the view is flicked or dragged past the edge of the
++    content area, or when returnToBounds() is called.
++
++    \qml
++    import QtQuick 2.0
++
++    Flickable {
++        width: 150; height: 150
++        contentWidth: 300; contentHeight: 300
++
++        rebound: Transition {
++            NumberAnimation {
++                properties: "x,y"
++                duration: 1000
++                easing.type: Easing.OutBounce
++            }
++        }
++
++        Rectangle {
++            width: 300; height: 300
++            gradient: Gradient {
++                GradientStop { position: 0.0; color: "lightsteelblue" }
++                GradientStop { position: 1.0; color: "blue" }
++            }
++        }
++    }
++    \endqml
++
++    When the above view is flicked beyond its bounds, it will return to its
++    bounds using the transition specified:
++
++    \image flickable-rebound.gif
++
++    If this property is not set, a default animation is applied.
++  */
++QQuickTransition *QQuickFlickable::rebound() const
++{
++    Q_D(const QQuickFlickable);
++    return d->rebound;
++}
++
++void QQuickFlickable::setRebound(QQuickTransition *transition)
++{
++    Q_D(QQuickFlickable);
++    if (transition) {
++        if (!d->hData.transitionToBounds)
++            d->hData.transitionToBounds = new QQuickFlickableReboundTransition(this, QLatin1String("x"));
++        if (!d->vData.transitionToBounds)
++            d->vData.transitionToBounds = new QQuickFlickableReboundTransition(this, QLatin1String("y"));
++    }
++    if (d->rebound != transition) {
++        d->rebound = transition;
++        emit reboundChanged();
++    }
++}
++
++/*!
+     \qmlproperty real QtQuick2::Flickable::contentWidth
+     \qmlproperty real QtQuick2::Flickable::contentHeight
+ 
+@@ -1818,7 +1972,7 @@ void QQuickFlickable::mouseUngrabEvent()
+         setKeepMouseGrab(false);
+         d->fixupX();
+         d->fixupY();
+-        if (!d->timeline.isActive())
++        if (!d->isViewMoving())
+             movementEnding();
+     }
+ }
+@@ -2051,6 +2205,16 @@ void QQuickFlickablePrivate::draggingEnding()
+     }
+ }
+ 
++bool QQuickFlickablePrivate::isViewMoving() const
++{
++    if (timeline.isActive()
++            || (hData.transitionToBounds && hData.transitionToBounds->isActive())
++            || (vData.transitionToBounds && vData.transitionToBounds->isActive()) ) {
++        return true;
++    }
++    return false;
++}
++
+ /*!
+     \qmlproperty int QtQuick2::Flickable::pressDelay
+ 
+@@ -2108,6 +2272,16 @@ bool QQuickFlickable::isMovingVertically() const
+     return d->vData.moving;
+ }
+ 
++void QQuickFlickable::timelineCompleted()
++{
++    Q_D(QQuickFlickable);
++    if ( (d->hData.transitionToBounds && d->hData.transitionToBounds->isActive())
++         || (d->vData.transitionToBounds && d->vData.transitionToBounds->isActive()) ) {
++        return;
++    }
++    movementEnding();
++}
++
+ void QQuickFlickable::movementStarting()
+ {
+     Q_D(QQuickFlickable);
+@@ -2120,6 +2294,7 @@ void QQuickFlickable::movementStarting()
+         d->vData.moving = true;
+         emit movingVerticallyChanged();
+     }
++
+     if (!wasMoving && (d->hData.moving || d->vData.moving)) {
+         emit movingChanged();
+         emit movementStarted();
+diff --git a/src/quick/items/qquickflickable_p.h b/src/quick/items/qquickflickable_p.h
+index 08aa487..81135c2 100644
+--- a/src/quick/items/qquickflickable_p.h
++++ b/src/quick/items/qquickflickable_p.h
+@@ -73,6 +73,7 @@ class Q_QUICK_PRIVATE_EXPORT QQuickFlickable : public QQuickItem
+     Q_PROPERTY(qreal verticalVelocity READ verticalVelocity NOTIFY verticalVelocityChanged)
+ 
+     Q_PROPERTY(BoundsBehavior boundsBehavior READ boundsBehavior WRITE setBoundsBehavior NOTIFY boundsBehaviorChanged)
++    Q_PROPERTY(QQuickTransition *rebound READ rebound WRITE setRebound NOTIFY reboundChanged)
+     Q_PROPERTY(qreal maximumFlickVelocity READ maximumFlickVelocity WRITE setMaximumFlickVelocity NOTIFY maximumFlickVelocityChanged)
+     Q_PROPERTY(qreal flickDeceleration READ flickDeceleration WRITE setFlickDeceleration NOTIFY flickDecelerationChanged)
+     Q_PROPERTY(bool moving READ isMoving NOTIFY movingChanged)
+@@ -116,6 +117,9 @@ public:
+     BoundsBehavior boundsBehavior() const;
+     void setBoundsBehavior(BoundsBehavior);
+ 
++    QQuickTransition *rebound() const;
++    void setRebound(QQuickTransition *transition);
++
+     qreal contentWidth() const;
+     void setContentWidth(qreal);
+ 
+@@ -213,6 +217,7 @@ Q_SIGNALS:
+     void flickableDirectionChanged();
+     void interactiveChanged();
+     void boundsBehaviorChanged();
++    void reboundChanged();
+     void maximumFlickVelocityChanged();
+     void flickDecelerationChanged();
+     void pressDelayChanged();
+@@ -238,6 +243,7 @@ protected Q_SLOTS:
+     void movementStarting();
+     void movementEnding();
+     void movementEnding(bool hMovementEnding, bool vMovementEnding);
++    void timelineCompleted();
+ 
+ protected:
+     virtual qreal minXExtent() const;
+@@ -263,6 +269,7 @@ private:
+     Q_DISABLE_COPY(QQuickFlickable)
+     Q_DECLARE_PRIVATE(QQuickFlickable)
+     friend class QQuickFlickableVisibleArea;
++    friend class QQuickFlickableReboundTransition;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickflickable_p_p.h b/src/quick/items/qquickflickable_p_p.h
+index ab3070e..64335c8 100644
+--- a/src/quick/items/qquickflickable_p_p.h
++++ b/src/quick/items/qquickflickable_p_p.h
+@@ -63,6 +63,7 @@
+ 
+ #include <private/qquicktimeline_p_p.h>
+ #include <private/qquickanimation_p_p.h>
++#include <private/qquicktransitionmanager_p_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -70,6 +71,9 @@ QT_BEGIN_NAMESPACE
+ const qreal MinimumFlickVelocity = 75.0;
+ 
+ class QQuickFlickableVisibleArea;
++class QQuickTransition;
++class QQuickFlickableReboundTransition;
++
+ class Q_AUTOTEST_EXPORT QQuickFlickablePrivate : public QQuickItemPrivate, public QQuickItemChangeListener
+ {
+     Q_DECLARE_PUBLIC(QQuickFlickable)
+@@ -95,14 +99,20 @@ public:
+ 
+     struct AxisData {
+         AxisData(QQuickFlickablePrivate *fp, void (QQuickFlickablePrivate::*func)(qreal))
+-            : move(fp, func), viewSize(-1), startMargin(0), endMargin(0)
++            : move(fp, func)
++            , transitionToBounds(0)
++            , viewSize(-1), startMargin(0), endMargin(0)
++            , transitionTo(0)
+             , continuousFlickVelocity(0)
+             , smoothVelocity(fp), atEnd(false), atBeginning(true)
++            , transitionToSet(false)
+             , fixingUp(false), inOvershoot(false), moving(false), flicking(false)
+             , dragging(false), extentsChanged(false)
+             , explicitValue(false), minExtentDirty(true), maxExtentDirty(true)
+         {}
+ 
++        ~AxisData();
++
+         void reset() {
+             velocityBuffer.clear();
+             dragStartOffset = 0;
+@@ -116,10 +126,16 @@ public:
+             extentsChanged = true;
+         }
+ 
++        void resetTransitionTo() {
++            transitionTo = 0;
++            transitionToSet = false;
++        }
++
+         void addVelocitySample(qreal v, qreal maxVelocity);
+         void updateVelocity();
+ 
+         QQuickTimeLineValueProxy<QQuickFlickablePrivate> move;
++        QQuickFlickableReboundTransition *transitionToBounds;
+         qreal viewSize;
+         qreal pressPos;
+         qreal dragStartOffset;
+@@ -129,11 +145,13 @@ public:
+         qreal flickTarget;
+         qreal startMargin;
+         qreal endMargin;
++        qreal transitionTo;
+         qreal continuousFlickVelocity;
+         QQuickFlickablePrivate::Velocity smoothVelocity;
+         QPODVector<qreal,10> velocityBuffer;
+         bool atEnd : 1;
+         bool atBeginning : 1;
++        bool transitionToSet : 1;
+         bool fixingUp : 1;
+         bool inOvershoot : 1;
+         bool moving : 1;
+@@ -154,6 +172,9 @@ public:
+     void fixupX();
+     void fixupY();
+     virtual void fixup(AxisData &data, qreal minExtent, qreal maxExtent);
++    void adjustContentPos(AxisData &data, qreal toPos);
++    void resetTimeline(AxisData &data);
++    void clearTimeline();
+ 
+     void updateBeginningEnd();
+ 
+@@ -171,6 +192,8 @@ public:
+     void draggingStarting();
+     void draggingEnding();
+ 
++    bool isViewMoving() const;
++
+ public:
+     QQuickItem *contentItem;
+ 
+@@ -214,6 +237,7 @@ public:
+     QQuickFlickableVisibleArea *visibleArea;
+     QQuickFlickable::FlickableDirection flickableDirection;
+     QQuickFlickable::BoundsBehavior boundsBehavior;
++    QQuickTransition *rebound;
+ 
+     void handleMousePressEvent(QMouseEvent *);
+     void handleMouseMoveEvent(QMouseEvent *);
+diff --git a/tests/auto/quick/qquickflickable/data/rebound.qml b/tests/auto/quick/qquickflickable/data/rebound.qml
+new file mode 100644
+index 0000000..d46f9dd
+--- /dev/null
++++ b/tests/auto/quick/qquickflickable/data/rebound.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++
++Flickable {
++    id: flick
++
++    property int transitionDuration: 100
++    property bool transitionEnabled: true
++    property int transitionsStarted
++
++    width: 200
++    height: 200
++
++    contentWidth: width * 1.25
++    contentHeight: width * 1.25
++
++    rebound: Transition {
++        objectName: "rebound"
++        enabled: flick.transitionEnabled
++        SequentialAnimation {
++            PropertyAction { target: flick; property: "transitionsStarted"; value: flick.transitionsStarted + 1 }
++            NumberAnimation {
++                properties: "x,y"
++                easing.type: Easing.OutElastic
++                duration: flick.transitionDuration
++            }
++        }
++    }
++
++    Grid {
++        columns: 2
++        Repeater {
++            model: 4
++            Rectangle {
++                width: flick.contentWidth/2
++                height: flick.contentHeight/2
++                color: Qt.rgba(Math.random(), Math.random(), Math.random(), 1)
++            }
++        }
++    }
++}
++
+diff --git a/tests/auto/quick/qquickflickable/data/resize.qml b/tests/auto/quick/qquickflickable/data/resize.qml
+index 1a9ef54..2f7ae7b 100644
+--- a/tests/auto/quick/qquickflickable/data/resize.qml
++++ b/tests/auto/quick/qquickflickable/data/resize.qml
+@@ -18,6 +18,16 @@ Rectangle {
+         contentWidth: 300
+         contentHeight: 300
+ 
++        rebound: setRebound ? boundsTransition : null
++        Transition {
++            id: boundsTransition
++            objectName: "rebound"
++            NumberAnimation {
++                properties: "x,y"
++                easing.type: Easing.OutElastic
++            }
++        }
++
+         Rectangle {
+             width: flick.contentWidth
+             height: flick.contentHeight
+diff --git a/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp b/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
+index 7438320..b6d9d03 100644
+--- a/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
++++ b/tests/auto/quick/qquickflickable/tst_qquickflickable.cpp
+@@ -45,6 +45,7 @@
+ #include <QtQuick/qquickview.h>
+ #include <private/qquickflickable_p.h>
+ #include <private/qquickflickable_p_p.h>
++#include <private/qquicktransition_p.h>
+ #include <private/qqmlvaluetype_p.h>
+ #include <math.h>
+ #include "../../shared/util.h"
+@@ -65,6 +66,7 @@ private slots:
+     void verticalViewportSize();
+     void properties();
+     void boundsBehavior();
++    void rebound();
+     void maximumFlickVelocity();
+     void flickDeceleration();
+     void pressDelay();
+@@ -72,6 +74,7 @@ private slots:
+     void flickableDirection();
+     void resizeContent();
+     void returnToBounds();
++    void returnToBounds_data();
+     void wheel();
+     void movingAndFlicking();
+     void movingAndFlicking_data();
+@@ -82,7 +85,7 @@ private slots:
+     void disabled();
+     void flickVelocity();
+     void margins();
+-    void cancel();
++    void cancelOnMouseGrab();
+ 
+ private:
+     QQmlEngine engine;
+@@ -195,6 +198,108 @@ void tst_qquickflickable::boundsBehavior()
+     QCOMPARE(spy.count(),3);
+ }
+ 
++void tst_qquickflickable::rebound()
++{
++#ifdef Q_OS_MAC
++    QSKIP("Producing flicks on Mac CI impossible due to timing problems");
++#endif
++
++    QQuickView *canvas = new QQuickView;
++    canvas->setSource(testFileUrl("rebound.qml"));
++    canvas->show();
++    canvas->requestActivateWindow();
++    QVERIFY(canvas->rootObject() != 0);
++
++    QQuickFlickable *flickable = qobject_cast<QQuickFlickable*>(canvas->rootObject());
++    QVERIFY(flickable != 0);
++
++    QQuickTransition *rebound = canvas->rootObject()->findChild<QQuickTransition*>("rebound");
++    QVERIFY(rebound);
++    QSignalSpy reboundSpy(rebound, SIGNAL(runningChanged()));
++
++    QSignalSpy movementStartedSpy(flickable, SIGNAL(movementStarted()));
++    QSignalSpy movementEndedSpy(flickable, SIGNAL(movementEnded()));
++    QSignalSpy vMoveSpy(flickable, SIGNAL(movingVerticallyChanged()));
++    QSignalSpy hMoveSpy(flickable, SIGNAL(movingHorizontallyChanged()));
++
++    // flick and test the transition is run
++    flick(canvas, QPoint(20,20), QPoint(120,120), 200);
++
++    QTRY_COMPARE(canvas->rootObject()->property("transitionsStarted").toInt(), 2);
++    QCOMPARE(hMoveSpy.count(), 1);
++    QCOMPARE(vMoveSpy.count(), 1);
++    QCOMPARE(movementStartedSpy.count(), 1);
++    QCOMPARE(movementEndedSpy.count(), 0);
++    QVERIFY(rebound->running());
++
++    QTRY_VERIFY(!flickable->isMoving());
++    QCOMPARE(flickable->contentX(), 0.0);
++    QCOMPARE(flickable->contentY(), 0.0);
++
++    QCOMPARE(hMoveSpy.count(), 2);
++    QCOMPARE(vMoveSpy.count(), 2);
++    QCOMPARE(movementStartedSpy.count(), 1);
++    QCOMPARE(movementEndedSpy.count(), 1);
++    QCOMPARE(canvas->rootObject()->property("transitionsStarted").toInt(), 2);
++    QVERIFY(!rebound->running());
++    QCOMPARE(reboundSpy.count(), 2);
++
++    hMoveSpy.clear();
++    vMoveSpy.clear();
++    movementStartedSpy.clear();
++    movementEndedSpy.clear();
++    canvas->rootObject()->setProperty("transitionsStarted", 0);
++    canvas->rootObject()->setProperty("transitionsFinished", 0);
++
++    // flick and trigger the transition multiple times
++    // (moving signals are emitted as soon as the first transition starts)
++    flick(canvas, QPoint(20,20), QPoint(120,120), 200);     // both x and y will bounce back
++    flick(canvas, QPoint(20,120), QPoint(120,20), 200);     // only x will bounce back
++
++    QVERIFY(flickable->isMoving());
++    QVERIFY(canvas->rootObject()->property("transitionsStarted").toInt() >= 1);
++    QCOMPARE(hMoveSpy.count(), 1);
++    QCOMPARE(vMoveSpy.count(), 1);
++    QCOMPARE(movementStartedSpy.count(), 1);
++
++    QTRY_VERIFY(!flickable->isMoving());
++    QCOMPARE(flickable->contentX(), 0.0);
++
++    // moving started/stopped signals should only have been emitted once,
++    // and when they are, all transitions should have finished
++    QCOMPARE(hMoveSpy.count(), 2);
++    QCOMPARE(vMoveSpy.count(), 2);
++    QCOMPARE(movementStartedSpy.count(), 1);
++    QCOMPARE(movementEndedSpy.count(), 1);
++
++    hMoveSpy.clear();
++    vMoveSpy.clear();
++    movementStartedSpy.clear();
++    movementEndedSpy.clear();
++    canvas->rootObject()->setProperty("transitionsStarted", 0);
++    canvas->rootObject()->setProperty("transitionsFinished", 0);
++
++    // disable and the default transition should run
++    // (i.e. moving but transition->running = false)
++    canvas->rootObject()->setProperty("transitionEnabled", false);
++
++    flick(canvas, QPoint(20,20), QPoint(120,120), 200);
++    QCOMPARE(canvas->rootObject()->property("transitionsStarted").toInt(), 0);
++    QCOMPARE(hMoveSpy.count(), 1);
++    QCOMPARE(vMoveSpy.count(), 1);
++    QCOMPARE(movementStartedSpy.count(), 1);
++    QCOMPARE(movementEndedSpy.count(), 0);
++
++    QTRY_VERIFY(!flickable->isMoving());
++    QCOMPARE(hMoveSpy.count(), 2);
++    QCOMPARE(vMoveSpy.count(), 2);
++    QCOMPARE(movementStartedSpy.count(), 1);
++    QCOMPARE(movementEndedSpy.count(), 1);
++    QCOMPARE(canvas->rootObject()->property("transitionsStarted").toInt(), 0);
++
++    delete canvas;
++}
++
+ void tst_qquickflickable::maximumFlickVelocity()
+ {
+     QQmlComponent component(&engine);
+@@ -325,13 +430,19 @@ void tst_qquickflickable::resizeContent()
+     delete root;
+ }
+ 
+-// QtQuick 1.1
+ void tst_qquickflickable::returnToBounds()
+ {
+-    QQmlEngine engine;
+-    QQmlComponent c(&engine, testFileUrl("resize.qml"));
+-    QQuickItem *root = qobject_cast<QQuickItem*>(c.create());
+-    QQuickFlickable *obj = findItem<QQuickFlickable>(root, "flick");
++    QFETCH(bool, setRebound);
++
++    QQuickView *canvas = new QQuickView;
++    canvas->rootContext()->setContextProperty("setRebound", setRebound);
++    canvas->setSource(testFileUrl("resize.qml"));
++    QVERIFY(canvas->rootObject() != 0);
++    QQuickFlickable *obj = findItem<QQuickFlickable>(canvas->rootObject(), "flick");
++
++    QQuickTransition *rebound = canvas->rootObject()->findChild<QQuickTransition*>("rebound");
++    QVERIFY(rebound);
++    QSignalSpy reboundSpy(rebound, SIGNAL(runningChanged()));
+ 
+     QVERIFY(obj != 0);
+     QCOMPARE(obj->contentX(), 0.);
+@@ -344,12 +455,26 @@ void tst_qquickflickable::returnToBounds()
+     QTRY_COMPARE(obj->contentX(), 100.);
+     QTRY_COMPARE(obj->contentY(), 400.);
+ 
+-    QMetaObject::invokeMethod(root, "returnToBounds");
++    QMetaObject::invokeMethod(canvas->rootObject(), "returnToBounds");
++
++    if (setRebound)
++        QTRY_VERIFY(rebound->running());
+ 
+     QTRY_COMPARE(obj->contentX(), 0.);
+     QTRY_COMPARE(obj->contentY(), 0.);
+ 
+-    delete root;
++    QVERIFY(!rebound->running());
++    QCOMPARE(reboundSpy.count(), setRebound ? 2 : 0);
++
++    delete canvas;
++}
++
++void tst_qquickflickable::returnToBounds_data()
++{
++    QTest::addColumn<bool>("setRebound");
++
++    QTest::newRow("with bounds transition") << true;
++    QTest::newRow("with bounds transition") << false;
+ }
+ 
+ void tst_qquickflickable::wheel()
+@@ -576,10 +701,6 @@ void tst_qquickflickable::movingAndDragging_data()
+ 
+ void tst_qquickflickable::movingAndDragging()
+ {
+-#ifdef Q_OS_MAC
+-    QSKIP("Producing flicks on Mac CI impossible due to timing problems");
+-#endif
+-
+     QFETCH(bool, verticalEnabled);
+     QFETCH(bool, horizontalEnabled);
+     QFETCH(QPoint, moveByWithoutSnapBack);
+@@ -757,7 +878,6 @@ void tst_qquickflickable::flickOnRelease()
+ #ifdef Q_OS_MAC
+     QSKIP("Producing flicks on Mac CI impossible due to timing problems");
+ #endif
+-
+     QQuickView *canvas = new QQuickView;
+     canvas->setSource(testFileUrl("flickable03.qml"));
+     canvas->show();
+@@ -976,7 +1096,7 @@ void tst_qquickflickable::margins()
+     delete root;
+ }
+ 
+-void tst_qquickflickable::cancel()
++void tst_qquickflickable::cancelOnMouseGrab()
+ {
+     QQuickView *canvas = new QQuickView;
+     canvas->setSource(testFileUrl("cancel.qml"));

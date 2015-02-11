@@ -1,0 +1,273 @@
+diff --git a/src/script/api/qscriptcontextinfo.cpp b/src/script/api/qscriptcontextinfo.cpp
+index 31e7cfc..0e7884f 100644
+--- a/src/script/api/qscriptcontextinfo.cpp
++++ b/src/script/api/qscriptcontextinfo.cpp
+@@ -197,8 +197,7 @@ QScriptContextInfoPrivate::QScriptContextInfoPrivate(const QScriptContext *conte
+         // ### get the function name from the AST
+     } else if (callee && callee->inherits(&QScript::QtFunction::info)) {
+         functionType = QScriptContextInfo::QtFunction;
+-        // ### the slot can be overloaded -- need to get the particular overload from the context
+-        functionMetaIndex = static_cast<QScript::QtFunction*>(callee)->initialIndex();
++        functionMetaIndex = static_cast<QScript::QtFunction*>(callee)->specificIndex(context);
+         const QMetaObject *meta = static_cast<QScript::QtFunction*>(callee)->metaObject();
+         if (meta != 0) {
+             QMetaMethod method = meta->method(functionMetaIndex);
+diff --git a/src/script/bridge/qscriptqobject.cpp b/src/script/bridge/qscriptqobject.cpp
+index 15288a7..3e82dbb 100644
+--- a/src/script/bridge/qscriptqobject.cpp
++++ b/src/script/bridge/qscriptqobject.cpp
+@@ -441,10 +441,15 @@ static QMetaMethod metaMethod(const QMetaObject *meta,
+         return meta->constructor(index);
+ }
+     
+-static JSC::JSValue callQtMethod(JSC::ExecState *exec, QMetaMethod::MethodType callType,
+-                                 QObject *thisQObject, const JSC::ArgList &scriptArgs,
+-                                 const QMetaObject *meta, int initialIndex,
+-                                 bool maybeOverloaded)
++/*!
++  \internal
++  Derives the actual method to call based on the script arguments,
++  \a scriptArgs, and delegates it to the given \a delegate.
++*/
++template <class Delegate>
++static JSC::JSValue delegateQtMethod(JSC::ExecState *exec, QMetaMethod::MethodType callType,
++                                     const JSC::ArgList &scriptArgs, const QMetaObject *meta,
++                                     int initialIndex, bool maybeOverloaded, Delegate &delegate)
+ {
+     QScriptMetaMethod chosenMethod;
+     int chosenIndex = -1;
+@@ -456,7 +461,6 @@ static JSC::JSValue callQtMethod(JSC::ExecState *exec, QMetaMethod::MethodType c
+     int index;
+     QByteArray methodName;
+     exec->clearException();
+-    QScriptEnginePrivate *engine = QScript::scriptEngineFromExec(exec);
+     for (index = initialIndex; index >= 0; --index) {
+         QMetaMethod method = metaMethod(meta, callType, index);
+ 
+@@ -844,70 +848,97 @@ static JSC::JSValue callQtMethod(JSC::ExecState *exec, QMetaMethod::MethodType c
+             }
+         }
+ 
+-        if (chosenIndex != -1) {
+-            // call it
+-//            context->calleeMetaIndex = chosenIndex;
+-
+-            QVarLengthArray<void*, 9> array(args.count());
+-            void **params = array.data();
+-            for (int i = 0; i < args.count(); ++i) {
+-                const QVariant &v = args[i];
+-                switch (chosenMethod.type(i).kind()) {
+-                case QScriptMetaType::Variant:
+-                    params[i] = const_cast<QVariant*>(&v);
+-                    break;
+-                case QScriptMetaType::MetaType:
+-                case QScriptMetaType::MetaEnum:
+-                case QScriptMetaType::Unresolved:
+-                    params[i] = const_cast<void*>(v.constData());
+-                    break;
+-                default:
+-                    Q_ASSERT(0);
+-                }
+-            }
++        if (chosenIndex != -1)
++            result = delegate(exec, callType, meta, chosenMethod, chosenIndex, args);
++    }
+ 
+-            QScriptable *scriptable = 0;
+-            if (thisQObject)
+-                scriptable = scriptableFromQObject(thisQObject);
+-            QScriptEngine *oldEngine = 0;
+-            if (scriptable) {
+-                oldEngine = QScriptablePrivate::get(scriptable)->engine;
+-                QScriptablePrivate::get(scriptable)->engine = QScriptEnginePrivate::get(engine);
++    return result;
++}
++
++struct QtMethodCaller
++{
++    QtMethodCaller(QObject *o)
++        : thisQObject(o)
++    {}
++    JSC::JSValue operator()(JSC::ExecState *exec, QMetaMethod::MethodType callType,
++                            const QMetaObject *meta, const QScriptMetaMethod &chosenMethod,
++                            int chosenIndex, const QVarLengthArray<QVariant, 9> &args)
++    {
++        JSC::JSValue result;
++
++        QVarLengthArray<void*, 9> array(args.count());
++        void **params = array.data();
++        for (int i = 0; i < args.count(); ++i) {
++            const QVariant &v = args[i];
++            switch (chosenMethod.type(i).kind()) {
++            case QScriptMetaType::Variant:
++                params[i] = const_cast<QVariant*>(&v);
++                break;
++            case QScriptMetaType::MetaType:
++            case QScriptMetaType::MetaEnum:
++            case QScriptMetaType::Unresolved:
++                params[i] = const_cast<void*>(v.constData());
++                break;
++            default:
++                Q_ASSERT(0);
+             }
++        }
+ 
+-// ### fixme
+-//#ifndef Q_SCRIPT_NO_EVENT_NOTIFY
+-//            engine->notifyFunctionEntry(context);
+-//#endif
++        QScriptable *scriptable = 0;
++        if (thisQObject)
++            scriptable = scriptableFromQObject(thisQObject);
++        QScriptEngine *oldEngine = 0;
++        QScriptEnginePrivate *engine = QScript::scriptEngineFromExec(exec);
++        if (scriptable) {
++            oldEngine = QScriptablePrivate::get(scriptable)->engine;
++            QScriptablePrivate::get(scriptable)->engine = QScriptEnginePrivate::get(engine);
++        }
+ 
+-            if (callType == QMetaMethod::Constructor) {
+-                Q_ASSERT(meta != 0);
+-                meta->static_metacall(QMetaObject::CreateInstance, chosenIndex, params);
+-            } else {
+-                QMetaObject::metacall(thisQObject, QMetaObject::InvokeMetaMethod, chosenIndex, params);
+-            }
++    // ### fixme
++    //#ifndef Q_SCRIPT_NO_EVENT_NOTIFY
++    //            engine->notifyFunctionEntry(context);
++    //#endif
+ 
+-            if (scriptable)
+-                QScriptablePrivate::get(scriptable)->engine = oldEngine;
++        if (callType == QMetaMethod::Constructor) {
++            Q_ASSERT(meta != 0);
++            meta->static_metacall(QMetaObject::CreateInstance, chosenIndex, params);
++        } else {
++            QMetaObject::metacall(thisQObject, QMetaObject::InvokeMetaMethod, chosenIndex, params);
++        }
+ 
+-            if (exec->hadException()) {
+-                result = exec->exception() ; // propagate
++        if (scriptable)
++            QScriptablePrivate::get(scriptable)->engine = oldEngine;
++
++        if (exec->hadException()) {
++            result = exec->exception() ; // propagate
++        } else {
++            QScriptMetaType retType = chosenMethod.returnType();
++            if (retType.isVariant()) {
++                result = QScriptEnginePrivate::jscValueFromVariant(exec, *(QVariant *)params[0]);
++            } else if (retType.typeId() != QMetaType::Void) {
++                result = QScriptEnginePrivate::create(exec, retType.typeId(), params[0]);
++                if (!result)
++                    result = engine->newVariant(QVariant(retType.typeId(), params[0]));
+             } else {
+-                QScriptMetaType retType = chosenMethod.returnType();
+-                if (retType.isVariant()) {
+-                    result = QScriptEnginePrivate::jscValueFromVariant(exec, *(QVariant *)params[0]);
+-                } else if (retType.typeId() != QMetaType::Void) {
+-                    result = QScriptEnginePrivate::create(exec, retType.typeId(), params[0]);
+-                    if (!result)
+-                        result = engine->newVariant(QVariant(retType.typeId(), params[0]));
+-                } else {
+-                    result = JSC::jsUndefined();
+-                }
++                result = JSC::jsUndefined();
+             }
+         }
++
++        return result;
+     }
+ 
+-    return result;
++private:
++    QObject *thisQObject;
++};
++
++static JSC::JSValue callQtMethod(JSC::ExecState *exec, QMetaMethod::MethodType callType,
++                                 QObject *thisQObject, const JSC::ArgList &scriptArgs,
++                                 const QMetaObject *meta, int initialIndex,
++                                 bool maybeOverloaded)
++{
++    QtMethodCaller caller(thisQObject);
++    return delegateQtMethod<QtMethodCaller>(exec, callType, scriptArgs, meta,
++                                            initialIndex, maybeOverloaded, caller);
+ }
+ 
+ JSC::JSValue QtFunction::execute(JSC::ExecState *exec, JSC::JSValue thisValue,
+@@ -960,6 +991,45 @@ JSC::JSValue JSC_HOST_CALL QtFunction::call(JSC::ExecState *exec, JSC::JSObject
+     return result;
+ }
+ 
++struct QtMethodIndexReturner
++{
++    JSC::JSValue operator()(JSC::ExecState *exec, QMetaMethod::MethodType,
++                            const QMetaObject *, const QScriptMetaMethod &,
++                            int chosenIndex, const QVarLengthArray<QVariant, 9> &)
++    {
++        return JSC::jsNumber(exec, chosenIndex);
++    }
++};
++
++/*!
++  \internal
++  Returns the specific index of the meta-method that was used in the
++  function call represented by the given \a context. If the method is
++  overloaded, the actual parameters that were passed to the function
++  are used to derive the selected index, matching the behavior of
++  callQtMethod().
++*/
++int QtFunction::specificIndex(const QScriptContext *context) const
++{
++    if (!maybeOverloaded())
++        return initialIndex();
++    JSC::ExecState *exec = const_cast<JSC::ExecState *>(QScriptEnginePrivate::frameForContext(context));
++    int argCount = exec->argumentCount();
++
++    // Create arguments list wrapper; this logic must match
++    // JITStubs.cpp op_call_NotJSFunction, and Interpreter.cpp op_call
++    JSC::Register* argv = exec->registers() - JSC::RegisterFile::CallFrameHeaderSize - argCount;
++    JSC::ArgList args(argv + 1, argCount - 1);
++
++    QtMethodIndexReturner returner;
++    JSC::JSValue result =  delegateQtMethod<QtMethodIndexReturner>(
++                exec, QMetaMethod::Method, args, metaObject(),
++                initialIndex(), maybeOverloaded(), returner);
++    if (exec->hadException() || !result || !result.isInt32())
++        return initialIndex();
++    return result.asInt32();
++}
++
+ const JSC::ClassInfo QtPropertyFunction::info = { "QtPropertyFunction", &InternalFunction::info, 0, 0 };
+ 
+ QtPropertyFunction::QtPropertyFunction(const QMetaObject *meta, int index,
+diff --git a/src/script/bridge/qscriptqobject_p.h b/src/script/bridge/qscriptqobject_p.h
+index c6ebc8a..55ed0f7 100644
+--- a/src/script/bridge/qscriptqobject_p.h
++++ b/src/script/bridge/qscriptqobject_p.h
+@@ -225,6 +225,7 @@ public:
+     QObject *qobject() const;
+     const QMetaObject *metaObject() const;
+     int initialIndex() const;
++    int specificIndex(const QScriptContext *context) const;
+     bool maybeOverloaded() const;
+     int mostGeneralMethod(QMetaMethod *out = 0) const;
+     QList<int> overloadedIndexes() const;
+diff --git a/tests/auto/qscriptcontextinfo/tst_qscriptcontextinfo.cpp b/tests/auto/qscriptcontextinfo/tst_qscriptcontextinfo.cpp
+index 1dea062..7816e52 100644
+--- a/tests/auto/qscriptcontextinfo/tst_qscriptcontextinfo.cpp
++++ b/tests/auto/qscriptcontextinfo/tst_qscriptcontextinfo.cpp
+@@ -246,14 +246,8 @@ void tst_QScriptContextInfo::qtFunction()
+             QCOMPARE(info.functionName(), QString::fromLatin1("testSlot"));
+             QCOMPARE(info.functionEndLineNumber(), -1);
+             QCOMPARE(info.functionStartLineNumber(), -1);
+-            if (x == 0)
+-                QEXPECT_FAIL("", "QTBUG-6133: QScriptContextInfo doesn't pick the correct meta-index for overloaded slots", Continue);
+             QCOMPARE(info.functionParameterNames().size(), pnames.size());
+-            if (x == 0)
+-                QEXPECT_FAIL("", "QTBUG-6133: QScriptContextInfo doesn't pick the correct meta-index for overloaded slots", Continue);
+             QCOMPARE(info.functionParameterNames(), pnames);
+-            if (x == 0)
+-                QEXPECT_FAIL("", "QTBUG-6133: QScriptContextInfo doesn't pick the correct meta-index for overloaded slots", Continue);
+             QCOMPARE(info.functionMetaIndex(), metaObject()->indexOfMethod(sig));
+         }

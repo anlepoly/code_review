@@ -1,0 +1,372 @@
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index 5dcff3e..ce57487 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -57,8 +57,8 @@ Q_DECLARE_METATYPE(QJSValue);
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-QQmlVMEVariantQObjectPtr::QQmlVMEVariantQObjectPtr()
+-    : QQmlGuard<QObject>(0), m_target(0), m_index(-1)
++QQmlVMEVariantQObjectPtr::QQmlVMEVariantQObjectPtr(bool isVar)
++    : QQmlGuard<QObject>(0), m_target(0), m_isVar(isVar), m_index(-1)
+ {
+ }
+ 
+@@ -66,10 +66,16 @@ QQmlVMEVariantQObjectPtr::~QQmlVMEVariantQObjectPtr()
+ {
+ }
+ 
+-void QQmlVMEVariantQObjectPtr::objectDestroyed(QObject *)
++void QQmlVMEVariantQObjectPtr::objectDestroyed(QObject *o)
+ {
+-    if (m_target && m_index >= 0)
++    if (m_target && m_index >= 0) {
++        if (m_isVar && m_target->varPropertiesInitialized && !m_target->varProperties.IsEmpty()) {
++            // Set the var property to NULL
++            m_target->varProperties->Set(m_index - m_target->firstVarPropertyIndex, v8::Null());
++        }
++
+         m_target->activate(m_target->object, m_target->methodOffset() + m_index, 0);
++    }
+ }
+ 
+ void QQmlVMEVariantQObjectPtr::setGuardedValue(QObject *obj, QQmlVMEMetaObject *target, int index)
+@@ -336,7 +342,7 @@ void QQmlVMEVariant::setValue(QObject *v, QQmlVMEMetaObject *target, int index)
+     if (type != QMetaType::QObjectStar) {
+         cleanup();
+         type = QMetaType::QObjectStar;
+-        new (dataPtr()) QQmlVMEVariantQObjectPtr;
++        new (dataPtr()) QQmlVMEVariantQObjectPtr(false);
+     }
+     reinterpret_cast<QQmlVMEVariantQObjectPtr*>(dataPtr())->setGuardedValue(v, target, index);
+ }
+@@ -602,6 +608,8 @@ QQmlVMEMetaObject::~QQmlVMEMetaObject()
+ 
+     if (metaData->varPropertyCount)
+         qPersistentDispose(varProperties); // if not weak, will not have been cleaned up by the callback.
++
++    qDeleteAll(varObjectGuards);
+ }
+ 
+ int QQmlVMEMetaObject::metaCall(QMetaObject::Call c, int _id, void **a)
+@@ -1036,15 +1044,30 @@ void QQmlVMEMetaObject::writeVarProperty(int id, v8::Handle<v8::Value> value)
+         }
+     }
+ 
+-    // And, if the new value is a scarce resource, we need to ensure that it does not get
+-    // automatically released by the engine until no other references to it exist.
++    QObject *valueObject = 0;
++    QQmlVMEVariantQObjectPtr *guard = getQObjectGuardForProperty(id);
++
+     if (value->IsObject()) {
+-        QV8VariantResource *r = v8_resource_cast<QV8VariantResource>(v8::Handle<v8::Object>::Cast(value));
+-        if (r) {
++        // And, if the new value is a scarce resource, we need to ensure that it does not get
++        // automatically released by the engine until no other references to it exist.
++        if (QV8VariantResource *r = v8_resource_cast<QV8VariantResource>(v8::Handle<v8::Object>::Cast(value))) {
+             r->addVmePropertyReference();
++        } else if (QV8QObjectResource *r = v8_resource_cast<QV8QObjectResource>(v8::Handle<v8::Object>::Cast(value))) {
++            // We need to track this QObject to signal its deletion
++            valueObject = r->object;
++
++            // Do we already have a QObject guard for this property?
++            if (valueObject && !guard) {
++                guard = new QQmlVMEVariantQObjectPtr(true);
++                varObjectGuards.append(guard);
++            }
+         }
+     }
+ 
++    if (guard) {
++        guard->setGuardedValue(valueObject, this, id);
++    }
++
+     // Write the value and emit change signal as appropriate.
+     varProperties->Set(id - firstVarPropertyIndex, value);
+     activate(object, methodOffset() + id, 0);
+@@ -1367,4 +1390,16 @@ QQmlVMEMetaObject *QQmlVMEMetaObject::getForSignal(QObject *o, int coreIndex)
+     return vme;
+ }
+ 
++QQmlVMEVariantQObjectPtr *QQmlVMEMetaObject::getQObjectGuardForProperty(int index) const
++{
++    QList<QQmlVMEVariantQObjectPtr *>::ConstIterator it = varObjectGuards.constBegin(), end = varObjectGuards.constEnd();
++    for ( ; it != end; ++it) {
++        if ((*it)->m_index == index) {
++            return *it;
++        }
++    }
++
++    return 0;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/qml/qml/qqmlvmemetaobject_p.h b/src/qml/qml/qqmlvmemetaobject_p.h
+index 7a01b70..5751989 100644
+--- a/src/qml/qml/qqmlvmemetaobject_p.h
++++ b/src/qml/qml/qqmlvmemetaobject_p.h
+@@ -141,13 +141,15 @@ class QQmlVMEMetaObject;
+ class QQmlVMEVariantQObjectPtr : public QQmlGuard<QObject>
+ {
+ public:
+-    inline QQmlVMEVariantQObjectPtr();
++    inline QQmlVMEVariantQObjectPtr(bool isVar);
+     inline ~QQmlVMEVariantQObjectPtr();
++
+     inline void objectDestroyed(QObject *);
+     inline void setGuardedValue(QObject *obj, QQmlVMEMetaObject *target, int index);
+ 
+     QQmlVMEMetaObject *m_target;
+-    int m_index;
++    unsigned m_isVar : 1;
++    int m_index : 31;
+ };
+ 
+ class QV8QObjectWrapper;
+@@ -238,6 +240,10 @@ public:
+ 
+     void activate(QObject *, int, void **);
+ 
++    QList<QQmlVMEVariantQObjectPtr *> varObjectGuards;
++
++    QQmlVMEVariantQObjectPtr *getQObjectGuardForProperty(int) const;
++
+     friend class QV8GCCallback;
+     friend class QV8QObjectWrapper;
+ };
+diff --git a/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.1.qml b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.1.qml
+new file mode 100644
+index 0000000..acd5463
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.1.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    Component {
++        id: internal
++
++        Item {
++        }
++    }
++
++    property bool expectNull: null
++
++    function setExpectNull(b) {
++        success = false;
++        expectNull = b;
++    }
++
++    property QtObject obj: null
++    onObjChanged: success = (expectNull ? obj == null : obj != null)
++
++    Component.onCompleted: {
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++        if (!success) return
++
++        // Replace with a different object
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++    }
++
++    function destroyObject() {
++        setExpectNull(true)
++        obj.destroy();
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.2.qml b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.2.qml
+new file mode 100644
+index 0000000..ed0e0d1
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.2.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    Component {
++        id: internal
++
++        Item {
++        }
++    }
++
++    property bool expectNull: null
++
++    function setExpectNull(b) {
++        success = false;
++        expectNull = b;
++    }
++
++    property variant obj: null
++    onObjChanged: success = (expectNull ? obj == null : obj != null)
++
++    Component.onCompleted: {
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++        if (!success) return
++
++        // Replace with a different object
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++    }
++
++    function destroyObject() {
++        setExpectNull(true)
++        obj.destroy();
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.3.qml b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.3.qml
+new file mode 100644
+index 0000000..f5e94ba
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.3.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    Component {
++        id: internal
++
++        Item {
++        }
++    }
++
++    property bool expectNull: null
++
++    function setExpectNull(b) {
++        success = false;
++        expectNull = b;
++    }
++
++    property var obj: null
++    onObjChanged: success = (expectNull ? obj == null : obj != null)
++
++    Component.onCompleted: {
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++        if (!success) return
++
++        // Replace with a different object
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++    }
++
++    function destroyObject() {
++        setExpectNull(true)
++        obj.destroy();
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.4.qml b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.4.qml
+new file mode 100644
+index 0000000..ccfda01
+--- /dev/null
++++ b/tests/auto/qml/qqmllanguage/data/objectDeletionNotify.4.qml
+@@ -0,0 +1,48 @@
++import QtQuick 2.0
++
++Item {
++    property bool success: false
++
++    Component {
++        id: internal
++
++        Item {
++        }
++    }
++
++    property var expectNull: null
++
++    function setExpectNull(b) {
++        success = false;
++        expectNull = b;
++    }
++
++    function setExpectNoChange() {
++        success = true;
++        expectNull = null;
++    }
++
++    property var obj: null
++    onObjChanged: success = (expectNull == null) ? false : (expectNull ? obj == null : obj != null)
++
++    property var temp: null
++
++    Component.onCompleted: {
++        // Set obj to contain an object
++        setExpectNull(false)
++        obj = internal.createObject(null, {})
++        if (!success) return
++
++        // Use temp variable to keep object reference alive
++        temp = obj
++
++        // Change obj to contain a string
++        setExpectNull(false)
++        obj = 'hello'
++    }
++
++    function destroyObject() {
++        setExpectNoChange()
++        temp.destroy();
++    }
++}
+diff --git a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+index 2c9593b..316d7e2 100644
+--- a/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
++++ b/tests/auto/qml/qqmllanguage/tst_qqmllanguage.cpp
+@@ -179,6 +179,9 @@ private slots:
+     void literals_data();
+     void literals();
+ 
++    void objectDeletionNotify_data();
++    void objectDeletionNotify();
++
+ private:
+     QQmlEngine engine;
+     QStringList defaultImportPathList;
+@@ -2987,6 +2990,37 @@ void tst_qqmllanguage::literals()
+     delete object;
+ }
+ 
++void tst_qqmllanguage::objectDeletionNotify_data()
++{
++    QTest::addColumn<QString>("file");
++
++    QTest::newRow("property QtObject") << "objectDeletionNotify.1.qml";
++    QTest::newRow("property variant") << "objectDeletionNotify.2.qml";
++    QTest::newRow("property var") << "objectDeletionNotify.3.qml";
++    QTest::newRow("property var guard removed") << "objectDeletionNotify.4.qml";
++}
++
++void tst_qqmllanguage::objectDeletionNotify()
++{
++    QFETCH(QString, file);
++
++    QQmlComponent component(&engine, testFile(file));
++
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QCOMPARE(object->property("success").toBool(), true);
++
++    QMetaObject::invokeMethod(object, "destroyObject");
++
++    // Process the deletion event
++    QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++    QCoreApplication::processEvents();
++
++    QCOMPARE(object->property("success").toBool(), true);
++
++    delete object;
++}
++
+ QTEST_MAIN(tst_qqmllanguage)
+ 
+ #include "tst_qqmllanguage.moc"

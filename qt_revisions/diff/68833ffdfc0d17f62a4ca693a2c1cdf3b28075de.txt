@@ -1,0 +1,232 @@
+diff --git a/src/declarative/qml/qdeclarativevme.cpp b/src/declarative/qml/qdeclarativevme.cpp
+index 0aa74a4..f44b767 100644
+--- a/src/declarative/qml/qdeclarativevme.cpp
++++ b/src/declarative/qml/qdeclarativevme.cpp
+@@ -822,10 +822,8 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+             if (instr.isRoot && BINDINGSKIPLIST.testBit(instr.property.coreIndex))
+                 QML_NEXT_INSTR(StoreV8Binding);
+ 
+-            QDeclarativeAbstractBinding *binding = 
+-                CTXT->v8bindings->configBinding(instr.value, target, scope, 
+-                                                instr.property, instr.line,
+-                                                instr.column);
++            QDeclarativeAbstractBinding *binding = CTXT->v8bindings->configBinding(target, scope,
++                                                                                   &instr);
+             if (binding) {
+                 bindValues.push(binding);
+                 binding->m_mePtr = &bindValues.top();
+diff --git a/src/declarative/qml/v8/qv8bindings.cpp b/src/declarative/qml/v8/qv8bindings.cpp
+index cd86e6a..3af9baa 100644
+--- a/src/declarative/qml/v8/qv8bindings.cpp
++++ b/src/declarative/qml/v8/qv8bindings.cpp
+@@ -54,14 +54,14 @@
+ QT_BEGIN_NAMESPACE
+ 
+ QV8Bindings::Binding::Binding()
+-: index(-1), enabled(false), updating(false), line(-1), column(-1), object(0), parent(0)
++: object(0), parent(0)
+ {
+ }
+ 
+ void QV8Bindings::Binding::setEnabled(bool e, QDeclarativePropertyPrivate::WriteFlags flags)
+ {
+-    if (enabled != e) {
+-        enabled = e;
++    if (enabledFlag() != e) {
++        setEnabledFlag(e);
+ 
+         if (e) update(flags);
+     }
+@@ -80,22 +80,22 @@ void QV8Bindings::Binding::refresh()
+ 
+ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+ {
+-    if (!enabled)
++    if (!enabledFlag())
+         return;
+ 
+     QDeclarativeTrace trace("V8 Binding Update");
+     trace.addDetail("URL", parent->url);
+-    trace.addDetail("Line", line);
+-    trace.addDetail("Column", column);
++    trace.addDetail("Line", instruction->line);
++    trace.addDetail("Column", instruction->column);
+ 
+-    QDeclarativeBindingProfiler prof(parent->url.toString(), line, column);
++    QDeclarativeBindingProfiler prof(parent->url.toString(), instruction->line, instruction->column);
+ 
+     QDeclarativeContextData *context = parent->context();
+     if (!context || !context->isValid())
+         return;
+ 
+-    if (!updating) {
+-        updating = true;
++    if (!updatingFlag()) {
++        setUpdatingFlag(true);
+         QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(context->engine);
+ 
+         bool isUndefined = false;
+@@ -106,14 +106,15 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+         v8::HandleScope handle_scope;
+         v8::Context::Scope scope(ep->v8engine()->context());
+         v8::Local<v8::Value> result =
+-            evaluate(context, v8::Handle<v8::Function>::Cast(parent->functions->Get(index)),
++            evaluate(context,
++                     v8::Handle<v8::Function>::Cast(parent->functions->Get(instruction->value)),
+                      &isUndefined);
+ 
+         trace.event("writing V8 result");
+         bool needsErrorData = false;
+         if (!watcher.wasDeleted() && !hasError()) {
+             typedef QDeclarativePropertyPrivate PP;
+-            needsErrorData = !PP::writeBinding(object, property, context, this, result,
++            needsErrorData = !PP::writeBinding(object, instruction->property, context, this, result,
+                                                isUndefined, flags);
+         }
+ 
+@@ -124,7 +125,7 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+                 if (url.isEmpty()) url = QUrl(QLatin1String("<Unknown File>"));
+ 
+                 delayedError()->error.setUrl(url);
+-                delayedError()->error.setLine(line);
++                delayedError()->error.setLine(instruction->line);
+                 delayedError()->error.setColumn(-1);
+             }
+ 
+@@ -134,20 +135,21 @@ void QV8Bindings::Binding::update(QDeclarativePropertyPrivate::WriteFlags flags)
+                 clearError();
+             }
+ 
+-            updating = false;
++            setUpdatingFlag(false);
+         }
+ 
+         ep->dereferenceScarceResources(); 
+ 
+     } else {
+-        QDeclarativeProperty p = QDeclarativePropertyPrivate::restore(object, property, context);
++        QDeclarativeProperty p = QDeclarativePropertyPrivate::restore(object, instruction->property,
++                                                                      context);
+         QDeclarativeBindingPrivate::printBindingLoopError(p);
+     }
+ }
+ 
+ QString QV8Bindings::Binding::expressionIdentifier()
+ {
+-    return parent->url.toString() + QLatin1String(":") + QString::number(line);
++    return parent->url.toString() + QLatin1String(":") + QString::number(instruction->line);
+ }
+ 
+ void QV8Bindings::Binding::expressionChanged()
+@@ -157,7 +159,7 @@ void QV8Bindings::Binding::expressionChanged()
+ 
+ void QV8Bindings::Binding::destroy()
+ {
+-    enabled = false;
++    setEnabledFlag(false);
+     removeFromObject();
+     clear();
+     clearError();
+@@ -212,32 +214,34 @@ QV8Bindings::QV8Bindings(int index, int line,
+     if (bindingsCount)
+         bindings = new QV8Bindings::Binding[bindingsCount];
+ 
++    cdata = compiled;
++    cdata->addref();
++
+     setContext(context);
+ }
+ 
+ QV8Bindings::~QV8Bindings()
+ {
+     qPersistentDispose(functions);
++    cdata->release();
+ 
+     delete [] bindings;
+     bindings = 0;
+     bindingsCount = 0;
+ }
+ 
+-QDeclarativeAbstractBinding *QV8Bindings::configBinding(int index, QObject *target, QObject *scope, 
+-                                                        const QDeclarativePropertyData &p,
+-                                                        int line, int column)
++QDeclarativeAbstractBinding *
++QV8Bindings::configBinding(QObject *target, QObject *scope,
++                           const QDeclarativeInstruction::instr_assignBinding *i)
+ {
+-    if (bindingsCount <= index) // initialization failed.
++    if (!bindings) // initialization failed.
+         return 0;
+ 
+-    QV8Bindings::Binding *rv = bindings + index;
++    QV8Bindings::Binding *rv = bindings + i->value;
++
++    rv->instruction = i;
+ 
+-    rv->line = line;
+-    rv->column = column;
+-    rv->index = index;
+     rv->object = target;
+-    rv->property = p;
+     rv->setScopeObject(scope);
+     rv->setUseSharedContext(true);
+     rv->setNotifyOnValueChanged(true);
+diff --git a/src/declarative/qml/v8/qv8bindings_p.h b/src/declarative/qml/v8/qv8bindings_p.h
+index 83bbed5..4c2584d 100644
+--- a/src/declarative/qml/v8/qv8bindings_p.h
++++ b/src/declarative/qml/v8/qv8bindings_p.h
+@@ -54,8 +54,10 @@
+ //
+ 
+ #include <private/qdeclarativepropertycache_p.h>
++#include <private/qdeclarativeinstruction_p.h>
+ #include <private/qdeclarativeexpression_p.h>
+ #include <private/qdeclarativebinding_p.h>
++#include <private/qflagpointer_p.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -73,9 +75,8 @@ public:
+                 QDeclarativeContextData *context);
+     virtual ~QV8Bindings();
+ 
+-    QDeclarativeAbstractBinding *configBinding(int index, QObject *target, QObject *scope, 
+-                                               const QDeclarativePropertyData &prop,
+-                                               int line, int column);
++    QDeclarativeAbstractBinding *configBinding(QObject *target, QObject *scope,
++                                               const QDeclarativeInstruction::instr_assignBinding *);
+ 
+     // Inherited from QDeclarativeAbstractExpression
+     virtual void refresh();
+@@ -99,20 +100,25 @@ private:
+         virtual void update(QDeclarativePropertyPrivate::WriteFlags flags);
+         virtual void destroy();
+ 
+-        int index:30;
+-        bool enabled:1;
+-        bool updating:1;
+-        int line;
+-        int column;
+         QObject *object;
+-        QDeclarativePropertyData property;
+         QV8Bindings *parent;
++
++        // To save memory, we store flags inside the instruction pointer.
++        //    flag1: enabled
++        //    flag2: updating
++        QFlagPointer<const QDeclarativeInstruction::instr_assignBinding> instruction;
++
++        inline bool enabledFlag() const { return instruction.flag(); }
++        inline void setEnabledFlag(bool v) { instruction.setFlagValue(v); }
++        inline bool updatingFlag() const { return instruction.flag2(); }
++        inline void setUpdatingFlag(bool v) { instruction.setFlag2Value(v); }
+     };
+ 
+     QUrl url;
+     int bindingsCount;
+     Binding *bindings;
+     v8::Persistent<v8::Array> functions;
++    QDeclarativeCompiledData *cdata;
+ };
+ 
+ QT_END_NAMESPACE

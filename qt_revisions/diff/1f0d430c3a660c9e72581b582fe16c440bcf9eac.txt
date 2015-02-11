@@ -1,0 +1,204 @@
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.cpp b/src/plugins/platforms/qnx/qqnxintegration.cpp
+index 1f6539f..a45c65d 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.cpp
++++ b/src/plugins/platforms/qnx/qqnxintegration.cpp
+@@ -124,7 +124,7 @@ QQnxIntegration::QQnxIntegration()
+     , m_eventDispatcher(createUnixEventDispatcher())
+ #endif
+     , m_nativeInterface(new QQnxNativeInterface())
+-    , m_screenEventHandler(new QQnxScreenEventHandler())
++    , m_screenEventHandler(new QQnxScreenEventHandler(this))
+ #if !defined(QT_NO_CLIPBOARD)
+     , m_clipboard(0)
+ #endif
+@@ -437,20 +437,45 @@ void QQnxIntegration::createDisplays()
+     }
+ 
+     for (int i=0; i<displayCount; i++) {
++        int isAttached = 0;
++        result = screen_get_display_property_iv(displays[i], SCREEN_PROPERTY_ATTACHED, &isAttached);
++        if (result != 0) {
++            qWarning("QQnxIntegration: failed to query display attachment, errno=%d", errno);
++            isAttached = 1; // assume attached
++        }
++
++        if (!isAttached) {
++            qIntegrationDebug() << Q_FUNC_INFO << "Skipping non-attached display" << i;
++            continue;
++        }
++
+         qIntegrationDebug() << Q_FUNC_INFO << "Creating screen for display" << i;
+-        QQnxScreen *screen = new QQnxScreen(m_screenContext, displays[i], i==0);
+-        m_screens.append(screen);
+-        screenAdded(screen);
+-
+-        QObject::connect(m_screenEventHandler, SIGNAL(newWindowCreated(void*)),
+-                         screen, SLOT(newWindowCreated(void*)));
+-        QObject::connect(m_screenEventHandler, SIGNAL(windowClosed(void*)),
+-                         screen, SLOT(windowClosed(void*)));
+-
+-        QObject::connect(m_navigatorEventHandler, SIGNAL(rotationChanged(int)), screen, SLOT(setRotation(int)));
+-        QObject::connect(m_navigatorEventHandler, SIGNAL(windowGroupActivated(QByteArray)), screen, SLOT(activateWindowGroup(QByteArray)));
+-        QObject::connect(m_navigatorEventHandler, SIGNAL(windowGroupDeactivated(QByteArray)), screen, SLOT(deactivateWindowGroup(QByteArray)));
+-    }
++        createDisplay(displays[i], i==0);
++    } // of displays iteration
++}
++
++void QQnxIntegration::createDisplay(screen_display_t display, bool isPrimary)
++{
++    QQnxScreen *screen = new QQnxScreen(m_screenContext, display, isPrimary);
++    m_screens.append(screen);
++    screenAdded(screen);
++
++    QObject::connect(m_screenEventHandler, SIGNAL(newWindowCreated(void*)),
++                     screen, SLOT(newWindowCreated(void*)));
++    QObject::connect(m_screenEventHandler, SIGNAL(windowClosed(void*)),
++                     screen, SLOT(windowClosed(void*)));
++
++    QObject::connect(m_navigatorEventHandler, SIGNAL(rotationChanged(int)), screen, SLOT(setRotation(int)));
++    QObject::connect(m_navigatorEventHandler, SIGNAL(windowGroupActivated(QByteArray)), screen, SLOT(activateWindowGroup(QByteArray)));
++    QObject::connect(m_navigatorEventHandler, SIGNAL(windowGroupDeactivated(QByteArray)), screen, SLOT(deactivateWindowGroup(QByteArray)));
++}
++
++void QQnxIntegration::removeDisplay(QQnxScreen *screen)
++{
++    Q_CHECK_PTR(screen);
++    Q_ASSERT(m_screens.contains(screen));
++    m_screens.removeAll(screen);
++    screen->deleteLater();
+ }
+ 
+ void QQnxIntegration::destroyDisplays()
+@@ -460,6 +485,16 @@ void QQnxIntegration::destroyDisplays()
+     m_screens.clear();
+ }
+ 
++QQnxScreen *QQnxIntegration::screenForNative(screen_display_t qnxScreen) const
++{
++    Q_FOREACH (QQnxScreen *screen, m_screens) {
++        if (screen->nativeDisplay() == qnxScreen)
++            return screen;
++    }
++
++    return 0;
++}
++
+ QQnxScreen *QQnxIntegration::primaryDisplay() const
+ {
+     return m_screens.first();
+diff --git a/src/plugins/platforms/qnx/qqnxintegration.h b/src/plugins/platforms/qnx/qqnxintegration.h
+index 9256b0d..acedda5 100644
+--- a/src/plugins/platforms/qnx/qqnxintegration.h
++++ b/src/plugins/platforms/qnx/qqnxintegration.h
+@@ -118,6 +118,10 @@ public:
+ 
+     static QWindow *window(screen_window_t qnxWindow);
+ 
++    QQnxScreen *screenForNative(screen_display_t qnxScreen) const;
++
++    void createDisplay(screen_display_t display, bool isPrimary);
++    void removeDisplay(QQnxScreen *screen);
+ private:
+     void createDisplays();
+     void destroyDisplays();
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp b/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
+index 14019d4..621440e 100644
+--- a/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
++++ b/src/plugins/platforms/qnx/qqnxscreeneventhandler.cpp
+@@ -57,8 +57,9 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-QQnxScreenEventHandler::QQnxScreenEventHandler()
+-    : m_lastButtonState(Qt::NoButton)
++QQnxScreenEventHandler::QQnxScreenEventHandler(QQnxIntegration *integration)
++    : m_qnxIntegration(integration)
++    , m_lastButtonState(Qt::NoButton)
+     , m_lastMouseWindow(0)
+     , m_touchDevice(0)
+ {
+@@ -120,9 +121,13 @@ bool QQnxScreenEventHandler::handleEvent(screen_event_t event, int qnxType)
+         handleCloseEvent(event);
+         break;
+ 
++    case SCREEN_EVENT_DISPLAY:
++        handleDisplayEvent(event);
++        break;
++
+     default:
+         // event ignored
+-        qScreenEventDebug() << Q_FUNC_INFO << "unknown event";
++        qScreenEventDebug() << Q_FUNC_INFO << "unknown event" << qnxType;
+         return false;
+     }
+ 
+@@ -455,6 +460,34 @@ void QQnxScreenEventHandler::handleCreateEvent(screen_event_t event)
+     Q_EMIT newWindowCreated(window);
+ }
+ 
++void QQnxScreenEventHandler::handleDisplayEvent(screen_event_t event)
++{
++    screen_display_t nativeDisplay = NULL;
++    if (screen_get_event_property_pv(event, SCREEN_PROPERTY_DISPLAY, (void **)&nativeDisplay) != 0) {
++        qWarning("QQnx: failed to query display property, errno=%d", errno);
++        return;
++    }
++
++    int isAttached = 0;
++    if (screen_get_event_property_iv(event, SCREEN_PROPERTY_ATTACHED, &isAttached) != 0) {
++        qWarning("QQnx: failed to query display attached property, errno=%d", errno);
++        return;
++    }
++
++    qScreenEventDebug() << Q_FUNC_INFO << "display attachment is now:" << isAttached;
++    QQnxScreen *screen = m_qnxIntegration->screenForNative(nativeDisplay);
++    if (!screen) {
++        if (isAttached) {
++            qScreenEventDebug() << "creating new QQnxScreen for newly attached display";
++            m_qnxIntegration->createDisplay(nativeDisplay, false /* not primary, we assume */);
++        }
++    } else if (!isAttached) {
++        // libscreen display is deactivated, let's remove the QQnxScreen / QScreen
++        qScreenEventDebug() << "removing display";
++        m_qnxIntegration->removeDisplay(screen);
++    }
++}
++
+ #include "moc_qqnxscreeneventhandler.cpp"
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/qnx/qqnxscreeneventhandler.h b/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
+index 9f73757..7a1af6f 100644
+--- a/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
++++ b/src/plugins/platforms/qnx/qqnxscreeneventhandler.h
+@@ -48,11 +48,13 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++class QQnxIntegration;
++
+ class QQnxScreenEventHandler : public QObject
+ {
+     Q_OBJECT
+ public:
+-    QQnxScreenEventHandler();
++    explicit QQnxScreenEventHandler(QQnxIntegration *integration);
+ 
+     bool handleEvent(screen_event_t event);
+     bool handleEvent(screen_event_t event, int qnxType);
+@@ -69,12 +71,14 @@ private:
+     void handleTouchEvent(screen_event_t event, int qnxType);
+     void handleCloseEvent(screen_event_t event);
+     void handleCreateEvent(screen_event_t event);
++    void handleDisplayEvent(screen_event_t event);
+ 
+ private:
+     enum {
+         MaximumTouchPoints = 10
+     };
+ 
++    QQnxIntegration *m_qnxIntegration;
+     QPoint m_lastGlobalMousePoint;
+     QPoint m_lastLocalMousePoint;
+     Qt::MouseButtons m_lastButtonState;

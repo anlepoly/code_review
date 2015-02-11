@@ -1,0 +1,320 @@
+diff --git a/src/qml/qml/qqmlincubator_p.h b/src/qml/qml/qqmlincubator_p.h
+index f5effe3..f5fc0b9 100644
+--- a/src/qml/qml/qqmlincubator_p.h
++++ b/src/qml/qml/qqmlincubator_p.h
+@@ -69,6 +69,8 @@ public:
+     QQmlIncubatorPrivate(QQmlIncubator *q, QQmlIncubator::IncubationMode m);
+     ~QQmlIncubatorPrivate();
+ 
++    inline static QQmlIncubatorPrivate *get(QQmlIncubator *incubator) { return incubator->d; }
++
+     QQmlIncubator *q;
+ 
+     QQmlIncubator::Status calculateStatus() const;
+diff --git a/src/qml/qml/qqmlvme_p.h b/src/qml/qml/qqmlvme_p.h
+index 844f2cc..4d49b79 100644
+--- a/src/qml/qml/qqmlvme_p.h
++++ b/src/qml/qml/qqmlvme_p.h
+@@ -90,7 +90,7 @@ namespace QQmlVMETypes {
+ }
+ Q_DECLARE_TYPEINFO(QQmlVMETypes::List, Q_PRIMITIVE_TYPE  | Q_MOVABLE_TYPE);
+ 
+-class QQmlVME
++class Q_QML_PRIVATE_EXPORT QQmlVME
+ {
+     Q_DECLARE_TR_FUNCTIONS(QQmlVME)
+ public:
+diff --git a/src/quick/items/qquickvisualdatamodel.cpp b/src/quick/items/qquickvisualdatamodel.cpp
+index a1da179..79ddeca 100644
+--- a/src/quick/items/qquickvisualdatamodel.cpp
++++ b/src/quick/items/qquickvisualdatamodel.cpp
+@@ -49,6 +49,9 @@
+ #include <private/qquickvisualadaptormodel_p.h>
+ #include <private/qquickchangeset_p.h>
+ #include <private/qqmlengine_p.h>
++#include <private/qqmlcomponent_p.h>
++#include <private/qqmlincubator_p.h>
++#include <private/qqmlcompiler_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -153,9 +156,11 @@ QQuickVisualDataModel::~QQuickVisualDataModel()
+             // Clear the guard before deleting the object so it doesn't decrement scriptRef and
+             // potentially delete the cacheItem itself.
+             cacheItem->setObject(0);
+-            cacheItem->scriptRef -= 1;
+-
+             delete object;
++
++            cacheItem->contextData->destroy();
++            cacheItem->contextData = 0;
++            cacheItem->scriptRef -= 1;
+         }
+         cacheItem->objectRef = 0;
+         if (!cacheItem->isReferenced())
+@@ -466,8 +471,6 @@ void QQuickVisualDataModel::cancel(int index)
+     QQuickVisualDataModelItem *cacheItem = it->inCache() ? d->m_cache.at(it.cacheIndex) : 0;
+     if (cacheItem) {
+         if (cacheItem->incubationTask) {
+-            delete cacheItem->incubationTask->incubatingContext;
+-            cacheItem->incubationTask->incubatingContext = 0;
+             d->releaseIncubator(cacheItem->incubationTask);
+             cacheItem->incubationTask = 0;
+         }
+@@ -743,9 +746,9 @@ void QQuickVisualDataModelPrivate::incubatorStatusChanged(QVDMIncubationTask *in
+         else if (QQuickItem *item = qobject_cast<QQuickItem *>(cacheItem->object()))
+             emitCreatedItem(cacheItem, item);
+     } else if (status == QQmlIncubator::Error) {
+-        delete incubationTask->incubatingContext;
+-        incubationTask->incubatingContext = 0;
+         cacheItem->scriptRef -= 1;
++        cacheItem->contextData->destroy();
++        cacheItem->contextData = 0;
+         if (!cacheItem->isReferenced()) {
+             int cidx = m_cache.indexOf(cacheItem);
+             if (cidx >= 0) {
+@@ -769,9 +772,6 @@ void QQuickVisualDataModelPrivate::setInitialState(QVDMIncubationTask *incubatio
+ {
+     QQuickVisualDataModelItem *cacheItem = incubationTask->incubating;
+     cacheItem->setObject(o);
+-    QQml_setParent_noEvent(incubationTask->incubatingContext, cacheItem->object());
+-    incubationTask->incubatingContext = 0;
+-
+ 
+     if (QQuickPackage *package = qobject_cast<QQuickPackage *>(cacheItem->object()))
+         emitInitPackage(cacheItem, package);
+@@ -812,25 +812,33 @@ QObject *QQuickVisualDataModelPrivate::object(Compositor::Group group, int index
+             cacheItem->incubationTask->forceCompletion();
+         }
+     } else if (!cacheItem->object()) {
++        QQmlContext *creationContext = m_delegate->creationContext();
++
+         cacheItem->scriptRef += 1;
+ 
+-        QVDMIncubationTask *incubator = new QVDMIncubationTask(this, asynchronous ? QQmlIncubator::Asynchronous : QQmlIncubator::AsynchronousIfNested);
+-        cacheItem->incubationTask = incubator;
++        cacheItem->incubationTask = new QVDMIncubationTask(this, asynchronous ? QQmlIncubator::Asynchronous : QQmlIncubator::AsynchronousIfNested);
++        cacheItem->incubationTask->incubating = cacheItem;
++        cacheItem->incubationTask->clear();
++
++        QQmlContextData *ctxt = new QQmlContextData;
++        ctxt->setParent(QQmlContextData::get(creationContext  ? creationContext : m_context));
++        ctxt->contextObject = cacheItem;
++        cacheItem->contextData = ctxt;
+ 
+-        QQmlContext *creationContext = m_delegate->creationContext();
+-        QQmlContext *rootContext = new QQmlContext(creationContext ? creationContext : m_context);
+-        QQmlContext *ctxt = rootContext;
+-        ctxt->setContextObject(cacheItem);
+         if (m_adaptorModel.hasProxyObject()) {
+-            if (QQuickVisualAdaptorModelProxyInterface *proxy = qobject_cast<QQuickVisualAdaptorModelProxyInterface *>(cacheItem)) {
+-                ctxt = new QQmlContext(ctxt, ctxt);
+-                ctxt->setContextObject(proxy->proxiedObject());
++            if (QQuickVisualAdaptorModelProxyInterface *proxy
++                    = qobject_cast<QQuickVisualAdaptorModelProxyInterface *>(cacheItem)) {
++                ctxt = new QQmlContextData;
++                ctxt->setParent(cacheItem->contextData, true);
++                ctxt->contextObject = proxy->proxiedObject();
+             }
+         }
+ 
+-        incubator->incubating = cacheItem;
+-        incubator->incubatingContext = rootContext;
+-        m_delegate->create(*incubator, ctxt, m_context);
++        cacheItem->incubateObject(
++                    m_delegate,
++                    m_context->engine(),
++                    ctxt,
++                    QQmlContextData::get(m_context));
+     }
+ 
+     if (index == m_compositor.count(group) - 1 && m_adaptorModel.canFetchMore())
+@@ -1617,17 +1625,16 @@ v8::Handle<v8::Value> QQuickVisualDataModelItemMetaType::get_index(
+ 
+ //---------------------------------------------------------------------------
+ 
+-QHash<QObject*, QQuickVisualDataModelItem *> QQuickVisualDataModelItem::contextData;
+-
+ QQuickVisualDataModelItem::QQuickVisualDataModelItem(
+         QQuickVisualDataModelItemMetaType *metaType, int modelIndex)
+     : QV8ObjectResource(metaType->v8Engine)
+     , metaType(metaType)
++    , contextData(0)
+     , attached(0)
++    , incubationTask(0)
+     , objectRef(0)
+     , scriptRef(0)
+     , groups(0)
+-    , incubationTask(0)
+ {
+     index[0] = modelIndex;
+     metaType->addref();
+@@ -1666,14 +1673,30 @@ void QQuickVisualDataModelItem::Dispose()
+     delete this;
+ }
+ 
+-void QQuickVisualDataModelItem::setObject(QObject *g)
++/*
++    This is essentially a copy of QQmlComponent::create(); except it takes the QQmlContextData
++    arguments instead of QQmlContext which means we don't have to construct the rather weighty
++    wrapper class for every delegate item.
++*/
++void QQuickVisualDataModelItem::incubateObject(
++        QQmlComponent *component,
++        QQmlEngine *engine,
++        QQmlContextData *context,
++        QQmlContextData *forContext)
+ {
+-    if (QObject *previous = object())
+-        contextData.remove(previous);
+-    if (g)
+-        contextData.insert(g, this);
++    QQmlIncubatorPrivate *incubatorPriv = QQmlIncubatorPrivate::get(incubationTask);
++    QQmlEnginePrivate *enginePriv = QQmlEnginePrivate::get(engine);
++    QQmlComponentPrivate *componentPriv = QQmlComponentPrivate::get(component);
++
++    incubatorPriv->compiledData = componentPriv->cc;
++    incubatorPriv->compiledData->addref();
++    incubatorPriv->vme.init(
++            context,
++            componentPriv->cc,
++            componentPriv->start,
++            componentPriv->creationContext);
+ 
+-    QQmlGuard<QObject>::setObject(g);
++    enginePriv->incubate(*incubationTask, forContext);
+ }
+ 
+ void QQuickVisualDataModelItem::destroyObject()
+@@ -1682,6 +1705,7 @@ void QQuickVisualDataModelItem::destroyObject()
+     setObject(0);
+ 
+     Q_ASSERT(obj);
++    Q_ASSERT(contextData);
+ 
+     QObjectPrivate *p = QObjectPrivate::get(obj);
+     Q_ASSERT(p->declarativeData);
+@@ -1694,14 +1718,43 @@ void QQuickVisualDataModelItem::destroyObject()
+         attached->m_cacheItem = 0;
+         attached = 0;
+     }
++
++    contextData->destroy();
++    contextData = 0;
+ }
+ 
+-void QQuickVisualDataModelItem::objectDestroyed(QObject *object)
++QQuickVisualDataModelItem *QQuickVisualDataModelItem::dataForObject(QObject *object)
+ {
+-    contextData.remove(object);
++    QObjectPrivate *p = QObjectPrivate::get(object);
++    QQmlContextData *context = p->declarativeData
++            ? static_cast<QQmlData *>(p->declarativeData)->context
++            : 0;
++    for (context = context ? context->parent : 0; context; context = context->parent) {
++        if (QQuickVisualDataModelItem *cacheItem = qobject_cast<QQuickVisualDataModelItem *>(
++                context->contextObject)) {
++            return cacheItem;
++        }
++    }
++    return 0;
++}
+ 
++void QQuickVisualDataModelItem::objectDestroyed(QObject *)
++{
++    const bool contextValid = contextData->isValid();
++    contextData->destroy();
++    contextData = 0;
+     attached = 0;
+-    Dispose();
++    objectRef = 0;
++
++    if (contextValid) {
++        Dispose();
++    } else {
++        // The parent context was invalidated, meaning the visual data model is about to be
++        // destroyed.  So we'll just decrement the script ref here and let the vdm destructor
++        // destroy the object if necessary, rather than Dispose of the object and unnecessarily
++        // remove each item from the soon to be destroyed cache list individually.
++        scriptRef -= 1;
++    }
+ }
+ 
+ //---------------------------------------------------------------------------
+diff --git a/src/quick/items/qquickvisualdatamodel_p_p.h b/src/quick/items/qquickvisualdatamodel_p_p.h
+index 7dd6603..e2887e7 100644
+--- a/src/quick/items/qquickvisualdatamodel_p_p.h
++++ b/src/quick/items/qquickvisualdatamodel_p_p.h
+@@ -103,7 +103,7 @@ public:
+ class QQuickVisualAdaptorModel;
+ class QVDMIncubationTask;
+ 
+-class QQuickVisualDataModelItem : public QObject, public QV8ObjectResource, private QQmlGuard<QObject>
++class QQuickVisualDataModelItem : public QObject, public QV8ObjectResource, public QQmlGuard<QObject>
+ {
+     Q_OBJECT
+     Q_PROPERTY(int index READ modelIndex NOTIFY modelIndexChanged)
+@@ -127,11 +127,14 @@ public:
+ 
+     QObject *modelObject() { return this; }
+ 
+-    inline QObject *object() const { return QQmlGuard<QObject>::object(); }
+-    void setObject(QObject *g);
++    void incubateObject(
++            QQmlComponent *component,
++            QQmlEngine *engine,
++            QQmlContextData *context,
++            QQmlContextData *forContext);
+     void destroyObject();
+ 
+-    static QQuickVisualDataModelItem *dataForObject(QObject *object) { return contextData.value(object, 0); }
++    static QQuickVisualDataModelItem *dataForObject(QObject *object);
+ 
+     int modelIndex() const { return index[0]; }
+     void setModelIndex(int idx) { index[0] = idx; emit modelIndexChanged(); }
+@@ -142,7 +145,9 @@ public:
+     virtual bool resolveIndex(const QQuickVisualAdaptorModel &, int) { return false; }
+ 
+     QQuickVisualDataModelItemMetaType * const metaType;
++    QQmlContextData *contextData;
+     QQuickVisualDataModelAttached *attached;
++    QVDMIncubationTask *incubationTask;
+     v8::Persistent<v8::Object> indexHandle;
+     v8::Persistent<v8::Value> modelHandle;
+     QIntrusiveListNode cacheNode;
+@@ -150,19 +155,13 @@ public:
+     int scriptRef;
+     int groups;
+     int index[QQuickListCompositor::MaximumGroupCount];
+-    QVDMIncubationTask *incubationTask;
++
+ 
+ Q_SIGNALS:
+     void modelIndexChanged();
+ 
+ protected:
+     void objectDestroyed(QObject *);
+-
+-private:
+-    // A static hash of context data for all delegate object isn't ideal, but it provides a way
+-    // to get the context data when constructing attached objects rather than constructing the
+-    // attached objects on suspicion.
+-    static QHash<QObject*, QQuickVisualDataModelItem *> contextData;
+ };
+ 
+ 
+@@ -173,14 +172,12 @@ public:
+     QVDMIncubationTask(QQuickVisualDataModelPrivate *l, IncubationMode mode)
+         : QQmlIncubator(mode)
+         , incubating(0)
+-        , incubatingContext(0)
+         , vdm(l) {}
+ 
+     virtual void statusChanged(Status);
+     virtual void setInitialState(QObject *);
+ 
+     QQuickVisualDataModelItem *incubating;
+-    QQmlContext *incubatingContext;
+ 
+ private:
+     QQuickVisualDataModelPrivate *vdm;

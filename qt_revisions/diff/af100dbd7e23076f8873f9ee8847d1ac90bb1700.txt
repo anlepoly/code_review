@@ -1,0 +1,205 @@
+diff --git a/src/network/access/qnetworkreplyhttpimpl.cpp b/src/network/access/qnetworkreplyhttpimpl.cpp
+index 624c39f..4796e4b 100644
+--- a/src/network/access/qnetworkreplyhttpimpl.cpp
++++ b/src/network/access/qnetworkreplyhttpimpl.cpp
+@@ -1521,6 +1521,9 @@ bool QNetworkReplyHttpImplPrivate::start()
+ 
+     if (managerPrivate->networkSession->isOpen() &&
+         managerPrivate->networkSession->state() == QNetworkSession::Connected) {
++        Q_Q(QNetworkReplyHttpImpl);
++        QObject::connect(managerPrivate->networkSession.data(), SIGNAL(usagePoliciesChanged(QNetworkSession::UsagePolicies)),
++                            q, SLOT(_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)));
+         postRequest();
+         return true;
+     }
+@@ -1564,8 +1567,6 @@ void QNetworkReplyHttpImplPrivate::_q_startOperation()
+         if (session) {
+             QObject::connect(session, SIGNAL(error(QNetworkSession::SessionError)),
+                              q, SLOT(_q_networkSessionFailed()));
+-            QObject::connect(session, SIGNAL(usagePoliciesChanged(QNetworkSession::UsagePolicies)),
+-                             q, SLOT(_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)));
+ 
+             if (!session->isOpen()) {
+                 session->setSessionProperty(QStringLiteral("ConnectInBackground"), isBackground);
+@@ -1767,8 +1768,20 @@ void QNetworkReplyHttpImplPrivate::_q_networkSessionFailed()
+     }
+ }
+ 
+-void QNetworkReplyHttpImplPrivate::_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)
++void QNetworkReplyHttpImplPrivate::_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies newPolicies)
+ {
++    if (request.attribute(QNetworkRequest::BackgroundRequestAttribute).toBool()) {
++        if (newPolicies & QNetworkSession::NoBackgroundTrafficPolicy) {
++            // Abort waiting and working replies.
++            if (state == WaitingForSession || state == Working) {
++                state = Working;
++                error(QNetworkReply::BackgroundRequestNotAllowedError,
++                    QCoreApplication::translate("QNetworkReply", "Background request not allowed."));
++                finished();
++            }
++            // ### if canResume(), then we could resume automatically
++        }
++    }
+ 
+ }
+ #endif
+diff --git a/src/network/access/qnetworkreplyimpl.cpp b/src/network/access/qnetworkreplyimpl.cpp
+index c9efcbb..d535cbd 100644
+--- a/src/network/access/qnetworkreplyimpl.cpp
++++ b/src/network/access/qnetworkreplyimpl.cpp
+@@ -73,6 +73,8 @@ inline QNetworkReplyImplPrivate::QNetworkReplyImplPrivate()
+ 
+ void QNetworkReplyImplPrivate::_q_startOperation()
+ {
++    Q_Q(QNetworkReplyImpl);
++
+     // ensure this function is only being called once
+     if (state == Working || state == Finished) {
+         qDebug("QNetworkReplyImpl::_q_startOperation was called more than once");
+@@ -110,12 +112,8 @@ void QNetworkReplyImplPrivate::_q_startOperation()
+         state = WaitingForSession;
+ 
+         if (session) {
+-            Q_Q(QNetworkReplyImpl);
+-
+             QObject::connect(session.data(), SIGNAL(error(QNetworkSession::SessionError)),
+                              q, SLOT(_q_networkSessionFailed()));
+-            QObject::connect(session.data(), SIGNAL(usagePoliciesChanged(QNetworkSession::UsagePolicies)),
+-                             q, SLOT(_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)));
+ 
+             if (!session->isOpen()) {
+                 session->setSessionProperty(QStringLiteral("ConnectInBackground"), isBackground);
+@@ -138,6 +136,12 @@ void QNetworkReplyImplPrivate::_q_startOperation()
+         return;
+     }
+ 
++    if (session) {
++        //get notification of policy changes.
++        QObject::connect(session.data(), SIGNAL(usagePoliciesChanged(QNetworkSession::UsagePolicies)),
++                    q, SLOT(_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)));
++    }
++
+     if (backend && backend->isSynchronous()) {
+         state = Finished;
+         q_func()->setFinished(true);
+@@ -321,9 +325,20 @@ void QNetworkReplyImplPrivate::_q_networkSessionFailed()
+     }
+ }
+ 
+-void QNetworkReplyImplPrivate::_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies)
++void QNetworkReplyImplPrivate::_q_networkSessionUsagePoliciesChanged(QNetworkSession::UsagePolicies newPolicies)
+ {
+-
++    if (backend->request().attribute(QNetworkRequest::BackgroundRequestAttribute).toBool()) {
++        if (newPolicies & QNetworkSession::NoBackgroundTrafficPolicy) {
++            // Abort waiting and working replies.
++            if (state == WaitingForSession || state == Working) {
++                state = Working;
++                error(QNetworkReply::BackgroundRequestNotAllowedError,
++                    QCoreApplication::translate("QNetworkReply", "Background request not allowed."));
++                finished();
++            }
++            // ### if backend->canResume(), then we could resume automatically, however no backend supports resuming
++        }
++    }
+ }
+ #endif
+ 
+diff --git a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+index 35d4add..aede0d2 100644
+--- a/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
++++ b/tests/auto/network/access/qnetworkreply/tst_qnetworkreply.cpp
+@@ -405,6 +405,9 @@ private Q_SLOTS:
+ 
+     void backgroundRequest_data();
+     void backgroundRequest();
++    void backgroundRequestInterruption_data();
++    void backgroundRequestInterruption();
++
+ 
+     // NOTE: This test must be last!
+     void parentingRepliesToTheApp();
+@@ -6844,6 +6847,7 @@ void tst_QNetworkReply::backgroundRequest_data()
+ 
+ }
+ 
++//test purpose: background requests can't be started when not allowed
+ void tst_QNetworkReply::backgroundRequest()
+ {
+ #ifdef QT_BUILD_INTERNAL
+@@ -6883,6 +6887,75 @@ void tst_QNetworkReply::backgroundRequest()
+ #endif
+ }
+ 
++void tst_QNetworkReply::backgroundRequestInterruption_data()
++{
++    QTest::addColumn<QUrl>("url");
++    QTest::addColumn<bool>("background");
++    QTest::addColumn<QNetworkReply::NetworkError>("error");
++
++    QUrl httpurl("http://" + QtNetworkSettings::serverName() + "/qtest/mediumfile");
++    QUrl httpsurl("https://" + QtNetworkSettings::serverName() + "/qtest/mediumfile");
++    QUrl ftpurl("ftp://" + QtNetworkSettings::serverName() + "/qtest/bigfile");
++
++    QTest::newRow("http, fg, nobg") << httpurl << false << QNetworkReply::NoError;
++    QTest::newRow("http, bg, nobg") << httpurl << true << QNetworkReply::BackgroundRequestNotAllowedError;
++
++#ifndef QT_NO_SSL
++    QTest::newRow("https, fg, nobg") << httpsurl << false << QNetworkReply::NoError;
++    QTest::newRow("https, bg, nobg") << httpsurl << true  << QNetworkReply::BackgroundRequestNotAllowedError;
++#endif
++
++    QTest::newRow("ftp, fg, nobg") << ftpurl << false << QNetworkReply::NoError;
++    QTest::newRow("ftp, bg, nobg") << ftpurl << true << QNetworkReply::BackgroundRequestNotAllowedError;
++
++}
++
++//test purpose: background requests in progress are aborted when policy changes to disallow them
++void tst_QNetworkReply::backgroundRequestInterruption()
++{
++#ifdef QT_BUILD_INTERNAL
++#ifndef QT_NO_BEARERMANAGEMENT
++    QFETCH(QUrl, url);
++    QFETCH(bool, background);
++    QFETCH(QNetworkReply::NetworkError, error);
++
++    QNetworkRequest request(url);
++
++    if (background)
++        request.setAttribute(QNetworkRequest::BackgroundRequestAttribute, QVariant::fromValue(true));
++
++    //this preconstructs the session so we can change policies in advance
++    manager.setConfiguration(networkConfiguration);
++
++#ifndef QT_NO_SSL
++    connect(&manager, SIGNAL(sslErrors(QNetworkReply*,QList<QSslError>)),
++        SLOT(sslErrors(QNetworkReply*,QList<QSslError>)));
++#endif
++
++    const QWeakPointer<const QNetworkSession> session = QNetworkAccessManagerPrivate::getNetworkSession(&manager);
++    QVERIFY(session);
++    QNetworkSession::UsagePolicies original = session.data()->usagePolicies();
++    QNetworkSessionPrivate::setUsagePolicies(*const_cast<QNetworkSession *>(session.data()), QNetworkSession::NoPolicy);
++
++    request.setAttribute(QNetworkRequest::MaximumDownloadBufferSizeAttribute, 8192);
++    QNetworkReplyPtr reply(manager.get(request));
++    reply->setReadBufferSize(1024);
++
++    QSignalSpy spy(reply.data(), SIGNAL(readyRead()));
++    QTRY_VERIFY(spy.count() > 0);
++
++    QNetworkSessionPrivate::setUsagePolicies(*const_cast<QNetworkSession *>(session.data()), QNetworkSession::NoBackgroundTrafficPolicy);
++
++    QVERIFY(waitForFinish(reply) != Timeout);
++    if (session)
++        QNetworkSessionPrivate::setUsagePolicies(*const_cast<QNetworkSession *>(session.data()), original);
++
++    QVERIFY(reply->isFinished());
++    QCOMPARE(reply->error(), error);
++#endif
++#endif
++}
++
+ // NOTE: This test must be last testcase in tst_qnetworkreply!
+ void tst_QNetworkReply::parentingRepliesToTheApp()
+ {

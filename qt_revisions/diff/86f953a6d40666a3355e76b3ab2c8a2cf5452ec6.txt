@@ -1,0 +1,308 @@
+diff --git a/src/corelib/tools/qdatetime.cpp b/src/corelib/tools/qdatetime.cpp
+index 8c139ea..d2064b3 100644
+--- a/src/corelib/tools/qdatetime.cpp
++++ b/src/corelib/tools/qdatetime.cpp
+@@ -52,6 +52,7 @@
+ #include <locale.h>
+ #endif
+ 
++#include <cmath>
+ #include <time.h>
+ #ifdef Q_OS_WIN
+ #  include <qt_windows.h>
+@@ -1764,60 +1765,115 @@ int QTime::msecsTo(const QTime &t) const
+ */
+ 
+ #ifndef QT_NO_DATESTRING
+-/*!
+-    \fn QTime QTime::fromString(const QString &string, Qt::DateFormat format)
+ 
+-    Returns the time represented in the \a string as a QTime using the
+-    \a format given, or an invalid time if this is not possible.
++// These anonymous functions tidy up QDateTime::fromString()
++// and avoid confusion of reponsibility between it and QTime::fromString().
++namespace {
++inline bool isMidnight(int hour, int minute, int second, int msec)
++{
++    return hour == 24 && minute == 0 && second == 0 && msec == 0;
++}
+ 
+-    Note that fromString() uses a "C" locale encoded string to convert
+-    milliseconds to a float value. If the default locale is not "C",
+-    this may result in two conversion attempts (if the conversion
+-    fails for the default locale). This should be considered an
+-    implementation detail.
+-*/
+-QTime QTime::fromString(const QString& s, Qt::DateFormat f)
++QTime fromStringImpl(const QString &s, Qt::DateFormat f, bool &isMidnight24)
+ {
+     if (s.isEmpty()) {
+-        QTime t;
+-        t.mds = NullTime;
+-        return t;
++        // Return a null time.
++        return QTime();
+     }
+ 
+     switch (f) {
+     case Qt::SystemLocaleDate:
+     case Qt::SystemLocaleShortDate:
+     case Qt::SystemLocaleLongDate:
+-        return fromString(s, QLocale::system().timeFormat(f == Qt::SystemLocaleLongDate ? QLocale::LongFormat
+-                                                                                        : QLocale::ShortFormat));
++    {
++        QLocale::FormatType formatType(Qt::SystemLocaleLongDate ? QLocale::LongFormat : QLocale::ShortFormat);
++        return QTime::fromString(s, QLocale::system().timeFormat(formatType));
++    }
+     case Qt::LocaleDate:
+     case Qt::DefaultLocaleShortDate:
+     case Qt::DefaultLocaleLongDate:
+-        return fromString(s, QLocale().timeFormat(f == Qt::DefaultLocaleLongDate ? QLocale::LongFormat
+-                                                                                 : QLocale::ShortFormat));
+-    default:
+-        {
+-            bool ok = true;
+-            const int hour(s.mid(0, 2).toInt(&ok));
+-            if (!ok)
+-                return QTime();
+-            const int minute(s.mid(3, 2).toInt(&ok));
+-            if (!ok)
+-                return QTime();
+-            if (f == Qt::ISODate && s.size() == 5) {
++    {
++        QLocale::FormatType formatType(f == Qt::DefaultLocaleLongDate ? QLocale::LongFormat : QLocale::ShortFormat);
++        return QTime::fromString(s, QLocale().timeFormat(formatType));
++    }
++    case Qt::TextDate:
++    case Qt::ISODate:
++    {
++        bool ok = true;
++        const int hour(s.mid(0, 2).toInt(&ok));
++        if (!ok)
++            return QTime();
++        const int minute(s.mid(3, 2).toInt(&ok));
++        if (!ok)
++            return QTime();
++        if (f == Qt::ISODate) {
++            if (s.size() == 5) {
+                 // Do not need to specify seconds if using ISO format.
+                 return QTime(hour, minute, 0, 0);
++            } else if ((s.size() > 6 && s[5] == QLatin1Char(',')) || s[5] == QLatin1Char('.')) {
++                // Possibly specifying fraction of a minute.
++
++                // We only want 5 digits worth of fraction of minute. This follows the existing
++                // behaviour that determines how milliseconds are read; 4 millisecond digits are
++                // read and then rounded to 3. If we read at most 5 digits for fraction of minute,
++                // the maximum amount of millisecond digits it will expand to once converted to
++                // seconds is 4. E.g. 12:34,99999 will expand to 12:34:59.9994. The milliseconds
++                // will then be rounded up AND clamped to 999.
++                const QString minuteFractionStr(QLatin1String("0.") + s.mid(6, 5));
++                const float minuteFraction = minuteFractionStr.toFloat(&ok);
++                if (!ok)
++                    return QTime();
++                const float secondWithMs = minuteFraction * 60;
++                const float second = std::floor(secondWithMs);
++                const float millisecond = 1000 * (secondWithMs - second);
++                const int millisecondRounded = qMin(qRound(millisecond), 999);
++
++                if (isMidnight(hour, minute, second, millisecondRounded)) {
++                    isMidnight24 = true;
++                    return QTime(0, 0, 0, 0);
++                }
++
++                return QTime(hour, minute, second, millisecondRounded);
++            }
++        }
++
++        const int second(s.mid(6, 2).toInt(&ok));
++        if (!ok)
++            return QTime();
++        const QString msec_s(QLatin1String("0.") + s.mid(9, 4));
++        const double msec(msec_s.toDouble(&ok));
++        if (!ok)
++            return QTime(hour, minute, second, 0);
++
++        if (f == Qt::ISODate) {
++            if (isMidnight(hour, minute, second, msec)) {
++                isMidnight24 = true;
++                return QTime(0, 0, 0, 0);
+             }
+-            const int second(s.mid(6, 2).toInt(&ok));
+-            if (!ok)
+-                return QTime();
+-            const QString msec_s(QLatin1String("0.") + s.mid(9, 4));
+-            const float msec(msec_s.toFloat(&ok));
+-            if (!ok)
+-                return QTime(hour, minute, second, 0);
+-            return QTime(hour, minute, second, qMin(qRound(msec * 1000.0), 999));
+         }
++        return QTime(hour, minute, second, qMin(qRound(msec * 1000.0), 999));
+     }
++    }
++}
++}
++
++
++/*!
++    \fn QTime QTime::fromString(const QString &string, Qt::DateFormat format)
++
++    Returns the time represented in the \a string as a QTime using the
++    \a format given, or an invalid time if this is not possible.
++
++    Note that fromString() uses a "C" locale encoded string to convert
++    milliseconds to a float value. If the default locale is not "C",
++    this may result in two conversion attempts (if the conversion
++    fails for the default locale). This should be considered an
++    implementation detail.
++*/
++QTime QTime::fromString(const QString& s, Qt::DateFormat f)
++{
++    bool unused;
++    return fromStringImpl(s, f, unused);
+ }
+ 
+ /*!
+@@ -3246,11 +3302,12 @@ QDateTime QDateTime::fromString(const QString& s, Qt::DateFormat f)
+             }
+         }
+ 
+-        QTime time(QTime::fromString(tmp, Qt::ISODate));
+-        if (!time.isValid() && tmp == QString::fromLatin1("24:00:00")) {
++        bool isMidnight24 = false;
++        // Might be end of day (24:00, including variants), which QTime considers invalid.
++        QTime time(fromStringImpl(tmp, Qt::ISODate, isMidnight24));
++        if (isMidnight24) {
+             // ISO 8601 (section 4.2.3) says that 24:00 is equivalent to 00:00 the next day.
+             date = date.addDays(1);
+-            // Don't need to correct time since QDateTime constructor will do it for us.
+         }
+ 
+         return QDateTime(date, time, ts);
+diff --git a/tests/auto/corelib/tools/qdatetime/tst_qdatetime.cpp b/tests/auto/corelib/tools/qdatetime/tst_qdatetime.cpp
+index a738c54..b54bf60 100644
+--- a/tests/auto/corelib/tools/qdatetime/tst_qdatetime.cpp
++++ b/tests/auto/corelib/tools/qdatetime/tst_qdatetime.cpp
+@@ -1270,25 +1270,76 @@ void tst_QDateTime::fromStringDateFormat_data()
+     // No time specified - defaults to Qt::LocalTime.
+     QTest::newRow("data16") << QString::fromLatin1("2002-10-01")
+         << Qt::ISODate << QDateTime(QDate(2002, 10, 1), QTime(0, 0, 0, 0)) << Qt::LocalTime;
+-    QTest::newRow("ISO date") << QString::fromLatin1("2005-06-28T07:57:30.0010000000Z")
++    QTest::newRow("ISO") << QString::fromLatin1("2005-06-28T07:57:30.0010000000Z")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 1)) << Qt::UTC;
+-    QTest::newRow("ISO date with comma 1") << QString::fromLatin1("2005-06-28T07:57:30,0040000000Z")
++    QTest::newRow("ISO with comma 1") << QString::fromLatin1("2005-06-28T07:57:30,0040000000Z")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 4)) << Qt::UTC;
+-    QTest::newRow("ISO date with comma 2") << QString::fromLatin1("2005-06-28T07:57:30,0015Z")
++    QTest::newRow("ISO with comma 2") << QString::fromLatin1("2005-06-28T07:57:30,0015Z")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 2)) << Qt::UTC;
+-    QTest::newRow("ISO date with comma 3") << QString::fromLatin1("2005-06-28T07:57:30,0014Z")
++    QTest::newRow("ISO with comma 3") << QString::fromLatin1("2005-06-28T07:57:30,0014Z")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 1)) << Qt::UTC;
+-    QTest::newRow("ISO date with comma 4") << QString::fromLatin1("2005-06-28T07:57:30,1Z")
++    QTest::newRow("ISO with comma 4") << QString::fromLatin1("2005-06-28T07:57:30,1Z")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 100)) << Qt::UTC;
+-    QTest::newRow("ISO date with comma 5") << QString::fromLatin1("2005-06-28T07:57:30,11")
++    QTest::newRow("ISO with comma 5") << QString::fromLatin1("2005-06-28T07:57:30,11")
+         << Qt::ISODate << QDateTime(QDate(2005, 6, 28), QTime(7, 57, 30, 110)) << Qt::LocalTime;
+-    // Should be next day according to ISO 8601 section 4.2.3.
+-    QTest::newRow("ISO date 24:00") << QString::fromLatin1("2012-06-04T24:00:00")
++    // 24:00:00 Should be next day according to ISO 8601 section 4.2.3.
++    QTest::newRow("ISO 24:00") << QString::fromLatin1("2012-06-04T24:00:00")
+         << Qt::ISODate << QDateTime(QDate(2012, 6, 5), QTime(0, 0, 0, 0)) << Qt::LocalTime;
+-    QTest::newRow("ISO date 24:00 end of month") << QString::fromLatin1("2012-06-30T24:00:00")
++    QTest::newRow("ISO 24:00 end of month") << QString::fromLatin1("2012-06-30T24:00:00")
+         << Qt::ISODate << QDateTime(QDate(2012, 7, 1), QTime(0, 0, 0, 0)) << Qt::LocalTime;
+-    QTest::newRow("ISO date 24:00 end of month and year") << QString::fromLatin1("2012-12-31T24:00:00")
++    QTest::newRow("ISO 24:00 end of year") << QString::fromLatin1("2012-12-31T24:00:00")
+         << Qt::ISODate << QDateTime(QDate(2013, 1, 1), QTime(0, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO 24:00, fract ms") << QString::fromLatin1("2012-01-01T24:00:00.000")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 2), QTime(0, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO 24:00 end of year, fract ms") << QString::fromLatin1("2012-12-31T24:00:00.000")
++        << Qt::ISODate << QDateTime(QDate(2013, 1, 1), QTime(0, 0, 0, 0)) << Qt::LocalTime;
++    // Test fractional seconds.
++    QTest::newRow("ISO .0 of a second (period)") << QString::fromLatin1("2012-01-01T08:00:00.0")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .00 of a second (period)") << QString::fromLatin1("2012-01-01T08:00:00.00")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .000 of a second (period)") << QString::fromLatin1("2012-01-01T08:00:00.000")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .1 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,1")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 100)) << Qt::LocalTime;
++    QTest::newRow("ISO .99 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,99")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 990)) << Qt::LocalTime;
++    QTest::newRow("ISO .998 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,998")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 998)) << Qt::LocalTime;
++    QTest::newRow("ISO .999 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,999")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 999)) << Qt::LocalTime;
++    QTest::newRow("ISO .3335 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,3335")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 334)) << Qt::LocalTime;
++    QTest::newRow("ISO .333333 of a second (comma)") << QString::fromLatin1("2012-01-01T08:00:00,333333")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 333)) << Qt::LocalTime;
++    QTest::newRow("ISO .00009 of a second (period)") << QString::fromLatin1("2012-01-01T08:00:00.00009")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO no fract specified") << QString::fromLatin1("2012-01-01T08:00:00.")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    // Test invalid characters (should ignore invalid characters at end of string).
++    QTest::newRow("ISO invalid character at end") << QString::fromLatin1("2012-01-01T08:00:00!")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO invalid character at front") << QString::fromLatin1("!2012-01-01T08:00:00")
++        << Qt::ISODate << invalidDateTime() << Qt::LocalTime;
++    QTest::newRow("ISO invalid character both ends") << QString::fromLatin1("!2012-01-01T08:00:00!")
++        << Qt::ISODate << invalidDateTime() << Qt::LocalTime;
++    QTest::newRow("ISO invalid character at front, 2 at back") << QString::fromLatin1("!2012-01-01T08:00:00..")
++        << Qt::ISODate << invalidDateTime() << Qt::LocalTime;
++    QTest::newRow("ISO invalid character 2 at front") << QString::fromLatin1("!!2012-01-01T08:00:00")
++        << Qt::ISODate << invalidDateTime() << Qt::LocalTime;
++    // Test fractional minutes.
++    QTest::newRow("ISO .0 of a minute (period)") << QString::fromLatin1("2012-01-01T08:00.0")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .8 of a minute (period)") << QString::fromLatin1("2012-01-01T08:00.8")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 48, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .99999 of a minute (period)") << QString::fromLatin1("2012-01-01T08:00.99999")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 59, 999)) << Qt::LocalTime;
++    QTest::newRow("ISO .0 of a minute (comma)") << QString::fromLatin1("2012-01-01T08:00,0")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 0, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .8 of a minute (comma)") << QString::fromLatin1("2012-01-01T08:00,8")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 48, 0)) << Qt::LocalTime;
++    QTest::newRow("ISO .99999 of a minute (comma)") << QString::fromLatin1("2012-01-01T08:00,99999")
++        << Qt::ISODate << QDateTime(QDate(2012, 1, 1), QTime(8, 0, 59, 999)) << Qt::LocalTime;
+ }
+ 
+ void tst_QDateTime::fromStringDateFormat()
+diff --git a/tests/auto/corelib/tools/qtime/tst_qtime.cpp b/tests/auto/corelib/tools/qtime/tst_qtime.cpp
+index 1e000a1..1d6b0d2 100644
+--- a/tests/auto/corelib/tools/qtime/tst_qtime.cpp
++++ b/tests/auto/corelib/tools/qtime/tst_qtime.cpp
+@@ -562,21 +562,22 @@ void tst_QTime::fromStringDateFormat_data()
+     QTest::addColumn<Qt::DateFormat>("format");
+     QTest::addColumn<QTime>("expected");
+ 
+-    QTest::newRow("valid, start of day, omit seconds") << QString::fromLatin1("00:00") << Qt::ISODate << QTime(0, 0, 0);
+-    QTest::newRow("valid, omit seconds") << QString::fromLatin1("22:21") << Qt::ISODate << QTime(22, 21, 0);
+-    QTest::newRow("valid, omit seconds (2)") << QString::fromLatin1("23:59") << Qt::ISODate << QTime(23, 59, 0);
+-    QTest::newRow("valid, end of day") << QString::fromLatin1("23:59:59") << Qt::ISODate << QTime(23, 59, 59);
+-
+-    QTest::newRow("invalid, empty string") << QString::fromLatin1("") << Qt::ISODate << invalidTime();
+-    QTest::newRow("invalid, too many hours") << QString::fromLatin1("25:00") << Qt::ISODate << invalidTime();
+-    QTest::newRow("invalid, too many minutes") << QString::fromLatin1("10:70") << Qt::ISODate << invalidTime();
+-    QTest::newRow("invalid, too many seconds") << QString::fromLatin1("23:59:60") << Qt::ISODate << invalidTime();
+-
+     QTest::newRow("TextDate - data0") << QString("00:00:00") << Qt::TextDate << QTime(0,0,0,0);
+     QTest::newRow("TextDate - data1") << QString("10:12:34") << Qt::TextDate << QTime(10,12,34,0);
+     QTest::newRow("TextDate - data2") << QString("19:03:54.998601") << Qt::TextDate << QTime(19, 3, 54, 999);
+     QTest::newRow("TextDate - data3") << QString("19:03:54.999601") << Qt::TextDate << QTime(19, 3, 54, 999);
+ 
++    QTest::newRow("IsoDate - valid, start of day, omit seconds") << QString::fromLatin1("00:00") << Qt::ISODate << QTime(0, 0, 0);
++    QTest::newRow("IsoDate - valid, omit seconds") << QString::fromLatin1("22:21") << Qt::ISODate << QTime(22, 21, 0);
++    QTest::newRow("IsoDate - valid, omit seconds (2)") << QString::fromLatin1("23:59") << Qt::ISODate << QTime(23, 59, 0);
++    QTest::newRow("IsoDate - valid, end of day") << QString::fromLatin1("23:59:59") << Qt::ISODate << QTime(23, 59, 59);
++
++    QTest::newRow("IsoDate - invalid, empty string") << QString::fromLatin1("") << Qt::ISODate << invalidTime();
++    QTest::newRow("IsoDate - invalid, too many hours") << QString::fromLatin1("25:00") << Qt::ISODate << invalidTime();
++    QTest::newRow("IsoDate - invalid, too many minutes") << QString::fromLatin1("10:70") << Qt::ISODate << invalidTime();
++    // This is a valid time if it happens on June 30 or December 31 (leap seconds).
++    QTest::newRow("IsoDate - invalid, too many seconds") << QString::fromLatin1("23:59:60") << Qt::ISODate << invalidTime();
++
+     QTest::newRow("IsoDate - data0") << QString("00:00:00") << Qt::ISODate << QTime(0,0,0,0);
+     QTest::newRow("IsoDate - data1") << QString("10:12:34") << Qt::ISODate << QTime(10,12,34,0);
+     QTest::newRow("IsoDate - data2") << QString("19:03:54.998601") << Qt::ISODate << QTime(19, 3, 54, 999);

@@ -1,0 +1,393 @@
+diff --git a/src/qml/qml/qqmlboundsignal.cpp b/src/qml/qml/qqmlboundsignal.cpp
+index 358e945..8b3a39c 100644
+--- a/src/qml/qml/qqmlboundsignal.cpp
++++ b/src/qml/qml/qqmlboundsignal.cpp
+@@ -221,14 +221,14 @@ void QQmlAbstractBoundSignal::removeFromObject()
+ }
+ 
+ QQmlBoundSignal::QQmlBoundSignal(QObject *scope, const QMetaMethod &signal,
+-                               QObject *owner)
++                               QObject *owner, QQmlEngine *engine)
+ : m_expression(0), m_params(0), m_scope(scope), m_index(signal.methodIndex())
+ {
+     setParamsValid(false);
+     setIsEvaluating(false);
+     addToObject(owner);
+     callback = &subscriptionCallback;
+-    QQmlNotifierEndpoint::connect(scope, m_index);
++    QQmlNotifierEndpoint::connect(scope, m_index, engine);
+ }
+ 
+ QQmlBoundSignal::~QQmlBoundSignal()
+diff --git a/src/qml/qml/qqmlboundsignal_p.h b/src/qml/qml/qqmlboundsignal_p.h
+index 3fb20a1..c054425 100644
+--- a/src/qml/qml/qqmlboundsignal_p.h
++++ b/src/qml/qml/qqmlboundsignal_p.h
+@@ -132,7 +132,7 @@ class Q_QML_EXPORT QQmlBoundSignal : public QQmlAbstractBoundSignal,
+                                      public QQmlNotifierEndpoint
+ {
+ public:
+-    QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, QObject *owner);
++    QQmlBoundSignal(QObject *scope, const QMetaMethod &signal, QObject *owner, QQmlEngine *engine);
+     virtual ~QQmlBoundSignal();
+ 
+     int index() const;
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index b6a3060..f948c31 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -80,6 +80,8 @@
+ #include <QtCore/qcoreapplication.h>
+ #include <QtCore/qdir.h>
+ #include <QtCore/qmutex.h>
++#include <QtCore/qthread.h>
++#include <private/qthread_p.h>
+ #include <QtNetwork/qnetworkconfigmanager.h>
+ 
+ #include <private/qobject_p.h>
+@@ -470,8 +472,51 @@ void QQmlData::signalEmitted(QAbstractDeclarativeData *, QObject *object, int in
+     QQmlData *ddata = QQmlData::get(object, false);
+     if (!ddata) return; // Probably being deleted
+ 
+-    QQmlNotifierEndpoint *ep = ddata->notify(index);
+-    if (ep) QQmlNotifier::emitNotify(ep, a);
++    // In general, QML only supports QObject's that live on the same thread as the QQmlEngine
++    // that they're exposed to.  However, to make writing "worker objects" that calculate data
++    // in a separate thread easier, QML allows a QObject that lives in the same thread as the
++    // QQmlEngine to emit signals from a different thread.  These signals are then automatically
++    // marshalled back onto the QObject's thread and handled by QML from there.  This is tested
++    // by the qqmlecmascript::threadSignal() autotest.
++    if (ddata->notifyList &&
++        QThread::currentThreadId() != QObjectPrivate::get(object)->threadData->threadId) {
++
++        QMetaMethod m = object->metaObject()->method(index);
++        QList<QByteArray> parameterTypes = m.parameterTypes();
++
++        int *types = (int *)malloc((parameterTypes.count() + 1) * sizeof(int));
++        void **args = (void **) malloc((parameterTypes.count() + 1) *sizeof(void *));
++
++        types[0] = 0; // return type
++        args[0] = 0; // return value
++
++        for (int ii = 0; ii < parameterTypes.count(); ++ii) {
++            const QByteArray &typeName = parameterTypes.at(ii);
++            if (typeName.endsWith('*'))
++                types[ii + 1] = QMetaType::VoidStar;
++            else
++                types[ii + 1] = QMetaType::type(typeName);
++
++            if (!types[ii + 1]) {
++                qWarning("QObject::connect: Cannot queue arguments of type '%s'\n"
++                         "(Make sure '%s' is registered using qRegisterMetaType().)",
++                         typeName.constData(), typeName.constData());
++                free(types);
++                free(args);
++                return;
++            }
++
++            args[ii + 1] = QMetaType::create(types[ii + 1], a[ii + 1]);
++        }
++
++        QMetaCallEvent *ev = new QMetaCallEvent(index, 0, 0, object, index,
++                                                parameterTypes.count() + 1, types, args);
++        QCoreApplication::postEvent(object, ev);
++
++    } else {
++        QQmlNotifierEndpoint *ep = ddata->notify(index);
++        if (ep) QQmlNotifier::emitNotify(ep, a);
++    }
+ }
+ 
+ int QQmlData::receivers(QAbstractDeclarativeData *d, const QObject *, int index)
+diff --git a/src/qml/qml/qqmljavascriptexpression.cpp b/src/qml/qml/qqmljavascriptexpression.cpp
+index 569a292..5b1261b 100644
+--- a/src/qml/qml/qqmljavascriptexpression.cpp
++++ b/src/qml/qml/qqmljavascriptexpression.cpp
+@@ -226,7 +226,7 @@ void QQmlJavaScriptExpression::GuardCapture::captureProperty(QObject *o, int c,
+                 Q_ASSERT(g->isConnected(o, n));
+             } else {
+                 g = Guard::New(expression, engine);
+-                g->connect(o, n);
++                g->connect(o, n, engine);
+             }
+ 
+             expression->activeGuards.prepend(g);
+diff --git a/src/qml/qml/qqmlnotifier.cpp b/src/qml/qml/qqmlnotifier.cpp
+index 1ed3a29..20b90a7 100644
+--- a/src/qml/qml/qqmlnotifier.cpp
++++ b/src/qml/qml/qqmlnotifier.cpp
+@@ -41,6 +41,8 @@
+ 
+ #include "qqmlnotifier_p.h"
+ #include "qqmlproperty_p.h"
++#include <QtCore/qdebug.h>
++#include <private/qthread_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -67,10 +69,26 @@ void QQmlNotifier::emitNotify(QQmlNotifierEndpoint *endpoint, void **a)
+     else if (endpoint) endpoint->notifying = 0;
+ }
+ 
+-void QQmlNotifierEndpoint::connect(QObject *source, int sourceSignal)
++void QQmlNotifierEndpoint::connect(QObject *source, int sourceSignal, QQmlEngine *engine)
+ {
+     disconnect();
+ 
++    Q_ASSERT(engine);
++    if (QObjectPrivate::get(source)->threadData->threadId !=
++        QObjectPrivate::get(engine)->threadData->threadId) {
++
++        QString sourceName;
++        QDebug(&sourceName) << source;
++        sourceName = sourceName.left(sourceName.length() - 1);
++        QString engineName;
++        QDebug(&engineName).nospace() << engine;
++        engineName = engineName.left(engineName.length() - 1);
++
++        qFatal("QQmlEngine: Illegal attempt to connect to %s that is in"
++               " a different thread than the QML engine %s.", qPrintable(sourceName),
++               qPrintable(engineName));
++    }
++
+     this->source = source;
+     this->sourceSignal = sourceSignal;
+     QQmlPropertyPrivate::flushSignal(source, sourceSignal);
+diff --git a/src/qml/qml/qqmlnotifier_p.h b/src/qml/qml/qqmlnotifier_p.h
+index 3192531..26fa684 100644
+--- a/src/qml/qml/qqmlnotifier_p.h
++++ b/src/qml/qml/qqmlnotifier_p.h
+@@ -63,6 +63,7 @@ private:
+     QQmlNotifierEndpoint *endpoints;
+ };
+ 
++class QQmlEngine;
+ class QQmlNotifierEndpoint
+ {
+ public:
+@@ -76,7 +77,7 @@ public:
+     inline bool isConnected(QObject *source, int sourceSignal);
+     inline bool isConnected(QQmlNotifier *);
+ 
+-    void connect(QObject *source, int sourceSignal);
++    void connect(QObject *source, int sourceSignal, QQmlEngine *engine);
+     inline void connect(QQmlNotifier *);
+     inline void disconnect();
+ 
+diff --git a/src/qml/qml/qqmlproperty.cpp b/src/qml/qml/qqmlproperty.cpp
+index d791d73..111a99b 100644
+--- a/src/qml/qml/qqmlproperty.cpp
++++ b/src/qml/qml/qqmlproperty.cpp
+@@ -987,7 +987,8 @@ QQmlPropertyPrivate::takeSignalExpression(const QQmlProperty &that,
+         return signalHandler->takeExpression(expr);
+ 
+     if (expr) {
+-        QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object);
++        QQmlBoundSignal *signal = new QQmlBoundSignal(that.d->object, that.method(), that.d->object,
++                                                      expr->context()->engine);
+         signal->takeExpression(expr);
+     }
+     return 0;
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index 093b6d1..852a682 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -738,7 +738,7 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+ 
+             QMetaMethod signal = target->metaObject()->method(instr.signalIndex);
+ 
+-            QQmlBoundSignal *bs = new QQmlBoundSignal(target, signal, target);
++            QQmlBoundSignal *bs = new QQmlBoundSignal(target, signal, target, engine);
+             QQmlBoundSignalExpression *expr =
+                 new QQmlBoundSignalExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column);
+             bs->takeExpression(expr);
+diff --git a/src/qml/qml/qqmlvmemetaobject.cpp b/src/qml/qml/qqmlvmemetaobject.cpp
+index d7e9a28..001ed79 100644
+--- a/src/qml/qml/qqmlvmemetaobject.cpp
++++ b/src/qml/qml/qqmlvmemetaobject.cpp
+@@ -473,7 +473,7 @@ void QQmlVMEMetaObjectEndpoint::tryConnect()
+ 
+             QMetaProperty prop = target->metaObject()->property(d->propertyIndex());
+             if (prop.hasNotifySignal())
+-                connect(target, prop.notifySignalIndex());
++                connect(target, prop.notifySignalIndex(), ctxt->engine);
+         }
+ 
+         metaObject.setFlag();
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index e19d743..896bf21 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -443,7 +443,7 @@ void QV4Bindings::subscribeId(QQmlContextData *p, int idIndex, int subIndex)
+     }
+ }
+  
+-void QV4Bindings::subscribe(QObject *o, int notifyIndex, int subIndex)
++void QV4Bindings::subscribe(QObject *o, int notifyIndex, int subIndex, QQmlEngine *e)
+ {
+     Subscription *sub = (subscriptions + subIndex);
+     if (sub->isConnected(o, notifyIndex))
+@@ -451,7 +451,7 @@ void QV4Bindings::subscribe(QObject *o, int notifyIndex, int subIndex)
+     sub->bindings = this;
+     sub->method = subIndex; 
+     if (o)
+-        sub->connect(o, notifyIndex);
++        sub->connect(o, notifyIndex, e);
+     else
+         sub->disconnect();
+ }
+@@ -801,7 +801,7 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         QObject *o = 0;
+         const Register &object = registers[instr->subscribeop.reg];
+         if (!object.isUndefined()) o = object.getQObject();
+-        subscribe(o, instr->subscribeop.index, instr->subscribeop.offset);
++        subscribe(o, instr->subscribeop.index, instr->subscribeop.offset, context->engine);
+     }
+     QML_V4_END_INSTR(Subscribe, subscribeop)
+ 
+@@ -843,7 +843,7 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+                 accessors->notifier(object, instr->fetchAndSubscribe.property.accessorData, &notifier);
+                 if (notifier) sub->connect(notifier);
+             } else if (instr->fetchAndSubscribe.property.notifyIndex != -1) {
+-                sub->connect(object, instr->fetchAndSubscribe.property.notifyIndex);
++                sub->connect(object, instr->fetchAndSubscribe.property.notifyIndex, context->engine);
+             }
+         }
+     }
+diff --git a/src/qml/qml/v4/qv4bindings_p.h b/src/qml/qml/v4/qv4bindings_p.h
+index 8ceccbb..cb483d1 100644
+--- a/src/qml/qml/v4/qv4bindings_p.h
++++ b/src/qml/qml/v4/qv4bindings_p.h
+@@ -146,7 +146,7 @@ private:
+ 
+     inline void unsubscribe(int subIndex);
+     inline void subscribeId(QQmlContextData *p, int idIndex, int subIndex);
+-    inline void subscribe(QObject *o, int notifyIndex, int subIndex);
++    inline void subscribe(QObject *o, int notifyIndex, int subIndex, QQmlEngine *);
+ 
+     inline static qint32 toInt32(double n);
+     static const double D32;
+diff --git a/src/quick/util/qquickconnections.cpp b/src/quick/util/qquickconnections.cpp
+index 1740224..2257761 100644
+--- a/src/quick/util/qquickconnections.cpp
++++ b/src/quick/util/qquickconnections.cpp
+@@ -279,7 +279,7 @@ void QQuickConnections::connectSignals()
+         QQmlProperty prop(target(), propName);
+         if (prop.isValid() && (prop.type() & QQmlProperty::SignalProperty)) {
+             QQmlBoundSignal *signal =
+-                new QQmlBoundSignal(target(), prop.method(), this);
++                new QQmlBoundSignal(target(), prop.method(), this, qmlEngine(this));
+ 
+             QString location;
+             QQmlContextData *ctxtdata = 0;
+diff --git a/tests/auto/qml/qqmlecmascript/data/threadSignal.qml b/tests/auto/qml/qqmlecmascript/data/threadSignal.qml
+new file mode 100644
+index 0000000..8f0e13b
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/threadSignal.qml
+@@ -0,0 +1,8 @@
++import Qt.test 1.0
++import QtQuick 2.0
++
++MyWorkerObject {
++    property bool passed: false
++    Component.onCompleted: doIt()
++    onDone: passed = (result == 'good')
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.cpp b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+index d674fa3..d3eff3b 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.cpp
++++ b/tests/auto/qml/qqmlecmascript/testtypes.cpp
+@@ -43,6 +43,7 @@
+ #include <QPlainTextEdit>
+ #include <QQmlEngine>
+ #include <QJSEngine>
++#include <QThread>
+ 
+ class BaseExtensionObject : public QObject
+ {
+@@ -154,6 +155,23 @@ static QObject *qobject_api_engine_parent(QQmlEngine *engine, QJSEngine *scriptE
+     return o;
+ }
+ 
++class MyWorkerObjectThread : public QThread
++{
++public:
++    MyWorkerObjectThread(MyWorkerObject *o) : QThread(o), o(o) { start(); }
++
++    virtual void run() {
++        emit o->done(QLatin1String("good"));
++    }
++
++    MyWorkerObject *o;
++};
++
++void MyWorkerObject::doIt()
++{
++    new MyWorkerObjectThread(this);
++}
++
+ void registerTypes()
+ {
+     qmlRegisterType<MyQmlObject>("Qt.test", 1,0, "MyQmlObjectAlias");
+@@ -170,6 +188,7 @@ void registerTypes()
+     qmlRegisterType<MyRevisionedClass>("Qt.test",1,0,"MyRevisionedClass");
+     qmlRegisterType<MyDeleteObject>("Qt.test", 1,0, "MyDeleteObject");
+     qmlRegisterType<MyRevisionedClass,1>("Qt.test",1,1,"MyRevisionedClass");
++    qmlRegisterType<MyWorkerObject>("Qt.test", 1,0, "MyWorkerObject");
+ 
+     // test scarce resource property binding post-evaluation optimisation
+     // and for testing memory usage in property var circular reference test
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index e781e77..5fb78e8 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1382,6 +1382,17 @@ private:
+     QString m_timespec;
+ };
+ 
++class MyWorkerObject : public QObject
++{
++    Q_OBJECT
++
++public Q_SLOTS:
++    void doIt();
++
++Q_SIGNALS:
++    void done(const QString &result);
++};
++
+ void registerTypes();
+ 
+ #endif // TESTTYPES_H
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index a523bea..40bff34 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -261,8 +261,8 @@ private slots:
+     void deleteRootObjectInCreation();
+     void onDestruction();
+     void bindingSuppression();
+-
+     void signalEmitted();
++    void threadSignal();
+ 
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+@@ -6760,6 +6760,16 @@ void tst_qqmlecmascript::signalEmitted()
+     }
+ }
+ 
++// QTBUG-25647
++void tst_qqmlecmascript::threadSignal()
++{
++    QQmlComponent c(&engine, testFileUrl("threadSignal.qml"));
++    QObject *object = c.create();
++    QVERIFY(object != 0);
++    QTRY_VERIFY(object->property("passed").toBool());
++    delete object;
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

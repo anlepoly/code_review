@@ -1,0 +1,321 @@
+diff --git a/src/quick/items/qquickcanvas_p.h b/src/quick/items/qquickcanvas_p.h
+index 1475264..0ecdf1f 100644
+--- a/src/quick/items/qquickcanvas_p.h
++++ b/src/quick/items/qquickcanvas_p.h
+@@ -144,7 +144,7 @@ public:
+ 
+     void setFocusInScope(QQuickItem *scope, QQuickItem *item, FocusOptions = 0);
+     void clearFocusInScope(QQuickItem *scope, QQuickItem *item, FocusOptions = 0);
+-    void notifyFocusChangesRecur(QQuickItem **item, int remaining);
++    static void notifyFocusChangesRecur(QQuickItem **item, int remaining);
+ 
+     void updateFocusItemTransform();
+ 
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index cb41add..f1dec0c 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -1924,17 +1924,21 @@ void QQuickItem::setParentItem(QQuickItem *parentItem)
+ 
+         QQuickItem *scopeItem = 0;
+ 
+-        if (d->canvas && hasFocus()) {
++        if (hasFocus())
+             scopeFocusedItem = this;
+-        } else if (d->canvas && !isFocusScope() && d->subFocusItem) {
++        else if (!isFocusScope() && d->subFocusItem)
+             scopeFocusedItem = d->subFocusItem;
+-        }
+ 
+         if (scopeFocusedItem) {
+             scopeItem = oldParentItem;
+-            while (!scopeItem->isFocusScope()) scopeItem = scopeItem->parentItem();
+-            QQuickCanvasPrivate::get(d->canvas)->clearFocusInScope(scopeItem, scopeFocusedItem,
++            while (!scopeItem->isFocusScope() && scopeItem->parentItem())
++                scopeItem = scopeItem->parentItem();
++            if (d->canvas) {
++                QQuickCanvasPrivate::get(d->canvas)->clearFocusInScope(scopeItem, scopeFocusedItem,
+                                                                 QQuickCanvasPrivate::DontChangeFocusProperty);
++            } else {
++                QQuickItemPrivate::get(scopeFocusedItem)->updateSubFocusItem(scopeItem, false);
++            }
+         }
+ 
+         const bool wasVisible = isVisible();
+@@ -1963,18 +1967,31 @@ void QQuickItem::setParentItem(QQuickItem *parentItem)
+     d->setEffectiveVisibleRecur(d->calcEffectiveVisible());
+     d->setEffectiveEnableRecur(0, d->calcEffectiveEnable());
+ 
+-    if (scopeFocusedItem && d->parentItem && d->canvas) {
+-        // We need to test whether this item becomes scope focused
+-        QQuickItem *scopeItem = 0;
+-        scopeItem = d->parentItem;
+-        while (!scopeItem->isFocusScope()) scopeItem = scopeItem->parentItem();
++    if (d->parentItem) {
++        if (!scopeFocusedItem) {
++            if (hasFocus())
++                scopeFocusedItem = this;
++            else if (!isFocusScope() && d->subFocusItem)
++                scopeFocusedItem = d->subFocusItem;
++        }
+ 
+-        if (scopeItem->scopedFocusItem()) {
+-            QQuickItemPrivate::get(scopeFocusedItem)->focus = false;
+-            emit scopeFocusedItem->focusChanged(false);
+-        } else {
+-            QQuickCanvasPrivate::get(d->canvas)->setFocusInScope(scopeItem, scopeFocusedItem,
+-                                                              QQuickCanvasPrivate::DontChangeFocusProperty);
++        if (scopeFocusedItem) {
++            // We need to test whether this item becomes scope focused
++            QQuickItem *scopeItem = d->parentItem;
++            while (!scopeItem->isFocusScope() && scopeItem->parentItem())
++                scopeItem = scopeItem->parentItem();
++
++            if (scopeItem->scopedFocusItem()) {
++                QQuickItemPrivate::get(scopeFocusedItem)->focus = false;
++                emit scopeFocusedItem->focusChanged(false);
++            } else {
++                if (d->canvas) {
++                    QQuickCanvasPrivate::get(d->canvas)->setFocusInScope(scopeItem, scopeFocusedItem,
++                                                                  QQuickCanvasPrivate::DontChangeFocusProperty);
++                } else {
++                    QQuickItemPrivate::get(scopeFocusedItem)->updateSubFocusItem(scopeItem, true);
++                }
++            }
+         }
+     }
+ 
+@@ -2210,16 +2227,6 @@ void QQuickItemPrivate::initCanvas(InitializationState *state, QQuickCanvas *c)
+         QQuickItemPrivate::get(child)->initCanvas(childState, c);
+     }
+ 
+-    if (c && focus) {
+-        // Fixup
+-        if (state->getFocusScope(q)->scopedFocusItem()) {
+-            focus = false;
+-            emit q->focusChanged(false);
+-        } else {
+-            QQuickCanvasPrivate::get(canvas)->setFocusInScope(state->getFocusScope(q), q);
+-        }
+-    }
+-
+     dirty(Canvas);
+ 
+     if (extra.isAllocated() && extra->screenAttached)
+@@ -4672,15 +4679,33 @@ void QQuickItem::setFocus(bool focus)
+     if (d->focus == focus)
+         return;
+ 
+-    if (d->canvas) {
++    if (d->canvas || d->parentItem) {
+         // Need to find our nearest focus scope
+         QQuickItem *scope = parentItem();
+-        while (scope && !scope->isFocusScope())
++        while (scope && !scope->isFocusScope() && scope->parentItem())
+             scope = scope->parentItem();
+-        if (focus)
+-            QQuickCanvasPrivate::get(d->canvas)->setFocusInScope(scope, this);
+-        else
+-            QQuickCanvasPrivate::get(d->canvas)->clearFocusInScope(scope, this);
++        if (d->canvas) {
++            if (focus)
++                QQuickCanvasPrivate::get(d->canvas)->setFocusInScope(scope, this);
++            else
++                QQuickCanvasPrivate::get(d->canvas)->clearFocusInScope(scope, this);
++        } else {
++            // do the focus changes from setFocusInScope/clearFocusInScope that are
++            // unrelated to a canvas
++            QVarLengthArray<QQuickItem *, 20> changed;
++            QQuickItem *oldSubFocusItem = QQuickItemPrivate::get(scope)->subFocusItem;
++            if (oldSubFocusItem) {
++                QQuickItemPrivate::get(oldSubFocusItem)->focus = false;
++                changed << oldSubFocusItem;
++            }
++            d->updateSubFocusItem(scope, focus);
++
++            d->focus = focus;
++            changed << this;
++            emit focusChanged(focus);
++
++            QQuickCanvasPrivate::notifyFocusChangesRecur(changed.data(), changed.count() - 1);
++        }
+     } else {
+         d->focus = focus;
+         emit focusChanged(focus);
+diff --git a/tests/auto/quick/qquickitem/tst_qquickitem.cpp b/tests/auto/quick/qquickitem/tst_qquickitem.cpp
+index 9fdfa78..abd0da8 100644
+--- a/tests/auto/quick/qquickitem/tst_qquickitem.cpp
++++ b/tests/auto/quick/qquickitem/tst_qquickitem.cpp
+@@ -181,7 +181,7 @@ void tst_qquickitem::initTestCase()
+     qmlRegisterType<TestPolishItem>("Qt.test", 1, 0, "TestPolishItem");
+ }
+ 
+-// Focus has no effect when outside a canvas
++// Focus still updates when outside a canvas
+ void tst_qquickitem::noCanvas()
+ {
+     QQuickItem *root = new TestItem;
+@@ -201,7 +201,7 @@ void tst_qquickitem::noCanvas()
+     scopedChild2->setFocus(true);
+     QCOMPARE(root->hasFocus(), true);
+     QCOMPARE(child->hasFocus(), false);
+-    QCOMPARE(scope->hasFocus(), true);
++    QCOMPARE(scope->hasFocus(), false);
+     QCOMPARE(scopedChild->hasFocus(), false);
+     QCOMPARE(scopedChild2->hasFocus(), true);
+ 
+@@ -210,10 +210,10 @@ void tst_qquickitem::noCanvas()
+     scopedChild->setFocus(true);
+     scope->setFocus(false);
+     QCOMPARE(root->hasFocus(), false);
+-    QCOMPARE(child->hasFocus(), true);
++    QCOMPARE(child->hasFocus(), false);
+     QCOMPARE(scope->hasFocus(), false);
+     QCOMPARE(scopedChild->hasFocus(), true);
+-    QCOMPARE(scopedChild2->hasFocus(), true);
++    QCOMPARE(scopedChild2->hasFocus(), false);
+ 
+     delete root;
+ }
+@@ -434,7 +434,7 @@ void tst_qquickitem::addedToCanvas()
+     c1->setFocus(true);
+     c2->setFocus(true);
+     focusState[item].set(true, true);
+-    focusState[c1].set(true, false);
++    focusState[c1].set(false, false);
+     focusState[c2].set(true, false);
+     focusState.active(item);
+     FVERIFY();
+@@ -458,14 +458,14 @@ void tst_qquickitem::addedToCanvas()
+     focusState << tree << c1 << c2;
+     c1->setFocus(true);
+     c2->setFocus(true);
+-    focusState[c1].set(true, false);
++    focusState[c1].set(false, false);
+     focusState[c2].set(true, false);
+     FVERIFY();
+ 
+     tree->setParentItem(canvas.rootItem());
+-    focusState[c1].set(true, true);
+-    focusState[c2].set(false, false);
+-    focusState.active(c1);
++    focusState[c1].set(false, false);
++    focusState[c2].set(true, true);
++    focusState.active(c2);
+     FVERIFY();
+     }
+ 
+@@ -481,19 +481,19 @@ void tst_qquickitem::addedToCanvas()
+     focusState << tree << c1 << c2;
+     c1->setFocus(true);
+     c2->setFocus(true);
+-    focusState[c1].set(true, false);
++    focusState[c1].set(false, false);
+     focusState[c2].set(true, false);
+     FVERIFY();
+ 
+     tree->setParentItem(canvas.rootItem());
+-    focusState[c1].set(true, false);
+-    focusState[c2].set(false, false);
++    focusState[c1].set(false, false);
++    focusState[c2].set(true, false);
+     FVERIFY();
+ 
+     tree->setFocus(true);
+     focusState[tree].set(true, true);
+-    focusState[c1].set(true, true);
+-    focusState.active(c1);
++    focusState[c2].set(true, true);
++    focusState.active(c2);
+     FVERIFY();
+     }
+ 
+@@ -511,15 +511,15 @@ void tst_qquickitem::addedToCanvas()
+     c1->setFocus(true);
+     c2->setFocus(true);
+     focusState[tree].set(true, false);
+-    focusState[c1].set(true, false);
++    focusState[c1].set(false, false);
+     focusState[c2].set(true, false);
+     FVERIFY();
+ 
+     tree->setParentItem(canvas.rootItem());
+     focusState[tree].set(true, true);
+-    focusState[c1].set(true, true);
+-    focusState[c2].set(false, false);
+-    focusState.active(c1);
++    focusState[c1].set(false, false);
++    focusState[c2].set(true, true);
++    focusState.active(c2);
+     FVERIFY();
+     }
+ 
+@@ -540,22 +540,22 @@ void tst_qquickitem::addedToCanvas()
+     c2->setFocus(true);
+     focusState[child].set(true, true);
+     focusState[tree].set(true, false);
+-    focusState[c1].set(true, false);
++    focusState[c1].set(false, false);
+     focusState[c2].set(true, false);
+     focusState.active(child);
+     FVERIFY();
+ 
+     tree->setParentItem(canvas.rootItem());
+     focusState[tree].set(false, false);
+-    focusState[c1].set(true, false);
+-    focusState[c2].set(false, false);
++    focusState[c1].set(false, false);
++    focusState[c2].set(true, false);
+     FVERIFY();
+ 
+     tree->setFocus(true);
+     focusState[child].set(false, false);
+     focusState[tree].set(true, true);
+-    focusState[c1].set(true, true);
+-    focusState.active(c1);
++    focusState[c2].set(true, true);
++    focusState.active(c2);
+     FVERIFY();
+     }
+ }
+@@ -674,6 +674,40 @@ void tst_qquickitem::changeParent()
+     FVERIFY();
+     }
+ 
++    // child has active focus, then its fs parent changes parent to 0, then
++    // child is deleted, then its parent changes again to a valid parent
++    {
++    QQuickCanvas canvas;
++    ensureFocus(&canvas);
++    QTRY_VERIFY(QGuiApplication::focusWindow() == &canvas);
++    QQuickItem *item = new TestFocusScope(canvas.rootItem());
++    QQuickItem *child = new TestItem(item);
++    QQuickItem *child2 = new TestItem;
++
++    FocusState focusState;
++    focusState << item << child;
++    FVERIFY();
++
++    item->setFocus(true);
++    child->setFocus(true);
++    focusState[child].set(true, true);
++    focusState[item].set(true, true);
++    focusState.active(child);
++    FVERIFY();
++
++    item->setParentItem(0);
++    focusState[child].set(true, false);
++    focusState[item].set(true, false);
++    focusState.active(0);
++    FVERIFY();
++
++    focusState.remove(child);
++    delete child;
++    item->setParentItem(canvas.rootItem());
++    focusState[item].set(true, true);
++    focusState.active(item);
++    FVERIFY();
++    }
+ }
+ 
+ void tst_qquickitem::multipleFocusClears()

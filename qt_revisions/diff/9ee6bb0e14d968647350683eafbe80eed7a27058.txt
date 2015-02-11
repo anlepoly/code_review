@@ -1,0 +1,857 @@
+diff --git a/src/qml/qml/v4/qv4bindings.cpp b/src/qml/qml/v4/qv4bindings.cpp
+index 0088741..169e60e 100644
+--- a/src/qml/qml/v4/qv4bindings.cpp
++++ b/src/qml/qml/v4/qv4bindings.cpp
+@@ -649,6 +649,7 @@ static void testBindingResult(const QString &binding, quint16 line, quint16 colu
+         qtscriptResult = "exception";
+     } else if ((value.userType() != resultType) &&
+                (resultType != QMetaType::QVariant) &&
++               (resultType != qMetaTypeId<QJSValue>()) &&
+                (resultType != handleType)) {
+         // Override the QMetaType conversions to make them more JS friendly.
+         if (value.userType() == QMetaType::Double && (resultType == QMetaType::QString ||
+@@ -708,6 +709,8 @@ static void testBindingResult(const QString &binding, quint16 line, quint16 colu
+         default:
+             if (resultType == QQmlMetaType::QQuickAnchorLineMetaTypeId()) {
+                 v4value = QVariant(QQmlMetaType::QQuickAnchorLineMetaTypeId(), result.typeDataPtr());
++            } else if (resultType == qMetaTypeId<QJSValue>()) {
++                v4value = result.getjsvalueptr()->toVariant();
+             } else if (resultType == handleType) {
+                 QQmlEnginePrivate *ep = QQmlEnginePrivate::get(context->engine);
+                 v4value = ep->v8engine()->toVariant(*result.gethandleptr(), resultType);
+@@ -1834,8 +1837,19 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+     {
+         const Register &src = registers[instr->unaryop.src];
+         Register &output = registers[instr->unaryop.output];
+-        if (src.isUndefined()) output.setUndefined();
+-        else output.setint(qFloor(src.getnumber()));
++        if (src.isUndefined())
++            output.setUndefined();
++        else if (src.isNaN())
++            // output should be an int, but still NaN
++            output.setNaNType();
++        else if (src.isInf())
++            // output should be an int, but still Inf
++            output.setInfType(signBitSet(src.getnumber()));
++        else if (src.isNegativeZero())
++            // output should be an int, but still -0
++            output.setNegativeZeroType();
++        else
++            output.setint(qFloor(src.getnumber()));
+     }
+     QML_V4_END_INSTR(MathFloorNumber, unaryop)
+ 
+@@ -1854,8 +1868,16 @@ void QV4Bindings::run(int instrIndex, quint32 &executedBlocks,
+         else if (src.isNegativeZero())
+             // output should be an int, but still -0
+             output.setNegativeZeroType();
+-        else
+-            output.setint(qCeil(src.getnumber()));
++        else {
++            // Ensure that we preserve the sign bit (Math.ceil(-0) -> -0)
++            const double input = src.getnumber();
++            const int ceiled = qCeil(input);
++            if (ceiled == 0 && signBitSet(input)) {
++                output.setNegativeZeroType();
++            } else {
++                output.setint(ceiled);
++            }
++        }
+     }
+     QML_V4_END_INSTR(MathCeilNumber, unaryop)
+ 
+diff --git a/src/qml/qml/v8/qv8engine.cpp b/src/qml/qml/v8/qv8engine.cpp
+index 9f37c2d..cbb9053 100644
+--- a/src/qml/qml/v8/qv8engine.cpp
++++ b/src/qml/qml/v8/qv8engine.cpp
+@@ -1289,6 +1289,8 @@ QVariant QV8Engine::variantFromJS(v8::Handle<v8::Value> value,
+         return variantValue(value);
+     if (isQObject(value))
+         return qVariantFromValue(qtObjectFromJS(value));
++    if (isValueType(value))
++        return toValueType(value);
+     return variantMapFromJS(value->ToObject(), visitedObjects);
+ }
+ 
+diff --git a/src/qml/qml/v8/qv8engine_p.h b/src/qml/qml/v8/qv8engine_p.h
+index 28acd15..09ff7f4 100644
+--- a/src/qml/qml/v8/qv8engine_p.h
++++ b/src/qml/qml/v8/qv8engine_p.h
+@@ -332,6 +332,8 @@ public:
+     // Create a new value type object
+     inline v8::Handle<v8::Value> newValueType(QObject *, int coreIndex, QQmlValueType *);
+     inline v8::Handle<v8::Value> newValueType(const QVariant &, QQmlValueType *);
++    inline bool isValueType(v8::Handle<v8::Value>) const;
++    inline QVariant toValueType(v8::Handle<v8::Value> obj);
+ 
+     // Create a new sequence type object
+     inline v8::Handle<v8::Value> newSequence(int sequenceType, QObject *, int coreIndex, bool *succeeded);
+@@ -599,6 +601,16 @@ v8::Handle<v8::Value> QV8Engine::newValueType(const QVariant &value, QQmlValueTy
+     return m_valueTypeWrapper.newValueType(value, type);
+ }
+ 
++bool QV8Engine::isValueType(v8::Handle<v8::Value> obj) const
++{
++    return obj->IsObject()?m_valueTypeWrapper.isValueType(v8::Handle<v8::Object>::Cast(obj)):false;
++}
++
++QVariant QV8Engine::toValueType(v8::Handle<v8::Value> obj)
++{
++    return obj->IsObject()?m_valueTypeWrapper.toVariant(v8::Handle<v8::Object>::Cast(obj)):QVariant();
++}
++
+ v8::Handle<v8::Value> QV8Engine::newSequence(int sequenceType, QObject *object, int property, bool *succeeded)
+ {
+     return m_sequenceWrapper.newSequence(sequenceType, object, property, succeeded);
+diff --git a/src/qml/qml/v8/qv8valuetypewrapper.cpp b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+index 6a0521b..0408df4 100644
+--- a/src/qml/qml/v8/qv8valuetypewrapper.cpp
++++ b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+@@ -181,6 +181,12 @@ static bool readReferenceValue(QV8ValueTypeReferenceResource *reference)
+     return true;
+ }
+ 
++bool QV8ValueTypeWrapper::isValueType(v8::Handle<v8::Object> obj) const
++{
++    QV8ValueTypeResource *r = v8_resource_cast<QV8ValueTypeResource>(obj);
++    return (r != 0);
++}
++
+ QVariant QV8ValueTypeWrapper::toVariant(v8::Handle<v8::Object> obj, int typeHint, bool *succeeded)
+ {
+     // NOTE: obj must not be an external resource object (ie, wrapper object)
+diff --git a/src/qml/qml/v8/qv8valuetypewrapper_p.h b/src/qml/qml/v8/qv8valuetypewrapper_p.h
+index f3dd246..849ca41 100644
+--- a/src/qml/qml/v8/qv8valuetypewrapper_p.h
++++ b/src/qml/qml/v8/qv8valuetypewrapper_p.h
+@@ -76,6 +76,8 @@ public:
+     v8::Local<v8::Object> newValueType(QObject *, int, QQmlValueType *);
+     v8::Local<v8::Object> newValueType(const QVariant &, QQmlValueType *);
+ 
++    bool isValueType(v8::Handle<v8::Object>) const;
++
+     QVariant toVariant(v8::Handle<v8::Object>, int typeHint, bool *succeeded);
+     QVariant toVariant(v8::Handle<v8::Object>);
+     QVariant toVariant(QV8ObjectResource *);
+diff --git a/tests/auto/qml/v4/data/conditionalExpr.qml b/tests/auto/qml/v4/data/conditionalExpr.qml
+index b74a95a..704f7c6 100644
+--- a/tests/auto/qml/v4/data/conditionalExpr.qml
++++ b/tests/auto/qml/v4/data/conditionalExpr.qml
+@@ -2,5 +2,7 @@ import Qt.v4 1.0
+ 
+ Result {
+     property int n: 2
+-    result: !n ? 100 : 0
++    property int a: n ? 1 : 0
++    property int b: if (n) { 1 } else { 0 }
++    result: (a && b) ? 0 : 1
+ }
+diff --git a/tests/auto/qml/v4/data/integerOperations.qml b/tests/auto/qml/v4/data/integerOperations.qml
+new file mode 100644
+index 0000000..805f456
+--- /dev/null
++++ b/tests/auto/qml/v4/data/integerOperations.qml
+@@ -0,0 +1,59 @@
++import QtQuick 2.0
++
++Item {
++    property int testa1: i1.p1
++    property int testa2: -testa1 - i1.p1
++
++    property int testb1: i1.p1 & 2
++    property int testb2: i1.p2 & 2
++    property int testb3: 2 & i1.p1
++    property int testb4: 2 & i1.p2
++    property int testb5: i1.p1 & i1.p3
++    property int testb6: i1.p2 & i1.p3
++    property int testb7: i1.p3 & i1.p1
++    property int testb8: i1.p3 & i1.p2
++
++    property int testc1: i1.p1 | 2
++    property int testc2: i1.p2 | 2
++    property int testc3: 2 | i1.p1
++    property int testc4: 2 | i1.p2
++    property int testc5: i1.p1 | i1.p3
++    property int testc6: i1.p2 | i1.p3
++    property int testc7: i1.p3 | i1.p1
++    property int testc8: i1.p3 | i1.p2
++
++    property int testd1: i1.p1 ^ 7
++    property int testd2: 7 ^ i1.p1
++    property int testd3: i1.p1 ^ i1.p4
++    property int testd4: i1.p4 ^ i1.p1
++
++    property int teste1: i1.p4 << 2
++    property int teste2: i1.p5 << 2
++    property int teste3: 2 << i1.p4
++    property int teste4: i1.p4 << i1.p3
++    property int teste5: i1.p5 << i1.p3
++    property int teste6: i1.p3 << i1.p4
++
++    property int testf1: i1.p4 >> 2
++    property int testf2: i1.p5 >> 2
++    property int testf3: 2 >> i1.p4
++    property int testf4: i1.p4 >> i1.p3
++    property int testf5: i1.p5 >> i1.p3
++    property int testf6: i1.p3 >> i1.p4
++
++    property int testg1: i1.p4 >>> 2
++    property int testg2: i1.p5 >>> 2
++    property int testg3: 2 >>> i1.p4
++    property int testg4: i1.p4 >>> i1.p3
++    property int testg5: i1.p5 >>> i1.p3
++    property int testg6: i1.p3 >>> i1.p4
++
++    QtObject {
++        id: i1
++        property int p1: 333
++        property int p2: -666
++        property int p3: 2
++        property int p4: 7
++        property int p5: -7
++    }
++ }
+diff --git a/tests/auto/qml/v4/data/jsvalueHandling.qml b/tests/auto/qml/v4/data/jsvalueHandling.qml
+new file mode 100644
+index 0000000..d15e878
+--- /dev/null
++++ b/tests/auto/qml/v4/data/jsvalueHandling.qml
+@@ -0,0 +1,69 @@
++import QtQuick 2.0
++import Qt.v4 1.0
++
++JSValueTest {
++    property bool pBool: true
++    property int pInt: 666
++    property real pReal: 3.1415927
++    property string pString: 'foo'
++    property url pUrl: 'http://tools.ietf.org/html/rfc3986#section-1.1.2'
++    property color pColor: Qt.rgba(1, 0, 0, 0.5)
++    property QtObject pObject: QtObject { property string foo: 'bar' }
++    property var pVar: pUrl
++
++    // Test assignment to QJSValue
++    boolVar: pBool
++    intVar: pInt
++    realVar: pReal
++    stringVar: pString
++    urlVar: pUrl
++    colorVar: pColor
++    objectVar: pObject
++    nullVar: null
++    varVar: pVar
++
++    // Test equivalence
++    property bool boolConversionSuccess: (boolVar == true)
++    property bool intConversionSuccess: (intVar == 666)
++    property bool realConversionSuccess: (realVar == 3.1415927)
++    property bool stringConversionSuccess: (stringVar == 'foo')
++
++    property url comparisonUrl: 'http://tools.ietf.org/html/rfc3986#section-1.1.2'
++    property bool urlConversionSuccess: (urlVar == comparisonUrl)
++
++    property color comparisonColor: Qt.rgba(1, 0, 0, 0.5)
++    property bool colorConversionSuccess: (colorVar == comparisonColor)
++
++    property bool objectConversionSuccess: (objectVar == pObject)
++    property bool nullConversionSuccess: (nullVar == null)
++
++    property bool varConversionSuccess: (varVar == comparisonUrl)
++
++    // Operations are not handled by V4 - they should pass through correctly
++    property var pVarNot: !boolVar
++    property var pVarComplement: ~intVar
++    property var pVarEqual: (boolVar == pBool)
++    property var pVarLiteralEqual: (boolVar == true)
++    property var pVarUnequal: (urlVar == colorVar)
++    property var pVarComparison: (intVar <= intVar)
++    property var pVarShift: (intVar >> 1)
++
++    Component.onCompleted: {
++        if (!boolConversionSuccess) console.warn('QV4: bool conversion failed');
++        if (!intConversionSuccess) console.warn('QV4: int conversion failed');
++        if (!realConversionSuccess) console.warn('QV4: real conversion failed');
++        if (!stringConversionSuccess) console.warn('QV4: string conversion failed');
++        if (!urlConversionSuccess) console.warn('QV4: url conversion failed');
++        if (!colorConversionSuccess) console.warn('QV4: color conversion failed');
++        if (!objectConversionSuccess) console.warn('QV4: object conversion failed');
++        if (!nullConversionSuccess) console.warn('QV4: null conversion failed');
++        if (!varConversionSuccess) console.warn('QV4: var conversion failed');
++        if (pVarNot != false) console.warn('QV4: var negation impeded');
++        if (pVarComplement != ~666) console.warn('QV4: var complement impeded');
++        if (pVarEqual != true) console.warn('QV4: var equality impeded');
++        if (pVarLiteralEqual != true) console.warn('QV4: var/literal equality impeded');
++        if (pVarUnequal != false) console.warn('QV4: var unequality impeded');
++        if (pVarComparison != true) console.warn('QV4: var comparison impeded');
++        if (pVarShift != 333) console.warn('QV4: var shift impeded');
++    }
++}
+diff --git a/tests/auto/qml/v4/data/mathCeil.qml b/tests/auto/qml/v4/data/mathCeil.qml
+index f67838a..1f65066 100644
+--- a/tests/auto/qml/v4/data/mathCeil.qml
++++ b/tests/auto/qml/v4/data/mathCeil.qml
+@@ -22,6 +22,9 @@ Item {
+     property real subtest10: Math.ceil(i1.p10)
+     property bool test10: subtest10 === 0 && (1/subtest10) === -Infinity
+ 
++    property real subtest11: Math.ceil(i1.p11)
++    property bool test11: subtest11 === 0 && (1/subtest11) === -Infinity
++
+     QtObject {
+         id: i1
+         property real p1: -3.7
+@@ -33,5 +36,6 @@ Item {
+         property real p8: Number.POSITIVE_INFINITY
+         property real p9: 0
+         property real p10: -0
++        property real p11: -0.5
+     }
+  }
+diff --git a/tests/auto/qml/v4/data/mathCos.qml b/tests/auto/qml/v4/data/mathCos.qml
+new file mode 100644
+index 0000000..44c47e9
+--- /dev/null
++++ b/tests/auto/qml/v4/data/mathCos.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++
++Item {
++    property real test1: Math.cos(i1.p1)
++    property real test2: Math.cos(i1.p2)
++
++    property real subtest3: Math.cos()
++    property real subtest4: Math.cos(i1.p4)
++    property bool test3: isNaN(subtest3)
++    property bool test4: isNaN(subtest4)
++
++    property real subtest5: Math.cos(i1.p5)
++    property bool test5: isNaN(subtest5)
++    property real test6: Math.cos(i1.p6)
++
++    property real subtest7: Math.cos(i1.p7)
++    property real subtest8: Math.cos(i1.p8)
++    property bool test7: isNaN(subtest7)
++    property bool test8: isNaN(subtest8)
++
++    property real subtest9: Math.cos(i1.p9)
++    property bool test9: subtest9 === 1
++    property real subtest10: Math.cos(i1.p10)
++    property bool test10: subtest10 === 1
++
++    property real subtest11: Math.PI / 6.66
++    property real test11: Math.cos(subtest11)
++
++    QtObject {
++        id: i1
++        property real p1: -3.7
++        property real p2: 4.4
++        property real p4: Number.NaN
++        property string p5: "hello world"
++        property string p6: "82.6"
++        property real p7: Number.NEGATIVE_INFINITY
++        property real p8: Number.POSITIVE_INFINITY
++        property real p9: 0
++        property real p10: -0
++    }
++ }
+diff --git a/tests/auto/qml/v4/data/mathFloor.qml b/tests/auto/qml/v4/data/mathFloor.qml
+new file mode 100644
+index 0000000..3473dcc
+--- /dev/null
++++ b/tests/auto/qml/v4/data/mathFloor.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++
++Item {
++    property real test1: Math.floor(i1.p1)
++    property real test2: Math.floor(i1.p2)
++
++    property real subtest3: Math.floor()
++    property real subtest4: Math.floor(i1.p4)
++    property bool test3: isNaN(subtest3)
++    property bool test4: isNaN(subtest4)
++
++    property real subtest5: Math.floor(i1.p5)
++    property bool test5: isNaN(subtest5)
++    property real test6: Math.floor(i1.p6)
++
++    property real subtest7: Math.floor(i1.p7)
++    property real subtest8: Math.floor(i1.p8)
++    property bool test7: subtest7 === Number.NEGATIVE_INFINITY
++    property bool test8: subtest8 === Number.POSITIVE_INFINITY
++
++    property real test9: Math.floor(i1.p9)
++    property real subtest10: Math.floor(i1.p10)
++    property bool test10: subtest10 === 0 && (1/subtest10) === -Infinity
++
++    QtObject {
++        id: i1
++        property real p1: -3.7
++        property real p2: 4.4
++        property real p4: Number.NaN
++        property string p5: "hello world"
++        property string p6: "82.6"
++        property real p7: Number.NEGATIVE_INFINITY
++        property real p8: Number.POSITIVE_INFINITY
++        property real p9: 0
++        property real p10: -0
++    }
++ }
+diff --git a/tests/auto/qml/v4/data/mathSin.qml b/tests/auto/qml/v4/data/mathSin.qml
+new file mode 100644
+index 0000000..c48ec03
+--- /dev/null
++++ b/tests/auto/qml/v4/data/mathSin.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++
++Item {
++    property real test1: Math.sin(i1.p1)
++    property real test2: Math.sin(i1.p2)
++
++    property real subtest3: Math.sin()
++    property real subtest4: Math.sin(i1.p4)
++    property bool test3: isNaN(subtest3)
++    property bool test4: isNaN(subtest4)
++
++    property real subtest5: Math.sin(i1.p5)
++    property bool test5: isNaN(subtest5)
++    property real test6: Math.sin(i1.p6)
++
++    property real subtest7: Math.sin(i1.p7)
++    property real subtest8: Math.sin(i1.p8)
++    property bool test7: isNaN(subtest7)
++    property bool test8: isNaN(subtest8)
++
++    property real subtest9: Math.sin(i1.p9)
++    property bool test9: subtest9 === 0 && (1/subtest9) === Infinity
++    property real subtest10: Math.sin(i1.p10)
++    property bool test10: subtest10 === 0 && (1/subtest10) === -Infinity
++
++    property real subtest11: Math.PI / 6.66
++    property real test11: Math.sin(subtest11)
++
++    QtObject {
++        id: i1
++        property real p1: -3.7
++        property real p2: 4.4
++        property real p4: Number.NaN
++        property string p5: "hello world"
++        property string p6: "82.6"
++        property real p7: Number.NEGATIVE_INFINITY
++        property real p8: Number.POSITIVE_INFINITY
++        property real p9: 0
++        property real p10: -0
++    }
++ }
+diff --git a/tests/auto/qml/v4/data/strictEquals.qml b/tests/auto/qml/v4/data/strictEquals.qml
+index 3f4d0d8..503ca50 100644
+--- a/tests/auto/qml/v4/data/strictEquals.qml
++++ b/tests/auto/qml/v4/data/strictEquals.qml
+@@ -44,5 +44,10 @@ QtObject {
+     property bool test32: true !== zero
+     property bool test33: true === 1
+     property bool test34: true !== 1
++
++    property bool test35: zero === 5.0
++    property bool test36: zero !== 5.0
++    property bool test37: zero === 1
++    property bool test38: zero !== 1
+ }
+ 
+diff --git a/tests/auto/qml/v4/data/stringComparison.qml b/tests/auto/qml/v4/data/stringComparison.qml
+index 64b6798..d9eab53 100644
+--- a/tests/auto/qml/v4/data/stringComparison.qml
++++ b/tests/auto/qml/v4/data/stringComparison.qml
+@@ -5,6 +5,7 @@ QtObject {
+     property string string2: "aa"
+     property string string3: "aaab"
+     property string string4: "c"
++    property string string5: string2 + string4
+ 
+     property bool test1: string1 > string2
+     property bool test2: string2 < string1
+@@ -12,23 +13,29 @@ QtObject {
+     property bool test4: string3 < string1
+     property bool test5: string1 < string4
+     property bool test6: string4 > string1
++    property bool test7: string1 < string5
++    property bool test8: string5 > string1
+ 
+-    property bool test7: string1 == "aaba"
+-    property bool test8: string1 != "baa"
+-    property bool test9: string1 === "aaba"
+-    property bool test10: string1 !== "baa"
+-    property bool test11: string4 == "c"
+-    property bool test12: string4 != "d"
+-    property bool test13: string4 === "c"
+-    property bool test14: string4 !== "d"
++    property bool test9: string1 == "aaba"
++    property bool test10: string1 != "baa"
++    property bool test11: string1 === "aaba"
++    property bool test12: string1 !== "baa"
++    property bool test13: string4 == "c"
++    property bool test14: string4 != "d"
++    property bool test15: string4 === "c"
++    property bool test16: string4 !== "d"
++    property bool test17: string5 === "aac"
++    property bool test18: string5 !== "aad"
+ 
+-    property bool test15: string1 >= string2
+-    property bool test16: string2 <= string1
+-    property bool test17: string1 >= string3
+-    property bool test18: string3 <= string1
+-    property bool test19: string1 <= string4
+-    property bool test20: string4 >= string1
+-    property bool test21: string4 <= "c"
+-    property bool test22: string4 >= "c"
++    property bool test19: string1 >= string2
++    property bool test20: string2 <= string1
++    property bool test21: string1 >= string3
++    property bool test22: string3 <= string1
++    property bool test23: string1 <= string4
++    property bool test24: string4 >= string1
++    property bool test25: string4 <= "c"
++    property bool test26: string4 >= "c"
++    property bool test27: string5 <= "aac"
++    property bool test28: string5 >= "aac"
+ }
+ 
+diff --git a/tests/auto/qml/v4/testtypes.cpp b/tests/auto/qml/v4/testtypes.cpp
+index 80ccf00..6b0a631 100644
+--- a/tests/auto/qml/v4/testtypes.cpp
++++ b/tests/auto/qml/v4/testtypes.cpp
+@@ -47,4 +47,5 @@ void registerTypes()
+     qmlRegisterType<ResultObject>("Qt.v4", 1,0, "Result");
+     qmlRegisterType<NestedObject>();
+     qmlRegisterType<ConversionObject>("Qt.v4", 1, 0, "Conversion");
++    qmlRegisterType<JSValueTest>("Qt.v4", 1, 0, "JSValueTest");
+ }
+diff --git a/tests/auto/qml/v4/testtypes.h b/tests/auto/qml/v4/testtypes.h
+index 04dd82e..63c8eb7 100644
+--- a/tests/auto/qml/v4/testtypes.h
++++ b/tests/auto/qml/v4/testtypes.h
+@@ -44,6 +44,7 @@
+ #include <QtCore/qobject.h>
+ #include <QtCore/qurl.h>
+ #include <QVector3D>
++#include <QJSValue>
+ 
+ class NestedObject : public QObject
+ {
+@@ -94,6 +95,7 @@ class ConversionObject : public QObject
+     Q_PROPERTY(QString qstringProp READ qstringProp WRITE setQstringProp NOTIFY qstringPropChanged)
+     Q_PROPERTY(QUrl qurlProp READ qurlProp WRITE setQurlProp NOTIFY qurlPropChanged)
+     Q_PROPERTY(QVector3D vec3Prop READ vec3Prop WRITE setVec3Prop NOTIFY vec3PropChanged)
++    Q_PROPERTY(QJSValue jsvalueProp READ jsvalueProp WRITE setJsvalueProp NOTIFY jsvaluePropChanged)
+ 
+ public:
+     ConversionObject() : m_boolProp(false), m_intProp(0), m_floatProp(0.0), m_doubleProp(0.0), m_qrealProp(0.0) {}
+@@ -115,6 +117,8 @@ public:
+     void setQurlProp(const QUrl& v) { m_qurlProp = v; emit qurlPropChanged(); }
+     QVector3D vec3Prop() const { return m_vec3Prop; }
+     void setVec3Prop(const QVector3D& v) { m_vec3Prop = v; emit vec3PropChanged(); }
++    QJSValue jsvalueProp() const { return m_jsvalueProp; }
++    void setJsvalueProp(const QJSValue &v) { m_jsvalueProp = v; emit jsvaluePropChanged(); }
+ 
+ signals:
+     void boolPropChanged();
+@@ -125,6 +129,7 @@ signals:
+     void qstringPropChanged();
+     void qurlPropChanged();
+     void vec3PropChanged();
++    void jsvaluePropChanged();
+ 
+ private:
+     bool m_boolProp;
+@@ -135,6 +140,74 @@ private:
+     QString m_qstringProp;
+     QUrl m_qurlProp;
+     QVector3D m_vec3Prop;
++    QJSValue m_jsvalueProp;
++};
++
++class JSValueTest : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QJSValue boolVar READ boolVar WRITE setBoolVar NOTIFY boolVarChanged)
++    Q_PROPERTY(QJSValue intVar READ intVar WRITE setIntVar NOTIFY intVarChanged)
++    Q_PROPERTY(QJSValue realVar READ realVar WRITE setRealVar NOTIFY realVarChanged)
++    Q_PROPERTY(QJSValue stringVar READ stringVar WRITE setStringVar NOTIFY stringVarChanged)
++    Q_PROPERTY(QJSValue urlVar READ urlVar WRITE setUrlVar NOTIFY urlVarChanged)
++    Q_PROPERTY(QJSValue colorVar READ colorVar WRITE setColorVar NOTIFY colorVarChanged)
++    Q_PROPERTY(QJSValue objectVar READ objectVar WRITE setObjectVar NOTIFY objectVarChanged)
++    Q_PROPERTY(QJSValue nullVar READ nullVar WRITE setNullVar NOTIFY nullVarChanged)
++    Q_PROPERTY(QJSValue varVar READ varVar WRITE setVarVar NOTIFY varVarChanged)
++
++public:
++    JSValueTest() {}
++    ~JSValueTest() {}
++
++    QJSValue boolVar() const { return m_boolVar; }
++    void setBoolVar(const QJSValue &v) { m_boolVar = v; emit boolVarChanged(); }
++
++    QJSValue intVar() const { return m_intVar; }
++    void setIntVar(const QJSValue &v) { m_intVar = v; emit intVarChanged(); }
++
++    QJSValue realVar() const { return m_realVar; }
++    void setRealVar(const QJSValue &v) { m_realVar = v; emit realVarChanged(); }
++
++    QJSValue stringVar() const { return m_stringVar; }
++    void setStringVar(const QJSValue &v) { m_stringVar = v; emit stringVarChanged(); }
++
++    QJSValue urlVar() const { return m_urlVar; }
++    void setUrlVar(const QJSValue &v) { m_urlVar = v; emit urlVarChanged(); }
++
++    QJSValue colorVar() const { return m_colorVar; }
++    void setColorVar(const QJSValue &v) { m_colorVar = v; emit colorVarChanged(); }
++
++    QJSValue objectVar() const { return m_objectVar; }
++    void setObjectVar(const QJSValue &v) { m_objectVar = v; emit objectVarChanged(); }
++
++    QJSValue nullVar() const { return m_nullVar; }
++    void setNullVar(const QJSValue &v) { m_nullVar = v; emit nullVarChanged(); }
++
++    QJSValue varVar() const { return m_varVar; }
++    void setVarVar(const QJSValue &v) { m_varVar = v; emit varVarChanged(); }
++
++signals:
++    void boolVarChanged();
++    void intVarChanged();
++    void realVarChanged();
++    void stringVarChanged();
++    void urlVarChanged();
++    void colorVarChanged();
++    void objectVarChanged();
++    void nullVarChanged();
++    void varVarChanged();
++
++private:
++    QJSValue m_boolVar;
++    QJSValue m_intVar;
++    QJSValue m_realVar;
++    QJSValue m_stringVar;
++    QJSValue m_urlVar;
++    QJSValue m_colorVar;
++    QJSValue m_objectVar;
++    QJSValue m_nullVar;
++    QJSValue m_varVar;
+ };
+ 
+ void registerTypes();
+diff --git a/tests/auto/qml/v4/tst_v4.cpp b/tests/auto/qml/v4/tst_v4.cpp
+index 78d6b86..fa01baf 100644
+--- a/tests/auto/qml/v4/tst_v4.cpp
++++ b/tests/auto/qml/v4/tst_v4.cpp
+@@ -80,9 +80,13 @@ private slots:
+     void colorType();
+     void mathAbs();
+     void mathCeil();
++    void mathFloor();
+     void mathMax();
+     void mathMin();
++    void mathCos();
++    void mathSin();
+     void singletonType();
++    void integerOperations();
+ 
+     void conversions_data();
+     void conversions();
+@@ -100,22 +104,29 @@ void tst_v4::initTestCase()
+     registerTypes();
+ }
+ 
+-static int v4ErrorsMsgCount = 0;
++static int v4ErrorCount;
++static QList<QByteArray> v4ErrorMessages;
+ static void v4ErrorsMsgHandler(QtMsgType, const char *message)
+ {
+     QByteArray m(message);
++    v4ErrorMessages.append(m);
++
+     if (m.contains("QV4"))
+-        v4ErrorsMsgCount++;
++        ++v4ErrorCount;
+ }
+ 
+ void tst_v4::qtscript()
+ {
++    if (strcmp(QTest::currentDataTag(), "jsvalueHandling") == 0)
++        QSKIP("Test failing - QTBUG-26951");
++
+     QFETCH(QString, file);
+     QV4Compiler::enableBindingsTest(true);
+ 
+     QQmlComponent component(&engine, testFileUrl(file));
+ 
+-    v4ErrorsMsgCount = 0;
++    v4ErrorCount = 0;
++    v4ErrorMessages.clear();
+     QtMsgHandler old = qInstallMsgHandler(v4ErrorsMsgHandler);
+ 
+     QObject *o = component.create();
+@@ -123,7 +134,11 @@ void tst_v4::qtscript()
+ 
+     qInstallMsgHandler(old);
+ 
+-    QCOMPARE(v4ErrorsMsgCount, 0);
++    if (v4ErrorCount) {
++        foreach (const QByteArray &msg, v4ErrorMessages)
++            qDebug() << msg;
++    }
++    QCOMPARE(v4ErrorCount, 0);
+ 
+     QV4Compiler::enableBindingsTest(false);
+ }
+@@ -152,6 +167,8 @@ void tst_v4::qtscript_data()
+     QTest::newRow("conversion from vec3") << "conversions.8.qml";
+     QTest::newRow("variantHandling") << "variantHandling.qml";
+     QTest::newRow("varHandling") << "varHandling.qml";
++    QTest::newRow("jsvalueHandling") << "jsvalueHandling.qml";
++    QTest::newRow("integerOperations") << "integerOperations.qml";
+ }
+ 
+ void tst_v4::unnecessaryReeval()
+@@ -558,6 +575,28 @@ void tst_v4::mathCeil()
+     QCOMPARE(o->property("test8").toBool(), true);
+     QCOMPARE(o->property("test9").toInt(), 0);
+     QCOMPARE(o->property("test10").toBool(), true);
++    QCOMPARE(o->property("test11").toBool(), true);
++
++    delete o;
++}
++
++void tst_v4::mathFloor()
++{
++    QQmlComponent component(&engine, testFileUrl("mathFloor.qml"));
++
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++
++    QCOMPARE(o->property("test1").toReal(), qreal(-4));
++    QCOMPARE(o->property("test2").toReal(), qreal(4));
++    QCOMPARE(o->property("test3").toBool(), true);
++    QCOMPARE(o->property("test4").toBool(), true);
++    QCOMPARE(o->property("test5").toBool(), true);
++    QCOMPARE(o->property("test6").toReal(), qreal(82));
++    QCOMPARE(o->property("test7").toBool(), true);
++    QCOMPARE(o->property("test8").toBool(), true);
++    QCOMPARE(o->property("test9").toInt(), 0);
++    QCOMPARE(o->property("test10").toBool(), true);
+ 
+     delete o;
+ }
+@@ -609,6 +648,113 @@ void tst_v4::mathMin()
+     delete o;
+ }
+ 
++static bool fuzzyCompare(qreal a, qreal b)
++{
++    const qreal EPSILON = 0.0001;
++    return (a + EPSILON > b) && (a - EPSILON < b);
++}
++
++void tst_v4::mathCos()
++{
++    QQmlComponent component(&engine, testFileUrl("mathCos.qml"));
++
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++
++    QVERIFY(fuzzyCompare(o->property("test1").toReal(), qreal(-0.848100)));
++    QVERIFY(fuzzyCompare(o->property("test2").toReal(), qreal(-0.307333)));
++    QCOMPARE(o->property("test3").toBool(), true);
++    QCOMPARE(o->property("test4").toBool(), true);
++    QCOMPARE(o->property("test5").toBool(), true);
++    QVERIFY(fuzzyCompare(o->property("test6").toReal(), qreal(0.606941)));
++    QCOMPARE(o->property("test7").toBool(), true);
++    QCOMPARE(o->property("test8").toBool(), true);
++    QCOMPARE(o->property("test9").toBool(), true);
++    QCOMPARE(o->property("test10").toBool(), true);
++    QVERIFY(fuzzyCompare(o->property("test11").toReal(), qreal(0.890792)));
++
++    delete o;
++}
++
++void tst_v4::mathSin()
++{
++    QQmlComponent component(&engine, testFileUrl("mathSin.qml"));
++
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++
++    QVERIFY(fuzzyCompare(o->property("test1").toReal(), qreal(0.529836)));
++    QVERIFY(fuzzyCompare(o->property("test2").toReal(), qreal(-0.951602)));
++    QCOMPARE(o->property("test3").toBool(), true);
++    QCOMPARE(o->property("test4").toBool(), true);
++    QCOMPARE(o->property("test5").toBool(), true);
++    QVERIFY(fuzzyCompare(o->property("test6").toReal(), qreal(0.794747)));
++    QCOMPARE(o->property("test7").toBool(), true);
++    QCOMPARE(o->property("test8").toBool(), true);
++    QCOMPARE(o->property("test9").toBool(), true);
++    QCOMPARE(o->property("test10").toBool(), true);
++    QVERIFY(fuzzyCompare(o->property("test11").toReal(), qreal(0.454411)));
++
++    delete o;
++}
++
++void tst_v4::integerOperations()
++{
++    QQmlComponent component(&engine, testFileUrl("integerOperations.qml"));
++
++    QObject *o = component.create();
++    QVERIFY(o != 0);
++
++    QCOMPARE(o->property("testa1").toInt(), 333);
++    QCOMPARE(o->property("testa2").toInt(), -666);
++
++    QCOMPARE(o->property("testb1").toInt(), 0);
++    QCOMPARE(o->property("testb2").toInt(), 2);
++    QCOMPARE(o->property("testb3").toInt(), 0);
++    QCOMPARE(o->property("testb4").toInt(), 2);
++    QCOMPARE(o->property("testb5").toInt(), 0);
++    QCOMPARE(o->property("testb6").toInt(), 2);
++    QCOMPARE(o->property("testb7").toInt(), 0);
++    QCOMPARE(o->property("testb8").toInt(), 2);
++
++    QCOMPARE(o->property("testc1").toInt(), 335);
++    QCOMPARE(o->property("testc2").toInt(), -666);
++    QCOMPARE(o->property("testc3").toInt(), 335);
++    QCOMPARE(o->property("testc4").toInt(), -666);
++    QCOMPARE(o->property("testc5").toInt(), 335);
++    QCOMPARE(o->property("testc6").toInt(), -666);
++    QCOMPARE(o->property("testc7").toInt(), 335);
++    QCOMPARE(o->property("testc8").toInt(), -666);
++
++    QCOMPARE(o->property("testd1").toInt(), 330);
++    QCOMPARE(o->property("testd2").toInt(), 330);
++    QCOMPARE(o->property("testd3").toInt(), 330);
++    QCOMPARE(o->property("testd4").toInt(), 330);
++
++    QCOMPARE(o->property("teste1").toInt(), 28);
++    QCOMPARE(o->property("teste2").toInt(), -28);
++    QCOMPARE(o->property("teste3").toInt(), 256);
++    QCOMPARE(o->property("teste4").toInt(), 28);
++    QCOMPARE(o->property("teste5").toInt(), -28);
++    QCOMPARE(o->property("teste6").toInt(), 256);
++
++    QCOMPARE(o->property("testf1").toInt(), 1);
++    QCOMPARE(o->property("testf2").toInt(), -2);
++    QCOMPARE(o->property("testf3").toInt(), 0);
++    QCOMPARE(o->property("testf4").toInt(), 1);
++    QCOMPARE(o->property("testf5").toInt(), -2);
++    QCOMPARE(o->property("testf6").toInt(), 0);
++
++    QCOMPARE(o->property("testg1").toInt(), 1);
++    QCOMPARE(o->property("testg2").toInt(), 0x3FFFFFFE);
++    QCOMPARE(o->property("testg3").toInt(), 0);
++    QCOMPARE(o->property("testg4").toInt(), 1);
++    QCOMPARE(o->property("testg5").toInt(), 0x3FFFFFFE);
++    QCOMPARE(o->property("testg6").toInt(), 0);
++
++    delete o;
++}
++
+ class V4SingletonType : public QObject
+ {
+     Q_OBJECT

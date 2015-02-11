@@ -1,0 +1,146 @@
+diff --git a/src/plugins/platforms/windows/qwindowsmousehandler.cpp b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+index f1e3d70..5098010 100644
+--- a/src/plugins/platforms/windows/qwindowsmousehandler.cpp
++++ b/src/plugins/platforms/windows/qwindowsmousehandler.cpp
+@@ -175,9 +175,26 @@ bool QWindowsMouseHandler::translateMouseEvent(QWindow *window, HWND hwnd,
+         return true;
+     }
+     compressMouseMove(&msg);
++    QWindowsWindow *platformWindow = static_cast<QWindowsWindow *>(window->handle());
++    // Qt expects the platform plugin to capture the mouse on
++    // any button press until release.
++    if (!platformWindow->hasMouseCapture()
++        && (msg.message == WM_LBUTTONDOWN || msg.message == WM_MBUTTONDOWN
++            || msg.message == WM_RBUTTONDOWN)) {
++        platformWindow->setMouseGrabEnabled(true);
++        platformWindow->setFlag(QWindowsWindow::AutoMouseCapture);
++        if (QWindowsContext::verboseEvents)
++            qDebug() << "Automatic mouse capture " << window;
++    } else if (platformWindow->hasMouseCapture()
++               && platformWindow->testFlag(QWindowsWindow::AutoMouseCapture)
++               && (msg.message == WM_LBUTTONUP || msg.message == WM_MBUTTONUP
++                   || msg.message == WM_RBUTTONUP)) {
++        platformWindow->setMouseGrabEnabled(false);
++        if (QWindowsContext::verboseEvents)
++            qDebug() << "Releasing automatic mouse capture " << window;
++    }
+     // Eat mouse move after size grip drag.
+     if (msg.message == WM_MOUSEMOVE) {
+-        QWindowsWindow *platformWindow = static_cast<QWindowsWindow *>(window->handle());
+         if (platformWindow->testFlag(QWindowsWindow::SizeGripOperation)) {
+             MSG mouseMsg;
+             while (PeekMessage(&mouseMsg, platformWindow->handle(), WM_MOUSEMOVE, WM_MOUSEMOVE, PM_REMOVE)) ;
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index b43032d..d58d10b 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -696,7 +696,6 @@ QWindowsWindow::QWindowsWindow(QWindow *aWindow, const WindowData &data) :
+     m_hdc(0),
+     m_windowState(Qt::WindowNoState),
+     m_opacity(1.0),
+-    m_mouseGrab(false),
+     m_cursor(QWindowsScreen::screenOf(aWindow)->windowsCursor()->standardWindowCursor()),
+     m_dropTarget(0),
+     m_savedStyle(0),
+@@ -738,6 +737,8 @@ void QWindowsWindow::destroyWindow()
+     if (QWindowsContext::verboseIntegration || QWindowsContext::verboseWindows)
+         qDebug() << __FUNCTION__ << this << window() << m_data.hwnd;
+     if (m_data.hwnd) { // Stop event dispatching before Window is destroyed.
++        if (hasMouseCapture())
++            setMouseGrabEnabled(false);
+         unregisterDropSite();
+         QWindowsContext::instance()->removeWindow(m_data.hwnd);
+ #ifdef QT_OPENGL_ES_2
+@@ -811,6 +812,8 @@ void QWindowsWindow::setVisible(bool visible)
+             QWindowSystemInterface::handleExposeEvent(window(),
+                                                       QRect(QPoint(), geometry().size()));
+         } else {
++            if (hasMouseCapture())
++                setMouseGrabEnabled(false);
+             hide_sys();
+             QWindowSystemInterface::handleExposeEvent(window(), QRegion());
+         }
+@@ -1495,29 +1498,27 @@ bool QWindowsWindow::setKeyboardGrabEnabled(bool grab)
+ 
+ bool QWindowsWindow::setMouseGrabEnabled(bool grab)
+ {
+-    bool result = false;
++    if (QWindowsContext::verboseWindows)
++        qDebug() << __FUNCTION__ << window() << grab;
+     if (!m_data.hwnd) {
+         qWarning("%s: No handle", __FUNCTION__);
+-        return result;
++        return false;
+     }
+-    if (QWindowsContext::verboseWindows)
+-        qDebug() << __FUNCTION__ << window() << grab;
+-
+-    if (m_mouseGrab != grab) {
+-        m_mouseGrab = grab;
+-        if (isVisible())
+-            setMouseGrabEnabled_sys(grab);
++    if (!isVisible() && grab) {
++        qWarning("%s: Not setting mouse grab for invisible window %s",
++                 __FUNCTION__, qPrintable(window()->objectName()));
++        return false;
+     }
+-    return grab;
+-}
+-
+-void QWindowsWindow::setMouseGrabEnabled_sys(bool grab)
+-{
+-    if (grab) {
+-        SetCapture(m_data.hwnd);
+-    } else {
+-        ReleaseCapture();
++    // release grab or an explicit grab overriding autocapture: Clear flag.
++    clearFlag(QWindowsWindow::AutoMouseCapture);
++    if (hasMouseCapture() != grab) {
++        if (grab) {
++            SetCapture(m_data.hwnd);
++        } else {
++            ReleaseCapture();
++        }
+     }
++    return grab;
+ }
+ 
+ static inline DWORD cornerToWinOrientation(Qt::Corner corner)
+diff --git a/src/plugins/platforms/windows/qwindowswindow.h b/src/plugins/platforms/windows/qwindowswindow.h
+index 35790e2..2bcca87 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.h
++++ b/src/plugins/platforms/windows/qwindowswindow.h
+@@ -126,7 +126,8 @@ public:
+         SizeGripOperation = 0x100,
+         FrameStrutEventsEnabled = 0x200,
+         SynchronousGeometryChangeEvent = 0x400,
+-        WithinSetStyle = 0x800
++        WithinSetStyle = 0x800,
++        AutoMouseCapture = 0x1000 //! Automatic mouse capture on button press.
+     };
+ 
+     struct WindowData
+@@ -179,6 +180,7 @@ public:
+ 
+     virtual bool setKeyboardGrabEnabled(bool grab);
+     virtual bool setMouseGrabEnabled(bool grab);
++    inline bool hasMouseCapture() const { return GetCapture() == m_data.hwnd; }
+ 
+     virtual bool startSystemResize(const QPoint &pos, Qt::Corner corner);
+ 
+@@ -249,7 +251,6 @@ private:
+     inline bool isFullScreen_sys() const;
+     inline void setWindowState_sys(Qt::WindowState newState);
+     inline void setParent_sys(const QPlatformWindow *parent) const;
+-    inline void setMouseGrabEnabled_sys(bool grab);
+     void destroyWindow();
+     void registerDropSite();
+     void unregisterDropSite();
+@@ -261,7 +262,6 @@ private:
+     HDC m_hdc;
+     Qt::WindowState m_windowState;
+     qreal m_opacity;
+-    bool m_mouseGrab;
+     QWindowsWindowCursor m_cursor;
+     QWindowsOleDropTarget *m_dropTarget;
+     unsigned m_savedStyle;

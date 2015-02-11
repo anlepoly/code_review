@@ -1,0 +1,1385 @@
+diff --git a/src/corelib/kernel/qcoreapplication.cpp b/src/corelib/kernel/qcoreapplication.cpp
+index ae30167..a248e18 100644
+--- a/src/corelib/kernel/qcoreapplication.cpp
++++ b/src/corelib/kernel/qcoreapplication.cpp
+@@ -271,6 +271,8 @@ struct QCoreApplicationData {
+ 
+ Q_GLOBAL_STATIC(QCoreApplicationData, coreappdata)
+ 
++static bool quitLockRefEnabled = true;
++
+ QCoreApplicationPrivate::QCoreApplicationPrivate(int &aargc, char **aargv, uint flags)
+     : QObjectPrivate(), argc(aargc), argv(aargv), application_type(0), eventFilter(0),
+       in_exec(false), aboutToQuitEmitted(false), threadData_clean(false)
+@@ -649,6 +651,29 @@ bool QCoreApplication::testAttribute(Qt::ApplicationAttribute attribute)
+     return QCoreApplicationPrivate::testAttribute(attribute);
+ }
+ 
++/*!/
++    Returns true if the use of the QEventLoopLocker feature can cause the
++    application to quit, otherwise returns false.
++
++    \sa QEventLoopLocker
++ */
++bool QCoreApplication::isQuitLockEnabled()
++{
++    return quitLockRefEnabled;
++}
++
++/*!
++    Enables the ability of the QEventLoopLocker feature to quit
++    the application.
++
++    If disabled, the use of QEventLoopLocker will not quit the application.
++
++    \sa QEventLoopLocker
++ */
++void QCoreApplication::setQuitLockEnabled(bool enabled)
++{
++    quitLockRefEnabled = enabled;
++}
+ 
+ /*!
+   \internal
+@@ -1476,6 +1501,17 @@ bool QCoreApplication::event(QEvent *e)
+     \sa QObject::tr(), QObject::trUtf8(), QString::fromUtf8()
+ */
+ 
++void QCoreApplicationPrivate::ref()
++{
++    quitLockRef.ref();
++}
++
++void QCoreApplicationPrivate::deref()
++{
++    if (!quitLockRef.deref() && in_exec && quitLockRefEnabled)
++        QCoreApplication::postEvent(qApp, new QEvent(QEvent::Quit));
++}
++
+ /*!
+     Tells the application to exit with return code 0 (success).
+     Equivalent to calling QCoreApplication::exit(0).
+diff --git a/src/corelib/kernel/qcoreapplication.h b/src/corelib/kernel/qcoreapplication.h
+index 45583a6..d1fba3b 100644
+--- a/src/corelib/kernel/qcoreapplication.h
++++ b/src/corelib/kernel/qcoreapplication.h
+@@ -71,6 +71,7 @@ class Q_CORE_EXPORT QCoreApplication : public QObject
+     Q_PROPERTY(QString applicationVersion READ applicationVersion WRITE setApplicationVersion)
+     Q_PROPERTY(QString organizationName READ organizationName WRITE setOrganizationName)
+     Q_PROPERTY(QString organizationDomain READ organizationDomain WRITE setOrganizationDomain)
++    Q_PROPERTY(bool quitLockEnabled READ isQuitLockEnabled WRITE setQuitLockEnabled)
+ 
+     Q_DECLARE_PRIVATE(QCoreApplication)
+ public:
+@@ -160,6 +161,9 @@ public:
+     EventFilter setEventFilter(EventFilter filter);
+     bool filterEvent(void *message, long *result);
+ 
++    static bool isQuitLockEnabled();
++    static void setQuitLockEnabled(bool enabled);
++
+ public Q_SLOTS:
+     static void quit();
+ 
+@@ -183,7 +187,7 @@ private:
+     void init();
+ 
+     static QCoreApplication *self;
+-    
++
+     Q_DISABLE_COPY(QCoreApplication)
+ 
+     friend class QEventDispatcherUNIXPrivate;
+diff --git a/src/corelib/kernel/qcoreapplication_p.h b/src/corelib/kernel/qcoreapplication_p.h
+index b5b6c0d..861a046 100644
+--- a/src/corelib/kernel/qcoreapplication_p.h
++++ b/src/corelib/kernel/qcoreapplication_p.h
+@@ -89,6 +89,10 @@ public:
+     static QString macMenuBarName();
+ #endif
+ 
++    QAtomicInt quitLockRef;
++    void ref();
++    void deref();
++
+     static QThread *theMainThread;
+     static QThread *mainThread();
+     static bool checkInstance(const char *method);
+diff --git a/src/corelib/kernel/qeventloop.cpp b/src/corelib/kernel/qeventloop.cpp
+index 0c1b8c7..8b0ec85 100644
+--- a/src/corelib/kernel/qeventloop.cpp
++++ b/src/corelib/kernel/qeventloop.cpp
+@@ -43,24 +43,15 @@
+ 
+ #include "qabstracteventdispatcher.h"
+ #include "qcoreapplication.h"
++#include "qcoreapplication_p.h"
+ #include "qelapsedtimer.h"
+ 
+ #include "qobject_p.h"
++#include "qeventloop_p.h"
+ #include <private/qthread_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QEventLoopPrivate : public QObjectPrivate
+-{
+-    Q_DECLARE_PUBLIC(QEventLoop)
+-public:
+-    inline QEventLoopPrivate()
+-        : exit(true), inExec(false), returnCode(-1)
+-    { }
+-    bool exit, inExec;
+-    int returnCode;
+-};
+-
+ /*!
+     \class QEventLoop
+     \brief The QEventLoop class provides a means of entering and leaving an event loop.
+@@ -305,6 +296,17 @@ void QEventLoop::wakeUp()
+     d->threadData->eventDispatcher->wakeUp();
+ }
+ 
++
++bool QEventLoop::event(QEvent *event)
++{
++    if (event->type() == QEvent::Quit) {
++        quit();
++        return true;
++    } else {
++        return QObject::event(event);
++    }
++}
++
+ /*!
+     Tells the event loop to exit normally.
+ 
+@@ -315,4 +317,85 @@ void QEventLoop::wakeUp()
+ void QEventLoop::quit()
+ { exit(0); }
+ 
++
++class QEventLoopLockerPrivate
++{
++public:
++    explicit QEventLoopLockerPrivate(QEventLoopPrivate *loop)
++      : loop(loop), app(0)
++    {
++        loop->ref();
++    }
++
++    explicit QEventLoopLockerPrivate(QCoreApplicationPrivate *app)
++      : loop(0), app(app)
++    {
++        app->ref();
++    }
++
++    ~QEventLoopLockerPrivate()
++    {
++        if (loop)
++            loop->deref();
++        else
++            app->deref();
++    }
++
++private:
++    QEventLoopPrivate *loop;
++    QCoreApplicationPrivate *app;
++};
++
++/*!
++    \class QEventLoopLocker
++    \brief The QEventLoopLocker class provides a means to quit an event loop when it is no longer needed.
++
++    The QEventLoopLocker operates on particular objects - either a QCoreApplication
++    instance or a QEventLoop instance.
++
++    This makes it possible to, for example, run a batch of jobs with an event loop
++    and exit that event loop after the last job is finished. That is accomplished
++    by keeping a QEventLoopLocker with each job instance.
++
++    The variant which operates on QCoreApplication makes it possible to finish
++    asynchronously running jobs after the last gui window has been closed. This
++    can be useful for example for running a job which uploads data to a network.
++
++    \sa QEventLoop, QCoreApplication
++*/
++
++/*!
++    Creates an event locker operating on the \p app.
++
++    The application will quit when there are no more QEventLoopLockers operating on it.
++
++    \sa QCoreApplication::quit(), QCoreApplication::isQuitLockEnabled()
++ */
++QEventLoopLocker::QEventLoopLocker()
++  : d_ptr(new QEventLoopLockerPrivate(static_cast<QCoreApplicationPrivate*>(QObjectPrivate::get(QCoreApplication::instance()))))
++{
++
++}
++
++/*!
++    Creates an event locker operating on the \p app.
++
++    This particular QEventLoop will quit when there are no more QEventLoopLockers operating on it.
++
++    \sa QEventLoop::quit()
++ */
++QEventLoopLocker::QEventLoopLocker(QEventLoop *loop)
++  : d_ptr(new QEventLoopLockerPrivate(static_cast<QEventLoopPrivate*>(QObjectPrivate::get(loop))))
++{
++
++}
++
++/*!
++    Destroys this event loop locker object
++ */
++QEventLoopLocker::~QEventLoopLocker()
++{
++    delete d_ptr;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/corelib/kernel/qeventloop.h b/src/corelib/kernel/qeventloop.h
+index 3f5cce2..0e7195d 100644
+--- a/src/corelib/kernel/qeventloop.h
++++ b/src/corelib/kernel/qeventloop.h
+@@ -80,12 +80,29 @@ public:
+ 
+     void wakeUp();
+ 
++    bool event(QEvent *event);
++
+ public Q_SLOTS:
+     void quit();
+ };
+ 
+ Q_DECLARE_OPERATORS_FOR_FLAGS(QEventLoop::ProcessEventsFlags)
+ 
++
++class QEventLoopLockerPrivate;
++
++class Q_CORE_EXPORT QEventLoopLocker
++{
++public:
++    QEventLoopLocker();
++    explicit QEventLoopLocker(QEventLoop *loop);
++    ~QEventLoopLocker();
++
++private:
++    Q_DISABLE_COPY(QEventLoopLocker)
++    QEventLoopLockerPrivate *d_ptr;
++};
++
+ QT_END_NAMESPACE
+ 
+ QT_END_HEADER
+diff --git a/src/corelib/kernel/qeventloop_p.h b/src/corelib/kernel/qeventloop_p.h
+new file mode 100644
+index 0000000..5770ed0
+--- /dev/null
++++ b/src/corelib/kernel/qeventloop_p.h
+@@ -0,0 +1,83 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtCore module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QEVENTLOOP_P_H
++#define QEVENTLOOP_P_H
++
++#include "qobject_p.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++QT_MODULE(Core)
++
++class QEventLoopPrivate : public QObjectPrivate
++{
++    Q_DECLARE_PUBLIC(QEventLoop)
++public:
++    inline QEventLoopPrivate()
++        : exit(true), inExec(false), returnCode(-1)
++    { }
++
++    QAtomicInt quitLockRef;
++
++    bool exit, inExec;
++    int returnCode;
++
++    void ref()
++    {
++        quitLockRef.ref();
++    }
++
++    void deref()
++    {
++        if (!quitLockRef.deref() && inExec) {
++            qApp->postEvent(q_ptr, new QEvent(QEvent::Quit));
++        }
++    }
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif // QEVENTLOOP_P_H
+diff --git a/src/gui/kernel/qguiapplication.cpp b/src/gui/kernel/qguiapplication.cpp
+index ea562c7..9f7bc24 100644
+--- a/src/gui/kernel/qguiapplication.cpp
++++ b/src/gui/kernel/qguiapplication.cpp
+@@ -107,8 +107,6 @@ int QGuiApplicationPrivate::mousePressX = 0;
+ int QGuiApplicationPrivate::mousePressY = 0;
+ int QGuiApplicationPrivate::mouse_double_click_distance = 5;
+ 
+-bool QGuiApplicationPrivate::quitOnLastWindowClosed = true;
+-
+ static Qt::LayoutDirection layout_direction = Qt::LeftToRight;
+ static bool force_reverse = false;
+ 
+@@ -1388,14 +1386,14 @@ void QGuiApplicationPrivate::notifyActiveWindowChange(QWindow *)
+ 
+ void QGuiApplication::setQuitOnLastWindowClosed(bool quit)
+ {
+-    QGuiApplicationPrivate::quitOnLastWindowClosed = quit;
++    QCoreApplication::setQuitLockEnabled(quit);
+ }
+ 
+ 
+ 
+ bool QGuiApplication::quitOnLastWindowClosed()
+ {
+-    return QGuiApplicationPrivate::quitOnLastWindowClosed;
++    return QCoreApplication::isQuitLockEnabled();
+ }
+ 
+ 
+@@ -1403,11 +1401,6 @@ bool QGuiApplication::quitOnLastWindowClosed()
+ void QGuiApplicationPrivate::emitLastWindowClosed()
+ {
+     if (qGuiApp && qGuiApp->d_func()->in_exec) {
+-        if (QGuiApplicationPrivate::quitOnLastWindowClosed) {
+-            // get ready to quit, this event might be removed if the
+-            // event loop is re-entered, however
+-            QGuiApplication::postEvent(qApp, new QEvent(QEvent::Quit));
+-        }
+         emit qGuiApp->lastWindowClosed();
+     }
+ }
+diff --git a/src/gui/kernel/qguiapplication_p.h b/src/gui/kernel/qguiapplication_p.h
+index 6d3e650..2f1cfa5 100644
+--- a/src/gui/kernel/qguiapplication_p.h
++++ b/src/gui/kernel/qguiapplication_p.h
+@@ -183,8 +183,6 @@ public:
+     QStyleHints *styleHints;
+     QInputPanel *inputPanel;
+ 
+-    static bool quitOnLastWindowClosed;
+-
+     static QList<QObject *> generic_plugin_list;
+ #ifndef QT_NO_SHORTCUT
+     QShortcutMap shortcutMap;
+diff --git a/src/gui/kernel/qwindow.cpp b/src/gui/kernel/qwindow.cpp
+index e85d837..4436884 100644
+--- a/src/gui/kernel/qwindow.cpp
++++ b/src/gui/kernel/qwindow.cpp
+@@ -165,6 +165,14 @@ void QWindow::setVisible(bool visible)
+         return;
+     d->visible = visible;
+     emit visibleChanged(visible);
++    if (QCoreApplication::instance() && !transientParent()) {
++        QCoreApplicationPrivate *applicationPrivate = static_cast<QCoreApplicationPrivate*>(QObjectPrivate::get(QCoreApplication::instance()));
++        if (visible) {
++            applicationPrivate->ref();
++        } else {
++            applicationPrivate->deref();
++        }
++    }
+ 
+     if (!d->platformWindow)
+         create();
+@@ -499,7 +507,19 @@ void QWindow::setWindowState(Qt::WindowState state)
+ void QWindow::setTransientParent(QWindow *parent)
+ {
+     Q_D(QWindow);
++
++    QWindow *previousParent = d->transientParent;
++
+     d->transientParent = parent;
++
++    if (QCoreApplication::instance() && d->visible) {
++        QCoreApplicationPrivate *applicationPrivate = static_cast<QCoreApplicationPrivate*>(QObjectPrivate::get(QCoreApplication::instance()));
++        if (parent && !previousParent) {
++            applicationPrivate->deref();
++        } else if (!parent && previousParent) {
++            applicationPrivate->ref();
++        }
++    }
+ }
+ 
+ QWindow *QWindow::transientParent() const
+diff --git a/src/widgets/kernel/qapplication.cpp b/src/widgets/kernel/qapplication.cpp
+index f4d2856..b0781c2 100644
+--- a/src/widgets/kernel/qapplication.cpp
++++ b/src/widgets/kernel/qapplication.cpp
+@@ -143,8 +143,6 @@ QApplicationPrivate *QApplicationPrivate::self = 0;
+ 
+ QInputContext *QApplicationPrivate::inputContext = 0;
+ 
+-bool QApplicationPrivate::quitOnLastWindowClosed = true;
+-
+ #ifdef Q_WS_WINCE
+ int QApplicationPrivate::autoMaximizeThreshold = -1;
+ bool QApplicationPrivate::autoSipEnabled = false;
+@@ -161,8 +159,6 @@ QApplicationPrivate::QApplicationPrivate(int &argc, char **argv, QApplication::T
+     is_session_restored = false;
+ #endif
+ 
+-    quitOnLastWindowClosed = true;
+-
+ #if defined(Q_WS_QWS) && !defined(QT_NO_DIRECTPAINTER)
+     directPainters = 0;
+ #endif
+@@ -4621,24 +4617,12 @@ bool QApplicationPrivate::inPopupMode() const
+ 
+ void QApplication::setQuitOnLastWindowClosed(bool quit)
+ {
+-    QApplicationPrivate::quitOnLastWindowClosed = quit;
++    QCoreApplication::setQuitLockEnabled(quit);
+ }
+ 
+ bool QApplication::quitOnLastWindowClosed()
+ {
+-    return QApplicationPrivate::quitOnLastWindowClosed;
+-}
+-
+-void QApplicationPrivate::emitLastWindowClosed()
+-{
+-    if (qApp && qApp->d_func()->in_exec) {
+-        if (QApplicationPrivate::quitOnLastWindowClosed) {
+-            // get ready to quit, this event might be removed if the
+-            // event loop is re-entered, however
+-            QApplication::postEvent(qApp, new QEvent(QEvent::Quit));
+-        }
+-        emit qApp->lastWindowClosed();
+-    }
++    return QCoreApplication::isQuitLockEnabled();
+ }
+ 
+ /*! \variable QApplication::NormalColors
+diff --git a/src/widgets/kernel/qapplication_p.h b/src/widgets/kernel/qapplication_p.h
+index eccc1b8..b6fbfa1 100644
+--- a/src/widgets/kernel/qapplication_p.h
++++ b/src/widgets/kernel/qapplication_p.h
+@@ -188,8 +188,6 @@ public:
+     static bool qws_apply_settings();
+     static QWidget *findWidget(const QObjectList&, const QPoint &, bool rec);
+ #endif
+-    static bool quitOnLastWindowClosed;
+-    static void emitLastWindowClosed();
+ #ifdef Q_WS_WINCE
+     static int autoMaximizeThreshold;
+ #endif
+diff --git a/src/widgets/kernel/qwidget.cpp b/src/widgets/kernel/qwidget.cpp
+index a8f3808..e004e15 100644
+--- a/src/widgets/kernel/qwidget.cpp
++++ b/src/widgets/kernel/qwidget.cpp
+@@ -92,6 +92,7 @@
+ #include <private/qpaintengine_raster_p.h>
+ 
+ #include "qwidget_p.h"
++#include <QtGui/private/qwindow_p.h>
+ #include "qaction_p.h"
+ #include "qlayout_p.h"
+ #include "QtWidgets/qgraphicsproxywidget.h"
+@@ -7434,23 +7435,11 @@ bool QWidgetPrivate::close_helper(CloseMode mode)
+     // Attempt to close the application only if this has WA_QuitOnClose set and a non-visible parent
+     quitOnClose = quitOnClose && (parentWidget.isNull() || !parentWidget->isVisible());
+ 
+-    if (quitOnClose) {
+-        /* if there is no non-withdrawn primary window left (except
+-           the ones without QuitOnClose), we emit the lastWindowClosed
+-           signal */
+-        QWidgetList list = QApplication::topLevelWidgets();
+-        bool lastWindowClosed = true;
+-        for (int i = 0; i < list.size(); ++i) {
+-            QWidget *w = list.at(i);
+-            if (!w->isVisible() || w->parentWidget() || !w->testAttribute(Qt::WA_QuitOnClose))
+-                continue;
+-            lastWindowClosed = false;
+-            break;
+-        }
+-        if (lastWindowClosed)
+-            QApplicationPrivate::emitLastWindowClosed();
++    if (quitOnClose && q->windowHandle()) {
++        static_cast<QWindowPrivate*>(QObjectPrivate::get(q->windowHandle()))->maybeQuitOnLastWindowClosed();
+     }
+ 
++
+     if (!that.isNull()) {
+         data.is_closing = 0;
+         if (q->testAttribute(Qt::WA_DeleteOnClose)) {
+diff --git a/tests/auto/corelib/kernel/qcoreapplication/qcoreapplication.pro b/tests/auto/corelib/kernel/qcoreapplication/qcoreapplication.pro
+index f9a38c2..14df20c 100644
+--- a/tests/auto/corelib/kernel/qcoreapplication/qcoreapplication.pro
++++ b/tests/auto/corelib/kernel/qcoreapplication/qcoreapplication.pro
+@@ -1,4 +1,4 @@
+ CONFIG += testcase parallel_test
+ TARGET = tst_qcoreapplication
+-QT = core testlib
++QT = core testlib core-private
+ SOURCES = tst_qcoreapplication.cpp
+diff --git a/tests/auto/corelib/kernel/qcoreapplication/tst_qcoreapplication.cpp b/tests/auto/corelib/kernel/qcoreapplication/tst_qcoreapplication.cpp
+index fc3d8e0..97c9757 100644
+--- a/tests/auto/corelib/kernel/qcoreapplication/tst_qcoreapplication.cpp
++++ b/tests/auto/corelib/kernel/qcoreapplication/tst_qcoreapplication.cpp
+@@ -39,10 +39,13 @@
+ **
+ ****************************************************************************/
+ 
+-
+ #include <QtCore/QtCore>
+ #include <QtTest/QtTest>
+ 
++#include <private/qcoreapplication_p.h>
++#include <private/qeventloop_p.h>
++#include <private/qthread_p.h>
++
+ class tst_QCoreApplication: public QObject
+ {
+     Q_OBJECT
+@@ -63,6 +66,7 @@ private slots:
+     void execAfterExit();
+     void eventLoopExecAfterExit();
+     void customEventDispatcher();
++    void testQuitLock();
+ };
+ 
+ class EventSpy : public QObject
+@@ -640,5 +644,113 @@ void tst_QCoreApplication::customEventDispatcher()
+     QVERIFY(weak_ed.isNull());
+ }
+ 
++class JobObject : public QObject
++{
++    Q_OBJECT
++public:
++
++    explicit JobObject(QEventLoop *loop, QObject *parent = 0)
++        : QObject(parent), locker(loop)
++    {
++        QTimer::singleShot(1000, this, SLOT(timeout()));
++    }
++
++    explicit JobObject(QObject *parent = 0)
++        : QObject(parent)
++    {
++        QTimer::singleShot(1000, this, SLOT(timeout()));
++    }
++
++public slots:
++    void startSecondaryJob()
++    {
++        new JobObject();
++    }
++
++private slots:
++    void timeout()
++    {
++        emit done();
++        deleteLater();
++    }
++
++signals:
++    void done();
++
++private:
++    QEventLoopLocker locker;
++};
++
++class QuitTester : public QObject
++{
++    Q_OBJECT
++public:
++    QuitTester(QObject *parent = 0)
++      : QObject(parent)
++    {
++        QTimer::singleShot(0, this, SLOT(doTest()));
++    }
++
++private slots:
++    void doTest()
++    {
++        QCoreApplicationPrivate *privateClass = static_cast<QCoreApplicationPrivate*>(QObjectPrivate::get(qApp));
++
++        {
++            QCOMPARE(privateClass->quitLockRef.load(), 0);
++            // Test with a lock active so that the refcount doesn't drop to zero during these tests, causing a quit.
++            // (until we exit the scope)
++            QEventLoopLocker locker;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            JobObject *job1 = new JobObject(this);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete job1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            job1 = new JobObject(this);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            JobObject *job2 = new JobObject(this);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            delete job1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            JobObject *job3 = new JobObject(job2);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            JobObject *job4 = new JobObject(job2);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 4);
++
++            delete job2;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++        }
++        QCOMPARE(privateClass->quitLockRef.load(), 0);
++    }
++};
++
++void tst_QCoreApplication::testQuitLock()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QCoreApplication app(argc, argv);
++
++    QuitTester tester;
++    app.exec();
++}
++
++
+ QTEST_APPLESS_MAIN(tst_QCoreApplication)
+ #include "tst_qcoreapplication.moc"
+diff --git a/tests/auto/corelib/kernel/qeventloop/qeventloop.pro b/tests/auto/corelib/kernel/qeventloop/qeventloop.pro
+index d21a7d6..adfc810 100644
+--- a/tests/auto/corelib/kernel/qeventloop/qeventloop.pro
++++ b/tests/auto/corelib/kernel/qeventloop/qeventloop.pro
+@@ -1,6 +1,6 @@
+ CONFIG += testcase
+ TARGET = tst_qeventloop
+-QT = core network testlib
++QT = core network testlib core-private
+ SOURCES = tst_qeventloop.cpp
+ 
+ win32:!wince*:LIBS += -luser32
+diff --git a/tests/auto/corelib/kernel/qeventloop/tst_qeventloop.cpp b/tests/auto/corelib/kernel/qeventloop/tst_qeventloop.cpp
+index 897cba1..e214413 100644
+--- a/tests/auto/corelib/kernel/qeventloop/tst_qeventloop.cpp
++++ b/tests/auto/corelib/kernel/qeventloop/tst_qeventloop.cpp
+@@ -45,6 +45,7 @@
+ #include <qcoreapplication.h>
+ #include <qcoreevent.h>
+ #include <qeventloop.h>
++#include <private/qeventloop_p.h>
+ #include <qmutex.h>
+ #include <qthread.h>
+ #include <qtimer.h>
+@@ -194,6 +195,8 @@ private slots:
+     // keep this test last:
+     void nestedLoops();
+ 
++    void testQuitLock();
++
+ protected:
+     void customEvent(QEvent *e);
+ };
+@@ -640,6 +643,85 @@ void tst_QEventLoop::deliverInDefinedOrder()
+ 
+ }
+ 
++class JobObject : public QObject
++{
++    Q_OBJECT
++public:
++
++    explicit JobObject(QEventLoop *loop, QObject *parent = 0)
++        : QObject(parent), loop(loop), locker(loop)
++    {
++    }
++
++    explicit JobObject(QObject *parent = 0)
++        : QObject(parent)
++    {
++    }
++
++public slots:
++    void start(int timeout = 200)
++    {
++        QTimer::singleShot(timeout, this, SLOT(timeout()));
++    }
++
++private slots:
++    void timeout()
++    {
++        emit done();
++        deleteLater();
++    }
++
++signals:
++    void done();
++
++private:
++    QEventLoop *loop;
++    QEventLoopLocker locker;
++};
++
++void tst_QEventLoop::testQuitLock()
++{
++    QEventLoop eventLoop;
++
++    QTimer timer;
++    timer.setInterval(100);
++    QSignalSpy timerSpy(&timer, SIGNAL(timeout()));
++    timer.start();
++
++    QEventLoopPrivate* privateClass = static_cast<QEventLoopPrivate*>(QObjectPrivate::get(&eventLoop));
++
++    QCOMPARE(privateClass->quitLockRef.load(), 0);
++
++    JobObject *job1 = new JobObject(&eventLoop, this);
++    job1->start(500);
++
++    QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++    eventLoop.exec();
++
++    QCOMPARE(privateClass->quitLockRef.load(), 0);
++
++    // The job takes long enough that the timer times out several times.
++    QVERIFY(timerSpy.count() > 3);
++    timerSpy.clear();
++
++    job1 = new JobObject(&eventLoop, this);
++    job1->start(200);
++
++    JobObject *previousJob = job1;
++    for (int i = 0; i < 9; ++i) {
++        JobObject *subJob = new JobObject(&eventLoop, this);
++        connect(previousJob, SIGNAL(done()), subJob, SLOT(start()));
++        previousJob = subJob;
++    }
++
++    eventLoop.exec();
++
++    qDebug() << timerSpy.count();
++    // The timer times out more if it has more subjobs to do.
++    // We run 10 jobs in sequence here of about 200ms each.
++    QVERIFY(timerSpy.count() > 17);
++}
+ 
+ QTEST_MAIN(tst_QEventLoop)
+ #include "tst_qeventloop.moc"
+diff --git a/tests/auto/widgets/kernel/qapplication/tst_qapplication.cpp b/tests/auto/widgets/kernel/qapplication/tst_qapplication.cpp
+index ac8f2a3..4b8034c 100644
+--- a/tests/auto/widgets/kernel/qapplication/tst_qapplication.cpp
++++ b/tests/auto/widgets/kernel/qapplication/tst_qapplication.cpp
+@@ -49,6 +49,7 @@
+ #include <QtCore/QFileInfo>
+ #include <QtCore/QDir>
+ #include <QtCore/QProcess>
++#include <QtCore/private/qeventloop_p.h>
+ 
+ #include <QtGui/QFontDatabase>
+ #include <QtGui/QClipboard>
+@@ -138,6 +139,16 @@ private slots:
+ 
+     void qtbug_12673();
+ 
++    void testQuitLockRef();
++    void testQuitLock1();
++    void testQuitLock2();
++    void testQuitLock3();
++    void testQuitLock4();
++    void testQuitLock5();
++    void testQuitLock6();
++    void testQuitLock7();
++    void testQuitLock8();
++
+     void globalStaticObjectDestruction(); // run this last
+ };
+ 
+@@ -189,7 +200,6 @@ public:
+         dialog.show();
+         dialog.close();
+ 
+-        hide();
+         event->ignore();
+     }
+ };
+@@ -516,6 +526,7 @@ void tst_QApplication::lastWindowClosed()
+ 
+     QPointer<CloseWidget>widget = new CloseWidget;
+     QVERIFY(widget->testAttribute(Qt::WA_QuitOnClose));
++    widget->show();
+     QObject::connect(&app, SIGNAL(lastWindowClosed()), widget, SLOT(deleteLater()));
+     app.exec();
+     QVERIFY(!widget);
+@@ -2048,6 +2059,509 @@ void tst_QApplication::qtbug_12673()
+     QCOMPARE(testProcess.exitStatus(), QProcess::NormalExit);
+ }
+ 
++class JobObject : public QObject
++{
++    Q_OBJECT
++public:
++    JobObject(int milliseconds, QObject *parent = 0)
++        : QObject(parent)
++    {
++        QTimer::singleShot(milliseconds, this, SLOT(timeout()));
++    }
++
++    JobObject(QObject *parent = 0)
++        : QObject(parent)
++    {
++        QTimer::singleShot(1000, this, SLOT(timeout()));
++    }
++
++private slots:
++    void timeout()
++    {
++        emit done();
++        deleteLater();
++    }
++
++signals:
++    void done();
++
++private:
++    QEventLoopLocker locker;
++};
++
++class QuitLockRefTester : public QObject
++{
++    Q_OBJECT
++public:
++    QuitLockRefTester(QObject *parent = 0)
++      : QObject(parent)
++    {
++        QTimer::singleShot(0, this, SLOT(doTest()));
++    }
++
++private slots:
++    void doTest()
++    {
++        QApplicationPrivate *privateClass = static_cast<QApplicationPrivate*>(QObjectPrivate::get(qApp));
++
++        {
++            QDialog *win1 = new QDialog;
++
++            // Test with a lock active so that the refcount doesn't drop to zero during these tests, causing a quit.
++            // (until we exit the scope)
++            QEventLoopLocker locker;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            win1->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QDialog *win2 = new QDialog;
++
++            win2->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            delete win1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete win2;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            win1 = new QDialog;
++
++            win1->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            JobObject *job1 = new JobObject(this);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            delete win1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete job1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            QWidget *w1 = new QWidget;
++
++            w1->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *w2 = new QMainWindow;
++
++            w2->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            QWidget *w3 = new QWidget(0, Qt::Dialog);
++
++            w3->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 4);
++
++            delete w3;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            delete w2;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *subWidget1 = new QWidget(w1, Qt::Window);
++
++            // Even though We create a new widget and show it,
++            // the ref count does not go up because it is a child of
++            // w1, which is the top-level, and what we are actually
++            // refcounting.
++            subWidget1->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            // When we use setParent(0) and re-show, the
++            // ref count does increase:
++            QCOMPARE(subWidget1->isVisible(), true);
++            subWidget1->setParent(0);
++            QCOMPARE(subWidget1->isVisible(), false);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            subWidget1->show();
++            QCOMPARE(subWidget1->isVisible(), true);
++            QCOMPARE(privateClass->quitLockRef.load(), 3);
++
++            subWidget1->setParent(w1);
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *subWidget2 = new QWidget(w1);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            subWidget2->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete subWidget2;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *subWidget3 = new QWidget(w1);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            subWidget3->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            subWidget3->hide();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete subWidget3;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *subWidget4 = new QWidget(subWidget1);
++            QWidget *subWidget5 = new QWidget(subWidget1);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            QWidget *subWidget6 = new QWidget(subWidget4, Qt::Window);
++
++            subWidget6->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            delete w1;
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            w1 = new QWidget;
++            w2 = new QWidget;
++            w3 = new QWidget;
++
++            QHBoxLayout *layout = new QHBoxLayout(w1);
++
++            layout->addWidget(w2);
++            layout->addWidget(w3);
++
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            w1->show();
++
++            QCOMPARE(privateClass->quitLockRef.load(), 2);
++
++            w1->hide();
++            QCOMPARE(privateClass->quitLockRef.load(), 1);
++
++            delete w1;
++
++        }
++        QCOMPARE(privateClass->quitLockRef.load(), 0);
++    }
++};
++
++void tst_QApplication::testQuitLockRef()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qapplication" };
++    QApplication app(argc, argv);
++
++    QuitLockRefTester tester;
++
++    app.exec();
++}
++
++void tst_QApplication::testQuitLock1()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    QWidget *w = new QWidget;
++
++    w->show();
++
++    QMetaObject::invokeMethod(w, "close", Qt::QueuedConnection);
++
++    app.exec();
++
++    // No hang = pass.
++}
++
++void tst_QApplication::testQuitLock2()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    QWidget *w1 = new QWidget;
++
++    w1->show();
++
++    QWidget *w2 = new QWidget;
++
++    w2->show();
++
++    QMetaObject::invokeMethod(w1, "deleteLater", Qt::QueuedConnection);
++    QMetaObject::invokeMethod(w2, "hide", Qt::QueuedConnection);
++
++    app.exec();
++
++    // No hang = pass.
++}
++
++class Result : public QObject
++{
++    Q_OBJECT
++public:
++    Result(QObject *parent = 0)
++        : QObject(parent), m_passes(false)
++    {
++
++    }
++
++    bool result() const
++    {
++        return m_passes;
++    }
++
++public slots:
++
++    void setPasses()
++    {
++        setResult(true);
++    }
++
++    void setFails()
++    {
++        setResult(false);
++    }
++
++    void setResult(bool result)
++    {
++        m_passes = result;
++    }
++
++private:
++    bool m_passes;
++};
++
++void tst_QApplication::testQuitLock3()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    Result *result = new Result(&app);
++
++    JobObject *job = new JobObject(&app);
++
++    QObject::connect(job, SIGNAL(done()), result, SLOT(setPasses()));
++
++    app.exec();
++
++    QVERIFY(result->result());
++}
++
++void tst_QApplication::testQuitLock4()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    QWidget *w = new QWidget;
++
++    w->show();
++
++    Result *result = new Result(&app);
++    JobObject *job = new JobObject(1000, &app);
++
++    QTimer::singleShot(500, w, SLOT(deleteLater()));
++
++    QObject::connect(w, SIGNAL(destroyed()), result, SLOT(setFails()));
++    QObject::connect(job, SIGNAL(done()), result, SLOT(setPasses()));
++
++    app.exec();
++
++    QVERIFY(result->result());
++}
++
++class JobBeforeWindowRunner : public QObject
++{
++    Q_OBJECT
++public:
++    JobBeforeWindowRunner(QObject *parent = 0)
++    : QObject(parent), m_result(new Result(this))
++    {
++
++    }
++
++    void start()
++    {
++        JobObject *job = new JobObject(this);
++        connect(job, SIGNAL(done()), m_result, SLOT(setFails()));
++        connect(job, SIGNAL(destroyed()), SLOT(showWindowDelayed()), Qt::QueuedConnection);
++    }
++
++    bool result() const { return m_result->result(); }
++
++private slots:
++    void showWindowDelayed()
++    {
++        qApp->setQuitLockEnabled(true);
++        QTimer::singleShot(500, this, SLOT(showWindow()));
++    }
++
++    void showWindow()
++    {
++        QWidget *w = new QWidget;
++        w->show();
++        w->deleteLater();
++        connect(w, SIGNAL(destroyed()), m_result, SLOT(setPasses()));
++    }
++
++private:
++    Result * const m_result;
++};
++
++void tst_QApplication::testQuitLock5()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++    app.setQuitLockEnabled(false);
++    // Run a job before showing a window, and only enable the refcounting
++    // after doing so.
++    // Although the job brings the refcount to zero, the app does not exit
++    // until setQuitLockEnabled is called and the feature re-enabled.
++
++    JobBeforeWindowRunner *eventRunner = new JobBeforeWindowRunner(&app);
++
++    eventRunner->start();
++
++    app.exec();
++
++    QVERIFY(eventRunner->result());
++}
++
++class JobDuringWindowRunner : public QObject
++{
++    Q_OBJECT
++public:
++    JobDuringWindowRunner(QObject *parent = 0)
++        : QObject(parent), m_result(new Result(this))
++    {
++
++    }
++
++    void start()
++    {
++        JobObject *job = new JobObject(this);
++
++        QWidget *w = new QWidget;
++        w->show();
++        w->deleteLater();
++
++        QObject::connect(w, SIGNAL(destroyed()), m_result, SLOT(setFails()));
++        QObject::connect(job, SIGNAL(done()), m_result, SLOT(setPasses()));
++    }
++
++    bool result() const { return m_result->result(); }
++
++private:
++    Result * const m_result;
++};
++
++void tst_QApplication::testQuitLock6()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    // A job runs, and while it is running, a window is shown and closed,
++    // then the job ends, which causes the quit.
++
++    JobDuringWindowRunner *eventRunner = new JobDuringWindowRunner(&app);
++
++    eventRunner->start();
++
++    app.exec();
++
++    QVERIFY(eventRunner->result());
++}
++class JobWindowJobWindowRunner : public QObject
++{
++    Q_OBJECT
++public:
++    JobWindowJobWindowRunner(QObject *parent = 0)
++        : QObject(parent), m_result(new Result(this))
++    {
++
++    }
++
++    void start()
++    {
++        JobObject *job = new JobObject(500, this);
++
++        QWidget *w = new QWidget;
++        w->show();
++        QTimer::singleShot(1000, w, SLOT(deleteLater()));
++
++        QObject::connect(w, SIGNAL(destroyed()), m_result, SLOT(setPasses()));
++        QObject::connect(job, SIGNAL(done()), m_result, SLOT(setFails()));
++    }
++
++    bool result() const { return m_result->result(); }
++private:
++    Result * const m_result;
++};
++
++void tst_QApplication::testQuitLock7()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    // A job runs, and while it is running, a window is shown
++    // then the job ends, then the window is closed, which causes the quit.
++
++    JobWindowJobWindowRunner *eventRunner = new JobWindowJobWindowRunner(&app);
++
++    eventRunner->start();
++
++    app.exec();
++
++    QVERIFY(eventRunner->result());
++}
++
++void tst_QApplication::testQuitLock8()
++{
++    int argc = 1;
++    char *argv[] = { "tst_qcoreapplication" };
++    QApplication app(argc, argv);
++
++    QMainWindow *mw1 = new QMainWindow;
++    mw1->show();
++    QMainWindow *mw2 = new QMainWindow;
++    mw2->show();
++
++    QMetaObject::invokeMethod(mw1, "close", Qt::QueuedConnection);
++    QMetaObject::invokeMethod(mw2, "close", Qt::QueuedConnection);
++
++    app.exec();
++
++    // No hang = pass
++}
++
++
+ /*
+     This test is meant to ensure that certain objects (public & commonly used)
+     can safely be used in a Q_GLOBAL_STATIC such that their destructors are

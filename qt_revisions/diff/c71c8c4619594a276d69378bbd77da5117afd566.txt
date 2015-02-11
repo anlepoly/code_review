@@ -1,0 +1,2302 @@
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index 782ae10..d2a8ada 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -5700,10 +5700,11 @@ void QQuickItemLayer::activateEffect()
+     Q_ASSERT(m_effectComponent);
+     Q_ASSERT(!m_effect);
+ 
+-    QObject *created = m_effectComponent->create();
++    QObject *created = m_effectComponent->beginCreate(m_effectComponent->creationContext());
+     m_effect = qobject_cast<QQuickItem *>(created);
+     if (!m_effect) {
+         qWarning("Item: layer.effect is not a QML Item.");
++        m_effectComponent->completeCreate();
+         delete created;
+         return;
+     }
+@@ -5714,6 +5715,7 @@ void QQuickItemLayer::activateEffect()
+     }
+     m_effect->setVisible(m_item->isVisible());
+     m_effect->setProperty(m_name, qVariantFromValue<QObject *>(m_effectSource));
++    m_effectComponent->completeCreate();
+ }
+ 
+ void QQuickItemLayer::deactivateEffect()
+diff --git a/src/quick/items/qquickshadereffect.cpp b/src/quick/items/qquickshadereffect.cpp
+index c872356..871e319 100644
+--- a/src/quick/items/qquickshadereffect.cpp
++++ b/src/quick/items/qquickshadereffect.cpp
+@@ -88,6 +88,446 @@ const char *qtTexCoordAttributeName()
+     return qt_texcoord_attribute_name;
+ }
+ 
++namespace {
++
++    enum VariableQualifier {
++        AttributeQualifier,
++        UniformQualifier
++    };
++
++    inline bool qt_isalpha(char c)
++    {
++        char ch = c | 0x20;
++        return (ch >= 'a' && ch <= 'z') || c == '_';
++    }
++
++    inline bool qt_isalnum(char c)
++    {
++        return qt_isalpha(c) || (c >= '0' && c <= '9');
++    }
++
++    inline bool qt_isspace(char c)
++    {
++        return c == ' ' || (c >= 0x09 && c <= 0x0d);
++    }
++
++    // Returns -1 if not found, returns index to first character after the name if found.
++    int qt_search_for_variable(const char *s, int length, int index, VariableQualifier &decl,
++                               int &typeIndex, int &typeLength,
++                               int &nameIndex, int &nameLength)
++    {
++        enum Identifier {
++            QualifierIdentifier, // Base state
++            PrecisionIdentifier,
++            TypeIdentifier,
++            NameIdentifier
++        };
++        Identifier expected = QualifierIdentifier;
++        bool compilerDirectiveExpected = index == 0;
++
++        while (index < length) {
++            // Skip whitespace.
++            while (qt_isspace(s[index])) {
++                compilerDirectiveExpected |= s[index] == '\n';
++                ++index;
++            }
++
++            if (qt_isalpha(s[index])) {
++                // Read identifier.
++                int idIndex = index;
++                ++index;
++                while (qt_isalnum(s[index]))
++                    ++index;
++                int idLength = index - idIndex;
++
++                const int attrLen = sizeof("attribute") - 1;
++                const int uniLen = sizeof("uniform") - 1;
++                const int loLen = sizeof("lowp") - 1;
++                const int medLen = sizeof("mediump") - 1;
++                const int hiLen = sizeof("highp") - 1;
++
++                switch (expected) {
++                case QualifierIdentifier:
++                    if (idLength == attrLen && qstrncmp("attribute", s + idIndex, attrLen) == 0) {
++                        decl = AttributeQualifier;
++                        expected = PrecisionIdentifier;
++                    } else if (idLength == uniLen && qstrncmp("uniform", s + idIndex, uniLen) == 0) {
++                        decl = UniformQualifier;
++                        expected = PrecisionIdentifier;
++                    }
++                    break;
++                case PrecisionIdentifier:
++                    if ((idLength == loLen && qstrncmp("lowp", s + idIndex, loLen) == 0)
++                            || (idLength == medLen && qstrncmp("mediump", s + idIndex, medLen) == 0)
++                            || (idLength == hiLen && qstrncmp("highp", s + idIndex, hiLen) == 0))
++                    {
++                        expected = TypeIdentifier;
++                        break;
++                    }
++                    // Fall through.
++                case TypeIdentifier:
++                    typeIndex = idIndex;
++                    typeLength = idLength;
++                    expected = NameIdentifier;
++                    break;
++                case NameIdentifier:
++                    nameIndex = idIndex;
++                    nameLength = idLength;
++                    return index; // Attribute or uniform declaration found. Return result.
++                default:
++                    break;
++                }
++            } else if (s[index] == '#' && compilerDirectiveExpected) {
++                // Skip compiler directives.
++                ++index;
++                while (index < length && (s[index] != '\n' || s[index - 1] == '\\'))
++                    ++index;
++            } else if (s[index] == '/' && s[index + 1] == '/') {
++                // Skip comments.
++                index += 2;
++                while (index < length && s[index] != '\n')
++                    ++index;
++            } else if (s[index] == '/' && s[index + 1] == '*') {
++                // Skip comments.
++                index += 2;
++                while (index < length && (s[index] != '*' || s[index + 1] != '/'))
++                    ++index;
++                if (index < length)
++                    index += 2; // Skip star-slash.
++            } else {
++                expected = QualifierIdentifier;
++                ++index;
++            }
++            compilerDirectiveExpected = false;
++        }
++        return -1;
++    }
++}
++
++
++
++QQuickShaderEffectCommon::~QQuickShaderEffectCommon()
++{
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType)
++        qDeleteAll(signalMappers[shaderType]);
++}
++
++void QQuickShaderEffectCommon::disconnectPropertySignals(QQuickItem *item, Key::ShaderType shaderType)
++{
++    for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++        if (signalMappers[shaderType].at(i) == 0)
++            continue;
++        const UniformData &d = uniformData[shaderType].at(i);
++        QSignalMapper *mapper = signalMappers[shaderType].at(i);
++        QObject::disconnect(item, 0, mapper, SLOT(map()));
++        QObject::disconnect(mapper, SIGNAL(mapped(int)), item, SLOT(propertyChanged(int)));
++        if (d.specialType == UniformData::Sampler) {
++            QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++            if (source) {
++                if (item->canvas())
++                    QQuickItemPrivate::get(source)->derefCanvas();
++                QObject::disconnect(source, SIGNAL(destroyed(QObject*)), item, SLOT(sourceDestroyed(QObject*)));
++            }
++        }
++    }
++}
++
++void QQuickShaderEffectCommon::connectPropertySignals(QQuickItem *item, Key::ShaderType shaderType)
++{
++    for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++        if (signalMappers[shaderType].at(i) == 0)
++            continue;
++        const UniformData &d = uniformData[shaderType].at(i);
++        int pi = item->metaObject()->indexOfProperty(d.name.constData());
++        if (pi >= 0) {
++            QMetaProperty mp = item->metaObject()->property(pi);
++            if (!mp.hasNotifySignal())
++                qWarning("QQuickShaderEffect: property '%s' does not have notification method!", d.name.constData());
++            QByteArray signalName("2");
++            signalName.append(mp.notifySignal().signature());
++            QSignalMapper *mapper = signalMappers[shaderType].at(i);
++            QObject::connect(item, signalName, mapper, SLOT(map()));
++            QObject::connect(mapper, SIGNAL(mapped(int)), item, SLOT(propertyChanged(int)));
++        } else {
++            // If the source is set via a dynamic property, like the layer is, then we need this
++            // check to disable the warning.
++            if (!item->property(d.name.constData()).isValid())
++                qWarning("QQuickShaderEffect: '%s' does not have a matching property!", d.name.constData());
++        }
++
++        if (d.specialType == UniformData::Sampler) {
++            QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++            if (source) {
++                if (item->canvas())
++                    QQuickItemPrivate::get(source)->refCanvas(item->canvas());
++                QObject::connect(source, SIGNAL(destroyed(QObject*)), item, SLOT(sourceDestroyed(QObject*)));
++            }
++        }
++    }
++}
++
++void QQuickShaderEffectCommon::updateParseLog(bool ignoreAttributes)
++{
++    parseLog.clear();
++    if (!ignoreAttributes) {
++        if (!attributes.contains(qt_position_attribute_name)) {
++            parseLog += QLatin1String("Warning: Missing reference to \'");
++            parseLog += QLatin1String(qt_position_attribute_name);
++            parseLog += QLatin1String("\'.\n");
++        }
++        if (!attributes.contains(qt_texcoord_attribute_name)) {
++            parseLog += QLatin1String("Warning: Missing reference to \'");
++            parseLog += QLatin1String(qt_texcoord_attribute_name);
++            parseLog += QLatin1String("\'.\n");
++        }
++    }
++    bool respectsMatrix = false;
++    bool respectsOpacity = false;
++    for (int i = 0; i < uniformData[Key::VertexShader].size(); ++i)
++        respectsMatrix |= uniformData[Key::VertexShader].at(i).specialType == UniformData::Matrix;
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++        for (int i = 0; i < uniformData[shaderType].size(); ++i)
++            respectsOpacity |= uniformData[shaderType].at(i).specialType == UniformData::Opacity;
++    }
++    if (!respectsMatrix)
++        parseLog += QLatin1String("Warning: Vertex shader is missing reference to \'qt_Matrix\'.\n");
++    if (!respectsOpacity)
++        parseLog += QLatin1String("Warning: Shaders are missing reference to \'qt_Opacity\'.\n");
++}
++
++void QQuickShaderEffectCommon::lookThroughShaderCode(QQuickItem *item, Key::ShaderType shaderType, const QByteArray &code)
++{
++    int index = 0;
++    int typeIndex, typeLength, nameIndex, nameLength;
++    const char *s = code.constData();
++    VariableQualifier decl;
++    while ((index = qt_search_for_variable(s, code.size(), index, decl, typeIndex, typeLength,
++                                           nameIndex, nameLength)) != -1)
++    {
++        if (decl == AttributeQualifier) {
++            if (shaderType == Key::VertexShader)
++                attributes.append(QByteArray(s + nameIndex, nameLength));
++        } else {
++            Q_ASSERT(decl == UniformQualifier);
++
++            const int sampLen = sizeof("sampler2D") - 1;
++            const int opLen = sizeof("qt_Opacity") - 1;
++            const int matLen = sizeof("qt_Matrix") - 1;
++
++            UniformData d;
++            QSignalMapper *mapper = 0;
++            d.name = QByteArray(s + nameIndex, nameLength);
++            if (nameLength == opLen && qstrncmp("qt_Opacity", s + nameIndex, opLen) == 0) {
++                d.specialType = UniformData::Opacity;
++            } else if (nameLength == matLen && qstrncmp("qt_Matrix", s + nameIndex, matLen) == 0) {
++                d.specialType = UniformData::Matrix;
++            } else {
++                mapper = new QSignalMapper;
++                mapper->setMapping(item, uniformData[shaderType].size() | (shaderType << 16));
++                d.value = item->property(d.name.constData());
++                bool sampler = typeLength == sampLen && qstrncmp("sampler2D", s + typeIndex, sampLen) == 0;
++                d.specialType = sampler ? UniformData::Sampler : UniformData::None;
++            }
++            uniformData[shaderType].append(d);
++            signalMappers[shaderType].append(mapper);
++        }
++    }
++}
++
++void QQuickShaderEffectCommon::updateShader(QQuickItem *item, Key::ShaderType shaderType)
++{
++    disconnectPropertySignals(item, shaderType);
++    qDeleteAll(signalMappers[shaderType]);
++    uniformData[shaderType].clear();
++    signalMappers[shaderType].clear();
++    if (shaderType == Key::VertexShader)
++        attributes.clear();
++
++    const QByteArray &code = source.sourceCode[shaderType];
++    if (code.isEmpty()) {
++        // Optimize for default code.
++        if (shaderType == Key::VertexShader) {
++            attributes.append(QByteArray(qt_position_attribute_name));
++            attributes.append(QByteArray(qt_texcoord_attribute_name));
++            UniformData d;
++            d.name = "qt_Matrix";
++            d.specialType = UniformData::Matrix;
++            uniformData[Key::VertexShader].append(d);
++            signalMappers[Key::VertexShader].append(0);
++        } else if (shaderType == Key::FragmentShader) {
++            UniformData d;
++            d.name = "qt_Opacity";
++            d.specialType = UniformData::Opacity;
++            uniformData[Key::FragmentShader].append(d);
++            signalMappers[Key::FragmentShader].append(0);
++            QSignalMapper *mapper = new QSignalMapper;
++            mapper->setMapping(item, 1 | (Key::FragmentShader << 16));
++            const char *sourceName = "source";
++            d.name = sourceName;
++            d.value = item->property(sourceName);
++            d.specialType = UniformData::Sampler;
++            uniformData[Key::FragmentShader].append(d);
++            signalMappers[Key::FragmentShader].append(mapper);
++        }
++    } else {
++        lookThroughShaderCode(item, shaderType, code);
++    }
++
++    connectPropertySignals(item, shaderType);
++}
++
++void QQuickShaderEffectCommon::updateMaterial(QQuickShaderEffectNode *node,
++                                              QQuickShaderEffectMaterial *material,
++                                              bool updateUniforms, bool updateUniformValues,
++                                              bool updateTextureProviders)
++{
++    if (updateUniforms) {
++        for (int i = 0; i < material->textureProviders.size(); ++i) {
++            QSGTextureProvider *t = material->textureProviders.at(i).second;
++            if (t) {
++                QObject::disconnect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
++                QObject::disconnect(t, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
++            }
++        }
++        material->textureProviders.clear();
++
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++                const UniformData &d = uniformData[shaderType].at(i);
++                // First make room in the textureProviders array. Set to proper value further down.
++                if (d.specialType == UniformData::Sampler)
++                    material->textureProviders.append(qMakePair(d.name, (QSGTextureProvider *)0));
++            }
++            material->uniforms[shaderType] = uniformData[shaderType];
++        }
++        updateUniformValues = false;
++        updateTextureProviders = true;
++    }
++
++    if (updateUniformValues) {
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            Q_ASSERT(uniformData[shaderType].size() == material->uniforms[shaderType].size());
++            for (int i = 0; i < uniformData[shaderType].size(); ++i)
++                material->uniforms[shaderType][i].value = uniformData[shaderType].at(i).value;
++        }
++    }
++
++    if (updateTextureProviders) {
++        int index = 0;
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++                const UniformData &d = uniformData[shaderType].at(i);
++                if (d.specialType != UniformData::Sampler)
++                    continue;
++                Q_ASSERT(material->textureProviders.at(index).first == d.name);
++                QSGTextureProvider *oldProvider = material->textureProviders.at(index).second;
++                QSGTextureProvider *newProvider = 0;
++                QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++                if (source && source->isTextureProvider())
++                    newProvider = source->textureProvider();
++                if (newProvider != oldProvider) {
++                    if (oldProvider) {
++                        QObject::disconnect(oldProvider, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
++                        QObject::disconnect(oldProvider, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
++                    }
++                    if (newProvider) {
++                        Q_ASSERT_X(newProvider->thread() == QThread::currentThread(),
++                                   "QQuickShaderEffect::updatePaintNode",
++                                   "Texture provider must belong to the rendering thread");
++                        QObject::connect(newProvider, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
++                        QObject::connect(newProvider, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
++                    } else {
++                        const char *typeName = source ? source->metaObject()->className() : d.value.typeName();
++                        qWarning("ShaderEffect: Property '%s' is not assigned a valid texture provider (%s).",
++                                 d.name.constData(), typeName);
++                    }
++                    material->textureProviders[index].second = newProvider;
++                }
++                ++index;
++            }
++        }
++        Q_ASSERT(index == material->textureProviders.size());
++    }
++}
++
++void QQuickShaderEffectCommon::updateCanvas(QQuickCanvas *canvas)
++{
++    // See comment in QQuickShaderEffectCommon::propertyChanged().
++    if (canvas) {
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++                const UniformData &d = uniformData[shaderType].at(i);
++                if (d.specialType == UniformData::Sampler) {
++                    QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++                    if (source)
++                        QQuickItemPrivate::get(source)->refCanvas(canvas);
++                }
++            }
++        }
++    } else {
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++                const UniformData &d = uniformData[shaderType].at(i);
++                if (d.specialType == UniformData::Sampler) {
++                    QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++                    if (source)
++                        QQuickItemPrivate::get(source)->derefCanvas();
++                }
++            }
++        }
++    }
++}
++
++void QQuickShaderEffectCommon::sourceDestroyed(QObject *object)
++{
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++        for (int i = 0; i < uniformData[shaderType].size(); ++i) {
++            UniformData &d = uniformData[shaderType][i];
++            if (d.specialType == UniformData::Sampler && qVariantCanConvert<QObject *>(d.value)) {
++                if (qVariantValue<QObject *>(d.value) == object)
++                    d.value = QVariant();
++            }
++        }
++    }
++}
++
++
++void QQuickShaderEffectCommon::propertyChanged(QQuickItem *item, int mappedId,
++                                               bool *textureProviderChanged)
++{
++    Key::ShaderType shaderType = Key::ShaderType(mappedId >> 16);
++    int index = mappedId & 0xffff;
++    UniformData &d = uniformData[shaderType][index];
++    if (d.specialType == UniformData::Sampler) {
++        QQuickItem *source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++        if (source) {
++            if (item->canvas())
++                QQuickItemPrivate::get(source)->derefCanvas();
++            QObject::disconnect(source, SIGNAL(destroyed(QObject*)), item, SLOT(sourceDestroyed(QObject*)));
++        }
++
++        d.value = item->property(d.name.constData());
++
++        source = qobject_cast<QQuickItem *>(qVariantValue<QObject *>(d.value));
++        if (source) {
++            // 'source' needs a canvas to get a scene graph node. It usually gets one through its
++            // parent, but if the source item is "inline" rather than a reference -- i.e.
++            // "property variant source: Image { }" instead of "property variant source: foo" -- it
++            // will not get a parent. In those cases, 'source' should get the canvas from 'item'.
++            if (item->canvas())
++                QQuickItemPrivate::get(source)->refCanvas(item->canvas());
++            QObject::connect(source, SIGNAL(destroyed(QObject*)), item, SLOT(sourceDestroyed(QObject*)));
++        }
++        if (textureProviderChanged)
++            *textureProviderChanged = true;
++    } else {
++        d.value = item->property(d.name.constData());
++        if (textureProviderChanged)
++            *textureProviderChanged = false;
++    }
++}
++
++
+ /*!
+     \qmlclass ShaderEffect QQuickShaderEffect
+     \inqmlmodule QtQuick 2
+@@ -187,18 +627,21 @@ QQuickShaderEffect::QQuickShaderEffect(QQuickItem *parent)
+     , m_cullMode(NoCulling)
+     , m_status(Uncompiled)
+     , m_blending(true)
+-    , m_dirtyData(true)
+-    , m_programDirty(true)
++    , m_dirtyUniforms(true)
++    , m_dirtyUniformValues(true)
++    , m_dirtyTextureProviders(true)
++    , m_dirtyProgram(true)
++    , m_dirtyParseLog(true)
+     , m_dirtyMesh(true)
+     , m_dirtyGeometry(true)
+-    , m_complete(false)
+ {
+     setFlag(QQuickItem::ItemHasContents);
+ }
+ 
+ QQuickShaderEffect::~QQuickShaderEffect()
+ {
+-    reset();
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType)
++        m_common.disconnectPropertySignals(this, Key::ShaderType(shaderType));
+ }
+ 
+ /*!
+@@ -211,11 +654,16 @@ QQuickShaderEffect::~QQuickShaderEffect()
+ 
+ void QQuickShaderEffect::setFragmentShader(const QByteArray &code)
+ {
+-    if (m_source.fragmentCode.constData() == code.constData())
++    if (m_common.source.sourceCode[Key::FragmentShader].constData() == code.constData())
+         return;
+-    m_source.fragmentCode = code;
++    m_common.source.sourceCode[Key::FragmentShader] = code;
++    m_dirtyProgram = true;
++    m_dirtyParseLog = true;
++
++    if (isComponentComplete())
++        m_common.updateShader(this, Key::FragmentShader);
++
+     update();
+-    m_complete = false;
+     if (m_status != Uncompiled) {
+         m_status = Uncompiled;
+         emit statusChanged();
+@@ -234,11 +682,16 @@ void QQuickShaderEffect::setFragmentShader(const QByteArray &code)
+ 
+ void QQuickShaderEffect::setVertexShader(const QByteArray &code)
+ {
+-    if (m_source.vertexCode.constData() == code.constData())
++    if (m_common.source.sourceCode[Key::VertexShader].constData() == code.constData())
+         return;
+-    m_source.vertexCode = code;
++    m_common.source.sourceCode[Key::VertexShader] = code;
++    m_dirtyProgram = true;
++    m_dirtyParseLog = true;
++
++    if (isComponentComplete())
++        m_common.updateShader(this, Key::VertexShader);
++
+     update();
+-    m_complete = false;
+     if (m_status != Uncompiled) {
+         m_status = Uncompiled;
+         emit statusChanged();
+@@ -316,6 +769,7 @@ void QQuickShaderEffect::setMesh(const QVariant &mesh)
+     }
+ 
+     m_dirtyMesh = true;
++    m_dirtyParseLog = true;
+     update();
+     emit meshChanged();
+ }
+@@ -343,6 +797,34 @@ void QQuickShaderEffect::setCullMode(CullMode face)
+     emit cullModeChanged();
+ }
+ 
++QString QQuickShaderEffect::parseLog()
++{
++    if (m_dirtyParseLog) {
++        m_common.updateParseLog(m_mesh != 0);
++        m_dirtyParseLog = false;
++    }
++    return m_common.parseLog;
++}
++
++bool QQuickShaderEffect::event(QEvent *event)
++{
++    if (event->type() == QEvent::DynamicPropertyChange) {
++        QDynamicPropertyChangeEvent *e = static_cast<QDynamicPropertyChangeEvent *>(event);
++        for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++            for (int i = 0; i < m_common.uniformData[shaderType].size(); ++i) {
++                if (m_common.uniformData[shaderType].at(i).name == e->propertyName()) {
++                    bool textureProviderChanged;
++                    m_common.propertyChanged(this, (shaderType << 16) | i, &textureProviderChanged);
++                    m_dirtyTextureProviders |= textureProviderChanged;
++                    m_dirtyUniformValues = true;
++                    update();
++                }
++            }
++        }
++    }
++    return QQuickItem::event(event);
++}
++
+ /*!
+     \qmlproperty enumeration QtQuick2::ShaderEffect::status
+ 
+@@ -371,19 +853,6 @@ void QQuickShaderEffect::setCullMode(CullMode face)
+     \sa status
+ */
+ 
+-void QQuickShaderEffect::changeSource(int index)
+-{
+-    Q_ASSERT(index >= 0 && index < m_sources.size());
+-    QVariant v = property(m_sources.at(index).name.constData());
+-    setSource(v, index);
+-}
+-
+-void QQuickShaderEffect::updateData()
+-{
+-    m_dirtyData = true;
+-    update();
+-}
+-
+ void QQuickShaderEffect::updateGeometry()
+ {
+     m_dirtyGeometry = true;
+@@ -392,7 +861,7 @@ void QQuickShaderEffect::updateGeometry()
+ 
+ void QQuickShaderEffect::updateLogAndStatus(const QString &log, int status)
+ {
+-    m_log = m_parseLog + log;
++    m_log = parseLog() + log;
+     m_status = Status(status);
+     emit logChanged();
+     emit statusChanged();
+@@ -400,341 +869,17 @@ void QQuickShaderEffect::updateLogAndStatus(const QString &log, int status)
+ 
+ void QQuickShaderEffect::sourceDestroyed(QObject *object)
+ {
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        SourceData &source = m_sources[i];
+-        if (object == source.sourceObject)
+-            source.sourceObject = 0;
+-    }
+-}
+-
+-void QQuickShaderEffect::setSource(const QVariant &var, int index)
+-{
+-    Q_ASSERT(index >= 0 && index < m_sources.size());
+-
+-    SourceData &source = m_sources[index];
+-
+-    if (source.sourceObject) {
+-        if (canvas())
+-            QQuickItemPrivate::get(source.sourceObject)->derefCanvas();
+-        disconnect(source.sourceObject, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
+-    }
+-
+-    source.sourceObject = 0;
+-    if (var.isNull()) {
+-        return;
+-    } else if (!qVariantCanConvert<QObject *>(var)) {
+-        qWarning("Could not assign source of type '%s' to property '%s'.", var.typeName(), source.name.constData());
+-        return;
+-    }
+-
+-    QObject *obj = qVariantValue<QObject *>(var);
+-    if (!obj)
+-        return;
+-    QQuickItem *item = qobject_cast<QQuickItem *>(obj);
+-    if (!item || !item->isTextureProvider()) {
+-        qWarning("ShaderEffect: source uniform [%s] is not assigned a valid texture provider: %s [%s]",
+-                 source.name.constData(), qPrintable(obj->objectName()), obj->metaObject()->className());
+-        return;
+-    }
+-
+-    source.sourceObject = item;
+-
+-    if (item) {
+-        // 'item' needs a canvas to get a scene graph node. It usually gets one through its
+-        // parent, but if the source item is "inline" rather than a reference -- i.e.
+-        // "property variant source: Image { }" instead of "property variant source: foo" -- it
+-        // will not get a parent. In those cases, 'item' should get the canvas from 'this'.
+-        if (canvas())
+-            QQuickItemPrivate::get(item)->refCanvas(canvas());
+-        connect(item, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
+-    }
+-}
+-
+-void QQuickShaderEffect::disconnectPropertySignals()
+-{
+-    disconnect(this, 0, this, SLOT(updateData()));
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        SourceData &source = m_sources[i];
+-        disconnect(this, 0, source.mapper, 0);
+-        disconnect(source.mapper, 0, this, 0);
+-    }
+-}
+-
+-void QQuickShaderEffect::connectPropertySignals()
+-{
+-    QSet<QByteArray>::const_iterator it;
+-    for (it = m_source.uniformNames.begin(); it != m_source.uniformNames.end(); ++it) {
+-        int pi = metaObject()->indexOfProperty(it->constData());
+-        if (pi >= 0) {
+-            QMetaProperty mp = metaObject()->property(pi);
+-            if (!mp.hasNotifySignal())
+-                qWarning("QQuickShaderEffect: property '%s' does not have notification method!", it->constData());
+-            QByteArray signalName("2");
+-            signalName.append(mp.notifySignal().signature());
+-            connect(this, signalName, this, SLOT(updateData()));
+-        } else {
+-            // If the source is set via a dynamic property, like the layer is, then we need this check
+-            // to disable the warning.
+-            if (property(it->constData()).isValid())
+-                continue;
+-            qWarning("QQuickShaderEffect: '%s' does not have a matching property!", it->constData());
+-        }
+-    }
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        SourceData &source = m_sources[i];
+-        int pi = metaObject()->indexOfProperty(source.name.constData());
+-        if (pi >= 0) {
+-            QMetaProperty mp = metaObject()->property(pi);
+-            QByteArray signalName("2");
+-            signalName.append(mp.notifySignal().signature());
+-            connect(this, signalName, source.mapper, SLOT(map()));
+-            source.mapper->setMapping(this, i);
+-            connect(source.mapper, SIGNAL(mapped(int)), this, SLOT(changeSource(int)));
+-        } else {
+-            // If the source is set via a dynamic property, like the layer is, then we need this check
+-            // to disable the warning.
+-            if (property(source.name.constData()).isValid())
+-                continue;
+-            qWarning("QQuickShaderEffect: '%s' does not have a matching source!", source.name.constData());
+-        }
+-    }
+-}
+-
+-
+-void QQuickShaderEffect::ensureCompleted()
+-{
+-    if (!m_complete) {
+-        reset();
+-        updateProperties();
+-        m_complete = true;
+-    }
+-}
+-
+-
+-void QQuickShaderEffect::reset()
+-{
+-    disconnectPropertySignals();
+-
+-    m_source.attributeNames.clear();
+-    m_source.uniformNames.clear();
+-    m_source.respectsOpacity = false;
+-    m_source.respectsMatrix = false;
+-    m_source.className = metaObject()->className();
+-
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        const SourceData &source = m_sources.at(i);
+-        delete source.mapper;
+-        if (source.sourceObject) {
+-            if (canvas())
+-                QQuickItemPrivate::get(source.sourceObject)->derefCanvas();
+-            disconnect(source.sourceObject, SIGNAL(destroyed(QObject*)), this, SLOT(sourceDestroyed(QObject*)));
+-        }
+-    }
+-    m_sources.clear();
+-    m_log.clear();
+-    m_parseLog.clear();
+-    m_programDirty = true;
+-    m_dirtyMesh = true;
+-}
+-
+-void QQuickShaderEffect::updateProperties()
+-{
+-    if (m_source.vertexCode.isEmpty()) {
+-        m_source.attributeNames.append(QByteArray(qt_position_attribute_name));
+-        m_source.attributeNames.append(QByteArray(qt_texcoord_attribute_name));
+-        m_source.respectsMatrix = true;
+-    } else {
+-        lookThroughShaderCode(m_source.vertexCode);
+-    }
+-    if (m_source.fragmentCode.isEmpty()) {
+-        m_source.respectsOpacity = true;
+-        QByteArray name("source");
+-        m_source.uniformNames.insert(name);
+-        SourceData d;
+-        d.mapper = new QSignalMapper;
+-        d.name = name;
+-        d.sourceObject = 0;
+-        m_sources.append(d);
+-    } else {
+-        lookThroughShaderCode(m_source.fragmentCode);
+-    }
+-
+-    if (!m_mesh && !m_source.attributeNames.contains(qt_position_attribute_name)) {
+-        m_parseLog += QLatin1String("Warning: Missing reference to \'");
+-        m_parseLog += QLatin1String(qt_position_attribute_name);
+-        m_parseLog += QLatin1String("\'.\n");
+-    }
+-    if (!m_mesh && !m_source.attributeNames.contains(qt_texcoord_attribute_name)) {
+-        m_parseLog += QLatin1String("Warning: Missing reference to \'");
+-        m_parseLog += QLatin1String(qt_texcoord_attribute_name);
+-        m_parseLog += QLatin1String("\'.\n");
+-    }
+-    if (!m_source.respectsMatrix) {
+-        m_parseLog += QLatin1String("Warning: Missing reference to \'qt_Matrix\'.\n");
+-    }
+-    if (!m_source.respectsOpacity) {
+-        m_parseLog += QLatin1String("Warning: Missing reference to \'qt_Opacity\'.\n");
+-    }
+-
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        QVariant v = property(m_sources.at(i).name);
+-        setSource(v, i);
+-    }
+-
+-    connectPropertySignals();
++    m_common.sourceDestroyed(object);
+ }
+ 
+-namespace {
+-
+-    enum VariableQualifier {
+-        AttributeQualifier,
+-        UniformQualifier
+-    };
+-
+-    inline bool qt_isalpha(char c)
+-    {
+-        char ch = c | 0x20;
+-        return (ch >= 'a' && ch <= 'z') || c == '_';
+-    }
+-
+-    inline bool qt_isalnum(char c)
+-    {
+-        return qt_isalpha(c) || (c >= '0' && c <= '9');
+-    }
+-
+-    inline bool qt_isspace(char c)
+-    {
+-        return c == ' ' || (c >= 0x09 && c <= 0x0d);
+-    }
+-
+-    // Returns -1 if not found, returns index to first character after the name if found.
+-    int qt_search_for_variable(const char *s, int length, int index, VariableQualifier &decl,
+-                               int &typeIndex, int &typeLength,
+-                               int &nameIndex, int &nameLength)
+-    {
+-        enum Identifier {
+-            QualifierIdentifier, // Base state
+-            PrecisionIdentifier,
+-            TypeIdentifier,
+-            NameIdentifier
+-        };
+-        Identifier expected = QualifierIdentifier;
+-        bool compilerDirectiveExpected = index == 0;
+-
+-        while (index < length) {
+-            // Skip whitespace.
+-            while (qt_isspace(s[index])) {
+-                compilerDirectiveExpected |= s[index] == '\n';
+-                ++index;
+-            }
+-
+-            if (qt_isalpha(s[index])) {
+-                // Read identifier.
+-                int idIndex = index;
+-                ++index;
+-                while (qt_isalnum(s[index]))
+-                    ++index;
+-                int idLength = index - idIndex;
+-
+-                const int attrLen = sizeof("attribute") - 1;
+-                const int uniLen = sizeof("uniform") - 1;
+-                const int loLen = sizeof("lowp") - 1;
+-                const int medLen = sizeof("mediump") - 1;
+-                const int hiLen = sizeof("highp") - 1;
+-
+-                switch (expected) {
+-                case QualifierIdentifier:
+-                    if (idLength == attrLen && qstrncmp("attribute", s + idIndex, attrLen) == 0) {
+-                        decl = AttributeQualifier;
+-                        expected = PrecisionIdentifier;
+-                    } else if (idLength == uniLen && qstrncmp("uniform", s + idIndex, uniLen) == 0) {
+-                        decl = UniformQualifier;
+-                        expected = PrecisionIdentifier;
+-                    }
+-                    break;
+-                case PrecisionIdentifier:
+-                    if ((idLength == loLen && qstrncmp("lowp", s + idIndex, loLen) == 0)
+-                            || (idLength == medLen && qstrncmp("mediump", s + idIndex, medLen) == 0)
+-                            || (idLength == hiLen && qstrncmp("highp", s + idIndex, hiLen) == 0))
+-                    {
+-                        expected = TypeIdentifier;
+-                        break;
+-                    }
+-                    // Fall through.
+-                case TypeIdentifier:
+-                    typeIndex = idIndex;
+-                    typeLength = idLength;
+-                    expected = NameIdentifier;
+-                    break;
+-                case NameIdentifier:
+-                    nameIndex = idIndex;
+-                    nameLength = idLength;
+-                    return index; // Attribute or uniform declaration found. Return result.
+-                default:
+-                    break;
+-                }
+-            } else if (s[index] == '#' && compilerDirectiveExpected) {
+-                // Skip compiler directives.
+-                ++index;
+-                while (index < length && (s[index] != '\n' || s[index - 1] == '\\'))
+-                    ++index;
+-            } else if (s[index] == '/' && s[index + 1] == '/') {
+-                // Skip comments.
+-                index += 2;
+-                while (index < length && s[index] != '\n')
+-                    ++index;
+-            } else if (s[index] == '/' && s[index + 1] == '*') {
+-                // Skip comments.
+-                index += 2;
+-                while (index < length && (s[index] != '*' || s[index + 1] != '/'))
+-                    ++index;
+-                if (index < length)
+-                    index += 2; // Skip star-slash.
+-            } else {
+-                expected = QualifierIdentifier;
+-                ++index;
+-            }
+-            compilerDirectiveExpected = false;
+-        }
+-        return -1;
+-    }
+-}
+ 
+-void QQuickShaderEffect::lookThroughShaderCode(const QByteArray &code)
++void QQuickShaderEffect::propertyChanged(int mappedId)
+ {
+-    int index = 0;
+-    int typeIndex, typeLength, nameIndex, nameLength;
+-    const char *s = code.constData();
+-    VariableQualifier decl;
+-    while ((index = qt_search_for_variable(s, code.size(), index, decl, typeIndex, typeLength,
+-                                           nameIndex, nameLength)) != -1)
+-    {
+-        if (decl == AttributeQualifier) {
+-            m_source.attributeNames.append(QByteArray(s + nameIndex, nameLength));
+-        } else {
+-            Q_ASSERT(decl == UniformQualifier);
+-
+-            const int matLen = sizeof("qt_Matrix") - 1;
+-            const int opLen = sizeof("qt_Opacity") - 1;
+-            const int sampLen = sizeof("sampler2D") - 1;
+-
+-            if (nameLength == matLen && qstrncmp("qt_Matrix", s + nameIndex, matLen) == 0) {
+-                m_source.respectsMatrix = true;
+-            } else if (nameLength == opLen && qstrncmp("qt_Opacity", s + nameIndex, opLen) == 0) {
+-                m_source.respectsOpacity = true;
+-            } else {
+-                QByteArray name(s + nameIndex, nameLength);
+-                m_source.uniformNames.insert(name);
+-                if (typeLength == sampLen && qstrncmp("sampler2D", s + typeIndex, sampLen) == 0) {
+-                    SourceData d;
+-                    d.mapper = new QSignalMapper;
+-                    d.name = name;
+-                    d.sourceObject = 0;
+-                    m_sources.append(d);
+-                }
+-            }
+-        }
+-    }
++    bool textureProviderChanged;
++    m_common.propertyChanged(this, mappedId, &textureProviderChanged);
++    m_dirtyTextureProviders |= textureProviderChanged;
++    m_dirtyUniformValues = true;
++    update();
+ }
+ 
+ void QQuickShaderEffect::geometryChanged(const QRectF &newGeometry, const QRectF &oldGeometry)
+@@ -747,10 +892,8 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+ {
+     QQuickShaderEffectNode *node = static_cast<QQuickShaderEffectNode *>(oldNode);
+ 
+-    ensureCompleted();
+-
+     // In the case of a bad vertex shader, don't try to create a node...
+-    if (m_source.attributeNames.isEmpty()) {
++    if (m_common.attributes.isEmpty()) {
+         if (node)
+             delete node;
+         return 0;
+@@ -758,14 +901,14 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+ 
+     if (!node) {
+         node = new QQuickShaderEffectNode;
+-        m_programDirty = true;
+-        m_dirtyData = true;
++        node->setMaterial(new QQuickShaderEffectMaterial(node));
++        node->setFlag(QSGNode::OwnsMaterial, true);
++        m_dirtyProgram = true;
++        m_dirtyUniforms = true;
+         m_dirtyGeometry = true;
+         connect(node, SIGNAL(logAndStatusChanged(QString,int)), this, SLOT(updateLogAndStatus(QString,int)));
+     }
+ 
+-    QQuickShaderEffectMaterial *material = node->shaderMaterial();
+-
+     if (m_dirtyMesh) {
+         node->setGeometry(0);
+         m_dirtyMesh = false;
+@@ -778,11 +921,11 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+         QRectF rect(0, 0, width(), height());
+         QQuickShaderEffectMesh *mesh = m_mesh ? m_mesh : &m_defaultMesh;
+ 
+-        geometry = mesh->updateGeometry(geometry, m_source.attributeNames, rect);
++        geometry = mesh->updateGeometry(geometry, m_common.attributes, rect);
+         if (!geometry) {
+             QString log = mesh->log();
+             if (!log.isNull()) {
+-                m_log = m_parseLog;
++                m_log = parseLog();
+                 m_log += QLatin1String("*** Mesh ***\n");
+                 m_log += log;
+                 m_status = Error;
+@@ -799,18 +942,7 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+         m_dirtyGeometry = false;
+     }
+ 
+-    if (m_programDirty) {
+-        QQuickShaderEffectProgram s = m_source;
+-        if (s.fragmentCode.isEmpty())
+-            s.fragmentCode = qt_default_fragment_code;
+-        if (s.vertexCode.isEmpty())
+-            s.vertexCode = qt_default_vertex_code;
+-        s.className = metaObject()->className();
+-
+-        material->setProgramSource(s);
+-        node->markDirty(QSGNode::DirtyMaterial);
+-        m_programDirty = false;
+-    }
++    QQuickShaderEffectMaterial *material = static_cast<QQuickShaderEffectMaterial *>(node->material());
+ 
+     // Update blending
+     if (bool(material->flags() & QSGMaterial::Blending) != m_blending) {
+@@ -818,66 +950,48 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+         node->markDirty(QSGNode::DirtyMaterial);
+     }
+ 
+-    if (int(material->cullMode()) != int(m_cullMode)) {
+-        material->setCullMode(QQuickShaderEffectMaterial::CullMode(m_cullMode));
++    if (int(material->cullMode) != int(m_cullMode)) {
++        material->cullMode = QQuickShaderEffectMaterial::CullMode(m_cullMode);
+         node->markDirty(QSGNode::DirtyMaterial);
+     }
+ 
+-    if (m_dirtyData) {
+-        QVector<QPair<QByteArray, QVariant> > values;
+-        QVector<QPair<QByteArray, QSGTextureProvider *> > textures;
+-        const QVector<QPair<QByteArray, QSGTextureProvider *> > &oldTextures = material->textureProviders();
++    if (m_dirtyProgram) {
++        Key s = m_common.source;
++        if (s.sourceCode[Key::FragmentShader].isEmpty())
++            s.sourceCode[Key::FragmentShader] = qt_default_fragment_code;
++        if (s.sourceCode[Key::VertexShader].isEmpty())
++            s.sourceCode[Key::VertexShader] = qt_default_vertex_code;
++        s.className = metaObject()->className();
+ 
+-        for (QSet<QByteArray>::const_iterator it = m_source.uniformNames.begin();
+-             it != m_source.uniformNames.end(); ++it) {
+-            values.append(qMakePair(*it, property(*it)));
+-        }
+-        for (int i = 0; i < oldTextures.size(); ++i) {
+-            QSGTextureProvider *t = oldTextures.at(i).second;
+-            if (t) {
+-                disconnect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
+-                disconnect(t, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
+-            }
+-        }
+-        for (int i = 0; i < m_sources.size(); ++i) {
+-            const SourceData &source = m_sources.at(i);
+-            QSGTextureProvider *t = source.sourceObject ? source.sourceObject->textureProvider() : 0;
+-            textures.append(qMakePair(source.name, t));
+-            if (t) {
+-                Q_ASSERT_X(t->thread() == QThread::currentThread(),
+-                           "QQuickShaderEffect::updatePaintNode",
+-                           "Texture provider must belong to the rendering thread");
+-                connect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
+-                connect(t, SIGNAL(destroyed(QObject*)), node, SLOT(textureProviderDestroyed(QObject*)));
+-            }
+-        }
+-        material->setUniforms(values);
+-        material->setTextureProviders(textures);
++        material->setProgramSource(s);
++        material->attributes = m_common.attributes;
+         node->markDirty(QSGNode::DirtyMaterial);
+-        m_dirtyData = false;
++        m_dirtyProgram = false;
++        m_dirtyUniforms = true;
++    }
++
++    if (m_dirtyUniforms || m_dirtyUniformValues || m_dirtyTextureProviders) {
++        m_common.updateMaterial(node, material, m_dirtyUniforms, m_dirtyUniformValues,
++                                m_dirtyTextureProviders);
++        node->markDirty(QSGNode::DirtyMaterial);
++        m_dirtyUniforms = m_dirtyUniformValues = m_dirtyTextureProviders = false;
+     }
+ 
+     return node;
+ }
+ 
++void QQuickShaderEffect::componentComplete()
++{
++    m_common.updateShader(this, Key::VertexShader);
++    m_common.updateShader(this, Key::FragmentShader);
++    QQuickItem::componentComplete();
++}
++
+ void QQuickShaderEffect::itemChange(ItemChange change, const ItemChangeData &value)
+ {
+-    if (change == QQuickItem::ItemSceneChange) {
+-        // See comment in QQuickShaderEffect::setSource().
+-        if (value.canvas) {
+-            for (int i = 0; i < m_sources.size(); ++i) {
+-                if (m_sources.at(i).sourceObject)
+-                    QQuickItemPrivate::get(m_sources.at(i).sourceObject)->refCanvas(value.canvas);
+-            }
+-        } else {
+-            for (int i = 0; i < m_sources.size(); ++i) {
+-                if (m_sources.at(i).sourceObject)
+-                    QQuickItemPrivate::get(m_sources.at(i).sourceObject)->derefCanvas();
+-            }
+-        }
+-    }
++    if (change == QQuickItem::ItemSceneChange)
++        m_common.updateCanvas(value.canvas);
+     QQuickItem::itemChange(change, value);
+ }
+ 
+-
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffect_p.h b/src/quick/items/qquickshadereffect_p.h
+index db1e4e7..32f12fa 100644
+--- a/src/quick/items/qquickshadereffect_p.h
++++ b/src/quick/items/qquickshadereffect_p.h
+@@ -62,6 +62,34 @@ class QSGContext;
+ class QSignalMapper;
+ class QQuickCustomMaterialShader;
+ 
++// Common class for QQuickShaderEffect and QQuickCustomParticle.
++struct QQuickShaderEffectCommon
++{
++    typedef QQuickShaderEffectMaterialKey Key;
++    typedef QQuickShaderEffectMaterial::UniformData UniformData;
++
++    ~QQuickShaderEffectCommon();
++    void disconnectPropertySignals(QQuickItem *item, Key::ShaderType shaderType);
++    void connectPropertySignals(QQuickItem *item, Key::ShaderType shaderType);
++    void updateParseLog(bool ignoreAttributes);
++    void lookThroughShaderCode(QQuickItem *item, Key::ShaderType shaderType, const QByteArray &code);
++    void updateShader(QQuickItem *item, Key::ShaderType shaderType);
++    void updateMaterial(QQuickShaderEffectNode *node, QQuickShaderEffectMaterial *material,
++                        bool updateUniforms, bool updateUniformValues, bool updateTextureProviders);
++    void updateCanvas(QQuickCanvas *canvas);
++
++    // Called by slots in QQuickShaderEffect:
++    void sourceDestroyed(QObject *object);
++    void propertyChanged(QQuickItem *item, int mappedId, bool *textureProviderChanged);
++
++    Key source;
++    QVector<QByteArray> attributes;
++    QVector<UniformData> uniformData[Key::ShaderTypeCount];
++    QVector<QSignalMapper *> signalMappers[Key::ShaderTypeCount];
++    QString parseLog;
++};
++
++
+ class Q_AUTOTEST_EXPORT QQuickShaderEffect : public QQuickItem
+ {
+     Q_OBJECT
+@@ -93,10 +121,10 @@ public:
+     QQuickShaderEffect(QQuickItem *parent = 0);
+     ~QQuickShaderEffect();
+ 
+-    QByteArray fragmentShader() const { return m_source.fragmentCode; }
++    QByteArray fragmentShader() const { return m_common.source.sourceCode[Key::FragmentShader]; }
+     void setFragmentShader(const QByteArray &code);
+ 
+-    QByteArray vertexShader() const { return m_source.vertexCode; }
++    QByteArray vertexShader() const { return m_common.source.sourceCode[Key::VertexShader]; }
+     void setVertexShader(const QByteArray &code);
+ 
+     bool blending() const { return m_blending; }
+@@ -111,8 +139,9 @@ public:
+     QString log() const { return m_log; }
+     Status status() const { return m_status; }
+ 
+-    void ensureCompleted();
+-    QString parseLog() { return m_parseLog; }
++    QString parseLog();
++
++    virtual bool event(QEvent *);
+ 
+ Q_SIGNALS:
+     void fragmentShaderChanged();
+@@ -126,27 +155,22 @@ Q_SIGNALS:
+ protected:
+     virtual void geometryChanged(const QRectF &newGeometry, const QRectF &oldGeometry);
+     virtual QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
++    virtual void componentComplete();
+     virtual void itemChange(ItemChange change, const ItemChangeData &value);
+ 
+ private Q_SLOTS:
+-    void changeSource(int index);
+-    void updateData();
+     void updateGeometry();
+     void updateLogAndStatus(const QString &log, int status);
+     void sourceDestroyed(QObject *object);
++    void propertyChanged(int mappedId);
+ 
+ private:
+     friend class QQuickCustomMaterialShader;
+     friend class QQuickShaderEffectNode;
+ 
+-    void setSource(const QVariant &var, int index);
+-    void disconnectPropertySignals();
+-    void connectPropertySignals();
+-    void reset();
+-    void updateProperties();
+-    void lookThroughShaderCode(const QByteArray &code);
++    typedef QQuickShaderEffectMaterialKey Key;
++    typedef QQuickShaderEffectMaterial::UniformData UniformData;
+ 
+-    QQuickShaderEffectProgram m_source;
+     QSize m_meshResolution;
+     QQuickShaderEffectMesh *m_mesh;
+     QQuickGridMesh m_defaultMesh;
+@@ -154,23 +178,16 @@ private:
+     QString m_log;
+     Status m_status;
+ 
+-    struct SourceData
+-    {
+-        QSignalMapper *mapper;
+-        QQuickItem *sourceObject;
+-        QByteArray name;
+-    };
+-    QVector<SourceData> m_sources;
+-    QString m_parseLog;
++    QQuickShaderEffectCommon m_common;
+ 
+     uint m_blending : 1;
+-    uint m_dirtyData : 1;
+-
+-    uint m_programDirty : 1;
++    uint m_dirtyUniforms : 1;
++    uint m_dirtyUniformValues : 1;
++    uint m_dirtyTextureProviders : 1;
++    uint m_dirtyProgram : 1;
++    uint m_dirtyParseLog : 1;
+     uint m_dirtyMesh : 1;
+     uint m_dirtyGeometry : 1;
+-
+-    uint m_complete : 1;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffectnode.cpp b/src/quick/items/qquickshadereffectnode.cpp
+index be1fb29..a3cadb9 100644
+--- a/src/quick/items/qquickshadereffectnode.cpp
++++ b/src/quick/items/qquickshadereffectnode.cpp
+@@ -60,7 +60,6 @@ protected:
+     friend class QQuickShaderEffectNode;
+ 
+     virtual void compile();
+-    virtual void initialize();
+     virtual const char *vertexShader() const;
+     virtual const char *fragmentShader() const;
+ 
+@@ -70,17 +69,15 @@ protected:
+     QString m_log;
+     bool m_compiled;
+ 
+-    QVector<int> m_uniformLocs;
+-    int m_opacityLoc;
+-    int m_matrixLoc;
+-    uint m_textureIndicesSet;
++    QVector<int> m_uniformLocs[QQuickShaderEffectMaterialKey::ShaderTypeCount];
++    uint m_initialized : 1;
+ };
+ 
+ QQuickCustomMaterialShader::QQuickCustomMaterialShader(const QQuickShaderEffectMaterialKey &key, const QVector<QByteArray> &attributes)
+     : m_key(key)
+     , m_attributes(attributes)
+     , m_compiled(false)
+-    , m_textureIndicesSet(false)
++    , m_initialized(false)
+ {
+     for (int i = 0; i < attributes.count(); ++i)
+         m_attributeNames.append(attributes.at(i).constData());
+@@ -104,24 +101,25 @@ void QQuickCustomMaterialShader::updateState(const RenderState &state, QSGMateri
+                                                                      : QQuickShaderEffect::Error);
+     }
+ 
+-    if (!m_textureIndicesSet) {
+-        for (int i = 0; i < material->m_textures.size(); ++i)
+-            program()->setUniformValue(material->m_textures.at(i).first.constData(), i);
+-        m_textureIndicesSet = true;
+-    }
++    if (!m_initialized) {
++        for (int i = 0; i < material->textureProviders.size(); ++i)
++            program()->setUniformValue(material->textureProviders.at(i).first.constData(), i);
+ 
+-    if (m_uniformLocs.size() != material->m_uniformValues.size()) {
+-        m_uniformLocs.reserve(material->m_uniformValues.size());
+-        for (int i = 0; i < material->m_uniformValues.size(); ++i) {
+-            const QByteArray &name = material->m_uniformValues.at(i).first;
+-            m_uniformLocs.append(program()->uniformLocation(name.constData()));
++        for (int shaderType = 0; shaderType < QQuickShaderEffectMaterialKey::ShaderTypeCount; ++shaderType) {
++            Q_ASSERT(m_uniformLocs[shaderType].isEmpty());
++            m_uniformLocs[shaderType].reserve(material->uniforms[shaderType].size());
++            for (int i = 0; i < material->uniforms[shaderType].size(); ++i) {
++                const QByteArray &name = material->uniforms[shaderType].at(i).name;
++                m_uniformLocs[shaderType].append(program()->uniformLocation(name.constData()));
++            }
+         }
++        m_initialized = true;
+     }
+ 
+     QOpenGLFunctions *functions = state.context()->functions();
+-    for (int i = material->m_textures.size() - 1; i >= 0; --i) {
++    for (int i = material->textureProviders.size() - 1; i >= 0; --i) {
+         functions->glActiveTexture(GL_TEXTURE0 + i);
+-        if (QSGTextureProvider *provider = material->m_textures.at(i).second) {
++        if (QSGTextureProvider *provider = material->textureProviders.at(i).second) {
+             if (QSGTexture *texture = provider->texture()) {
+                 texture->bind();
+                 continue;
+@@ -131,57 +129,67 @@ void QQuickCustomMaterialShader::updateState(const RenderState &state, QSGMateri
+         glBindTexture(GL_TEXTURE_2D, 0);
+     }
+ 
+-    if (material->m_source.respectsOpacity)
+-        program()->setUniformValue(m_opacityLoc, state.opacity());
+-
+-    for (int i = 0; i < material->m_uniformValues.count(); ++i) {
+-        const QVariant &v = material->m_uniformValues.at(i).second;
+-
+-        switch (v.type()) {
+-        case QMetaType::QColor:
+-            program()->setUniformValue(m_uniformLocs.at(i), qt_premultiply_color(qvariant_cast<QColor>(v)));
+-            break;
+-        case QMetaType::Float:
+-            program()->setUniformValue(m_uniformLocs.at(i), qvariant_cast<float>(v));
+-            break;
+-        case QMetaType::Double:
+-            program()->setUniformValue(m_uniformLocs.at(i), (float) qvariant_cast<double>(v));
+-            break;
+-        case QMetaType::QTransform:
+-            program()->setUniformValue(m_uniformLocs.at(i), qvariant_cast<QTransform>(v));
+-            break;
+-        case QMetaType::Int:
+-            program()->setUniformValue(m_uniformLocs.at(i), v.toInt());
+-            break;
+-        case QMetaType::Bool:
+-            program()->setUniformValue(m_uniformLocs.at(i), GLint(v.toBool()));
+-            break;
+-        case QMetaType::QSize:
+-        case QMetaType::QSizeF:
+-            program()->setUniformValue(m_uniformLocs.at(i), v.toSizeF());
+-            break;
+-        case QMetaType::QPoint:
+-        case QMetaType::QPointF:
+-            program()->setUniformValue(m_uniformLocs.at(i), v.toPointF());
+-            break;
+-        case QMetaType::QRect:
+-        case QMetaType::QRectF:
+-            {
+-                QRectF r = v.toRectF();
+-                program()->setUniformValue(m_uniformLocs.at(i), r.x(), r.y(), r.width(), r.height());
++    for (int shaderType = 0; shaderType < QQuickShaderEffectMaterialKey::ShaderTypeCount; ++shaderType) {
++        for (int i = 0; i < material->uniforms[shaderType].size(); ++i) {
++            const QQuickShaderEffectMaterial::UniformData &d = material->uniforms[shaderType].at(i);
++            int loc = m_uniformLocs[shaderType].at(i);
++
++            if (d.specialType == QQuickShaderEffectMaterial::UniformData::Opacity) {
++                program()->setUniformValue(loc, state.opacity());
++            } if (d.specialType == QQuickShaderEffectMaterial::UniformData::Matrix) {
++                if (state.isMatrixDirty())
++                    program()->setUniformValue(loc, state.combinedMatrix());
++            } else {
++                switch (d.value.type()) {
++                case QMetaType::QColor:
++                    program()->setUniformValue(loc, qt_premultiply_color(qvariant_cast<QColor>(d.value)));
++                    break;
++                case QMetaType::Float:
++                    program()->setUniformValue(loc, qvariant_cast<float>(d.value));
++                    break;
++                case QMetaType::Double:
++                    program()->setUniformValue(loc, (float) qvariant_cast<double>(d.value));
++                    break;
++                case QMetaType::QTransform:
++                    program()->setUniformValue(loc, qvariant_cast<QTransform>(d.value));
++                    break;
++                case QMetaType::Int:
++                    program()->setUniformValue(loc, d.value.toInt());
++                    break;
++                case QMetaType::Bool:
++                    program()->setUniformValue(loc, GLint(d.value.toBool()));
++                    break;
++                case QMetaType::QSize:
++                case QMetaType::QSizeF:
++                    program()->setUniformValue(loc, d.value.toSizeF());
++                    break;
++                case QMetaType::QPoint:
++                case QMetaType::QPointF:
++                    program()->setUniformValue(loc, d.value.toPointF());
++                    break;
++                case QMetaType::QRect:
++                case QMetaType::QRectF:
++                    {
++                        QRectF r = d.value.toRectF();
++                        program()->setUniformValue(loc, r.x(), r.y(), r.width(), r.height());
++                    }
++                    break;
++                case QMetaType::QVector3D:
++                    program()->setUniformValue(loc, qvariant_cast<QVector3D>(d.value));
++                    break;
++                case QMetaType::QVector4D:
++                    program()->setUniformValue(loc, qvariant_cast<QVector4D>(d.value));
++                    break;
++                default:
++                    break;
++                }
+             }
+-            break;
+-        case QMetaType::QVector3D:
+-            program()->setUniformValue(m_uniformLocs.at(i), qvariant_cast<QVector3D>(v));
+-            break;
+-        default:
+-            break;
+         }
+     }
+ 
+     const QQuickShaderEffectMaterial *oldMaterial = static_cast<const QQuickShaderEffectMaterial *>(oldEffect);
+-    if (oldEffect == 0 || material->cullMode() != oldMaterial->cullMode()) {
+-        switch (material->cullMode()) {
++    if (oldEffect == 0 || material->cullMode != oldMaterial->cullMode) {
++        switch (material->cullMode) {
+         case QQuickShaderEffectMaterial::FrontFaceCulling:
+             glEnable(GL_CULL_FACE);
+             glCullFace(GL_FRONT);
+@@ -195,9 +203,6 @@ void QQuickCustomMaterialShader::updateState(const RenderState &state, QSGMateri
+             break;
+         }
+     }
+-
+-    if ((state.isMatrixDirty()) && material->m_source.respectsMatrix)
+-        program()->setUniformValue(m_matrixLoc, state.combinedMatrix());
+ }
+ 
+ char const *const *QQuickCustomMaterialShader::attributeNames() const
+@@ -277,38 +282,42 @@ void QQuickCustomMaterialShader::compile()
+     }
+ }
+ 
+-void QQuickCustomMaterialShader::initialize()
+-{
+-    m_opacityLoc = program()->uniformLocation("qt_Opacity");
+-    m_matrixLoc = program()->uniformLocation("qt_Matrix");
+-}
+-
+ const char *QQuickCustomMaterialShader::vertexShader() const
+ {
+-    return m_key.vertexCode.constData();
++    return m_key.sourceCode[QQuickShaderEffectMaterialKey::VertexShader].constData();
+ }
+ 
+ const char *QQuickCustomMaterialShader::fragmentShader() const
+ {
+-    return m_key.fragmentCode.constData();
++    return m_key.sourceCode[QQuickShaderEffectMaterialKey::FragmentShader].constData();
+ }
+ 
+ 
+ bool QQuickShaderEffectMaterialKey::operator == (const QQuickShaderEffectMaterialKey &other) const
+ {
+-    return vertexCode == other.vertexCode && fragmentCode == other.fragmentCode && className == other.className;
++    if (className != other.className)
++        return false;
++    for (int shaderType = 0; shaderType < ShaderTypeCount; ++shaderType) {
++        if (sourceCode[shaderType] != other.sourceCode[shaderType])
++            return false;
++    }
++    return true;
+ }
+ 
+ uint qHash(const QQuickShaderEffectMaterialKey &key)
+ {
+-    return qHash(qMakePair(qMakePair(key.vertexCode, key.fragmentCode), key.className));
++    uint hash = qHash((void *)key.className);
++    typedef QQuickShaderEffectMaterialKey Key;
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType)
++        hash = hash * 31337 + qHash(key.sourceCode[shaderType]);
++    return hash;
+ }
+ 
+ 
+ QHash<QQuickShaderEffectMaterialKey, QSharedPointer<QSGMaterialType> > QQuickShaderEffectMaterial::materialMap;
+ 
+ QQuickShaderEffectMaterial::QQuickShaderEffectMaterial(QQuickShaderEffectNode *node)
+-    : m_cullMode(NoCulling)
++    : cullMode(NoCulling)
+     , m_node(node)
+     , m_emittedLogChanged(false)
+ {
+@@ -322,7 +331,7 @@ QSGMaterialType *QQuickShaderEffectMaterial::type() const
+ 
+ QSGMaterialShader *QQuickShaderEffectMaterial::createShader() const
+ {
+-    return new QQuickCustomMaterialShader(m_source, m_source.attributeNames);
++    return new QQuickCustomMaterialShader(m_source, attributes);
+ }
+ 
+ int QQuickShaderEffectMaterial::compare(const QSGMaterial *other) const
+@@ -330,17 +339,7 @@ int QQuickShaderEffectMaterial::compare(const QSGMaterial *other) const
+     return this - static_cast<const QQuickShaderEffectMaterial *>(other);
+ }
+ 
+-void QQuickShaderEffectMaterial::setCullMode(QQuickShaderEffectMaterial::CullMode face)
+-{
+-    m_cullMode = face;
+-}
+-
+-QQuickShaderEffectMaterial::CullMode QQuickShaderEffectMaterial::cullMode() const
+-{
+-    return m_cullMode;
+-}
+-
+-void QQuickShaderEffectMaterial::setProgramSource(const QQuickShaderEffectProgram &source)
++void QQuickShaderEffectMaterial::setProgramSource(const QQuickShaderEffectMaterialKey &source)
+ {
+     m_source = source;
+     m_emittedLogChanged = false;
+@@ -351,25 +350,10 @@ void QQuickShaderEffectMaterial::setProgramSource(const QQuickShaderEffectProgra
+     }
+ }
+ 
+-void QQuickShaderEffectMaterial::setUniforms(const QVector<QPair<QByteArray, QVariant> > &uniformValues)
+-{
+-    m_uniformValues = uniformValues;
+-}
+-
+-void QQuickShaderEffectMaterial::setTextureProviders(const QVector<QPair<QByteArray, QSGTextureProvider *> > &textures)
+-{
+-    m_textures = textures;
+-}
+-
+-const QVector<QPair<QByteArray, QSGTextureProvider *> > &QQuickShaderEffectMaterial::textureProviders() const
+-{
+-    return m_textures;
+-}
+-
+ void QQuickShaderEffectMaterial::updateTextures() const
+ {
+-    for (int i = 0; i < m_textures.size(); ++i) {
+-        if (QSGTextureProvider *provider = m_textures.at(i).second) {
++    for (int i = 0; i < textureProviders.size(); ++i) {
++        if (QSGTextureProvider *provider = textureProviders.at(i).second) {
+             if (QSGDynamicTexture *texture = qobject_cast<QSGDynamicTexture *>(provider->texture()))
+                 texture->updateTexture();
+         }
+@@ -378,18 +362,16 @@ void QQuickShaderEffectMaterial::updateTextures() const
+ 
+ void QQuickShaderEffectMaterial::invalidateTextureProvider(QSGTextureProvider *provider)
+ {
+-    for (int i = 0; i < m_textures.size(); ++i) {
+-        if (provider == m_textures.at(i).second)
+-            m_textures[i].second = 0;
++    for (int i = 0; i < textureProviders.size(); ++i) {
++        if (provider == textureProviders.at(i).second)
++            textureProviders[i].second = 0;
+     }
+ }
+ 
+ 
+ QQuickShaderEffectNode::QQuickShaderEffectNode()
+-    : m_material(this)
+ {
+     QSGNode::setFlag(UsePreprocess, true);
+-    setMaterial(&m_material);
+ 
+ #ifdef QML_RUNTIME_TESTING
+     description = QLatin1String("shadereffect");
+@@ -407,7 +389,8 @@ void QQuickShaderEffectNode::markDirtyTexture()
+ 
+ void QQuickShaderEffectNode::textureProviderDestroyed(QObject *object)
+ {
+-    m_material.invalidateTextureProvider(static_cast<QSGTextureProvider *>(object));
++    Q_ASSERT(material());
++    static_cast<QQuickShaderEffectMaterial *>(material())->invalidateTextureProvider(static_cast<QSGTextureProvider *>(object));
+ }
+ 
+ void QQuickShaderEffectNode::preprocess()
+diff --git a/src/quick/items/qquickshadereffectnode_p.h b/src/quick/items/qquickshadereffectnode_p.h
+index e22d2de..1bbce86 100644
+--- a/src/quick/items/qquickshadereffectnode_p.h
++++ b/src/quick/items/qquickshadereffectnode_p.h
+@@ -55,8 +55,14 @@ QT_BEGIN_HEADER
+ QT_BEGIN_NAMESPACE
+ 
+ struct QQuickShaderEffectMaterialKey {
+-    QByteArray vertexCode;
+-    QByteArray fragmentCode;
++    enum ShaderType
++    {
++        VertexShader,
++        FragmentShader,
++        ShaderTypeCount
++    };
++
++    QByteArray sourceCode[ShaderTypeCount];
+     const char *className;
+ 
+     bool operator == (const QQuickShaderEffectMaterialKey &other) const;
+@@ -64,24 +70,21 @@ struct QQuickShaderEffectMaterialKey {
+ 
+ uint qHash(const QQuickShaderEffectMaterialKey &key);
+ 
+-// TODO: Implement support for multisampling.
+-struct QQuickShaderEffectProgram : public QQuickShaderEffectMaterialKey
+-{
+-    QQuickShaderEffectProgram() : respectsOpacity(false), respectsMatrix(false) {}
+-
+-    QVector<QByteArray> attributeNames;
+-    QSet<QByteArray> uniformNames;
+-
+-    uint respectsOpacity : 1;
+-    uint respectsMatrix : 1;
+-};
+-
+ 
+ class QQuickCustomMaterialShader;
+ class QQuickShaderEffectNode;
+ class QQuickShaderEffectMaterial : public QSGMaterial
+ {
+ public:
++    struct UniformData
++    {
++        enum SpecialType { None, Sampler, Opacity, Matrix };
++
++        QByteArray name;
++        QVariant value;
++        SpecialType specialType;
++    };
++
+     enum CullMode
+     {
+         NoCulling,
+@@ -94,13 +97,12 @@ public:
+     virtual QSGMaterialShader *createShader() const;
+     virtual int compare(const QSGMaterial *other) const;
+ 
+-    void setCullMode(CullMode face);
+-    CullMode cullMode() const;
++    QVector<QByteArray> attributes;
++    QVector<UniformData> uniforms[QQuickShaderEffectMaterialKey::ShaderTypeCount];
++    QVector<QPair<QByteArray, QSGTextureProvider *> > textureProviders;
++    CullMode cullMode;
+ 
+-    void setProgramSource(const QQuickShaderEffectProgram &);
+-    void setUniforms(const QVector<QPair<QByteArray, QVariant> > &uniformValues);
+-    void setTextureProviders(const QVector<QPair<QByteArray, QSGTextureProvider *> > &textures);
+-    const QVector<QPair<QByteArray, QSGTextureProvider *> > &textureProviders() const;
++    void setProgramSource(const QQuickShaderEffectMaterialKey &source);
+     void updateTextures() const;
+     void invalidateTextureProvider(QSGTextureProvider *provider);
+ 
+@@ -114,11 +116,8 @@ protected:
+     // one. To guarantee that the type pointer is unique, the type object must live as long as
+     // there are any CustomMaterialShaders of that type.
+     QSharedPointer<QSGMaterialType> m_type;
++    QQuickShaderEffectMaterialKey m_source;
+ 
+-    QQuickShaderEffectProgram m_source;
+-    QVector<QPair<QByteArray, QVariant> > m_uniformValues;
+-    QVector<QPair<QByteArray, QSGTextureProvider *> > m_textures;
+-    CullMode m_cullMode;
+     QQuickShaderEffectNode *m_node;
+     bool m_emittedLogChanged;
+ 
+@@ -137,17 +136,12 @@ public:
+ 
+     virtual void preprocess();
+ 
+-    QQuickShaderEffectMaterial *shaderMaterial() { return &m_material; }
+-
+ Q_SIGNALS:
+     void logAndStatusChanged(const QString &, int status);
+ 
+ private Q_SLOTS:
+     void markDirtyTexture();
+     void textureProviderDestroyed(QObject *object);
+-
+-private:
+-    QQuickShaderEffectMaterial m_material;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/particles/qquickcustomparticle.cpp b/src/quick/particles/qquickcustomparticle.cpp
+index 6f10307..7d27e48 100644
+--- a/src/quick/particles/qquickcustomparticle.cpp
++++ b/src/quick/particles/qquickcustomparticle.cpp
+@@ -130,29 +130,27 @@ struct PlainVertices {
+ 
+ QQuickCustomParticle::QQuickCustomParticle(QQuickItem* parent)
+     : QQuickParticlePainter(parent)
+-    , m_dirtyData(true)
+-    , m_material(0)
+-    , m_rootNode(0)
++    , m_dirtyUniforms(true)
++    , m_dirtyUniformValues(true)
++    , m_dirtyTextureProviders(true)
++    , m_dirtyProgram(true)
+ {
+     setFlag(QQuickItem::ItemHasContents);
+ }
+ 
+-class QQuickShaderEffectMaterialObject : public QObject, public QQuickShaderEffectMaterial { };
+-
+ void QQuickCustomParticle::sceneGraphInvalidated()
+ {
+     m_nodes.clear();
+-    m_rootNode = 0;
+ }
+ 
+ QQuickCustomParticle::~QQuickCustomParticle()
+ {
+-    if (m_material)
+-        m_material->deleteLater();
+ }
+ 
+ void QQuickCustomParticle::componentComplete()
+ {
++    m_common.updateShader(this, Key::FragmentShader);
++    updateVertexShader();
+     reset();
+     QQuickParticlePainter::componentComplete();
+ }
+@@ -170,10 +168,12 @@ void QQuickCustomParticle::componentComplete()
+ 
+ void QQuickCustomParticle::setFragmentShader(const QByteArray &code)
+ {
+-    if (m_source.fragmentCode.constData() == code.constData())
++    if (m_common.source.sourceCode[Key::FragmentShader].constData() == code.constData())
+         return;
+-    m_source.fragmentCode = code;
++    m_common.source.sourceCode[Key::FragmentShader] = code;
++    m_dirtyProgram = true;
+     if (isComponentComplete()) {
++        m_common.updateShader(this, Key::FragmentShader);
+         reset();
+     }
+     emit fragmentShaderChanged();
+@@ -222,236 +222,108 @@ void QQuickCustomParticle::setFragmentShader(const QByteArray &code)
+ 
+ void QQuickCustomParticle::setVertexShader(const QByteArray &code)
+ {
+-    if (m_source.vertexCode.constData() == code.constData())
++    if (m_common.source.sourceCode[Key::VertexShader].constData() == code.constData())
+         return;
+-    m_source.vertexCode = code;
++    m_common.source.sourceCode[Key::VertexShader] = code;
++
++    m_dirtyProgram = true;
+     if (isComponentComplete()) {
++        updateVertexShader();
+         reset();
+     }
+     emit vertexShaderChanged();
+ }
+ 
+-void QQuickCustomParticle::reset()
++void QQuickCustomParticle::updateVertexShader()
+ {
+-    disconnectPropertySignals();
+-
+-    m_source.attributeNames.clear();
+-    m_source.uniformNames.clear();
+-    m_source.respectsOpacity = false;
+-    m_source.respectsMatrix = false;
+-    m_source.className = metaObject()->className();
+-
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        const SourceData &source = m_sources.at(i);
+-        delete source.mapper;
+-        if (source.item && source.item->parentItem() == this)
+-            source.item->setParentItem(0);
+-    }
+-    m_sources.clear();
+-
+-    QQuickParticlePainter::reset();
+-    m_pleaseReset = true;
+-    update();
++    m_common.disconnectPropertySignals(this, Key::VertexShader);
++    qDeleteAll(m_common.signalMappers[Key::VertexShader]);
++    m_common.uniformData[Key::VertexShader].clear();
++    m_common.signalMappers[Key::VertexShader].clear();
++    m_common.attributes.clear();
++    m_common.attributes.append("qt_ParticlePos");
++    m_common.attributes.append("qt_ParticleTex");
++    m_common.attributes.append("qt_ParticleData");
++    m_common.attributes.append("qt_ParticleVec");
++    m_common.attributes.append("qt_ParticleR");
++
++    UniformData d;
++    d.name = "qt_Matrix";
++    d.specialType = UniformData::Matrix;
++    m_common.uniformData[Key::VertexShader].append(d);
++    m_common.signalMappers[Key::VertexShader].append(0);
++
++    d.name = "qt_Timestamp";
++    d.specialType = UniformData::None;
++    m_common.uniformData[Key::VertexShader].append(d);
++    m_common.signalMappers[Key::VertexShader].append(0);
++
++    const QByteArray &code = m_common.source.sourceCode[Key::VertexShader];
++    if (!code.isEmpty())
++        m_common.lookThroughShaderCode(this, Key::VertexShader, code);
++
++    m_common.connectPropertySignals(this, Key::VertexShader);
+ }
+ 
+-
+-void QQuickCustomParticle::changeSource(int index)
+-{
+-    Q_ASSERT(index >= 0 && index < m_sources.size());
+-    QVariant v = property(m_sources.at(index).name.constData());
+-    setSource(v, index);
+-}
+-
+-void QQuickCustomParticle::updateData()
++void QQuickCustomParticle::reset()
+ {
+-    m_dirtyData = true;
++    QQuickParticlePainter::reset();
+     update();
+ }
+ 
+-void QQuickCustomParticle::setSource(const QVariant &var, int index)
+-{
+-    Q_ASSERT(index >= 0 && index < m_sources.size());
+-
+-    SourceData &source = m_sources[index];
+-
+-    source.item = 0;
+-    if (var.isNull()) {
+-        return;
+-    } else if (!qVariantCanConvert<QObject *>(var)) {
+-        qWarning("Could not assign source of type '%s' to property '%s'.", var.typeName(), source.name.constData());
+-        return;
+-    }
+-
+-    QObject *obj = qVariantValue<QObject *>(var);
+-    source.item = qobject_cast<QQuickItem *>(obj);
+-    if (!source.item || !source.item->isTextureProvider()) {
+-        qWarning("ShaderEffect: source uniform [%s] is not assigned a valid texture provider: %s [%s]",
+-                 source.name.constData(), qPrintable(obj->objectName()), obj->metaObject()->className());
+-        return;
+-    }
+-
+-    // TODO: Copy better solution in QQuickShaderEffect when they find it.
+-    // 'source.item' needs a canvas to get a scenegraph node.
+-    // The easiest way to make sure it gets a canvas is to
+-    // make it a part of the same item tree as 'this'.
+-    if (source.item && source.item->parentItem() == 0) {
+-        source.item->setParentItem(this);
+-        source.item->setVisible(false);
+-    }
+-}
+-
+-void QQuickCustomParticle::disconnectPropertySignals()
+-{
+-    disconnect(this, 0, this, SLOT(updateData()));
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        SourceData &source = m_sources[i];
+-        disconnect(this, 0, source.mapper, 0);
+-        disconnect(source.mapper, 0, this, 0);
+-    }
+-}
+-
+-void QQuickCustomParticle::connectPropertySignals()
+-{
+-    QSet<QByteArray>::const_iterator it;
+-    for (it = m_source.uniformNames.begin(); it != m_source.uniformNames.end(); ++it) {
+-        int pi = metaObject()->indexOfProperty(it->constData());
+-        if (pi >= 0) {
+-            QMetaProperty mp = metaObject()->property(pi);
+-            if (!mp.hasNotifySignal())
+-                qWarning("QQuickCustomParticle: property '%s' does not have notification method!", it->constData());
+-            QByteArray signalName("2");
+-            signalName.append(mp.notifySignal().signature());
+-            connect(this, signalName, this, SLOT(updateData()));
+-        } else {
+-            qWarning("QQuickCustomParticle: '%s' does not have a matching property!", it->constData());
+-        }
+-    }
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        SourceData &source = m_sources[i];
+-        int pi = metaObject()->indexOfProperty(source.name.constData());
+-        if (pi >= 0) {
+-            QMetaProperty mp = metaObject()->property(pi);
+-            QByteArray signalName("2");
+-            signalName.append(mp.notifySignal().signature());
+-            connect(this, signalName, source.mapper, SLOT(map()));
+-            source.mapper->setMapping(this, i);
+-            connect(source.mapper, SIGNAL(mapped(int)), this, SLOT(changeSource(int)));
+-        } else {
+-            qWarning("QQuickCustomParticle: '%s' does not have a matching source!", source.name.constData());
+-        }
+-    }
+-}
+-
+-void QQuickCustomParticle::updateProperties()
+-{
+-    QByteArray vertexCode = m_source.vertexCode;
+-    QByteArray fragmentCode = m_source.fragmentCode;
+-    if (vertexCode.isEmpty())
+-        vertexCode = qt_particles_default_vertex_code;
+-    if (fragmentCode.isEmpty())
+-        fragmentCode = qt_particles_default_fragment_code;
+-    vertexCode = qt_particles_template_vertex_code + vertexCode;
+-
+-    m_source.attributeNames.clear();
+-    m_source.attributeNames << "qt_ParticlePos"
+-                            << "qt_ParticleTex"
+-                            << "qt_ParticleData"
+-                            << "qt_ParticleVec"
+-                            << "qt_ParticleR";
+-
+-    lookThroughShaderCode(vertexCode);
+-    lookThroughShaderCode(fragmentCode);
+-
+-    if (!m_source.respectsMatrix)
+-        qWarning("QQuickCustomParticle: Missing reference to \'qt_Matrix\'.");
+-    if (!m_source.respectsOpacity)
+-        qWarning("QQuickCustomParticle: Missing reference to \'qt_Opacity\'.");
+-
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        QVariant v = property(m_sources.at(i).name);
+-        setSource(v, i);
+-    }
+-
+-    connectPropertySignals();
+-}
+-
+-void QQuickCustomParticle::lookThroughShaderCode(const QByteArray &code)
+-{
+-    // Regexp for matching attributes and uniforms.
+-    // In human readable form: attribute|uniform [lowp|mediump|highp] <type> <name>
+-    static QRegExp re(QLatin1String("\\b(attribute|uniform)\\b\\s*\\b(?:lowp|mediump|highp)?\\b\\s*\\b(\\w+)\\b\\s*\\b(\\w+)"));
+-    Q_ASSERT(re.isValid());
+-
+-    int pos = -1;
+-
+-    QString wideCode = QString::fromLatin1(code.constData(), code.size());
+-
+-    while ((pos = re.indexIn(wideCode, pos + 1)) != -1) {
+-        QByteArray decl = re.cap(1).toLatin1(); // uniform or attribute
+-        QByteArray type = re.cap(2).toLatin1(); // type
+-        QByteArray name = re.cap(3).toLatin1(); // variable name
+-
+-        if (decl == "attribute") {
+-            if (!m_source.attributeNames.contains(name))
+-                qWarning() << "Custom Particle: Unknown attribute " << name;
+-        } else {
+-            Q_ASSERT(decl == "uniform");//TODO: Shouldn't assert
+-
+-            if (name == "qt_Matrix") {
+-                m_source.respectsMatrix = true;
+-            } else if (name == "qt_Opacity") {
+-                m_source.respectsOpacity = true;
+-            } else if (name == "qt_Timestamp") {
+-                //Not strictly necessary
+-            } else {
+-                m_source.uniformNames.insert(name);
+-                if (type == "sampler2D") {
+-                    SourceData d;
+-                    d.mapper = new QSignalMapper;
+-                    d.name = name;
+-                    d.item = 0;
+-                    m_sources.append(d);
+-                }
+-            }
+-        }
+-    }
+-}
+-
+ QSGNode *QQuickCustomParticle::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
+ {
+-    Q_UNUSED(oldNode);
++    QQuickShaderEffectNode *rootNode = static_cast<QQuickShaderEffectNode *>(oldNode);
+     if (m_pleaseReset){
+-
+-        //delete m_material;//Shader effect item doesn't regen material?
+-
+-        delete m_rootNode;//Automatically deletes children
+-        m_rootNode = 0;
++        delete rootNode;//Automatically deletes children
++        rootNode = 0;
+         m_nodes.clear();
+         m_pleaseReset = false;
+-        m_dirtyData = false;
++        m_dirtyProgram = true;
+     }
+ 
+     if (m_system && m_system->isRunning() && !m_system->isPaused()){
+-        prepareNextFrame();
+-        if (m_rootNode) {
++        rootNode = prepareNextFrame(rootNode);
++        if (rootNode)
+             update();
+-            foreach (QSGGeometryNode* node, m_nodes)
+-                node->markDirty(QSGNode::DirtyGeometry);//done in buildData?
+-        }
+     }
+ 
+-    return m_rootNode;
++    return rootNode;
+ }
+ 
+-void QQuickCustomParticle::prepareNextFrame(){
+-    if (!m_rootNode)
+-        m_rootNode = buildCustomNodes();
+-    if (!m_rootNode)
+-        return;
++QQuickShaderEffectNode *QQuickCustomParticle::prepareNextFrame(QQuickShaderEffectNode *rootNode)
++{
++    if (!rootNode)
++        rootNode = buildCustomNodes();
++
++    if (!rootNode)
++        return 0;
++
++    if (m_dirtyProgram) {
++        QQuickShaderEffectMaterial *material = static_cast<QQuickShaderEffectMaterial *>(rootNode->material());
++        Q_ASSERT(material);
++
++        Key s = m_common.source;
++        if (s.sourceCode[Key::FragmentShader].isEmpty())
++            s.sourceCode[Key::FragmentShader] = qt_particles_default_fragment_code;
++        if (s.sourceCode[Key::VertexShader].isEmpty())
++            s.sourceCode[Key::VertexShader] = qt_particles_default_vertex_code;
++        s.sourceCode[Key::VertexShader] = qt_particles_template_vertex_code + s.sourceCode[Key::VertexShader];
++        s.className = metaObject()->className();
++
++        material->setProgramSource(s);
++        material->attributes = m_common.attributes;
++        foreach (QQuickShaderEffectNode* node, m_nodes)
++            node->markDirty(QSGNode::DirtyMaterial);
++
++        m_dirtyProgram = false;
++        m_dirtyUniforms = true;
++    }
+ 
+     m_lastTime = m_system->systemSync(this) / 1000.;
+-    if (m_dirtyData || true)//Currently this is how we update timestamp... potentially over expensive.
+-        buildData();
++    if (true) //Currently this is how we update timestamp... potentially over expensive.
++        buildData(rootNode);
++    return rootNode;
+ }
+ 
+ QQuickShaderEffectNode* QQuickCustomParticle::buildCustomNodes()
+@@ -468,20 +340,13 @@ QQuickShaderEffectNode* QQuickCustomParticle::buildCustomNodes()
+         return 0;
+     }
+ 
+-    updateProperties();
+-
+-    QQuickShaderEffectProgram s = m_source;
+-    if (s.fragmentCode.isEmpty())
+-        s.fragmentCode = qt_particles_default_fragment_code;
+-    if (s.vertexCode.isEmpty())
+-        s.vertexCode = qt_particles_default_vertex_code;
++    if (m_groups.isEmpty())
++        return 0;
+ 
+-    if (!m_material) {
+-        m_material = new QQuickShaderEffectMaterialObject;
+-    }
++    QQuickShaderEffectNode *rootNode = 0;
++    QQuickShaderEffectMaterial *material = new QQuickShaderEffectMaterial;
++    m_dirtyProgram = true;
+ 
+-    s.vertexCode = qt_particles_template_vertex_code + s.vertexCode;
+-    m_material->setProgramSource(s);
+     foreach (const QString &str, m_groups){
+         int gIdx = m_system->groupIds[str];
+         int count = m_system->groupData[gIdx]->size();
+@@ -489,8 +354,7 @@ QQuickShaderEffectNode* QQuickCustomParticle::buildCustomNodes()
+         QQuickShaderEffectNode* node = new QQuickShaderEffectNode();
+         m_nodes.insert(gIdx, node);
+ 
+-        node->setMaterial(m_material);
+-        node->markDirty(QSGNode::DirtyMaterial);
++        node->setMaterial(material);
+ 
+         //Create Particle Geometry
+         int vCount = count * 4;
+@@ -498,6 +362,7 @@ QQuickShaderEffectNode* QQuickCustomParticle::buildCustomNodes()
+         QSGGeometry *g = new QSGGeometry(PlainParticle_AttributeSet, vCount, iCount);
+         g->setDrawingMode(GL_TRIANGLES);
+         node->setGeometry(g);
++        node->setFlag(QSGNode::OwnsGeometry, true);
+         PlainVertex *vertices = (PlainVertex *) g->vertexData();
+         for (int p=0; p < count; ++p) {
+             commit(gIdx, p);
+@@ -526,48 +391,46 @@ QQuickShaderEffectNode* QQuickCustomParticle::buildCustomNodes()
+             indices += 6;
+         }
+     }
+-    foreach (QQuickShaderEffectNode* node, m_nodes){
+-        if (node == *(m_nodes.begin()))
+-                continue;
+-        (*(m_nodes.begin()))->appendChildNode(node);
+-    }
+ 
+-    return *(m_nodes.begin());
++    QHash<int, QQuickShaderEffectNode*>::const_iterator it = m_nodes.begin();
++    rootNode = it.value();
++    rootNode->setFlag(QSGNode::OwnsMaterial, true);
++    for (++it; it != m_nodes.end(); ++it)
++        rootNode->appendChildNode(it.value());
++
++    return rootNode;
+ }
+ 
++void QQuickCustomParticle::sourceDestroyed(QObject *object)
++{
++    m_common.sourceDestroyed(object);
++}
+ 
+-void QQuickCustomParticle::buildData()
++void QQuickCustomParticle::propertyChanged(int mappedId)
+ {
+-    if (!m_rootNode)
++    bool textureProviderChanged;
++    m_common.propertyChanged(this, mappedId, &textureProviderChanged);
++    m_dirtyTextureProviders |= textureProviderChanged;
++    m_dirtyUniformValues = true;
++    update();
++}
++
++
++void QQuickCustomParticle::buildData(QQuickShaderEffectNode *rootNode)
++{
++    if (!rootNode)
+         return;
+-    const QByteArray timestampName("qt_Timestamp");
+-    QVector<QPair<QByteArray, QVariant> > values;
+-    QVector<QPair<QByteArray, QSGTextureProvider *> > textures;
+-    const QVector<QPair<QByteArray, QSGTextureProvider *> > &oldTextures = m_material->textureProviders();
+-    for (int i = 0; i < oldTextures.size(); ++i) {
+-        QSGTextureProvider *t = oldTextures.at(i).second;
+-        if (t)
+-            foreach (QQuickShaderEffectNode* node, m_nodes)
+-                disconnect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()));
+-    }
+-    for (int i = 0; i < m_sources.size(); ++i) {
+-        const SourceData &source = m_sources.at(i);
+-        QSGTextureProvider *t = source.item->textureProvider();
+-        textures.append(qMakePair(source.name, t));
+-        if (t)
+-            foreach (QQuickShaderEffectNode* node, m_nodes)
+-                connect(t, SIGNAL(textureChanged()), node, SLOT(markDirtyTexture()), Qt::DirectConnection);
+-    }
+-    for (QSet<QByteArray>::const_iterator it = m_source.uniformNames.begin();
+-         it != m_source.uniformNames.end(); ++it) {
+-        values.append(qMakePair(*it, property(*it)));
++    for (int shaderType = 0; shaderType < Key::ShaderTypeCount; ++shaderType) {
++        for (int i = 0; i < m_common.uniformData[shaderType].size(); ++i) {
++            if (m_common.uniformData[shaderType].at(i).name == "qt_Timestamp")
++                m_common.uniformData[shaderType][i].value = qVariantFromValue(m_lastTime);
++        }
+     }
+-    values.append(qMakePair(timestampName, QVariant(m_lastTime)));
+-    m_material->setUniforms(values);
+-    m_material->setTextureProviders(textures);
+-    m_dirtyData = false;
++    m_common.updateMaterial(rootNode, static_cast<QQuickShaderEffectMaterial *>(rootNode->material()),
++                            m_dirtyUniforms, true, m_dirtyTextureProviders);
+     foreach (QQuickShaderEffectNode* node, m_nodes)
+         node->markDirty(QSGNode::DirtyMaterial);
++    m_dirtyUniforms = m_dirtyUniformValues = m_dirtyTextureProviders = false;
+ }
+ 
+ void QQuickCustomParticle::initialize(int gIdx, int pIdx)
+@@ -599,4 +462,12 @@ void QQuickCustomParticle::commit(int gIdx, int pIdx)
+     }
+ }
+ 
++void QQuickCustomParticle::itemChange(ItemChange change, const ItemChangeData &value)
++{
++    if (change == QQuickItem::ItemSceneChange)
++        m_common.updateCanvas(value.canvas);
++    QQuickParticlePainter::itemChange(change, value);
++}
++
++
+ QT_END_NAMESPACE
+diff --git a/src/quick/particles/qquickcustomparticle_p.h b/src/quick/particles/qquickcustomparticle_p.h
+index e04ac70..f689091 100644
+--- a/src/quick/particles/qquickcustomparticle_p.h
++++ b/src/quick/particles/qquickcustomparticle_p.h
+@@ -43,6 +43,7 @@
+ #define CUSTOM_PARTICLE_H
+ #include "qquickparticlepainter_p.h"
+ #include <private/qquickshadereffectnode_p.h>
++#include <private/qquickshadereffect_p.h>
+ #include <QSignalMapper>
+ 
+ QT_BEGIN_HEADER
+@@ -65,53 +66,50 @@ public:
+     explicit QQuickCustomParticle(QQuickItem* parent=0);
+     ~QQuickCustomParticle();
+ 
+-    QByteArray fragmentShader() const { return m_source.fragmentCode; }
++    QByteArray fragmentShader() const { return m_common.source.sourceCode[Key::FragmentShader]; }
+     void setFragmentShader(const QByteArray &code);
+ 
+-    QByteArray vertexShader() const { return m_source.vertexCode; }
++    QByteArray vertexShader() const { return m_common.source.sourceCode[Key::VertexShader]; }
+     void setVertexShader(const QByteArray &code);
+-public Q_SLOTS:
+-    void updateData();
+-    void changeSource(int);
++
+ Q_SIGNALS:
+     void fragmentShaderChanged();
+     void vertexShaderChanged();
++
+ protected:
+     virtual void initialize(int gIdx, int pIdx);
+     virtual void commit(int gIdx, int pIdx);
+ 
+     QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *);
+-    void prepareNextFrame();
+-    void setSource(const QVariant &var, int index);
+-    void disconnectPropertySignals();
+-    void connectPropertySignals();
++    QQuickShaderEffectNode *prepareNextFrame(QQuickShaderEffectNode *rootNode);
+     void reset();
+     void resize(int oldCount, int newCount);
+-    void updateProperties();
+-    void lookThroughShaderCode(const QByteArray &code);
+     virtual void componentComplete();
+     QQuickShaderEffectNode *buildCustomNodes();
+-    void performPendingResize();
+ 
+     void sceneGraphInvalidated();
++    void itemChange(ItemChange change, const ItemChangeData &value);
++
++private Q_SLOTS:
++    void sourceDestroyed(QObject *object);
++    void propertyChanged(int mappedId);
+ 
+ private:
+-    void buildData();
+-
+-    bool m_dirtyData;
+-    QQuickShaderEffectProgram m_source;
+-    struct SourceData
+-    {
+-        QSignalMapper *mapper;
+-        QPointer<QQuickItem> item;
+-        QByteArray name;
+-    };
+-    QVector<SourceData> m_sources;
+-    QQuickShaderEffectMaterialObject *m_material;
+-    QQuickShaderEffectNode* m_rootNode;
++    typedef QQuickShaderEffectMaterialKey Key;
++    typedef QQuickShaderEffectMaterial::UniformData UniformData;
++
++    void buildData(QQuickShaderEffectNode *rootNode);
++    void updateVertexShader();
++
++    QQuickShaderEffectCommon m_common;
++
+     QHash<int, QQuickShaderEffectNode*> m_nodes;
+     qreal m_lastTime;
+ 
++    uint m_dirtyUniforms : 1;
++    uint m_dirtyUniformValues : 1;
++    uint m_dirtyTextureProviders : 1;
++    uint m_dirtyProgram : 1;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/tests/auto/quick/qquickshadereffect/tst_qquickshadereffect.cpp b/tests/auto/quick/qquickshadereffect/tst_qquickshadereffect.cpp
+index 00ae8fc..1edf511 100644
+--- a/tests/auto/quick/qquickshadereffect/tst_qquickshadereffect.cpp
++++ b/tests/auto/quick/qquickshadereffect/tst_qquickshadereffect.cpp
+@@ -257,13 +257,12 @@ void tst_qquickshadereffect::lookThroughShaderCode()
+     if ((presenceFlags & TexCoordPresent) == 0)
+         expected += "Warning: Missing reference to \'qt_MultiTexCoord0\'.\n";
+     if ((presenceFlags & MatrixPresent) == 0)
+-        expected += "Warning: Missing reference to \'qt_Matrix\'.\n";
++        expected += "Warning: Vertex shader is missing reference to \'qt_Matrix\'.\n";
+     if ((presenceFlags & OpacityPresent) == 0)
+-        expected += "Warning: Missing reference to \'qt_Opacity\'.\n";
++        expected += "Warning: Shaders are missing reference to \'qt_Opacity\'.\n";
+ 
+     item.setVertexShader(vertexShader);
+     item.setFragmentShader(fragmentShader);
+-    item.ensureCompleted();
+     QCOMPARE(item.parseLog(), expected);
+ 
+     // If the uniform was successfully parsed, the notify signal has been connected to an update slot.

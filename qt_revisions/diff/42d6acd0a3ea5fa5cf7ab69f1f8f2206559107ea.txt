@@ -1,0 +1,1746 @@
+diff --git a/src/quick/items/qquickimage.cpp b/src/quick/items/qquickimage.cpp
+index 19a8ef1..b2504fe 100644
+--- a/src/quick/items/qquickimage.cpp
++++ b/src/quick/items/qquickimage.cpp
+@@ -42,7 +42,7 @@
+ #include "qquickimage_p.h"
+ #include "qquickimage_p_p.h"
+ 
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ 
+ #include <QtQuick/private/qsgcontext_p.h>
+ #include <private/qsgadaptationlayer_p.h>
+diff --git a/src/quick/items/qquickimage_p.h b/src/quick/items/qquickimage_p.h
+index 36b4307..fff7468 100644
+--- a/src/quick/items/qquickimage_p.h
++++ b/src/quick/items/qquickimage_p.h
+@@ -44,7 +44,7 @@
+ #define QQUICKIMAGE_P_H
+ 
+ #include "qquickimagebase_p.h"
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ 
+ QT_BEGIN_HEADER
+ 
+diff --git a/src/quick/items/qquickitem.cpp b/src/quick/items/qquickitem.cpp
+index a6cff52..ea0defd 100644
+--- a/src/quick/items/qquickitem.cpp
++++ b/src/quick/items/qquickitem.cpp
+@@ -1827,6 +1827,7 @@ QQuickItem::~QQuickItem()
+     delete d->_anchors; d->_anchors = 0;
+     delete d->_stateGroup; d->_stateGroup = 0;
+     delete d->_contents; d->_contents = 0;
++    delete d->_layer;
+ }
+ 
+ /*!
+@@ -2298,7 +2299,7 @@ QQuickItemPrivate::QQuickItemPrivate()
+ 
+   itemNodeInstance(0), opacityNode(0), clipNode(0), rootNode(0), groupNode(0), paintNode(0)
+   , beforePaintNode(0), effectRefCount(0), hideRefCount(0)
+-  , screenAttached(0)
++  , screenAttached(0), _layer(0)
+ {
+ }
+ 
+@@ -3368,6 +3369,8 @@ void QQuickItem::classBegin()
+         d->_stateGroup->classBegin();
+     if (d->_anchors)
+         d->_anchors->classBegin();
++    if (d->_layer)
++        d->_layer->classBegin();
+ }
+ 
+ void QQuickItem::componentComplete()
+@@ -3380,6 +3383,10 @@ void QQuickItem::componentComplete()
+         d->_anchors->componentComplete();
+         QQuickAnchorsPrivate::get(d->_anchors)->updateOnComplete();
+     }
++
++    if (d->_layer)
++        d->_layer->componentComplete();
++
+     if (d->keyHandler)
+         d->keyHandler->componentComplete();
+     if (d->_contents)
+@@ -3445,6 +3452,8 @@ QPointF QQuickItemPrivate::computeTransformOrigin() const
+ 
+ void QQuickItemPrivate::transformChanged()
+ {
++    if (_layer)
++        _layer->updateMatrix();
+ }
+ 
+ void QQuickItemPrivate::deliverKeyEvent(QKeyEvent *e)
+@@ -3666,6 +3675,9 @@ void QQuickItem::setZ(qreal v)
+     }
+ 
+     emit zChanged();
++
++    if (d->_layer)
++        d->_layer->updateZ();
+ }
+ 
+ 
+@@ -5304,6 +5316,12 @@ qint64 QQuickItemPrivate::restart(QElapsedTimer &t)
+     This function can be called from any thread.
+  */
+ 
++bool QQuickItem::isTextureProvider() const
++{
++    Q_D(const QQuickItem);
++    return d->_layer && d->_layer->effectSource() ? d->_layer->effectSource()->isTextureProvider() : false;
++}
++
+ /*!
+     \fn QSGTextureProvider *QQuickItem::textureProvider() const
+ 
+@@ -5313,6 +5331,403 @@ qint64 QQuickItemPrivate::restart(QElapsedTimer &t)
+     This function may only be called on the rendering thread.
+  */
+ 
++QSGTextureProvider *QQuickItem::textureProvider() const
++{
++    Q_D(const QQuickItem);
++    return d->_layer && d->_layer->effectSource() ? d->_layer->effectSource()->textureProvider() : 0;
++}
++
++
++
++QQuickItemLayer *QQuickItemPrivate::layer() const
++{
++    if (!_layer)
++        _layer = new QQuickItemLayer(const_cast<QQuickItem *>(q_func()));
++    return _layer;
++}
++
++
++
++QQuickItemLayer::QQuickItemLayer(QQuickItem *item)
++    : m_item(item)
++    , m_enabled(false)
++    , m_mipmap(false)
++    , m_smooth(false)
++    , m_componentComplete(true)
++    , m_wrapMode(QQuickShaderEffectSource::ClampToEdge)
++    , m_format(QQuickShaderEffectSource::RGBA)
++    , m_effectComponent(0)
++    , m_effect(0)
++    , m_effectSource(0)
++{
++    m_name = QLatin1String("source");
++}
++
++QQuickItemLayer::~QQuickItemLayer()
++{
++    delete m_effectSource;
++    delete m_effect;
++}
++
++
++
++/*!
++    \qmlproperty bool QtQuick2::Item::layer.enabled
++
++    Holds wether the item is layered or not. Layering is disabled by default.
++
++    A layered item is rendered into an offscreen surface and cached until
++    it is changed. Enabling layering for complex QML item hierarchies can
++    some times be an optimization.
++
++    None of the other layer properties have any effect when the layer
++    is disabled.
++ */
++
++void QQuickItemLayer::setEnabled(bool e)
++{
++    if (e == m_enabled)
++        return;
++    m_enabled = e;
++    if (m_componentComplete) {
++        if (m_enabled)
++            activate();
++        else
++            deactivate();
++    }
++
++    emit enabledChanged(e);
++}
++
++void QQuickItemLayer::classBegin()
++{
++    m_componentComplete = false;
++}
++
++void QQuickItemLayer::componentComplete()
++{
++    m_componentComplete = true;
++    if (m_enabled)
++        activate();
++}
++
++void QQuickItemLayer::activate()
++{
++    QQuickItem *parentItem = m_item->parentItem();
++    if (!m_effectSource)
++        m_effectSource = new QQuickShaderEffectSource();
++
++    if (parentItem) {
++        m_effectSource->setParentItem(parentItem);
++        m_effectSource->stackAfter(m_item);
++    }
++
++    m_effectSource->setVisible(!m_effectComponent && m_item->isVisible());
++    m_effectSource->setSourceItem(m_item);
++    m_effectSource->setHideSource(true);
++    m_effectSource->setSmooth(m_smooth);
++    m_effectSource->setTextureSize(m_size);
++    m_effectSource->setSourceRect(m_sourceRect);
++    m_effectSource->setMipmap(m_mipmap);
++    m_effectSource->setWrapMode(m_wrapMode);
++    m_effectSource->setFormat(m_format);
++
++    if (m_effectComponent) {
++        if (!m_effect) {
++            QObject *created = m_effectComponent->create();
++            m_effect = qobject_cast<QQuickShaderEffect *>(created);
++            if (!m_effect) {
++                qWarning("Item: layer.effect is not a shader effect");
++                delete created;
++            }
++        }
++        if (m_effect) {
++            if (parentItem) {
++                m_effect->setParentItem(parentItem);
++                m_effect->stackAfter(m_effectSource);
++            }
++            m_effect->setVisible(m_item->isVisible());
++            m_effect->setProperty(m_name.toLatin1(), qVariantFromValue<QObject *>(m_effectSource));
++            m_effect->update();
++        }
++    }
++
++    updateZ();
++    updateGeometry();
++    updateOpacity();
++    updateMatrix();
++
++    QQuickItemPrivate *id = QQuickItemPrivate::get(m_item);
++    id->addItemChangeListener(this, QQuickItemPrivate::Geometry | QQuickItemPrivate::Opacity | QQuickItemPrivate::Parent | QQuickItemPrivate::Visibility | QQuickItemPrivate::SiblingOrder);
++}
++
++void QQuickItemLayer::deactivate()
++{
++    delete m_effectSource;
++    m_effectSource = 0;
++
++    delete m_effect;
++    m_effect = 0;
++
++    QQuickItemPrivate *id = QQuickItemPrivate::get(m_item);
++    id->removeItemChangeListener(this,  QQuickItemPrivate::Geometry | QQuickItemPrivate::Opacity | QQuickItemPrivate::Parent | QQuickItemPrivate::Visibility | QQuickItemPrivate::SiblingOrder);
++}
++
++
++
++/*!
++    \qmlproperty Component QtQuick2::Item::layer.effect
++
++    Holds the effect that is applied to this layer.
++
++    The effect must be a \l ShaderEffect.
++ */
++
++void QQuickItemLayer::setEffect(QDeclarativeComponent *component)
++{
++    if (component == m_effectComponent)
++        return;
++    m_effectComponent = component;
++
++    if (m_effect) {
++        delete m_effect;
++        m_effect = 0;
++    }
++
++    if (m_effectSource)
++        activate();
++
++    emit effectChanged(component);
++}
++
++
++/*!
++    \qmlproperty bool QtQuick2::Item::layer.mipmap
++
++    If this property is true, mipmaps are generated for the texture.
++
++    \note Some OpenGL ES 2 implementations do not support mipmapping of
++    non-power-of-two textures.
++ */
++
++void QQuickItemLayer::setMipmap(bool mipmap)
++{
++    if (mipmap == m_mipmap)
++        return;
++    m_mipmap = mipmap;
++
++    if (m_effectSource)
++        m_effectSource->setMipmap(m_mipmap);
++
++    emit mipmapChanged(mipmap);
++}
++
++
++/*!
++    \qmlproperty enumeration QtQuick2::Item::layer.format
++
++    This property defines the internal OpenGL format of the texture.
++    Modifying this property makes most sense when the \a layer.effect is also
++    specified. Depending on the OpenGL implementation, this property might
++    allow you to save some texture memory.
++
++    \list
++    \o ShaderEffectSource.Alpha - GL_ALPHA
++    \o ShaderEffectSource.RGB - GL_RGB
++    \o ShaderEffectSource.RGBA - GL_RGBA
++    \endlist
++
++    \note Some OpenGL implementations do not support the GL_ALPHA format.
++ */
++
++void QQuickItemLayer::setFormat(QQuickShaderEffectSource::Format f)
++{
++    if (f == m_format)
++        return;
++    m_format = f;
++
++    if (m_effectSource)
++        m_effectSource->setFormat(m_format);
++
++    emit formatChanged(m_format);
++}
++
++
++/*!
++    \qmlproperty enumeration QtQuick2::Item::layer.sourceRect
++
++    This property defines which rectangular area of the \l sourceItem to
++    render into the texture. The source rectangle can be larger than
++    \l sourceItem itself. If the rectangle is null, which is the default,
++    the whole \l sourceItem is rendered to texture.
++ */
++
++void QQuickItemLayer::setSourceRect(const QRectF &sourceRect)
++{
++    if (sourceRect == m_sourceRect)
++        return;
++    m_sourceRect = sourceRect;
++
++    if (m_effectSource)
++        m_effectSource->setSourceRect(m_sourceRect);
++
++    emit sourceRectChanged(sourceRect);
++}
++
++
++
++/*!
++    \qmlproperty bool QtQuick2::Item::layer.smooth
++
++    Holds whether the layer is smoothly transformed.
++ */
++
++void QQuickItemLayer::setSmooth(bool s)
++{
++    if (m_smooth == s)
++        return;
++    m_smooth = s;
++
++    if (m_effectSource)
++        m_effectSource->setSmooth(m_smooth);
++
++    emit smoothChanged(s);
++}
++
++
++
++/*!
++    \qmlproperty size QtQuick2::Item::layer.textureSize
++
++    This property holds the requested pixel size of the layers texture. If it is empty,
++    which is the default, the size of the item is used.
++
++    \note Some platforms have a limit on how small framebuffer objects can be,
++    which means the actual texture size might be larger than the requested
++    size.
++ */
++
++void QQuickItemLayer::setSize(const QSize &size)
++{
++    if (size == m_size)
++        return;
++    m_size = size;
++
++    if (m_effectSource)
++        m_effectSource->setTextureSize(size);
++
++    emit sizeChanged(size);
++}
++
++
++
++/*!
++    \qmlproperty enumeration QtQuick2::Item::layer.wrapMode
++
++    This property defines the OpenGL wrap modes associated with the texture.
++    Modifying this property makes most sense when the \a layer.effect is
++    specified.
++
++    \list
++    \o ShaderEffectSource.ClampToEdge - GL_CLAMP_TO_EDGE both horizontally and vertically
++    \o ShaderEffectSource.RepeatHorizontally - GL_REPEAT horizontally, GL_CLAMP_TO_EDGE vertically
++    \o ShaderEffectSource.RepeatVertically - GL_CLAMP_TO_EDGE horizontally, GL_REPEAT vertically
++    \o ShaderEffectSource.Repeat - GL_REPEAT both horizontally and vertically
++    \endlist
++
++    \note Some OpenGL ES 2 implementations do not support the GL_REPEAT
++    wrap mode with non-power-of-two textures.
++ */
++
++void QQuickItemLayer::setWrapMode(QQuickShaderEffectSource::WrapMode mode)
++{
++    if (mode != m_wrapMode)
++        return;
++    m_wrapMode = mode;
++
++    if (m_effectSource)
++        m_effectSource->setWrapMode(m_wrapMode);
++
++    emit wrapModeChanged(mode);
++}
++
++
++void QQuickItemLayer::itemOpacityChanged(QQuickItem *item)
++{
++    updateOpacity();
++}
++
++void QQuickItemLayer::itemGeometryChanged(QQuickItem *, const QRectF &, const QRectF &)
++{
++    updateGeometry();
++}
++
++void QQuickItemLayer::itemParentChanged(QQuickItem *item, QQuickItem *parent)
++{
++    if (parent == m_effectSource || parent == m_effect)
++        return;
++
++    m_effectSource->setParentItem(parent);
++    if (parent)
++        m_effectSource->stackAfter(m_item);
++
++    if (m_effect) {
++        m_effect->setParentItem(parent);
++        if (parent)
++            m_effect->stackAfter(m_effectSource);
++    }
++}
++
++void QQuickItemLayer::itemSiblingOrderChanged(QQuickItem *)
++{
++    m_effectSource->stackAfter(m_item);
++    if (m_effect)
++        m_effect->stackAfter(m_effectSource);
++}
++
++void QQuickItemLayer::itemVisibilityChanged(QQuickItem *)
++{
++    QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    l->setVisible(m_item->isVisible());
++}
++
++void QQuickItemLayer::updateZ()
++{
++    QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    l->setZ(m_item->z());
++}
++
++void QQuickItemLayer::updateOpacity()
++{
++    QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    l->setOpacity(m_item->opacity());
++}
++
++void QQuickItemLayer::updateGeometry()
++{
++    QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    QRectF bounds = m_item->boundingRect();
++    l->setWidth(bounds.width());
++    l->setHeight(bounds.height());
++    l->setX(bounds.x() + m_item->x());
++    l->setY(bounds.y() + m_item->y());
++}
++
++void QQuickItemLayer::updateMatrix()
++{
++    // Called directly from transformChanged(), so needs some extra
++    // checks.
++    if (!m_componentComplete || !m_enabled)
++        return;
++    QQuickItem *l = m_effect ? (QQuickItem *) m_effect : (QQuickItem *) m_effectSource;
++    QQuickItemPrivate *ld = QQuickItemPrivate::get(l);
++    l->setScale(m_item->scale());
++    l->setRotation(m_item->rotation());
++    ld->transforms = QQuickItemPrivate::get(m_item)->transforms;
++    ld->origin = QQuickItemPrivate::get(m_item)->origin;
++    ld->dirty(QQuickItemPrivate::Transform);
++}
++
+ QT_END_NAMESPACE
+ 
+ #include <moc_qquickitem.cpp>
+diff --git a/src/quick/items/qquickitem.h b/src/quick/items/qquickitem.h
+index 763fc59..9810e0c 100644
+--- a/src/quick/items/qquickitem.h
++++ b/src/quick/items/qquickitem.h
+@@ -81,6 +81,7 @@ private:
+     Q_DECLARE_PRIVATE(QQuickTransform)
+ };
+ 
++class QQuickItemLayer;
+ class QDeclarativeV8Function;
+ class QDeclarativeState;
+ class QQuickAnchorLine;
+@@ -145,6 +146,8 @@ class Q_QUICK_EXPORT QQuickItem : public QObject, public QDeclarativeParserStatu
+     Q_PROPERTY(qreal implicitWidth READ implicitWidth WRITE setImplicitWidth NOTIFY implicitWidthChanged)
+     Q_PROPERTY(qreal implicitHeight READ implicitHeight WRITE setImplicitHeight NOTIFY implicitHeightChanged)
+ 
++    Q_PRIVATE_PROPERTY(QQuickItem::d_func(), QQuickItemLayer *layer READ layer DESIGNABLE false CONSTANT FINAL)
++
+     Q_ENUMS(TransformOrigin)
+     Q_CLASSINFO("DefaultProperty", "data")
+     Q_CLASSINFO("qt_HasQmlAccessors", "true")
+@@ -316,8 +319,8 @@ public:
+        UpdatePaintNodeData();
+     };
+ 
+-    virtual bool isTextureProvider() const { return false; }
+-    virtual QSGTextureProvider *textureProvider() const { return 0; }
++    virtual bool isTextureProvider() const;
++    virtual QSGTextureProvider *textureProvider() const;
+ 
+ public Q_SLOTS:
+     void update();
+diff --git a/src/quick/items/qquickitem_p.h b/src/quick/items/qquickitem_p.h
+index 1a23ab1..358bc74 100644
+--- a/src/quick/items/qquickitem_p.h
++++ b/src/quick/items/qquickitem_p.h
+@@ -78,6 +78,9 @@
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qelapsedtimer.h>
+ 
++#include <QtQuick/private/qquickshadereffectsource_p.h>
++#include <QtQuick/private/qquickshadereffect_p.h>
++
+ QT_BEGIN_NAMESPACE
+ 
+ class QNetworkReply;
+@@ -134,6 +137,101 @@ public:
+     QList<QQuickItem *> items;
+ };
+ 
++
++class QQuickItemLayer : public QObject, public QQuickItemChangeListener
++{
++    Q_OBJECT
++    Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY enabledChanged)
++    Q_PROPERTY(QSize textureSize READ size WRITE setSize NOTIFY sizeChanged)
++    Q_PROPERTY(QRectF sourceRect READ sourceRect WRITE setSourceRect NOTIFY sourceRectChanged)
++    Q_PROPERTY(bool mipmap READ mipmap WRITE setMipmap NOTIFY mipmapChanged)
++    Q_PROPERTY(bool smooth READ smooth WRITE setSmooth NOTIFY smoothChanged)
++    Q_PROPERTY(QQuickShaderEffectSource::WrapMode wrapMode READ wrapMode WRITE setWrapMode NOTIFY wrapModeChanged)
++    Q_PROPERTY(QQuickShaderEffectSource::Format format READ format WRITE setFormat NOTIFY formatChanged)
++    Q_PROPERTY(QString samplerName READ name WRITE setName NOTIFY nameChanged)
++    Q_PROPERTY(QDeclarativeComponent *effect READ effect WRITE setEffect NOTIFY effectChanged)
++public:
++    QQuickItemLayer(QQuickItem *item);
++    ~QQuickItemLayer();
++
++    void classBegin();
++    void componentComplete();
++
++    bool enabled() const { return m_effectSource != 0; }
++    void setEnabled(bool enabled);
++
++    bool mipmap() const { return m_mipmap; }
++    void setMipmap(bool mipmap);
++
++    bool smooth() const { return m_smooth; }
++    void setSmooth(bool s);
++
++    QSize size() const { return m_size; }
++    void setSize(const QSize &size);
++
++    QQuickShaderEffectSource::Format format() const { return m_format; }
++    void setFormat(QQuickShaderEffectSource::Format f);
++
++    QRectF sourceRect() const { return m_sourceRect; }
++    void setSourceRect(const QRectF &sourceRect);
++
++    QQuickShaderEffectSource::WrapMode wrapMode() const { return m_wrapMode; }
++    void setWrapMode(QQuickShaderEffectSource::WrapMode mode);
++
++    QString name() const { return m_name; }
++    void setName(const QString &name) {
++        if (m_name == name)
++            return;
++        m_name = name;
++        emit nameChanged(name);
++    }
++
++    QDeclarativeComponent *effect() const { return m_effectComponent; }
++    void setEffect(QDeclarativeComponent *effect);
++
++    QQuickShaderEffectSource *effectSource() const { return m_effectSource; }
++
++    void itemGeometryChanged(QQuickItem *, const QRectF &, const QRectF &);
++    void itemOpacityChanged(QQuickItem *);
++    void itemParentChanged(QQuickItem *, QQuickItem *);
++    void itemSiblingOrderChanged(QQuickItem *);
++    void itemVisibilityChanged(QQuickItem *);
++
++    void updateMatrix();
++    void updateGeometry();
++    void updateOpacity();
++    void updateZ();
++
++signals:
++    void enabledChanged(bool enabled);
++    void sizeChanged(const QSize &size);
++    void mipmapChanged(bool mipmap);
++    void wrapModeChanged(QQuickShaderEffectSource::WrapMode mode);
++    void nameChanged(const QString &name);
++    void effectChanged(QDeclarativeComponent *component);
++    void smoothChanged(bool smooth);
++    void formatChanged(QQuickShaderEffectSource::Format format);
++    void sourceRectChanged(const QRectF &sourceRect);
++
++private:
++    void activate();
++    void deactivate();
++
++    QQuickItem *m_item;
++    bool m_enabled;
++    bool m_mipmap;
++    bool m_smooth;
++    bool m_componentComplete;
++    QQuickShaderEffectSource::WrapMode m_wrapMode;
++    QQuickShaderEffectSource::Format m_format;
++    QSize m_size;
++    QRectF m_sourceRect;
++    QString m_name;
++    QDeclarativeComponent *m_effectComponent;
++    QQuickShaderEffect *m_effect;
++    QQuickShaderEffectSource *m_effectSource;
++};
++
+ class Q_QUICK_EXPORT QQuickItemPrivate : public QObjectPrivate
+ {
+     Q_DECLARE_PUBLIC(QQuickItem)
+@@ -166,6 +264,8 @@ public:
+     QQuickAnchorLine verticalCenter() const;
+     QQuickAnchorLine baseline() const;
+ 
++    QQuickItemLayer *layer() const;
++
+     // data property
+     static void data_append(QDeclarativeListProperty<QObject> *, QObject *);
+     static int data_count(QDeclarativeListProperty<QObject> *);
+@@ -407,7 +507,7 @@ public:
+         TransformUpdateMask     = TransformOrigin | Transform | BasicTransform | Position | Size | Canvas,
+         ComplexTransformUpdateMask     = Transform | Canvas,
+         ContentUpdateMask       = Size | Content | Smooth | Canvas,
+-        ChildrenUpdateMask      = ChildrenChanged | ChildrenStackingChanged | EffectReference | Canvas,
++        ChildrenUpdateMask      = ChildrenChanged | ChildrenStackingChanged | EffectReference | Canvas
+ 
+     };
+     quint32 dirtyAttributes;
+@@ -453,6 +553,8 @@ public:
+ 
+     QQuickScreenAttached *screenAttached;
+ 
++    mutable QQuickItemLayer *_layer;
++
+     static qint64 consistentTime;
+     static void setConsistentTime(qint64 t);
+     static void start(QElapsedTimer &);
+@@ -755,6 +857,7 @@ Q_DECLARE_OPERATORS_FOR_FLAGS(QQuickItemPrivate::ChangeTypes);
+ 
+ QT_END_NAMESPACE
+ 
++QML_DECLARE_TYPE(QQuickItemLayer)
+ QML_DECLARE_TYPE(QQuickKeysAttached)
+ QML_DECLARE_TYPEINFO(QQuickKeysAttached, QML_HAS_ATTACHED_PROPERTIES)
+ QML_DECLARE_TYPE(QQuickKeyNavigationAttached)
+diff --git a/src/quick/items/qquickitemchangelistener_p.h b/src/quick/items/qquickitemchangelistener_p.h
+index a021658..ba46c1f 100644
+--- a/src/quick/items/qquickitemchangelistener_p.h
++++ b/src/quick/items/qquickitemchangelistener_p.h
+@@ -64,7 +64,7 @@ class QQuickAnchorsPrivate;
+ class QQuickItemChangeListener
+ {
+ public:
+-    virtual void itemGeometryChanged(QQuickItem *, const QRectF &, const QRectF &) {}
++    virtual void itemGeometryChanged(QQuickItem *, const QRectF & /* new */, const QRectF & /* old */ ) {}
+     virtual void itemSiblingOrderChanged(QQuickItem *) {}
+     virtual void itemVisibilityChanged(QQuickItem *) {}
+     virtual void itemOpacityChanged(QQuickItem *) {}
+diff --git a/src/quick/items/qquickitemsmodule.cpp b/src/quick/items/qquickitemsmodule.cpp
+index b5eb611..0d7f1e1 100644
+--- a/src/quick/items/qquickitemsmodule.cpp
++++ b/src/quick/items/qquickitemsmodule.cpp
+@@ -163,6 +163,7 @@ static void qt_quickitems_defineModule(const char *uri, int major, int minor)
+     qmlRegisterType<QQuickVisualDataGroup>(uri,major,minor,"VisualDataGroup");
+     qmlRegisterType<QQuickVisualItemModel>(uri,major,minor,"VisualItemModel");
+ 
++    qmlRegisterType<QQuickItemLayer>();
+     qmlRegisterType<QQuickAnchors>();
+     qmlRegisterType<QQuickKeyEvent>();
+     qmlRegisterType<QQuickMouseEvent>();
+diff --git a/src/quick/items/qquickshadereffect.cpp b/src/quick/items/qquickshadereffect.cpp
+index f90c538..be01338 100644
+--- a/src/quick/items/qquickshadereffect.cpp
++++ b/src/quick/items/qquickshadereffect.cpp
+@@ -46,7 +46,7 @@
+ #include "qquickitem_p.h"
+ 
+ #include <QtQuick/private/qsgcontext_p.h>
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ #include "qquickcanvas.h"
+ 
+ #include "qquickimage_p.h"
+@@ -190,6 +190,7 @@ QQuickShaderEffect::QQuickShaderEffect(QQuickItem *parent)
+     , m_programDirty(true)
+     , m_dirtyMesh(true)
+     , m_dirtyGeometry(true)
++    , m_complete(false)
+ {
+     setFlag(QQuickItem::ItemHasContents);
+ }
+@@ -199,12 +200,6 @@ QQuickShaderEffect::~QQuickShaderEffect()
+     reset();
+ }
+ 
+-void QQuickShaderEffect::componentComplete()
+-{
+-    updateProperties();
+-    QQuickItem::componentComplete();
+-}
+-
+ /*!
+     \qmlproperty string QtQuick2::ShaderEffect::fragmentShader
+ 
+@@ -218,11 +213,8 @@ void QQuickShaderEffect::setFragmentShader(const QByteArray &code)
+     if (m_source.fragmentCode.constData() == code.constData())
+         return;
+     m_source.fragmentCode = code;
+-    if (isComponentComplete()) {
+-        reset();
+-        updateProperties();
+-        update();
+-    }
++    update();
++    m_complete = false;
+     emit fragmentShaderChanged();
+ }
+ 
+@@ -240,11 +232,8 @@ void QQuickShaderEffect::setVertexShader(const QByteArray &code)
+     if (m_source.vertexCode.constData() == code.constData())
+         return;
+     m_source.vertexCode = code;
+-    if (isComponentComplete()) {
+-        reset();
+-        updateProperties();
+-        update();
+-    }
++    update();
++    m_complete = false;
+     emit vertexShaderChanged();
+ }
+ 
+@@ -425,6 +414,10 @@ void QQuickShaderEffect::connectPropertySignals()
+             signalName.append(mp.notifySignal().signature());
+             connect(this, signalName, this, SLOT(updateData()));
+         } else {
++            // If the source is set via a dynamic property, like the layer is, then we need this check
++            // to disable the warning.
++            if (property(it->constData()).isValid())
++                continue;
+             qWarning("QQuickShaderEffect: '%s' does not have a matching property!", it->constData());
+         }
+     }
+@@ -439,11 +432,26 @@ void QQuickShaderEffect::connectPropertySignals()
+             source.mapper->setMapping(this, i);
+             connect(source.mapper, SIGNAL(mapped(int)), this, SLOT(changeSource(int)));
+         } else {
++            // If the source is set via a dynamic property, like the layer is, then we need this check
++            // to disable the warning.
++            if (property(source.name.constData()).isValid())
++                continue;
+             qWarning("QQuickShaderEffect: '%s' does not have a matching source!", source.name.constData());
+         }
+     }
+ }
+ 
++
++void QQuickShaderEffect::ensureCompleted()
++{
++    if (!m_complete) {
++        reset();
++        updateProperties();
++        m_complete = true;
++    }
++}
++
++
+ void QQuickShaderEffect::reset()
+ {
+     disconnectPropertySignals();
+@@ -666,6 +674,8 @@ QSGNode *QQuickShaderEffect::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDa
+ {
+     QQuickShaderEffectNode *node = static_cast<QQuickShaderEffectNode *>(oldNode);
+ 
++    ensureCompleted();
++
+     // In the case of a bad vertex shader, don't try to create a node...
+     if (m_source.attributeNames.isEmpty()) {
+         if (node)
+diff --git a/src/quick/items/qquickshadereffect_p.h b/src/quick/items/qquickshadereffect_p.h
+index ca67a6a..7536b42 100644
+--- a/src/quick/items/qquickshadereffect_p.h
++++ b/src/quick/items/qquickshadereffect_p.h
+@@ -83,8 +83,6 @@ public:
+     QQuickShaderEffect(QQuickItem *parent = 0);
+     ~QQuickShaderEffect();
+ 
+-    virtual void componentComplete();
+-
+     QByteArray fragmentShader() const { return m_source.fragmentCode; }
+     void setFragmentShader(const QByteArray &code);
+ 
+@@ -100,6 +98,8 @@ public:
+     CullMode cullMode() const { return m_cullMode; }
+     void setCullMode(CullMode face);
+ 
++    void ensureCompleted();
++
+ Q_SIGNALS:
+     void fragmentShaderChanged();
+     void vertexShaderChanged();
+@@ -148,6 +148,8 @@ private:
+     uint m_programDirty : 1;
+     uint m_dirtyMesh : 1;
+     uint m_dirtyGeometry : 1;
++
++    uint m_complete : 1;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffectnode.cpp b/src/quick/items/qquickshadereffectnode.cpp
+index 02b49b9..968982b 100644
+--- a/src/quick/items/qquickshadereffectnode.cpp
++++ b/src/quick/items/qquickshadereffectnode.cpp
+@@ -42,7 +42,7 @@
+ #include <private/qquickshadereffectnode_p.h>
+ 
+ #include "qquickshadereffectmesh_p.h"
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ #include <QtQuick/private/qsgrenderer_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+diff --git a/src/quick/items/qquickshadereffectnode_p.h b/src/quick/items/qquickshadereffectnode_p.h
+index abcd4a9..5f90e71 100644
+--- a/src/quick/items/qquickshadereffectnode_p.h
++++ b/src/quick/items/qquickshadereffectnode_p.h
+@@ -44,7 +44,7 @@
+ 
+ #include <QtQuick/qsgnode.h>
+ #include <QtQuick/qsgmaterial.h>
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ #include <QtQuick/qquickitem.h>
+ 
+ #include <QtCore/qsharedpointer.h>
+diff --git a/src/quick/items/qquickshadereffectsource_p.h b/src/quick/items/qquickshadereffectsource_p.h
+index bf5a7d1..d66d80b 100644
+--- a/src/quick/items/qquickshadereffectsource_p.h
++++ b/src/quick/items/qquickshadereffectsource_p.h
+@@ -43,7 +43,7 @@
+ #define QQUICKSHADEREFFECTSOURCE_P_H
+ 
+ #include "qquickitem.h"
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ #include <private/qsgadaptationlayer_p.h>
+ #include <QtQuick/private/qsgcontext_p.h>
+ #include <private/qsgdefaultimagenode_p.h>
+diff --git a/src/quick/scenegraph/qsgdefaultimagenode.cpp b/src/quick/scenegraph/qsgdefaultimagenode.cpp
+index f360aae..072a309 100644
+--- a/src/quick/scenegraph/qsgdefaultimagenode.cpp
++++ b/src/quick/scenegraph/qsgdefaultimagenode.cpp
+@@ -41,7 +41,7 @@
+ 
+ #include "qsgdefaultimagenode_p.h"
+ 
+-#include <QtQuick/private/qsgtextureprovider_p.h>
++#include <QtQuick/qsgtextureprovider.h>
+ 
+ #include <QtCore/qvarlengtharray.h>
+ #include <QtCore/qmath.h>
+diff --git a/src/quick/scenegraph/scenegraph.pri b/src/quick/scenegraph/scenegraph.pri
+index 0adc205..db57b1e 100644
+--- a/src/quick/scenegraph/scenegraph.pri
++++ b/src/quick/scenegraph/scenegraph.pri
+@@ -32,7 +32,7 @@ HEADERS += \
+     $$PWD/util/qsgvertexcolormaterial.h \
+     $$PWD/util/qsgtexture.h \
+     $$PWD/util/qsgtexture_p.h \
+-    $$PWD/util/qsgtextureprovider_p.h \
++    $$PWD/util/qsgtextureprovider.h \
+     $$PWD/util/qsgpainternode_p.h \
+     $$PWD/util/qsgdistancefieldutil_p.h
+ 
+diff --git a/src/quick/scenegraph/util/qsgtextureprovider.cpp b/src/quick/scenegraph/util/qsgtextureprovider.cpp
+index 10faf2e..62b2819 100644
+--- a/src/quick/scenegraph/util/qsgtextureprovider.cpp
++++ b/src/quick/scenegraph/util/qsgtextureprovider.cpp
+@@ -39,11 +39,7 @@
+ **
+ ****************************************************************************/
+ 
+-#include "qsgtextureprovider_p.h"
+-
+-#ifndef GL_CLAMP_TO_EDGE
+-#define GL_CLAMP_TO_EDGE 0x812F
+-#endif
++#include "qsgtextureprovider.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+diff --git a/src/quick/scenegraph/util/qsgtextureprovider.h b/src/quick/scenegraph/util/qsgtextureprovider.h
+new file mode 100644
+index 0000000..bc4ffec
+--- /dev/null
++++ b/src/quick/scenegraph/util/qsgtextureprovider.h
+@@ -0,0 +1,66 @@
++/****************************************************************************
++**
++** Copyright (C) 2010 Nokia Corporation and/or its subsidiary(-ies).
++** All rights reserved.
++** Contact: Nokia Corporation (qt-info@nokia.com)
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QSGTEXTUREPROVIDER_H
++#define QSGTEXTUREPROVIDER_H
++
++#include "qsgtexture.h"
++#include "qobject.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++class Q_QUICK_EXPORT QSGTextureProvider : public QObject
++{
++    Q_OBJECT
++public:
++    virtual QSGTexture *texture() const = 0;
++
++Q_SIGNALS:
++    void textureChanged();
++};
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif
+diff --git a/src/quick/scenegraph/util/qsgtextureprovider_p.h b/src/quick/scenegraph/util/qsgtextureprovider_p.h
+deleted file mode 100644
+index bc4ffec..0000000
+--- a/src/quick/scenegraph/util/qsgtextureprovider_p.h
++++ /dev/null
+@@ -1,66 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2010 Nokia Corporation and/or its subsidiary(-ies).
+-** All rights reserved.
+-** Contact: Nokia Corporation (qt-info@nokia.com)
+-**
+-** This file is part of the QtDeclarative module of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** GNU Lesser General Public License Usage
+-** This file may be used under the terms of the GNU Lesser General Public
+-** License version 2.1 as published by the Free Software Foundation and
+-** appearing in the file LICENSE.LGPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU Lesser
+-** General Public License version 2.1 requirements will be met:
+-** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Nokia gives you certain additional
+-** rights. These rights are described in the Nokia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU General
+-** Public License version 3.0 as published by the Free Software Foundation
+-** and appearing in the file LICENSE.GPL included in the packaging of this
+-** file. Please review the following information to ensure the GNU General
+-** Public License version 3.0 requirements will be met:
+-** http://www.gnu.org/copyleft/gpl.html.
+-**
+-** Other Usage
+-** Alternatively, this file may be used in accordance with the terms and
+-** conditions contained in a signed written agreement between you and Nokia.
+-**
+-**
+-**
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QSGTEXTUREPROVIDER_H
+-#define QSGTEXTUREPROVIDER_H
+-
+-#include "qsgtexture.h"
+-#include "qobject.h"
+-
+-QT_BEGIN_HEADER
+-
+-QT_BEGIN_NAMESPACE
+-
+-class Q_QUICK_EXPORT QSGTextureProvider : public QObject
+-{
+-    Q_OBJECT
+-public:
+-    virtual QSGTexture *texture() const = 0;
+-
+-Q_SIGNALS:
+-    void textureChanged();
+-};
+-
+-QT_END_NAMESPACE
+-
+-QT_END_HEADER
+-
+-#endif
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/Effect.qml b/tests/auto/qtquick2/qquickitemlayer/data/Effect.qml
+new file mode 100644
+index 0000000..630c8f9
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/Effect.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++
++Item
++{
++    width: 100
++    height: 100
++
++    Rectangle {
++        id: box
++        width: 100
++        height: 100
++
++        color: "#0000ff"
++
++        Rectangle {
++            x: 50
++            width: 50
++            height: 100
++            color: "#00ff00"
++        }
++
++        layer.enabled: true
++        layer.effect: ShaderEffect {
++            fragmentShader: "
++            uniform lowp sampler2D source;
++            uniform lowp float qt_Opacity;
++            varying highp vec2 qt_TexCoord0;
++            void main() {
++                gl_FragColor = texture2D(source, qt_TexCoord0).bgra * qt_Opacity;
++            }"
++        }
++
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/Enabled.qml b/tests/auto/qtquick2/qquickitemlayer/data/Enabled.qml
+new file mode 100644
+index 0000000..0e7d4f5
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/Enabled.qml
+@@ -0,0 +1,25 @@
++import QtQuick 2.0
++
++Item
++{
++    width: 200
++    height: 200
++
++    Item {
++        width: 20
++        height: 20
++        scale: 10
++
++        layer.enabled: true
++        anchors.centerIn: parent
++
++        Rectangle {
++            width: 20
++            height: 20
++            gradient: Gradient {
++                GradientStop { position: 0; color: "white" }
++                GradientStop { position: 1; color: "black" }
++            }
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/Mipmap.qml b/tests/auto/qtquick2/qquickitemlayer/data/Mipmap.qml
+new file mode 100644
+index 0000000..8de4107
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/Mipmap.qml
+@@ -0,0 +1,30 @@
++import QtQuick 2.0
++
++Item
++{
++    width: 100
++    height: 100
++
++    Rectangle {
++        id: box
++        width: 600
++        height: 600
++
++        scale: 1 / 6.
++
++        color: "black"
++
++        layer.enabled: true
++        layer.mipmap: true
++        layer.smooth: true
++
++        anchors.centerIn: parent
++
++        Rectangle {
++            x: 1
++            width: 1
++            height: parent.height
++            color: "white"
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/Smooth.qml b/tests/auto/qtquick2/qquickitemlayer/data/Smooth.qml
+new file mode 100644
+index 0000000..3f9575b
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/Smooth.qml
+@@ -0,0 +1,23 @@
++import QtQuick 2.0
++
++
++Item {
++    width: 200
++    height: 100
++
++    Row {
++        id: layerRoot
++
++        width: 20
++        height: 10
++
++        Rectangle { width: 10; height: 10; color: "red" }
++        Rectangle { width: 10; height: 10; color: "blue" }
++
++        layer.enabled: true
++        layer.smooth: true
++
++        anchors.centerIn: parent
++        scale: 10
++   }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/SourceRect.qml b/tests/auto/qtquick2/qquickitemlayer/data/SourceRect.qml
+new file mode 100644
+index 0000000..7cc7e8b
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/SourceRect.qml
+@@ -0,0 +1,33 @@
++import QtQuick 2.0
++
++Item
++{
++    width: 100
++    height: 100
++
++    Rectangle {
++        id: box
++        width: 100
++        height: 100
++
++        color: "#ff0000"
++
++        layer.enabled: true
++        layer.sourceRect: Qt.rect(-10, -10, box.width + 20, box.height + 20);
++
++        // A shader that pads the transparent pixels with blue.
++        layer.effect: ShaderEffect {
++            fragmentShader: "
++            uniform lowp sampler2D source;
++            uniform lowp float qt_Opacity;
++            varying highp vec2 qt_TexCoord0;
++            void main() {
++                vec4 c = texture2D(source, qt_TexCoord0);
++                if (c.a == 0.)
++                    c = vec4(0, 0, 1, 1);
++                gl_FragColor = c * qt_Opacity;
++            }
++            "
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/TextureProvider.qml b/tests/auto/qtquick2/qquickitemlayer/data/TextureProvider.qml
+new file mode 100644
+index 0000000..ccd5156
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/TextureProvider.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item
++{
++    width: 100
++    height: 100
++
++    Rectangle {
++        id: box
++        width: 100
++        height: 100
++
++        color: "#0000ff"
++
++        Rectangle {
++            x: 50
++            width: 50
++            height: 100
++            color: "#00ff00"
++        }
++
++        visible: false
++
++        layer.enabled: true
++    }
++
++    ShaderEffect {
++        anchors.fill: parent
++        property variant source: box
++
++        fragmentShader: "
++        uniform lowp sampler2D source;
++        uniform lowp float qt_Opacity;
++        varying highp vec2 qt_TexCoord0;
++        void main() {
++            gl_FragColor = texture2D(source, qt_TexCoord0).bgra * qt_Opacity;
++        }"
++    }
++
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/Visible.qml b/tests/auto/qtquick2/qquickitemlayer/data/Visible.qml
+new file mode 100644
+index 0000000..8267f18
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/Visible.qml
+@@ -0,0 +1,56 @@
++import QtQuick 2.0
++
++Item
++{
++    id: root
++
++    width: 100
++    height: 100
++
++    property bool layerEffect: false;
++    onLayerEffectChanged: root.maybeUse();
++    Component.onCompleted: root.maybeUse();
++
++    property real layerOpacity: 1;
++    property bool layerVisible: true;
++
++    function maybeUse() {
++        if (root.layerEffect)
++            box.layer.effect = shaderEffect
++    }
++
++    Component {
++        id: shaderEffect
++        ShaderEffect {
++            fragmentShader: "
++                uniform lowp sampler2D source;
++                uniform lowp float qt_Opacity;
++                varying highp vec2 qt_TexCoord0;
++                void main() {
++                    gl_FragColor = texture2D(source, qt_TexCoord0).bgra * qt_Opacity;
++                }
++            "
++        }
++
++    }
++
++    Rectangle {
++        id: box
++        width: 100
++        height: 100
++
++        color: "#0000ff"
++        visible: parent.layerVisible;
++        opacity: parent.layerOpacity;
++
++        Rectangle {
++            x: 50
++            width: 50
++            height: 100
++            color: "#00ff00"
++        }
++
++        layer.enabled: true
++
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/data/ZOrder.qml b/tests/auto/qtquick2/qquickitemlayer/data/ZOrder.qml
+new file mode 100644
+index 0000000..59ccb32
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/data/ZOrder.qml
+@@ -0,0 +1,52 @@
++import QtQuick 2.0
++
++Item
++{
++    id: root
++
++    width: 200
++    height: 200
++
++    Component {
++        id: shaderEffect
++        ShaderEffect { }
++    }
++
++    property bool layerEffect: false;
++    onLayerEffectChanged: root.maybeUse();
++    Component.onCompleted: root.maybeUse();
++
++    function maybeUse() {
++        if (root.layerEffect)
++            box.layer.effect = shaderEffect
++    }
++
++
++    Rectangle {
++        color: "red"
++        anchors.left: parent.left
++        anchors.top: parent.top
++        width: 100
++        height: 100
++        z: 1
++    }
++
++    Rectangle {
++        color: "#00ff00"
++        anchors.bottom: parent.bottom
++        anchors.right: parent.right
++        width: 100
++        height: 100
++        z: 3
++    }
++
++    Rectangle {
++        id: box
++        color: "blue"
++        anchors.fill: parent
++        anchors.margins: 10
++        layer.enabled: true
++        z: 2
++    }
++
++}
+diff --git a/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro b/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro
+new file mode 100644
+index 0000000..bf22d04
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/qquickitemlayer.pro
+@@ -0,0 +1,32 @@
++CONFIG += testcase
++TARGET = tst_qquickitemlayer
++SOURCES += tst_qquickitemlayer.cpp
++
++macx:CONFIG -= app_bundle
++
++testDataFiles.files = data
++testDataFiles.path = .
++DEPLOYMENT += testDataFiles
++
++include(../../shared/util.pri)
++
++CONFIG += parallel_test
++QT += core-private gui-private v8-private declarative-private quick-private testlib
++
++OTHER_FILES += \
++    data/Smooth.qml \
++    data/Enabled.qml \
++    data/Mipmap.qml \
++    data/Effect.qml \
++    data/SourceRect.qml \
++    data/TextureProvider.qml \
++    data/Visible.qml \
++    data/ZOrder.qml
++
++
++
++
++
++
++
++
+diff --git a/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp b/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp
+new file mode 100644
+index 0000000..2b7a169
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickitemlayer/tst_qquickitemlayer.cpp
+@@ -0,0 +1,267 @@
++/****************************************************************************
++**
++** Copyright (C) 2011 Nokia Corporation and/or its subsidiary(-ies).
++** All rights reserved.
++** Contact: Nokia Corporation (qt-info@nokia.com)
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <qtest.h>
++
++#include <QtQuick/qquickitem.h>
++#include <QtQuick/qquickview.h>
++
++#include "../../shared/util.h"
++
++class tst_QQuickItemLayer: public QDeclarativeDataTest
++{
++    Q_OBJECT
++public:
++    tst_QQuickItemLayer();
++
++    QImage runTest(const QString &url)
++    {
++        QQuickView view;
++        view.setSource(QUrl(url));
++
++        view.show();
++        QTest::qWaitForWindowShown(&view);
++
++        return view.grabFrameBuffer();
++    }
++
++private slots:
++    void layerEnabled();
++    void layerSmooth();
++    void layerMipmap();
++    void layerEffect();
++
++    void layerVisibility_data();
++    void layerVisibility();
++
++    void layerSourceRect();
++
++
++    void layerZOrder_data();
++    void layerZOrder();
++
++    void layerIsTextureProvider();
++};
++
++tst_QQuickItemLayer::tst_QQuickItemLayer()
++{
++}
++
++
++
++// The test draws a red and a blue box next to each other and tests that the
++// output is still red and blue on the left and right and a combination of
++// the two in the middle.
++
++void tst_QQuickItemLayer::layerSmooth()
++{
++    QImage fb = runTest(testFile("Smooth.qml"));
++    QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
++    QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0, 0xff));
++
++    uint pixel = fb.pixel(fb.width() / 2, 0);
++    QVERIFY(qRed(pixel) > 0);
++    QVERIFY(qBlue(pixel) > 0);
++}
++
++
++
++// The test draws a gradient at a small size into a layer and scales the
++// layer. If the layer is enabled there should be very visible bands in
++// the gradient.
++
++void tst_QQuickItemLayer::layerEnabled()
++{
++    QImage fb = runTest(testFile("Enabled.qml"));
++    // Verify the banding
++    QCOMPARE(fb.pixel(0, 0), fb.pixel(0, 1));
++    // Verify the gradient
++    QVERIFY(fb.pixel(0, 0) != fb.pixel(0, fb.height() - 1));
++}
++
++
++
++// The test draws a one pixel wide line and scales it down by more than a a factor 2
++// If mipmpping works, the pixels should be gray, not white or black
++
++void tst_QQuickItemLayer::layerMipmap()
++{
++    QImage fb = runTest(testFile("Mipmap.qml"));
++    QVERIFY(fb.pixel(0, 0) != 0xff000000);
++    QVERIFY(fb.pixel(0, 0) != 0xffffffff);
++}
++
++
++
++// The test implements an rgb swapping effect sourced from a blue rectangle. The
++// resulting pixel should be red
++
++void tst_QQuickItemLayer::layerEffect()
++{
++    QImage fb = runTest(testFile("Effect.qml"));
++    QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
++    QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0xff, 0));
++}
++
++
++
++// The test draws a rectangle and verifies that there is padding on each side
++// as the source rect spans outside the item. The padding is verified using
++// a shader that pads transparent to blue. Everything else is red.
++void tst_QQuickItemLayer::layerSourceRect()
++{
++    QImage fb = runTest(testFile("SourceRect.qml"));
++
++    // Check that the edges are converted to blue
++    QCOMPARE(fb.pixel(0, 0), qRgb(0, 0, 0xff));
++    QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0, 0xff));
++    QCOMPARE(fb.pixel(0, fb.height() - 1), qRgb(0, 0, 0xff));
++    QCOMPARE(fb.pixel(fb.width() - 1, fb.height() - 1), qRgb(0, 0, 0xff));
++
++    // The center pixel should be red
++    QCOMPARE(fb.pixel(fb.width() / 2, fb.height() / 2), qRgb(0xff, 0, 0));
++}
++
++
++
++// Same as the effect test up above, but this time use the item
++// directly in a stand alone ShaderEffect
++void tst_QQuickItemLayer::layerIsTextureProvider()
++{
++    QImage fb = runTest(testFile("TextureProvider.qml"));
++    QCOMPARE(fb.pixel(0, 0), qRgb(0xff, 0, 0));
++    QCOMPARE(fb.pixel(fb.width() - 1, 0), qRgb(0, 0xff, 0));
++}
++
++
++void tst_QQuickItemLayer::layerVisibility_data()
++{
++    QTest::addColumn<bool>("visible");
++    QTest::addColumn<bool>("effect");
++    QTest::addColumn<qreal>("opacity");
++
++    QTest::newRow("!effect, !visible, a=1") << false << false << 1.;
++    QTest::newRow("!effect, visible, a=1") << false << true << 1.;
++    QTest::newRow("effect, !visible, a=1") << true << false << 1.;
++    QTest::newRow("effect, visible, a=1") << true << true << 1.;
++
++    QTest::newRow("!effect, !visible, a=.5") << false << false << .5;
++    QTest::newRow("!effect, visible, a=.5") << false << true << .5;
++    QTest::newRow("effect, !visible, a=.5") << true << false << .5;
++    QTest::newRow("effect, visible, a=.5") << true << true << .5;
++
++    QTest::newRow("!effect, !visible, a=0") << false << false << 0.;
++    QTest::newRow("!effect, visible, a=0") << false << true << 0.;
++    QTest::newRow("effect, !visible, a=0") << true << false << 0.;
++    QTest::newRow("effect, visible, a=0") << true << true << 0.;
++}
++
++void tst_QQuickItemLayer::layerVisibility()
++{
++    QFETCH(bool, visible);
++    QFETCH(bool, effect);
++    QFETCH(qreal, opacity);
++
++    QQuickView view;
++    view.setSource(testFile("Visible.qml"));
++
++    QQuickItem *child = view.rootItem()->childItems().at(0);
++    child->setProperty("layerVisible", visible);
++    child->setProperty("layerEffect", effect);
++    child->setProperty("layerOpacity", opacity);
++
++    view.show();
++
++    QTest::qWaitForWindowShown(&view);
++
++    QImage fb = view.grabFrameBuffer();
++    uint pixel = fb.pixel(0, 0);
++
++    if (!visible || opacity == 0) {
++        QCOMPARE(pixel, qRgb(0xff, 0xff, 0xff));
++    } else if (effect) {
++        QCOMPARE(qRed(pixel), 0xff);
++        QVERIFY(qGreen(pixel) < 0xff);
++        QVERIFY(qBlue(pixel) < 0xff);
++    } else { // no effect
++        QCOMPARE(qBlue(pixel), 0xff);
++        QVERIFY(qGreen(pixel) < 0xff);
++        QVERIFY(qRed(pixel) < 0xff);
++    }
++}
++
++
++
++
++void tst_QQuickItemLayer::layerZOrder_data()
++{
++    QTest::addColumn<bool>("effect");
++
++    QTest::newRow("!effect") << false;
++    QTest::newRow("effect") << true;
++}
++
++void tst_QQuickItemLayer::layerZOrder()
++{
++    QFETCH(bool, effect);
++
++    QQuickView view;
++    view.setSource(testFile("ZOrder.qml"));
++
++    QQuickItem *child = view.rootItem()->childItems().at(0);
++    child->setProperty("layerEffect", effect);
++
++    view.show();
++
++    QTest::qWaitForWindowShown(&view);
++
++    QImage fb = view.grabFrameBuffer();
++
++    QCOMPARE(fb.pixel(50, 50), qRgb(0, 0, 0xff));
++    QCOMPARE(fb.pixel(150, 150), qRgb(0, 0xff, 00));
++
++}
++
++
++
++QTEST_MAIN(tst_QQuickItemLayer)
++
++#include "tst_qquickitemlayer.moc"
+diff --git a/tests/auto/qtquick2/qquickshadereffect/tst_qquickshadereffect.cpp b/tests/auto/qtquick2/qquickshadereffect/tst_qquickshadereffect.cpp
+index 327fecf..6e264ea 100644
+--- a/tests/auto/qtquick2/qquickshadereffect/tst_qquickshadereffect.cpp
++++ b/tests/auto/qtquick2/qquickshadereffect/tst_qquickshadereffect.cpp
+@@ -305,10 +305,10 @@ void tst_qquickshadereffect::lookThroughShaderCode()
+     if ((presenceFlags & OpacityPresent) == 0)
+         expectWarning("QQuickShaderEffect: Missing reference to \'qt_Opacity\'.");
+ 
+-    static_cast<QDeclarativeParserStatus &>(item).classBegin();
+     item.setVertexShader(vertexShader);
+     item.setFragmentShader(fragmentShader);
+-    static_cast<QDeclarativeParserStatus &>(item).componentComplete();
++    item.ensureCompleted();
++
+     uninstallMsgHandler();
+ 
+     // If the uniform was successfully parsed, the notify signal has been connected to an update slot.

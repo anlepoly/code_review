@@ -1,0 +1,322 @@
+diff --git a/src/tools/qdoc/location.cpp b/src/tools/qdoc/location.cpp
+index 8964633..48e5d61 100644
+--- a/src/tools/qdoc/location.cpp
++++ b/src/tools/qdoc/location.cpp
+@@ -336,6 +336,15 @@ void Location::information(const QString& message)
+ }
+ 
+ /*!
++  Prints \a message to \c stderr followed by a \c{'\n'}.
++ */
++void Location::logToStdErr(const QString& message)
++{
++    fprintf(stderr, "%s\n", message.toLatin1().data());
++    fflush(stderr);
++}
++
++/*!
+   Report a program bug, including the \a hint.
+  */
+ void Location::internalError(const QString& hint)
+diff --git a/src/tools/qdoc/location.h b/src/tools/qdoc/location.h
+index d2c9487..71492e6 100644
+--- a/src/tools/qdoc/location.h
++++ b/src/tools/qdoc/location.h
+@@ -96,6 +96,7 @@ public:
+     static void terminate();
+     static void information(const QString& message);
+     static void internalError(const QString& hint);
++    static void logToStdErr(const QString& message);
+ 
+ private:
+     enum MessageType { Warning, Error };
+diff --git a/src/tools/qdoc/main.cpp b/src/tools/qdoc/main.cpp
+index 5fbc01f..d46580b 100644
+--- a/src/tools/qdoc/main.cpp
++++ b/src/tools/qdoc/main.cpp
+@@ -101,6 +101,9 @@ static bool obsoleteLinks = false;
+ static QStringList defines;
+ static QStringList dependModules;
+ static QStringList indexDirs;
++static QString currentDir;
++static QString prevCurrentDir;
++static QString documentationPath;
+ 
+ /*!
+   Print the help message to \c stdout.
+@@ -118,7 +121,7 @@ static void printHelp()
+                              "    -highlighting  "
+                              "Turn on syntax highlighting (makes qdoc run slower)\n"
+                              "    -indexdir      "
+-                             "Specify a directory where QDoc should search for indices to link to\n"
++                             "Specify a directory where QDoc should search for index files to load\n"
+                              "    -installdir    "
+                              "Specify the directory where the output will be after running \"make install\"\n"
+                              "    -no-examples   "
+@@ -150,6 +153,88 @@ static void printVersion()
+     Location::information(s);
+ }
+ 
++static void loadIndexFiles(Config& config)
++{
++    QDocDatabase* qdb = QDocDatabase::qdocDB();
++    /*
++      Read some XML indexes containing definitions from other documentation sets.
++     */
++    QStringList indexFiles = config.getStringList(CONFIG_INDEXES);
++
++    dependModules += config.getStringList(CONFIG_DEPENDS);
++
++    // Allow modules and third-party application/libraries to link
++    // to the Qt docs without having to explicitly pass --indexdir.
++    if (!indexDirs.contains(documentationPath))
++        indexDirs.append(documentationPath);
++
++    if (dependModules.size() > 0) {
++        if (indexDirs.size() > 0) {
++            for (int i = 0; i < indexDirs.size(); i++) {
++                if (indexDirs[i].startsWith("..")) {
++                    const QString prefix(QDir(currentDir).relativeFilePath(prevCurrentDir));
++                    if (!prefix.isEmpty())
++                        indexDirs[i].prepend(prefix + QLatin1Char('/'));
++                }
++            }
++            /*
++              Add all subdirectories of the indexdirs as dependModules,
++              when an asterisk is used in the 'depends' list.
++            */
++            if (dependModules.contains("*")) {
++                dependModules.removeOne("*");
++                for (int i = 0; i < indexDirs.size(); i++) {
++                    QDir scanDir = QDir(indexDirs[i]);
++                    scanDir.setFilter(QDir::Dirs | QDir::NoDotAndDotDot);
++                    QFileInfoList dirList = scanDir.entryInfoList();
++                    for (int j = 0; j < dirList.size(); j++) {
++                        if (dirList[j].fileName().toLower() != config.getString(CONFIG_PROJECT).toLower())
++                            dependModules.append(dirList[j].fileName());
++                    }
++                }
++            }
++            for (int i = 0; i < dependModules.size(); i++) {
++                QString indexToAdd;
++                QList<QFileInfo> foundIndices;
++                for (int j = 0; j < indexDirs.size(); j++) {
++                    QString fileToLookFor = indexDirs[j] + QLatin1Char('/') + dependModules[i] +
++                            QLatin1Char('/') + dependModules[i] + QLatin1String(".index");
++                    if (QFile::exists(fileToLookFor)) {
++                        QFileInfo tempFileInfo(fileToLookFor);
++                        if (!foundIndices.contains(tempFileInfo))
++                            foundIndices.append(tempFileInfo);
++                    }
++                }
++                qSort(foundIndices.begin(), foundIndices.end(), creationTimeBefore);
++                if (foundIndices.size() > 1) {
++                    /*
++                        QDoc should always use the last entry in the multimap when there are
++                        multiple index files for a module, since the last modified file has the
++                        highest UNIX timestamp.
++                    */
++                    qDebug() << "Multiple indices found for dependency:" << dependModules[i] << "\nFound:";
++                    for (int k = 0; k < foundIndices.size(); k++)
++                        qDebug() << foundIndices[k].absoluteFilePath();
++                    qDebug() << "Using" << foundIndices[foundIndices.size() - 1].absoluteFilePath()
++                            << "as index for" << dependModules[i];
++                    indexToAdd = foundIndices[foundIndices.size() - 1].absoluteFilePath();
++                }
++                else if (foundIndices.size() == 1) {
++                    indexToAdd = foundIndices[0].absoluteFilePath();
++                }
++                if (!indexToAdd.isEmpty() && !indexFiles.contains(indexToAdd))
++                    indexFiles << indexToAdd;
++            }
++        }
++        else {
++            qDebug() << "Dependant modules specified, but no index directories or "
++                     << "install directory were set."
++                     << "There will probably be errors for missing links.";
++        }
++    }
++    qdb->readIndexes(indexFiles);
++}
++
+ /*!
+   Processes the qdoc config file \a fileName. This is the
+   controller for all of qdoc.
+@@ -168,8 +253,7 @@ static void processQdocconfFile(const QString &fileName)
+     Config config(tr("qdoc"));
+     int i = 0;
+     while (defaults[i].key) {
+-        config.setStringList(defaults[i].key,
+-                             QStringList() << defaults[i].value);
++        config.setStringList(defaults[i].key, QStringList() << defaults[i].value);
+         ++i;
+     }
+     config.setStringList(CONFIG_SYNTAXHIGHLIGHTING, QStringList(highlighting ? "true" : "false"));
+@@ -177,8 +261,8 @@ static void processQdocconfFile(const QString &fileName)
+     config.setStringList(CONFIG_NOLINKERRORS, QStringList(noLinkErrors ? "true" : "false"));
+     config.setStringList(CONFIG_OBSOLETELINKS, QStringList(obsoleteLinks ? "true" : "false"));
+ 
+-    QString documentationPath = QLibraryInfo::rawLocation(QLibraryInfo::DocumentationPath,
+-                                                          QLibraryInfo::EffectivePaths);
++    documentationPath = QLibraryInfo::rawLocation(QLibraryInfo::DocumentationPath,
++                                                  QLibraryInfo::EffectivePaths);
+ 
+     // Set a few environment variables that can be used from the qdocconf file
+     qputenv("QT_INSTALL_DOCS", documentationPath.toLatin1());
+@@ -202,10 +286,18 @@ static void processQdocconfFile(const QString &fileName)
+     config.setStringList(CONFIG_DEFINES,defs);
+     Location::terminate();
+ 
+-    QString prevCurrentDir = QDir::currentPath();
+-    QString dir = QFileInfo(fileName).path();
+-    if (!dir.isEmpty())
+-        QDir::setCurrent(dir);
++    prevCurrentDir = QDir::currentPath();
++    currentDir = QFileInfo(fileName).path();
++    if (!currentDir.isEmpty())
++        QDir::setCurrent(currentDir);
++
++    QString phase;
++    if (Generator::runPrepareOnly())
++        phase = "in -prepare mode ";
++    else if (Generator::runGenerateOnly())
++        phase = "in -generate mode ";
++    QString msg = "Running qdoc " + phase + "for " + config.getString(CONFIG_PROJECT);
++    Location::logToStdErr(msg);
+ 
+     /*
+       Initialize all the classes and data structures with the
+@@ -227,8 +319,7 @@ static void processQdocconfFile(const QString &fileName)
+     while (fn != fileNames.constEnd()) {
+         QTranslator *translator = new QTranslator(0);
+         if (!translator->load(*fn))
+-            config.lastLocation().error(tr("Cannot load translator '%1'")
+-                                        .arg(*fn));
++            config.lastLocation().error(tr("Cannot load translator '%1'").arg(*fn));
+         QCoreApplication::instance()->installTranslator(translator);
+         translators.append(translator);
+         ++fn;
+@@ -260,86 +351,8 @@ static void processQdocconfFile(const QString &fileName)
+     QSet<QString> outputFormats = config.getOutputFormats();
+     Location outputFormatsLocation = config.lastLocation();
+ 
+-    /*
+-      Read some XML indexes containing definitions from other documentation sets.
+-     */
+-    QStringList indexFiles = config.getStringList(CONFIG_INDEXES);
+-
+-    dependModules += config.getStringList(CONFIG_DEPENDS);
+-
+-    // Allow modules and third-party application/libraries to link
+-    // to the Qt docs without having to explicitly pass --indexdir.
+-    if (!indexDirs.contains(documentationPath))
+-        indexDirs.append(documentationPath);
+-
+-    if (dependModules.size() > 0) {
+-        if (indexDirs.size() > 0) {
+-            for (int i = 0; i < indexDirs.size(); i++) {
+-                if (indexDirs[i].startsWith("..")) {
+-                    const QString prefix(QDir(dir).relativeFilePath(prevCurrentDir));
+-                    if (!prefix.isEmpty())
+-                        indexDirs[i].prepend(prefix + QLatin1Char('/'));
+-                }
+-            }
+-            /*
+-                Add all subdirectories of the indexdirs as dependModules when an asterisk is used in
+-                the 'depends' list.
+-            */
+-            if (dependModules.contains("*")) {
+-                dependModules.removeOne("*");
+-                for (int i = 0; i < indexDirs.size(); i++) {
+-                    QDir scanDir = QDir(indexDirs[i]);
+-                    scanDir.setFilter(QDir::Dirs | QDir::NoDotAndDotDot);
+-                    QFileInfoList dirList = scanDir.entryInfoList();
+-                    for (int j = 0; j < dirList.size(); j++) {
+-                        if (dirList[j].fileName().toLower() != config.getString(CONFIG_PROJECT).toLower())
+-                            dependModules.append(dirList[j].fileName());
+-                    }
+-                }
+-            }
+-            for (int i = 0; i < dependModules.size(); i++) {
+-                QString indexToAdd;
+-                QList<QFileInfo> foundIndices;
+-                for (int j = 0; j < indexDirs.size(); j++) {
+-                    QString fileToLookFor = indexDirs[j] + QLatin1Char('/') + dependModules[i] +
+-                            QLatin1Char('/') + dependModules[i] + QLatin1String(".index");
+-                    if (QFile::exists(fileToLookFor)) {
+-                        QFileInfo tempFileInfo(fileToLookFor);
+-                        if (!foundIndices.contains(tempFileInfo))
+-                            foundIndices.append(tempFileInfo);
+-                    }
+-                }
+-                qSort(foundIndices.begin(), foundIndices.end(), creationTimeBefore);
+-                if (foundIndices.size() > 1) {
+-                    /*
+-                        QDoc should always use the last entry in the multimap when there are
+-                        multiple index files for a module, since the last modified file has the
+-                        highest UNIX timestamp.
+-                    */
+-                    qDebug() << "Multiple indices found for dependency:" << dependModules[i] << "\nFound:";
+-                    for (int k = 0; k < foundIndices.size(); k++)
+-                        qDebug() << foundIndices[k].absoluteFilePath();
+-                    qDebug() << "Using" << foundIndices[foundIndices.size() - 1].absoluteFilePath()
+-                            << "as index for" << dependModules[i];
+-                    indexToAdd = foundIndices[foundIndices.size() - 1].absoluteFilePath();
+-                }
+-                else if (foundIndices.size() == 1) {
+-                    indexToAdd = foundIndices[0].absoluteFilePath();
+-                }
+-                else {
+-                    qDebug() << "No indices for" << dependModules[i] <<
+-                                "could be found in the specified index directories.";
+-                }
+-                if (!indexToAdd.isEmpty() && !indexFiles.contains(indexToAdd))
+-                    indexFiles << indexToAdd;
+-            }
+-        }
+-        else {
+-            qDebug() << "Dependant modules specified, but no index directories or install directory were set."
+-                     << "There will probably be errors for missing links.";
+-        }
+-    }
+-    qdb->readIndexes(indexFiles);
++    if (!Generator::runPrepareOnly())
++        loadIndexFiles(config);
+ 
+     QSet<QString> excludedDirs;
+     QSet<QString> excludedFiles;
+diff --git a/src/tools/qdoc/qdocindexfiles.cpp b/src/tools/qdoc/qdocindexfiles.cpp
+index d68fe0e..6d697c6 100644
+--- a/src/tools/qdoc/qdocindexfiles.cpp
++++ b/src/tools/qdoc/qdocindexfiles.cpp
+@@ -48,6 +48,7 @@
+ #include "location.h"
+ #include "atom.h"
+ #include "generator.h"
++#include <qdebug.h>
+ 
+ //include "doc.h"
+ //include "htmlgenerator.h"
+@@ -109,8 +110,11 @@ void QDocIndexFiles::destroyQDocIndexFiles()
+  */
+ void QDocIndexFiles::readIndexes(const QStringList& indexFiles)
+ {
+-    foreach (const QString& indexFile, indexFiles)
++    foreach (const QString& indexFile, indexFiles) {
++        QString msg = "  Loading index file: " + indexFile;
++        Location::logToStdErr(msg);
+         readIndexFile(indexFile);
++    }
+ }
+ 
+ /*!
+@@ -1048,6 +1052,9 @@ void QDocIndexFiles::generateIndex(const QString& fileName,
+     if (!file.open(QFile::WriteOnly | QFile::Text))
+         return;
+ 
++    QString msg = "  Writing index file: " + fileName;
++    Location::logToStdErr(msg);
++
+     gen_ = g;
+     QXmlStreamWriter writer(&file);
+     writer.setAutoFormatting(true);

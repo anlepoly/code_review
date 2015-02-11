@@ -1,0 +1,179 @@
+diff --git a/src/dbus/qdbusconnection_p.h b/src/dbus/qdbusconnection_p.h
+index d249789..4ecbe06 100644
+--- a/src/dbus/qdbusconnection_p.h
++++ b/src/dbus/qdbusconnection_p.h
+@@ -276,6 +276,7 @@ public:
+     QDBusConnection::ConnectionCapabilities capabilities;
+     QString name;               // this connection's name
+     QString baseService;        // this connection's base service
++    QStringList serverConnectionNames;
+ 
+     ConnectionMode mode;
+ 
+diff --git a/src/dbus/qdbusintegrator.cpp b/src/dbus/qdbusintegrator.cpp
+index eada7b7..18a25b0 100644
+--- a/src/dbus/qdbusintegrator.cpp
++++ b/src/dbus/qdbusintegrator.cpp
+@@ -50,6 +50,7 @@
+ 
+ #include "qdbusargument.h"
+ #include "qdbusconnection_p.h"
++#include "qdbusconnectionmanager_p.h"
+ #include "qdbusinterface_p.h"
+ #include "qdbusmessage.h"
+ #include "qdbusmetatype.h"
+@@ -385,16 +386,21 @@ static void qDBusNewConnection(DBusServer *server, DBusConnection *connection, v
+ 
+     // keep the connection alive
+     q_dbus_connection_ref(connection);
+-    QDBusConnectionPrivate *d = static_cast<QDBusConnectionPrivate *>(data);
++    QDBusConnectionPrivate *serverConnection = static_cast<QDBusConnectionPrivate *>(data);
++
++    QDBusConnectionPrivate *newConnection = new QDBusConnectionPrivate(serverConnection->parent());
++    QMutexLocker locker(&QDBusConnectionManager::instance()->mutex);
++    QDBusConnectionManager::instance()->setConnection(QLatin1String("QDBusServer-") + QString::number(reinterpret_cast<qulonglong>(newConnection)), newConnection);
++    serverConnection->serverConnectionNames << newConnection->name;
+ 
+     // setPeer does the error handling for us
+     QDBusErrorInternal error;
+-    d->setPeer(connection, error);
++    newConnection->setPeer(connection, error);
+ 
+-    QDBusConnection retval = QDBusConnectionPrivate::q(d);
++    QDBusConnection retval = QDBusConnectionPrivate::q(newConnection);
+ 
+     // make QDBusServer emit the newConnection signal
+-    d->serverConnection(retval);
++    serverConnection->serverConnection(retval);
+ }
+ 
+ } // extern "C"
+diff --git a/src/dbus/qdbusserver.cpp b/src/dbus/qdbusserver.cpp
+index 32471df..280ae92 100644
+--- a/src/dbus/qdbusserver.cpp
++++ b/src/dbus/qdbusserver.cpp
+@@ -71,9 +71,6 @@ QDBusServer::QDBusServer(const QString &address, QObject *parent)
+     }
+     d = new QDBusConnectionPrivate(this);
+ 
+-    QMutexLocker locker(&QDBusConnectionManager::instance()->mutex);
+-    QDBusConnectionManager::instance()->setConnection(QLatin1String("QDBusServer-") + QString::number(reinterpret_cast<qulonglong>(d)), d);
+-
+     QObject::connect(d, SIGNAL(newServerConnection(QDBusConnection)),
+                      this, SIGNAL(newConnection(QDBusConnection)));
+ 
+@@ -96,9 +93,6 @@ QDBusServer::QDBusServer(QObject *parent)
+     }
+     d = new QDBusConnectionPrivate(this);
+ 
+-    QMutexLocker locker(&QDBusConnectionManager::instance()->mutex);
+-    QDBusConnectionManager::instance()->setConnection(QLatin1String("QDBusServer-") + QString::number(reinterpret_cast<qulonglong>(d)), d);
+-
+     QObject::connect(d, SIGNAL(newServerConnection(QDBusConnection)),
+                      this, SIGNAL(newConnection(QDBusConnection)));
+ 
+@@ -113,7 +107,10 @@ QDBusServer::~QDBusServer()
+ {
+     if (QDBusConnectionManager::instance()) {
+         QMutexLocker locker(&QDBusConnectionManager::instance()->mutex);
+-        QDBusConnectionManager::instance()->removeConnection(d->name);
++        Q_FOREACH (const QString &name, d->serverConnectionNames) {
++            QDBusConnectionManager::instance()->removeConnection(name);
++        }
++        d->serverConnectionNames.clear();
+     }
+ }
+ 
+diff --git a/tests/auto/dbus/qdbusconnection/tst_qdbusconnection.cpp b/tests/auto/dbus/qdbusconnection/tst_qdbusconnection.cpp
+index f99220e..9b998eb 100644
+--- a/tests/auto/dbus/qdbusconnection/tst_qdbusconnection.cpp
++++ b/tests/auto/dbus/qdbusconnection/tst_qdbusconnection.cpp
+@@ -391,38 +391,51 @@ class MyServer : public QDBusServer
+ public:
+     MyServer(QString path, QString addr, QObject* parent) : QDBusServer(addr, parent),
+                                                             m_path(path),
+-                                                            m_conn("none")
++                                                            m_connections()
+     {
+         connect(this, SIGNAL(newConnection(const QDBusConnection&)), SLOT(handleConnection(const QDBusConnection&)));
+     }
+ 
+-    bool registerObject()
++    bool registerObject(const QDBusConnection& c)
+     {
+-        if( !m_conn.registerObject(m_path, &m_obj, QDBusConnection::ExportAllSlots) )
++        QDBusConnection conn(c);
++        if (!conn.registerObject(m_path, &m_obj, QDBusConnection::ExportAllSlots))
+             return false;
+-        if(! (m_conn.objectRegisteredAt(m_path) == &m_obj))
++        if (!(conn.objectRegisteredAt(m_path) == &m_obj))
+             return false;
+         return true;
+     }
+ 
++    bool registerObject()
++    {
++        Q_FOREACH (const QString &name, m_connections) {
++            if (!registerObject(QDBusConnection(name)))
++                return false;
++        }
++        return true;
++    }
++
+     void unregisterObject()
+     {
+-        m_conn.unregisterObject(m_path);
++        Q_FOREACH (const QString &name, m_connections) {
++            QDBusConnection c(name);
++            c.unregisterObject(m_path);
++        }
+     }
+ 
+ public slots:
+     void handleConnection(const QDBusConnection& c)
+     {
+-        m_conn = c;
++        m_connections << c.name();
+         QVERIFY(isConnected());
+-        QVERIFY(m_conn.isConnected());
+-        QVERIFY(registerObject());
++        QVERIFY(c.isConnected());
++        QVERIFY(registerObject(c));
+     }
+ 
+ private:
+     MyObject m_obj;
+     QString m_path;
+-    QDBusConnection m_conn;
++    QStringList m_connections;
+ };
+ 
+ 
+@@ -443,6 +456,8 @@ void tst_QDBusConnection::registerObjectPeer()
+ 
+     MyServer server(path, "unix:tmpdir=/tmp", 0);
+ 
++    QDBusConnection::connectToPeer(server.address(), "beforeFoo");
++
+     {
+         QDBusConnection con = QDBusConnection::connectToPeer(server.address(), "foo");
+ 
+@@ -454,6 +469,8 @@ void tst_QDBusConnection::registerObjectPeer()
+         QCOMPARE(obj.path, path);
+     }
+ 
++    QDBusConnection::connectToPeer(server.address(), "afterFoo");
++
+     {
+         QDBusConnection con("foo");
+         QVERIFY(con.isConnected());
+@@ -483,6 +500,9 @@ void tst_QDBusConnection::registerObjectPeer()
+         QVERIFY(!con.isConnected());
+         QVERIFY(!callMethodPeer(con, path));
+     }
++
++    QDBusConnection::disconnectFromPeer("beforeFoo");
++    QDBusConnection::disconnectFromPeer("afterFoo");
+ }
+ 
+ void tst_QDBusConnection::registerObject2()

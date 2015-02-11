@@ -1,0 +1,1578 @@
+diff --git a/src/quick/scenegraph/coreapi/qsgdefaultrenderer.cpp b/src/quick/scenegraph/coreapi/qsgdefaultrenderer.cpp
+index 404fe06..bbea89b 100644
+--- a/src/quick/scenegraph/coreapi/qsgdefaultrenderer.cpp
++++ b/src/quick/scenegraph/coreapi/qsgdefaultrenderer.cpp
+@@ -62,8 +62,15 @@ int geometryNodesDrawn;
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-static bool nodeLessThan(QSGGeometryNode *a, QSGGeometryNode *b)
++static bool nodeLessThan(QSGNode *nodeA, QSGNode *nodeB)
+ {
++    if (nodeA->type() != nodeB->type())
++        return nodeA->type() < nodeB->type();
++    if (nodeA->type() != QSGNode::GeometryNodeType)
++        return nodeA < nodeB;
++    QSGGeometryNode *a = static_cast<QSGGeometryNode *>(nodeA);
++    QSGGeometryNode *b = static_cast<QSGGeometryNode *>(nodeA);
++
+     // Sort by clip...
+     if (a->clipList() != b->clipList())
+         return a->clipList() < b->clipList();
+@@ -83,8 +90,15 @@ static bool nodeLessThan(QSGGeometryNode *a, QSGGeometryNode *b)
+     return a->matrix() < b->matrix();
+ }
+ 
+-static bool nodeLessThanWithRenderOrder(QSGGeometryNode *a, QSGGeometryNode *b)
++static bool nodeLessThanWithRenderOrder(QSGNode *nodeA, QSGNode *nodeB)
+ {
++    if (nodeA->type() != nodeB->type())
++        return nodeA->type() < nodeB->type();
++    if (nodeA->type() != QSGNode::GeometryNodeType)
++        return nodeA < nodeB;
++    QSGGeometryNode *a = static_cast<QSGGeometryNode *>(nodeA);
++    QSGGeometryNode *b = static_cast<QSGGeometryNode *>(nodeA);
++
+     // Sort by clip...
+     if (a->clipList() != b->clipList())
+         return a->clipList() < b->clipList();
+@@ -112,23 +126,23 @@ static bool nodeLessThanWithRenderOrder(QSGGeometryNode *a, QSGGeometryNode *b)
+ }
+ 
+ 
+-QSGDefaultRenderer::IndexGeometryNodePair::IndexGeometryNodePair(int i, QSGGeometryNode *node)
+-    : QPair<int, QSGGeometryNode *>(i, node)
++QSGDefaultRenderer::IndexNodePair::IndexNodePair(int i, QSGNode *node)
++    : QPair<int, QSGNode *>(i, node)
+ {
+ }
+ 
+-bool QSGDefaultRenderer::IndexGeometryNodePair::operator < (const QSGDefaultRenderer::IndexGeometryNodePair &other) const
++bool QSGDefaultRenderer::IndexNodePair::operator < (const QSGDefaultRenderer::IndexNodePair &other) const
+ {
+     return nodeLessThan(second, other.second);
+ }
+ 
+ 
+-QSGDefaultRenderer::IndexGeometryNodePairHeap::IndexGeometryNodePairHeap()
++QSGDefaultRenderer::IndexNodePairHeap::IndexNodePairHeap()
+     : v(64)
+ {
+ }
+ 
+-void QSGDefaultRenderer::IndexGeometryNodePairHeap::insert(const QSGDefaultRenderer::IndexGeometryNodePair &x)
++void QSGDefaultRenderer::IndexNodePairHeap::insert(const QSGDefaultRenderer::IndexNodePair &x)
+ {
+     int i = v.size();
+     v.add(x);
+@@ -138,9 +152,9 @@ void QSGDefaultRenderer::IndexGeometryNodePairHeap::insert(const QSGDefaultRende
+     }
+ }
+ 
+-QSGDefaultRenderer::IndexGeometryNodePair QSGDefaultRenderer::IndexGeometryNodePairHeap::pop()
++QSGDefaultRenderer::IndexNodePair QSGDefaultRenderer::IndexNodePairHeap::pop()
+ {
+-    IndexGeometryNodePair x = top();
++    IndexNodePair x = top();
+     if (v.size() > 1)
+         qSwap(v.first(), v.last());
+     v.pop_back();
+@@ -163,9 +177,11 @@ QSGDefaultRenderer::QSGDefaultRenderer(QSGContext *context)
+     , m_opaqueNodes(64)
+     , m_transparentNodes(64)
+     , m_tempNodes(64)
++    , m_renderGroups(4)
+     , m_rebuild_lists(false)
+     , m_needs_sorting(false)
+     , m_sort_front_to_back(false)
++    , m_render_node_added(false)
+     , m_currentRenderOrder(1)
+ {
+     QStringList args = qApp->arguments();
+@@ -250,22 +266,30 @@ void QSGDefaultRenderer::render()
+     if (m_rebuild_lists) {
+         m_opaqueNodes.reset();
+         m_transparentNodes.reset();
++        m_renderGroups.reset();
+         m_currentRenderOrder = 1;
+         buildLists(rootNode());
+         m_rebuild_lists = false;
++        m_render_node_added = false;
++        RenderGroup group = { m_opaqueNodes.size(), m_transparentNodes.size() };
++        m_renderGroups.add(group);
+     }
+ 
+ #ifdef RENDERER_DEBUG
+     int debugtimeLists = debugTimer.elapsed();
+ #endif
+ 
+-
+     if (m_needs_sorting) {
+         if (!m_opaqueNodes.isEmpty()) {
+-            qSort(&m_opaqueNodes.first(), &m_opaqueNodes.first() + m_opaqueNodes.size(),
+-                  m_sort_front_to_back
+-                  ? nodeLessThanWithRenderOrder
+-                  : nodeLessThan);
++            bool (*lessThan)(QSGNode *, QSGNode *);
++            lessThan = m_sort_front_to_back ? nodeLessThanWithRenderOrder : nodeLessThan;
++            int start = 0;
++            for (int i = 0; i < m_renderGroups.size(); ++i) {
++                int end = m_renderGroups.at(i).opaqueEnd;
++                if (end != start)
++                    qSort(&m_opaqueNodes.first() + start, &m_opaqueNodes.first() + end, lessThan);
++                start = end;
++            }
+         }
+         m_needs_sorting = false;
+     }
+@@ -277,60 +301,64 @@ void QSGDefaultRenderer::render()
+     m_renderOrderMatrix.setToIdentity();
+     m_renderOrderMatrix.scale(1, 1, qreal(1) / m_currentRenderOrder);
+ 
+-    glDisable(GL_BLEND);
+-    glDepthMask(true);
++    int opaqueStart = 0;
++    int transparentStart = 0;
++    for (int i = 0; i < m_renderGroups.size(); ++i) {
++        int opaqueEnd = m_renderGroups.at(i).opaqueEnd;
++        int transparentEnd = m_renderGroups.at(i).transparentEnd;
++
++        glDisable(GL_BLEND);
++        glDepthMask(true);
+ #ifdef QML_RUNTIME_TESTING
+-    if (m_render_opaque_nodes)
++        if (m_render_opaque_nodes)
+ #endif
+-    {
++        {
+ #if defined (QML_RUNTIME_TESTING)
+-        if (dumpTree)
+-            qDebug() << "Opaque Nodes:";
+-#endif
+-        renderNodes(m_opaqueNodes);
+-    }
+-
+-#ifdef RENDERER_DEBUG
+-    int debugtimeOpaque = debugTimer.elapsed();
+-    int opaqueNodes = geometryNodesDrawn;
+-    int opaqueMaterialChanges = materialChanges;
++            if (dumpTree)
++                qDebug() << "Opaque Nodes:";
+ #endif
++            if (opaqueEnd != opaqueStart)
++                renderNodes(&m_opaqueNodes.first() + opaqueStart, opaqueEnd - opaqueStart);
++        }
+ 
+-    glEnable(GL_BLEND);
+-    glDepthMask(false);
++        glEnable(GL_BLEND);
++        glDepthMask(false);
+ #ifdef QML_RUNTIME_TESTING
+-    if (m_render_alpha_nodes)
++        if (m_render_alpha_nodes)
+ #endif
+-    {
++        {
+ #if defined (QML_RUNTIME_TESTING)
+-        if (dumpTree)
+-            qDebug() << "Alpha Nodes:";
++            if (dumpTree)
++                qDebug() << "Alpha Nodes:";
+ #endif
+-        renderNodes(m_transparentNodes);
++            if (transparentEnd != transparentStart)
++                renderNodes(&m_transparentNodes.first() + transparentStart, transparentEnd - transparentStart);
++        }
++
++        opaqueStart = opaqueEnd;
++        transparentStart = transparentEnd;
+     }
+ 
+ #ifdef RENDERER_DEBUG
+-    int debugtimeAlpha = debugTimer.elapsed();
++    int debugtimeRender = debugTimer.elapsed();
+ #endif
+ 
+-
+     if (m_currentProgram)
+         m_currentProgram->deactivate();
+ 
+ #ifdef RENDERER_DEBUG
+     if (debugTimer.elapsed() > DEBUG_THRESHOLD) {
+         printf(" --- Renderer breakdown:\n"
+-               "     - setup=%d, clear=%d, building=%d, sorting=%d, opaque=%d, alpha=%d\n"
+-               "     - material changes: opaque=%d, alpha=%d, total=%d\n"
+-               "     - geometry ndoes: opaque=%d, alpha=%d, total=%d\n",
++               "     - setup=%d, clear=%d, building=%d, sorting=%d, render=%d\n"
++               "     - material changes: total=%d\n"
++               "     - geometry nodes: total=%d\n",
+                debugtimeSetup,
+                debugtimeClear - debugtimeSetup,
+                debugtimeLists - debugtimeClear,
+                debugtimeSorting - debugtimeLists,
+-               debugtimeOpaque - debugtimeSorting,
+-               debugtimeAlpha - debugtimeOpaque,
+-               opaqueMaterialChanges, materialChanges - opaqueMaterialChanges, materialChanges,
+-               opaqueNodes, geometryNodesDrawn - opaqueNodes, geometryNodesDrawn);
++               debugtimeRender - debugtimeSorting,
++               materialChanges,
++               geometryNodesDrawn);
+     }
+ #endif
+ 
+@@ -365,10 +393,21 @@ void QSGDefaultRenderer::buildLists(QSGNode *node)
+             geomNode->setRenderOrder(m_currentRenderOrder - 1);
+             m_transparentNodes.add(geomNode);
+         } else {
++            if (m_render_node_added) {
++                // Start new group of nodes so that this opaque node is render on top of the
++                // render node.
++                RenderGroup group = { m_opaqueNodes.size(), m_transparentNodes.size() };
++                m_renderGroups.add(group);
++                m_render_node_added = false;
++            }
+             geomNode->setRenderOrder(m_currentRenderOrder);
+             m_opaqueNodes.add(geomNode);
+             m_currentRenderOrder += 2;
+         }
++    } else if (node->type() == QSGNode::RenderNodeType) {
++        QSGRenderNode *renderNode = static_cast<QSGRenderNode *>(node);
++        m_transparentNodes.add(renderNode);
++        m_render_node_added = true;
+     }
+ 
+     if (!node->firstChild())
+@@ -384,6 +423,7 @@ void QSGDefaultRenderer::buildLists(QSGNode *node)
+         QVarLengthArray<int, 16> beginIndices;
+         QVarLengthArray<int, 16> endIndices;
+         int baseCount = m_transparentNodes.size();
++        int baseGroupCount = m_renderGroups.size();
+         int count = 0;
+         for (QSGNode *c = node->firstChild(); c; c = c->nextSibling()) {
+             beginIndices.append(m_transparentNodes.size());
+@@ -393,21 +433,22 @@ void QSGDefaultRenderer::buildLists(QSGNode *node)
+         }
+ 
+         int childNodeCount = m_transparentNodes.size() - baseCount;
+-        if (childNodeCount) {
++        // Don't reorder if new render groups were added.
++        if (m_renderGroups.size() == baseGroupCount && childNodeCount) {
+             m_tempNodes.reset();
+             m_tempNodes.reserve(childNodeCount);
+             while (childNodeCount) {
+                 for (int i = 0; i < count; ++i) {
+                     if (beginIndices[i] != endIndices[i])
+-                        m_heap.insert(IndexGeometryNodePair(i, m_transparentNodes.at(beginIndices[i]++)));
++                        m_heap.insert(IndexNodePair(i, m_transparentNodes.at(beginIndices[i]++)));
+                 }
+                 while (!m_heap.isEmpty()) {
+-                    IndexGeometryNodePair pair = m_heap.pop();
++                    IndexNodePair pair = m_heap.pop();
+                     m_tempNodes.add(pair.second);
+                     --childNodeCount;
+                     int i = pair.first;
+                     if (beginIndices[i] != endIndices[i] && !nodeLessThan(m_transparentNodes.at(beginIndices[i]), pair.second))
+-                        m_heap.insert(IndexGeometryNodePair(i, m_transparentNodes.at(beginIndices[i]++)));
++                        m_heap.insert(IndexNodePair(i, m_transparentNodes.at(beginIndices[i]++)));
+                 }
+             }
+             Q_ASSERT(m_tempNodes.size() == m_transparentNodes.size() - baseCount);
+@@ -420,105 +461,182 @@ void QSGDefaultRenderer::buildLists(QSGNode *node)
+     }
+ }
+ 
+-void QSGDefaultRenderer::renderNodes(const QDataBuffer<QSGGeometryNode *> &list)
++void QSGDefaultRenderer::renderNodes(QSGNode *const *nodes, int count)
+ {
+     const float scale = 1.0f / m_currentRenderOrder;
+-    int count = list.size();
+     int currentRenderOrder = 0x80000000;
+-    m_current_projection_matrix.setColumn(2, scale * projectionMatrix().column(2));
++    ClipType currentClipType = NoClip;
++    QMatrix4x4 projection = projectionMatrix();
++    m_current_projection_matrix.setColumn(2, scale * projection.column(2));
+ 
+     //int clipChangeCount = 0;
+     //int programChangeCount = 0;
+     //int materialChangeCount = 0;
+ 
+     for (int i = 0; i < count; ++i) {
+-        QSGGeometryNode *geomNode = list.at(i);
++        if (nodes[i]->type() == QSGNode::RenderNodeType) {
++            QSGRenderNode *renderNode = static_cast<QSGRenderNode *>(nodes[i]);
++
++            if (m_currentProgram)
++                m_currentProgram->deactivate();
++            m_currentMaterial = 0;
++            m_currentProgram = 0;
++            m_currentMatrix = 0;
++            currentRenderOrder = 0x80000000;
+ 
+-        QSGMaterialShader::RenderState::DirtyStates updates;
++            bool changeClip = renderNode->clipList() != m_currentClip;
++            // The clip function relies on there not being any depth testing..
++            glDisable(GL_DEPTH_TEST);
++            if (changeClip) {
++                currentClipType = updateStencilClip(renderNode->clipList());
++                m_currentClip = renderNode->clipList();
++                //++clipChangeCount;
++            }
++
++            glDepthMask(false);
++            glBindBuffer(GL_ARRAY_BUFFER, 0);
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++
++            QSGRenderNode::RenderState state;
++            state.projectionMatrix = &projection;
++            state.scissorEnabled = currentClipType & ScissorClip;
++            state.stencilEnabled = currentClipType & StencilClip;
++            state.scissorRect = m_current_scissor_rect;
++            state.stencilValue = m_current_stencil_value;
++
++            renderNode->render(state);
++
++            QSGRenderNode::StateFlags changes = renderNode->changedStates();
++            if (changes & QSGRenderNode::ViewportState) {
++                QRect r = viewportRect();
++                glViewport(r.x(), deviceRect().bottom() - r.bottom(), r.width(), r.height());
++            }
++            if (changes & QSGRenderNode::StencilState) {
++                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
++                glStencilMask(0xff);
++                glDisable(GL_STENCIL_TEST);
++            }
++            if (changes & (QSGRenderNode::StencilState | QSGRenderNode::ScissorState)) {
++                glDisable(GL_SCISSOR_TEST);
++                m_currentClip = 0;
++                currentClipType = NoClip;
++            }
++            if (changes & QSGRenderNode::DepthState) {
++#if defined(QT_OPENGL_ES)
++                glClearDepthf(0);
++#else
++                glClearDepth(0);
++#endif
++                if (m_clear_mode & QSGRenderer::ClearDepthBuffer) {
++                    glDepthMask(true);
++                    glClear(GL_DEPTH_BUFFER_BIT);
++                }
++                glDepthMask(false);
++                glDepthFunc(GL_GREATER);
++            }
++            if (changes & QSGRenderNode::ColorState)
++                bindable()->reactivate();
++            if (changes & QSGRenderNode::BlendState) {
++                glEnable(GL_BLEND);
++                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            }
++            if (changes & QSGRenderNode::CullState) {
++                glFrontFace(isMirrored() ? GL_CW : GL_CCW);
++                glDisable(GL_CULL_FACE);
++            }
++
++            glEnable(GL_DEPTH_TEST);
++
++            m_current_model_view_matrix.setToIdentity();
++            m_current_determinant = 1;
++        } else if (nodes[i]->type() == QSGNode::GeometryNodeType) {
++            QSGGeometryNode *geomNode = static_cast<QSGGeometryNode *>(nodes[i]);
++
++            QSGMaterialShader::RenderState::DirtyStates updates;
+ 
+ #if defined (QML_RUNTIME_TESTING)
+-        static bool dumpTree = qApp->arguments().contains(QLatin1String("--dump-tree"));
+-        if (dumpTree)
+-            qDebug() << geomNode;
++            static bool dumpTree = qApp->arguments().contains(QLatin1String("--dump-tree"));
++            if (dumpTree)
++                qDebug() << geomNode;
+ #endif
+ 
+-        bool changeMatrix = m_currentMatrix != geomNode->matrix();
++            bool changeMatrix = m_currentMatrix != geomNode->matrix();
+ 
+-        if (changeMatrix) {
+-            m_currentMatrix = geomNode->matrix();
+-            if (m_currentMatrix)
+-                m_current_model_view_matrix = *m_currentMatrix;
+-            else
+-                m_current_model_view_matrix.setToIdentity();
+-            m_current_determinant = m_current_model_view_matrix.determinant();
+-            updates |= QSGMaterialShader::RenderState::DirtyMatrix;
+-        }
++            if (changeMatrix) {
++                m_currentMatrix = geomNode->matrix();
++                if (m_currentMatrix)
++                    m_current_model_view_matrix = *m_currentMatrix;
++                else
++                    m_current_model_view_matrix.setToIdentity();
++                m_current_determinant = m_current_model_view_matrix.determinant();
++                updates |= QSGMaterialShader::RenderState::DirtyMatrix;
++            }
+ 
+-        bool changeOpacity = m_current_opacity != geomNode->inheritedOpacity();
+-        if (changeOpacity) {
+-            updates |= QSGMaterialShader::RenderState::DirtyOpacity;
+-            m_current_opacity = geomNode->inheritedOpacity();
+-        }
++            bool changeOpacity = m_current_opacity != geomNode->inheritedOpacity();
++            if (changeOpacity) {
++                updates |= QSGMaterialShader::RenderState::DirtyOpacity;
++                m_current_opacity = geomNode->inheritedOpacity();
++            }
+ 
+-        Q_ASSERT(geomNode->activeMaterial());
++            Q_ASSERT(geomNode->activeMaterial());
+ 
+-        QSGMaterial *material = geomNode->activeMaterial();
+-        QSGMaterialShader *program = m_context->prepareMaterial(material);
+-        Q_ASSERT(program->program()->isLinked());
++            QSGMaterial *material = geomNode->activeMaterial();
++            QSGMaterialShader *program = m_context->prepareMaterial(material);
++            Q_ASSERT(program->program()->isLinked());
+ 
+-        bool changeClip = geomNode->clipList() != m_currentClip;
+-        QSGRenderer::ClipType clipType = QSGRenderer::NoClip;
+-        if (changeClip) {
+-            // The clip function relies on there not being any depth testing..
+-            glDisable(GL_DEPTH_TEST);
+-            clipType = updateStencilClip(geomNode->clipList());
+-            glEnable(GL_DEPTH_TEST);
+-            m_currentClip = geomNode->clipList();
++            bool changeClip = geomNode->clipList() != m_currentClip;
++            if (changeClip) {
++                // The clip function relies on there not being any depth testing..
++                glDisable(GL_DEPTH_TEST);
++                currentClipType = updateStencilClip(geomNode->clipList());
++                glEnable(GL_DEPTH_TEST);
++                m_currentClip = geomNode->clipList();
+ #ifdef FORCE_NO_REORDER
+-            glDepthMask(false);
++                glDepthMask(false);
+ #else
+-            glDepthMask((material->flags() & QSGMaterial::Blending) == 0 && m_current_opacity == 1);
++                glDepthMask((material->flags() & QSGMaterial::Blending) == 0 && m_current_opacity == 1);
+ #endif
+-            //++clipChangeCount;
+-        }
++                //++clipChangeCount;
++            }
+ 
+-        bool changeProgram = (changeClip && clipType == QSGRenderer::StencilClip) || m_currentProgram != program;
+-        if (changeProgram) {
+-            if (m_currentProgram)
+-                m_currentProgram->deactivate();
+-            m_currentProgram = program;
+-            m_currentProgram->activate();
+-            //++programChangeCount;
+-            updates |= (QSGMaterialShader::RenderState::DirtyMatrix | QSGMaterialShader::RenderState::DirtyOpacity);
++            bool changeProgram = (changeClip && (currentClipType & StencilClip)) || m_currentProgram != program;
++            if (changeProgram) {
++                if (m_currentProgram)
++                    m_currentProgram->deactivate();
++                m_currentProgram = program;
++                m_currentProgram->activate();
++                //++programChangeCount;
++                updates |= (QSGMaterialShader::RenderState::DirtyMatrix | QSGMaterialShader::RenderState::DirtyOpacity);
+ 
+ #ifdef RENDERER_DEBUG
+-            materialChanges++;
++                materialChanges++;
+ #endif
+-        }
++            }
+ 
+-        bool changeRenderOrder = currentRenderOrder != geomNode->renderOrder();
+-        if (changeRenderOrder) {
+-            currentRenderOrder = geomNode->renderOrder();
+-            m_current_projection_matrix.setColumn(3, projectionMatrix().column(3)
+-                                                  + currentRenderOrder
+-                                                  * m_current_projection_matrix.column(2));
+-            updates |= QSGMaterialShader::RenderState::DirtyMatrix;
+-        }
++            bool changeRenderOrder = currentRenderOrder != geomNode->renderOrder();
++            if (changeRenderOrder) {
++                currentRenderOrder = geomNode->renderOrder();
++                m_current_projection_matrix.setColumn(3, projection.column(3)
++                                                      + currentRenderOrder
++                                                      * m_current_projection_matrix.column(2));
++                updates |= QSGMaterialShader::RenderState::DirtyMatrix;
++            }
+ 
+-        if (changeProgram || m_currentMaterial != material) {
+-            program->updateState(state(updates), material, changeProgram ? 0 : m_currentMaterial);
+-            m_currentMaterial = material;
+-            //++materialChangeCount;
+-        }
++            if (changeProgram || m_currentMaterial != material) {
++                program->updateState(state(updates), material, changeProgram ? 0 : m_currentMaterial);
++                m_currentMaterial = material;
++                //++materialChangeCount;
++            }
+ 
+-        //glDepthRange((geomNode->renderOrder() + 0.1) * scale, (geomNode->renderOrder() + 0.9) * scale);
++            //glDepthRange((geomNode->renderOrder() + 0.1) * scale, (geomNode->renderOrder() + 0.9) * scale);
+ 
+-        const QSGGeometry *g = geomNode->geometry();
+-        draw(program, g);
++            const QSGGeometry *g = geomNode->geometry();
++            draw(program, g);
+ 
+ #ifdef RENDERER_DEBUG
+-        geometryNodesDrawn++;
++            geometryNodesDrawn++;
+ #endif
++        }
+     }
+     //qDebug("Clip: %i, shader program: %i, material: %i times changed while drawing %s items",
+     //    clipChangeCount, programChangeCount, materialChangeCount,
+diff --git a/src/quick/scenegraph/coreapi/qsgdefaultrenderer_p.h b/src/quick/scenegraph/coreapi/qsgdefaultrenderer_p.h
+index 3919442..9ef7622 100644
+--- a/src/quick/scenegraph/coreapi/qsgdefaultrenderer_p.h
++++ b/src/quick/scenegraph/coreapi/qsgdefaultrenderer_p.h
+@@ -45,6 +45,7 @@
+ #include "qsgrenderer_p.h"
+ 
+ #include <QtGui/private/qdatabuffer_p.h>
++#include "qsgrendernode_p.h"
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -54,28 +55,28 @@ class QSGDefaultRenderer : public QSGRenderer
+ {
+     Q_OBJECT
+ public:
+-    class IndexGeometryNodePair : public QPair<int, QSGGeometryNode *>
++    class IndexNodePair : public QPair<int, QSGNode *>
+     {
+     public:
+-        IndexGeometryNodePair(int i, QSGGeometryNode *n);
+-        bool operator < (const IndexGeometryNodePair &other) const;
++        IndexNodePair(int i, QSGNode *n);
++        bool operator < (const IndexNodePair &other) const;
+     };
+ 
+ 
+     // Minimum heap.
+-    class IndexGeometryNodePairHeap
++    class IndexNodePairHeap
+     {
+     public:
+-        IndexGeometryNodePairHeap();
+-        void insert(const IndexGeometryNodePair &x);
+-        const IndexGeometryNodePair &top() const { return v.first(); }
+-        IndexGeometryNodePair pop();
++        IndexNodePairHeap();
++        void insert(const IndexNodePair &x);
++        const IndexNodePair &top() const { return v.first(); }
++        IndexNodePair pop();
+         bool isEmpty() const { return v.isEmpty(); }
+     private:
+         static int parent(int i) { return (i - 1) >> 1; }
+         static int left(int i) { return (i << 1) | 1; }
+         static int right(int i) { return (i + 1) << 1; }
+-        QDataBuffer<IndexGeometryNodePair> v;
++        QDataBuffer<IndexNodePair> v;
+     };
+ 
+     QSGDefaultRenderer(QSGContext *context);
+@@ -89,21 +90,24 @@ public:
+ 
+ private:
+     void buildLists(QSGNode *node);
+-    void renderNodes(const QDataBuffer<QSGGeometryNode *> &list);
++    void renderNodes(QSGNode *const *nodes, int count);
+ 
+     const QSGClipNode *m_currentClip;
+     QSGMaterial *m_currentMaterial;
+     QSGMaterialShader *m_currentProgram;
+     const QMatrix4x4 *m_currentMatrix;
+     QMatrix4x4 m_renderOrderMatrix;
+-    QDataBuffer<QSGGeometryNode *> m_opaqueNodes;
+-    QDataBuffer<QSGGeometryNode *> m_transparentNodes;
+-    QDataBuffer<QSGGeometryNode *> m_tempNodes;
+-    IndexGeometryNodePairHeap m_heap;
++    QDataBuffer<QSGNode *> m_opaqueNodes;
++    QDataBuffer<QSGNode *> m_transparentNodes;
++    QDataBuffer<QSGNode *> m_tempNodes;
++    struct RenderGroup { int opaqueEnd, transparentEnd; };
++    QDataBuffer<RenderGroup> m_renderGroups;
++    IndexNodePairHeap m_heap;
+ 
+     bool m_rebuild_lists;
+     bool m_needs_sorting;
+     bool m_sort_front_to_back;
++    bool m_render_node_added;
+     int m_currentRenderOrder;
+ 
+ #ifdef QML_RUNTIME_TESTING
+diff --git a/src/quick/scenegraph/coreapi/qsgnode.cpp b/src/quick/scenegraph/coreapi/qsgnode.cpp
+index 4a8ba1d..88afac7 100644
+--- a/src/quick/scenegraph/coreapi/qsgnode.cpp
++++ b/src/quick/scenegraph/coreapi/qsgnode.cpp
+@@ -90,7 +90,7 @@ QSGNode::QSGNode()
+     , m_lastChild(0)
+     , m_nextSibling(0)
+     , m_previousSibling(0)
+-    , m_subtreeGeometryCount(0)
++    , m_subtreeRenderableCount(0)
+     , m_nodeFlags(OwnedByParent)
+     , m_dirtyState(0)
+ {
+@@ -104,7 +104,7 @@ QSGNode::QSGNode(NodeType type)
+     , m_lastChild(0)
+     , m_nextSibling(0)
+     , m_previousSibling(0)
+-    , m_subtreeGeometryCount(type == GeometryNodeType ? 1 : 0)
++    , m_subtreeRenderableCount(type == GeometryNodeType || type == RenderNodeType ? 1 : 0)
+     , m_nodeFlags(OwnedByParent)
+     , m_dirtyState(0)
+ {
+@@ -173,7 +173,7 @@ QSGNode::~QSGNode()
+ 
+ bool QSGNode::isSubtreeBlocked() const
+ {
+-    return m_subtreeGeometryCount == 0;
++    return m_subtreeRenderableCount == 0;
+ }
+ 
+ /*!
+@@ -471,16 +471,16 @@ void QSGNode::markDirty(DirtyState bits)
+ 
+     DirtyState subtreeBits = DirtyState((bits & DirtyPropagationMask) << 16);
+ 
+-    int geometryCountDiff = 0;
++    int renderableCountDiff = 0;
+     if (bits & DirtyNodeAdded)
+-        geometryCountDiff += m_subtreeGeometryCount;
++        renderableCountDiff += m_subtreeRenderableCount;
+     if (bits & DirtyNodeRemoved)
+-        geometryCountDiff -= m_subtreeGeometryCount;
++        renderableCountDiff -= m_subtreeRenderableCount;
+ 
+     QSGNode *p = m_parent;
+     while (p) {
+         p->m_dirtyState |= subtreeBits;
+-        p->m_subtreeGeometryCount += geometryCountDiff;
++        p->m_subtreeRenderableCount += renderableCountDiff;
+         if (p->type() == RootNodeType)
+             static_cast<QSGRootNode *>(p)->notifyNodeChange(this, bits);
+         p = p->m_parent;
+diff --git a/src/quick/scenegraph/coreapi/qsgnode.h b/src/quick/scenegraph/coreapi/qsgnode.h
+index 6ffbadd..becee6a 100644
+--- a/src/quick/scenegraph/coreapi/qsgnode.h
++++ b/src/quick/scenegraph/coreapi/qsgnode.h
+@@ -71,6 +71,9 @@ public:
+         TransformNodeType,
+         ClipNodeType,
+         OpacityNodeType,
++#ifndef Q_QDOC
++        RenderNodeType, // internal
++#endif
+         UserNodeType = 1024
+     };
+ 
+@@ -165,7 +168,7 @@ private:
+     QSGNode *m_lastChild;
+     QSGNode *m_nextSibling;
+     QSGNode *m_previousSibling;
+-    int m_subtreeGeometryCount;
++    int m_subtreeRenderableCount;
+ 
+     Flags m_nodeFlags;
+     DirtyState m_dirtyState;
+diff --git a/src/quick/scenegraph/coreapi/qsgnodeupdater.cpp b/src/quick/scenegraph/coreapi/qsgnodeupdater.cpp
+index 31b82d9..2562e8d 100644
+--- a/src/quick/scenegraph/coreapi/qsgnodeupdater.cpp
++++ b/src/quick/scenegraph/coreapi/qsgnodeupdater.cpp
+@@ -40,6 +40,8 @@
+ ****************************************************************************/
+ 
+ #include "qsgnodeupdater_p.h"
++#include "qsgnode.h"
++#include "qsgrendernode_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -204,6 +206,26 @@ void QSGNodeUpdater::leaveGeometryNode(QSGGeometryNode *g)
+ #endif
+ }
+ 
++void QSGNodeUpdater::enterRenderNode(QSGRenderNode *r)
++{
++#ifdef QSG_UPDATER_DEBUG
++    qDebug() << "enter render:" << r;
++#endif
++
++    r->m_matrix = m_combined_matrix_stack.isEmpty() ? 0 : m_combined_matrix_stack.last();
++    r->m_clip_list = m_current_clip;
++    r->setInheritedOpacity(m_opacity_stack.last());
++}
++
++void QSGNodeUpdater::leaveRenderNode(QSGRenderNode *r)
++{
++#ifdef QSG_UPDATER_DEBUG
++    qDebug() << "leave render" << r;
++#else
++    Q_UNUSED(r)
++#endif
++}
++
+ void QSGNodeUpdater::enterOpacityNode(QSGOpacityNode *o)
+ {
+     if (o->dirtyState() & QSGNode::DirtyOpacity)
+@@ -263,6 +285,12 @@ void QSGNodeUpdater::visitNode(QSGNode *n)
+         visitChildren(g);
+         leaveGeometryNode(g);
+         break; }
++    case QSGNode::RenderNodeType: {
++        QSGRenderNode *r = static_cast<QSGRenderNode *>(n);
++        enterRenderNode(r);
++        visitChildren(r);
++        leaveRenderNode(r);
++        break; }
+     case QSGNode::ClipNodeType: {
+         QSGClipNode *c = static_cast<QSGClipNode *>(n);
+         enterClipNode(c);
+diff --git a/src/quick/scenegraph/coreapi/qsgnodeupdater_p.h b/src/quick/scenegraph/coreapi/qsgnodeupdater_p.h
+index 5c455b8..0ad9d76 100644
+--- a/src/quick/scenegraph/coreapi/qsgnodeupdater_p.h
++++ b/src/quick/scenegraph/coreapi/qsgnodeupdater_p.h
+@@ -42,11 +42,21 @@
+ #ifndef NODEUPDATER_P_H
+ #define NODEUPDATER_P_H
+ 
+-#include "qsgnode.h"
++#include <QtQuick/qtquickglobal.h>
+ #include <QtGui/private/qdatabuffer_p.h>
+ 
++QT_BEGIN_HEADER
++
+ QT_BEGIN_NAMESPACE
+ 
++class QSGNode;
++class QSGTransformNode;
++class QSGClipNode;
++class QSGOpacityNode;
++class QSGGeometryNode;
++class QMatrix4x4;
++class QSGRenderNode;
++
+ class Q_QUICK_EXPORT QSGNodeUpdater
+ {
+ public:
+@@ -68,6 +78,8 @@ protected:
+     void leaveOpacityNode(QSGOpacityNode *o);
+     void enterGeometryNode(QSGGeometryNode *);
+     void leaveGeometryNode(QSGGeometryNode *);
++    void enterRenderNode(QSGRenderNode *);
++    void leaveRenderNode(QSGRenderNode *);
+ 
+     void visitNode(QSGNode *n);
+     void visitChildren(QSGNode *n);
+@@ -84,4 +96,6 @@ protected:
+ 
+ QT_END_NAMESPACE
+ 
++QT_END_HEADER
++
+ #endif // NODEUPDATER_P_H
+diff --git a/src/quick/scenegraph/coreapi/qsgrenderer.cpp b/src/quick/scenegraph/coreapi/qsgrenderer.cpp
+index eb7cab5..9737fbb 100644
+--- a/src/quick/scenegraph/coreapi/qsgrenderer.cpp
++++ b/src/quick/scenegraph/coreapi/qsgrenderer.cpp
+@@ -138,6 +138,7 @@ QSGRenderer::QSGRenderer(QSGContext *context)
+     , m_clear_mode(ClearColorBuffer | ClearDepthBuffer)
+     , m_current_opacity(1)
+     , m_current_determinant(1)
++    , m_current_stencil_value(0)
+     , m_context(context)
+     , m_root_node(0)
+     , m_node_updater(0)
+@@ -425,13 +426,12 @@ QSGRenderer::ClipType QSGRenderer::updateStencilClip(const QSGClipNode *clip)
+         return NoClip;
+     }
+ 
+-    bool stencilEnabled = false;
+-    bool scissorEnabled = false;
++    ClipType clipType = NoClip;
+ 
+     glDisable(GL_SCISSOR_TEST);
+ 
+-    int clipDepth = 0;
+-    QRect clipRect;
++    m_current_stencil_value = 0;
++    m_current_scissor_rect = QRect();
+     while (clip) {
+         QMatrix4x4 m = m_current_projection_matrix;
+         if (clip->matrix())
+@@ -470,17 +470,17 @@ QSGRenderer::ClipType QSGRenderer::updateStencilClip(const QSGClipNode *clip)
+             GLint ix2 = qRound((fx2 + 1) * m_device_rect.width() * qreal(0.5));
+             GLint iy2 = qRound((fy2 + 1) * m_device_rect.height() * qreal(0.5));
+ 
+-            if (!scissorEnabled) {
+-                clipRect = QRect(ix1, iy1, ix2 - ix1, iy2 - iy1);
++            if (!(clipType & ScissorClip)) {
++                m_current_scissor_rect = QRect(ix1, iy1, ix2 - ix1, iy2 - iy1);
+                 glEnable(GL_SCISSOR_TEST);
+-                scissorEnabled = true;
++                clipType |= ScissorClip;
+             } else {
+-                clipRect &= QRect(ix1, iy1, ix2 - ix1, iy2 - iy1);
++                m_current_scissor_rect &= QRect(ix1, iy1, ix2 - ix1, iy2 - iy1);
+             }
+-
+-            glScissor(clipRect.x(), clipRect.y(), clipRect.width(), clipRect.height());
++            glScissor(m_current_scissor_rect.x(), m_current_scissor_rect.y(),
++                      m_current_scissor_rect.width(), m_current_scissor_rect.height());
+         } else {
+-            if (!stencilEnabled) {
++            if (!(clipType & StencilClip)) {
+                 if (!m_clip_program.isLinked()) {
+                     m_clip_program.addShaderFromSourceCode(QOpenGLShader::Vertex,
+                         "attribute highp vec4 vCoord;       \n"
+@@ -497,20 +497,28 @@ QSGRenderer::ClipType QSGRenderer::updateStencilClip(const QSGClipNode *clip)
+                     m_clip_matrix_id = m_clip_program.uniformLocation("matrix");
+                 }
+ 
+-                glStencilMask(0xff); // write mask
+                 glClearStencil(0);
+                 glClear(GL_STENCIL_BUFFER_BIT);
+                 glEnable(GL_STENCIL_TEST);
+                 glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                 glDepthMask(GL_FALSE);
+ 
++                if (m_vertex_buffer_bound) {
++                    glBindBuffer(GL_ARRAY_BUFFER, 0);
++                    m_vertex_buffer_bound = false;
++                }
++                if (m_index_buffer_bound) {
++                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++                    m_index_buffer_bound = false;
++                }
++
+                 m_clip_program.bind();
+                 m_clip_program.enableAttributeArray(0);
+ 
+-                stencilEnabled = true;
++                clipType |= StencilClip;
+             }
+ 
+-            glStencilFunc(GL_EQUAL, clipDepth, 0xff); // stencil test, ref, test mask
++            glStencilFunc(GL_EQUAL, m_current_stencil_value, 0xff); // stencil test, ref, test mask
+             glStencilOp(GL_KEEP, GL_KEEP, GL_INCR); // stencil fail, z fail, z pass
+ 
+             const QSGGeometry *g = clip->geometry();
+@@ -525,26 +533,22 @@ QSGRenderer::ClipType QSGRenderer::updateStencilClip(const QSGClipNode *clip)
+                 glDrawArrays(g->drawingMode(), 0, g->vertexCount());
+             }
+ 
+-            ++clipDepth;
++            ++m_current_stencil_value;
+         }
+ 
+         clip = clip->clipList();
+     }
+ 
+-    if (stencilEnabled) {
++    if (clipType & StencilClip) {
+         m_clip_program.disableAttributeArray(0);
+-        glStencilFunc(GL_EQUAL, clipDepth, 0xff); // stencil test, ref, test mask
++        glStencilFunc(GL_EQUAL, m_current_stencil_value, 0xff); // stencil test, ref, test mask
+         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP); // stencil fail, z fail, z pass
+-        glStencilMask(0); // write mask
+         bindable()->reactivate();
+     } else {
+         glDisable(GL_STENCIL_TEST);
+     }
+ 
+-    if (!scissorEnabled)
+-        glDisable(GL_SCISSOR_TEST);
+-
+-    return stencilEnabled ? StencilClip : ScissorClip;
++    return clipType;
+ }
+ 
+ 
+diff --git a/src/quick/scenegraph/coreapi/qsgrenderer_p.h b/src/quick/scenegraph/coreapi/qsgrenderer_p.h
+index ec09ed4..9b177ab 100644
+--- a/src/quick/scenegraph/coreapi/qsgrenderer_p.h
++++ b/src/quick/scenegraph/coreapi/qsgrenderer_p.h
+@@ -70,12 +70,13 @@ class Q_QUICK_EXPORT QSGRenderer : public QObject, public QOpenGLFunctions
+ {
+     Q_OBJECT
+ public:
+-    enum ClipType
++    enum ClipTypeBit
+     {
+-        NoClip,
+-        ScissorClip,
+-        StencilClip
++        NoClip = 0x00,
++        ScissorClip = 0x01,
++        StencilClip = 0x02
+     };
++    Q_DECLARE_FLAGS(ClipType, ClipTypeBit)
+ 
+     enum ClearModeBit
+     {
+@@ -155,6 +156,8 @@ protected:
+     QMatrix4x4 m_current_model_view_matrix;
+     qreal m_current_opacity;
+     qreal m_current_determinant;
++    QRect m_current_scissor_rect;
++    int m_current_stencil_value;
+ 
+     QSGContext *m_context;
+ 
+diff --git a/src/quick/scenegraph/coreapi/qsgrendernode.cpp b/src/quick/scenegraph/coreapi/qsgrendernode.cpp
+new file mode 100644
+index 0000000..0697fbe
+--- /dev/null
++++ b/src/quick/scenegraph/coreapi/qsgrendernode.cpp
+@@ -0,0 +1,122 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include "qsgrendernode_p.h"
++
++QT_BEGIN_NAMESPACE
++
++QSGRenderNode::QSGRenderNode()
++    : QSGNode(RenderNodeType)
++    , m_matrix(0)
++    , m_clip_list(0)
++    , m_opacity(1)
++{
++}
++
++void QSGRenderNode::setInheritedOpacity(qreal opacity)
++{
++    Q_ASSERT(opacity >= 0 && opacity <= 1);
++    m_opacity = opacity;
++}
++
++/*!
++    \fn QSGRenderNode::StateFlags QSGRenderNode::changedStates()
++
++    This function should return a mask where each bit represents OpenGL states changed by
++    the \l render() function:
++    \list
++    \o DepthState - depth write mask, depth test enabled, depth comparison function
++    \o StencilState - stencil write masks, stencil test enabled, stencil operations,
++                      stencil comparison functions
++    \o ScissorState - scissor enabled, scissor test enabled
++    \o ColorState - clear color, color write mask
++    \o BlendState - blend enabled, blend function
++    \o CullState - front face, cull face enabled
++    \o ViewportState - viewport
++    \endlist
++
++    The function is called by the renderer so it can reset the OpenGL states after rendering this
++    node.
++
++    \internal
++  */
++
++/*!
++    \fn void QSGRenderNode::render(const RenderState &state)
++
++    This function is called by the renderer and should paint this node with OpenGL commands.
++
++    The states necessary for clipping has already been set before the function is called.
++    The clip is a combination of a stencil clip and scissor clip. Information about the clip is
++    found in \a state.
++
++    The effective opacity can be retrieved with \l inheritedOpacity().
++
++    The projection matrix is available through \a state, while the model-view matrix can be
++    fetched with \l matrix(). The combined matrix is then the projection matrix times the
++    model-view matrix.
++
++    The following states are set before this function is called:
++    \list
++    \o glDepthMask(false)
++    \o glDisable(GL_DEPTH_TEST)
++    \o glStencilMask(0)
++    \o glEnable(GL_STENCIL_TEST)/glDisable(GL_STENCIL_TEST) depending on clip
++    \o glStencilFunc(GL_EQUAL, state.stencilValue, 0xff) depending on clip
++    \o glEnable(GL_SCISSOR_TEST)/glDisable(GL_SCISSOR_TEST) depending on clip
++    \o glScissor(state.scissorRect.x(), state.scissorRect.y(),
++                 state.scissorRect.width(), state.scissorRect.height()) depending on clip
++    \o glEnable(GL_BLEND)
++    \o glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
++    \o glDisable(GL_CULL_FACE)
++    \endlist
++
++    States that are not listed above, but are included in \l StateFlags, can have arbitrary
++    values.
++
++    \l changedStates() should return which states this function has changed. If a state is not
++    covered by \l StateFlags, the state should be set to the default value according to the
++    OpenGL specification.
++
++    \internal
++  */
++
++QT_END_NAMESPACE
+diff --git a/src/quick/scenegraph/coreapi/qsgrendernode_p.h b/src/quick/scenegraph/coreapi/qsgrendernode_p.h
+new file mode 100644
+index 0000000..a2f2be8
+--- /dev/null
++++ b/src/quick/scenegraph/coreapi/qsgrendernode_p.h
+@@ -0,0 +1,114 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the QtDeclarative module of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QSGRENDERNODE_P_H
++#define QSGRENDERNODE_P_H
++
++//
++//  W A R N I N G
++//  -------------
++//
++// This file is not part of the Qt API.  It exists purely as an
++// implementation detail.  This header file may change from version to
++// version without notice, or even be removed.
++//
++// We mean it.
++//
++
++#include "qsgnode.h"
++
++QT_BEGIN_HEADER
++
++QT_BEGIN_NAMESPACE
++
++class Q_QUICK_EXPORT QSGRenderNode : public QSGNode
++{
++public:
++    enum StateFlag
++    {
++        DepthState = 0x01, // depth mask, depth test enable, depth func, clear depth
++        StencilState = 0x02, // stencil mask, stencil test enable, stencil op, stencil func, clear stencil
++        ScissorState = 0x04, // scissor enable, scissor test enable
++        ColorState = 0x08, // clear color, color mask
++        BlendState = 0x10, // blend enable, blend func
++        CullState = 0x20, // front face, cull face enable
++        ViewportState = 0x40 // viewport
++    };
++    Q_DECLARE_FLAGS(StateFlags, StateFlag)
++
++    struct RenderState
++    {
++        // The model-view matrix can be retrieved with matrix().
++        // The opacity can be retrieved with inheritedOpacity().
++        const QMatrix4x4 *projectionMatrix;
++        QRect scissorRect;
++        int stencilValue;
++
++        bool stencilEnabled;
++        bool scissorEnabled;
++    };
++
++    QSGRenderNode();
++
++    virtual StateFlags changedStates() = 0;
++    virtual void render(const RenderState &state) = 0;
++
++    const QMatrix4x4 *matrix() const { return m_matrix; }
++    const QSGClipNode *clipList() const { return m_clip_list; }
++
++    void setInheritedOpacity(qreal opacity);
++    qreal inheritedOpacity() const { return m_opacity; }
++
++private:
++    friend class QSGNodeUpdater;
++
++    const QMatrix4x4 *m_matrix;
++    const QSGClipNode *m_clip_list;
++    qreal m_opacity;
++};
++
++Q_DECLARE_OPERATORS_FOR_FLAGS(QSGRenderNode::StateFlags)
++
++QT_END_NAMESPACE
++
++QT_END_HEADER
++
++#endif
+diff --git a/src/quick/scenegraph/scenegraph.pri b/src/quick/scenegraph/scenegraph.pri
+index 9fc9222..dae4a3b 100644
+--- a/src/quick/scenegraph/scenegraph.pri
++++ b/src/quick/scenegraph/scenegraph.pri
+@@ -8,6 +8,7 @@ HEADERS += \
+     $$PWD/coreapi/qsgnode.h \
+     $$PWD/coreapi/qsgnodeupdater_p.h \
+     $$PWD/coreapi/qsgrenderer_p.h \
++    $$PWD/coreapi/qsgrendernode_p.h \
+     $$PWD/coreapi/qsggeometry_p.h
+ 
+ SOURCES += \
+@@ -16,7 +17,8 @@ SOURCES += \
+     $$PWD/coreapi/qsgmaterial.cpp \
+     $$PWD/coreapi/qsgnode.cpp \
+     $$PWD/coreapi/qsgnodeupdater.cpp \
+-    $$PWD/coreapi/qsgrenderer.cpp
++    $$PWD/coreapi/qsgrenderer.cpp \
++    $$PWD/coreapi/qsgrendernode.cpp
+ 
+ # Util API
+ HEADERS += \
+diff --git a/tests/auto/qtquick2/qtquick2.pro b/tests/auto/qtquick2/qtquick2.pro
+index 7066446..7acd75f 100644
+--- a/tests/auto/qtquick2/qtquick2.pro
++++ b/tests/auto/qtquick2/qtquick2.pro
+@@ -4,6 +4,7 @@ PUBLICTESTS += \
+     examples \
+     geometry \
+     nodes \
++    rendernode \
+     qdeclarativepixmapcache
+ 
+ # This test requires the qtconcurrent module
+diff --git a/tests/auto/qtquick2/rendernode/data/MessUpState.qml b/tests/auto/qtquick2/rendernode/data/MessUpState.qml
+new file mode 100644
+index 0000000..58f6e80
+--- /dev/null
++++ b/tests/auto/qtquick2/rendernode/data/MessUpState.qml
+@@ -0,0 +1,32 @@
++import QtQuick 2.0
++import Test 1.0
++
++Rectangle {
++    width: 200
++    height: 200
++    color: "black"
++    Rectangle {
++        width: 200
++        height: 100
++        anchors.centerIn: parent
++        clip: true
++        color: "white"
++        Rectangle {
++            width: 100
++            height: 100
++            anchors.centerIn: parent
++            rotation: 45
++            color: "blue"
++            clip: true
++            MessUpItem {
++                anchors.fill: parent
++            }
++            Rectangle {
++                anchors.fill: parent
++                anchors.margins: -50
++                color: "red"
++                opacity: 0.5
++            }
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/rendernode/data/RenderOrder.qml b/tests/auto/qtquick2/rendernode/data/RenderOrder.qml
+new file mode 100644
+index 0000000..3342756
+--- /dev/null
++++ b/tests/auto/qtquick2/rendernode/data/RenderOrder.qml
+@@ -0,0 +1,53 @@
++import QtQuick 2.0
++import Test 1.0
++
++Rectangle {
++    id: root
++
++    width: 200
++    height: 200
++    color: "black"
++
++    Rectangle {
++        width: 100
++        height: 100
++        anchors.top: parent.top
++        anchors.left: parent.left
++        color: "red"
++        opacity: 0.5
++    }
++
++    Rectangle {
++        width: 100
++        height: 100
++        anchors.bottom: parent.bottom
++        anchors.left: parent.left
++        color: "red"
++    }
++
++    ClearItem {
++        width: 100
++        height: 100
++        anchors.centerIn: parent
++        color: "white"
++        clip: true
++    }
++
++    Rectangle {
++        width: 100
++        height: 100
++        anchors.top: parent.top
++        anchors.right: parent.right
++        color: "blue"
++    }
++
++    Rectangle {
++        width: 100
++        height: 100
++        anchors.bottom: parent.bottom
++        anchors.right: parent.right
++        color: "blue"
++        opacity: 0.5
++    }
++
++}
+diff --git a/tests/auto/qtquick2/rendernode/rendernode.pro b/tests/auto/qtquick2/rendernode/rendernode.pro
+new file mode 100644
+index 0000000..f915a58
+--- /dev/null
++++ b/tests/auto/qtquick2/rendernode/rendernode.pro
+@@ -0,0 +1,18 @@
++CONFIG += testcase
++TARGET = tst_rendernode
++SOURCES += tst_rendernode.cpp
++
++macx:CONFIG -= app_bundle
++
++testDataFiles.files = data
++testDataFiles.path = .
++DEPLOYMENT += testDataFiles
++
++include(../../shared/util.pri)
++
++CONFIG += parallel_test
++QT += core-private gui-private v8-private declarative-private quick-private testlib
++
++OTHER_FILES += \
++    data/RenderOrder.qml \
++    data/MessUpState.qml \
+diff --git a/tests/auto/qtquick2/rendernode/tst_rendernode.cpp b/tests/auto/qtquick2/rendernode/tst_rendernode.cpp
+new file mode 100644
+index 0000000..f0e3851
+--- /dev/null
++++ b/tests/auto/qtquick2/rendernode/tst_rendernode.cpp
+@@ -0,0 +1,242 @@
++/****************************************************************************
++**
++** Copyright (C) 2012 Nokia Corporation and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/
++**
++** This file is part of the test suite of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL$
++** GNU Lesser General Public License Usage
++** This file may be used under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation and
++** appearing in the file LICENSE.LGPL included in the packaging of this
++** file. Please review the following information to ensure the GNU Lesser
++** General Public License version 2.1 requirements will be met:
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Nokia gives you certain additional
++** rights. These rights are described in the Nokia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU General
++** Public License version 3.0 as published by the Free Software Foundation
++** and appearing in the file LICENSE.GPL included in the packaging of this
++** file. Please review the following information to ensure the GNU General
++** Public License version 3.0 requirements will be met:
++** http://www.gnu.org/copyleft/gpl.html.
++**
++** Other Usage
++** Alternatively, this file may be used in accordance with the terms and
++** conditions contained in a signed written agreement between you and Nokia.
++**
++**
++**
++**
++**
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <qtest.h>
++
++#include <QtQuick/qquickitem.h>
++#include <QtQuick/qquickview.h>
++#include <QtGui/qopenglcontext.h>
++#include <private/qsgrendernode_p.h>
++
++#include "../../shared/util.h"
++
++class tst_rendernode: public QDeclarativeDataTest
++{
++    Q_OBJECT
++public:
++    tst_rendernode();
++
++    QImage runTest(const QString &url)
++    {
++        QQuickView view;
++        view.setSource(QUrl(url));
++
++        view.show();
++        QTest::qWaitForWindowShown(&view);
++
++        return view.grabFrameBuffer();
++    }
++
++private slots:
++    void renderOrder();
++    void messUpState();
++};
++
++class ClearNode : public QSGRenderNode
++{
++public:
++    virtual StateFlags changedStates()
++    {
++        return ColorState;
++    }
++
++    virtual void render(const RenderState &)
++    {
++        // If clip has been set, scissoring will make sure the right area is cleared.
++        glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0f);
++        glClear(GL_COLOR_BUFFER_BIT);
++    }
++
++    QColor color;
++};
++
++class ClearItem : public QQuickItem
++{
++    Q_OBJECT
++    Q_PROPERTY(QColor color READ color WRITE setColor NOTIFY colorChanged)
++public:
++    ClearItem() : m_color(Qt::black)
++    {
++        setFlag(ItemHasContents, true);
++    }
++
++    QColor color() const { return m_color; }
++    void setColor(const QColor &color)
++    {
++        if (color == m_color)
++            return;
++        m_color = color;
++        emit colorChanged();
++    }
++
++protected:
++    virtual QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
++    {
++        ClearNode *node = static_cast<ClearNode *>(oldNode);
++        if (!node)
++            node = new ClearNode;
++        node->color = m_color;
++        return node;
++    }
++
++Q_SIGNALS:
++    void colorChanged();
++
++private:
++    QColor m_color;
++};
++
++class MessUpNode : public QSGRenderNode
++{
++public:
++    virtual StateFlags changedStates()
++    {
++        return StateFlags(DepthState) | StencilState | ScissorState | ColorState | BlendState
++                | CullState | ViewportState;
++    }
++
++    virtual void render(const RenderState &)
++    {
++        // Don't draw anything, just mess up the state
++        glViewport(10, 10, 10, 10);
++        glDisable(GL_SCISSOR_TEST);
++        glDepthMask(true);
++        glEnable(GL_DEPTH_TEST);
++        glDepthFunc(GL_EQUAL);
++#if defined(QT_OPENGL_ES)
++        glClearDepthf(1);
++#else
++        glClearDepth(1);
++#endif
++        glClearStencil(42);
++        glClearColor(1.0f, 0.5f, 1.0f, 0.0f);
++        glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(190, 190, 10, 10);
++        glStencilFunc(GL_EQUAL, 28, 0xff);
++        glBlendFunc(GL_ZERO, GL_ZERO);
++        GLint frontFace;
++        glGetIntegerv(GL_FRONT_FACE, &frontFace);
++        glFrontFace(frontFace == GL_CW ? GL_CCW : GL_CW);
++        glEnable(GL_CULL_FACE);
++    }
++};
++
++class MessUpItem : public QQuickItem
++{
++    Q_OBJECT
++public:
++    MessUpItem()
++    {
++        setFlag(ItemHasContents, true);
++    }
++
++protected:
++    virtual QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
++    {
++        MessUpNode *node = static_cast<MessUpNode *>(oldNode);
++        if (!node)
++            node = new MessUpNode;
++        return node;
++    }
++};
++
++tst_rendernode::tst_rendernode()
++{
++    qmlRegisterType<ClearItem>("Test", 1, 0, "ClearItem");
++    qmlRegisterType<MessUpItem>("Test", 1, 0, "MessUpItem");
++}
++
++static void fuzzyCompareColor(QRgb x, QRgb y)
++{
++    QVERIFY(qAbs(qRed(x) - qRed(y)) < 4);
++    QVERIFY(qAbs(qGreen(x) - qGreen(y)) < 4);
++    QVERIFY(qAbs(qBlue(x) - qBlue(y)) < 4);
++}
++
++void tst_rendernode::renderOrder()
++{
++    QImage fb = runTest(testFile("RenderOrder.qml"));
++    int x1 = fb.width() / 8;
++    int x2 = fb.width() * 3 / 8;
++    int x3 = fb.width() * 5 / 8;
++    int x4 = fb.width() * 7 / 8;
++    int y1 = fb.height() / 8;
++    int y2 = fb.height() * 3 / 8;
++    int y3 = fb.height() * 5 / 8;
++    int y4 = fb.height() * 7 / 8;
++
++    fuzzyCompareColor(fb.pixel(x1, y1), qRgb(0x7f, 0x00, 0x00));
++    QCOMPARE(fb.pixel(x2, y2), qRgb(0xff, 0xff, 0xff));
++    QCOMPARE(fb.pixel(x3, y2), qRgb(0x00, 0x00, 0xff));
++    QCOMPARE(fb.pixel(x4, y1), qRgb(0x00, 0x00, 0xff));
++    QCOMPARE(fb.pixel(x1, y4), qRgb(0xff, 0x00, 0x00));
++    QCOMPARE(fb.pixel(x2, y3), qRgb(0xff, 0xff, 0xff));
++    fuzzyCompareColor(fb.pixel(x3, y3), qRgb(0x7f, 0x7f, 0xff));
++    fuzzyCompareColor(fb.pixel(x4, y4), qRgb(0x00, 0x00, 0x7f));
++}
++
++void tst_rendernode::messUpState()
++{
++    QImage fb = runTest(testFile("MessUpState.qml"));
++    int x1 = 0;
++    int x2 = fb.width() / 2;
++    int x3 = fb.width() - 1;
++    int y1 = 0;
++    int y2 = fb.height() * 3 / 16;
++    int y3 = fb.height() / 2;
++    int y4 = fb.height() * 13 / 16;
++    int y5 = fb.height() - 1;
++
++    QCOMPARE(fb.pixel(x1, y3), qRgb(0xff, 0xff, 0xff));
++    QCOMPARE(fb.pixel(x3, y3), qRgb(0xff, 0xff, 0xff));
++
++    QCOMPARE(fb.pixel(x2, y1), qRgb(0x00, 0x00, 0x00));
++    QCOMPARE(fb.pixel(x2, y2), qRgb(0x00, 0x00, 0x00));
++    fuzzyCompareColor(fb.pixel(x2, y3), qRgb(0x7f, 0x00, 0x7f));
++    QCOMPARE(fb.pixel(x2, y4), qRgb(0x00, 0x00, 0x00));
++    QCOMPARE(fb.pixel(x2, y5), qRgb(0x00, 0x00, 0x00));
++}
++
++
++QTEST_MAIN(tst_rendernode)
++
++#include "tst_rendernode.moc"

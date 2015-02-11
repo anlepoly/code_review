@@ -1,0 +1,388 @@
+diff --git a/src/multimedia/audio/qaudiodevicefactory.cpp b/src/multimedia/audio/qaudiodevicefactory.cpp
+index 24972dd..78b6911 100644
+--- a/src/multimedia/audio/qaudiodevicefactory.cpp
++++ b/src/multimedia/audio/qaudiodevicefactory.cpp
+@@ -106,6 +106,8 @@ public:
+     QAudio::State state() const { return QAudio::StoppedState; }
+     void setFormat(const QAudioFormat&) {}
+     QAudioFormat format() const { return QAudioFormat(); }
++    void setVolume(qreal) {}
++    qreal volume() const {return 1.0f;}
+ };
+ 
+ class QNullOutputDevice : public QAbstractAudioOutput
+diff --git a/src/multimedia/audio/qaudioinput_mac_p.cpp b/src/multimedia/audio/qaudioinput_mac_p.cpp
+index 7b42786..483741d 100644
+--- a/src/multimedia/audio/qaudioinput_mac_p.cpp
++++ b/src/multimedia/audio/qaudioinput_mac_p.cpp
+@@ -59,6 +59,7 @@
+ #include "qaudio_mac_p.h"
+ #include "qaudioinput_mac_p.h"
+ #include "qaudiodeviceinfo_mac_p.h"
++#include "qaudiohelpers_p.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -235,7 +236,8 @@ public:
+         m_deviceError(false),
+         m_audioConverter(0),
+         m_inputFormat(inputFormat),
+-        m_outputFormat(outputFormat)
++        m_outputFormat(outputFormat),
++        m_volume(qreal(1.0f))
+     {
+         m_maxPeriodSize = maxPeriodSize;
+         m_periodTime = m_maxPeriodSize / m_outputFormat.mBytesPerFrame * 1000 / m_outputFormat.mSampleRate;
+@@ -253,6 +255,8 @@ public:
+                 m_audioConverter = 0;
+             }
+         }
++
++        m_qFormat = toQAudioFormat(inputFormat); // we adjust volume before conversion
+     }
+ 
+     ~QAudioInputBuffer()
+@@ -260,6 +264,16 @@ public:
+         delete m_buffer;
+     }
+ 
++    qreal volume() const
++    {
++        return m_volume;
++    }
++
++    void setVolume(qreal v)
++    {
++        m_volume = v;
++    }
++
+     qint64 renderFromDevice(AudioUnit audioUnit,
+                              AudioUnitRenderActionFlags* ioActionFlags,
+                              const AudioTimeStamp* inTimeStamp,
+@@ -279,6 +293,15 @@ public:
+                                 inNumberFrames,
+                                 m_inputBufferList->audioBufferList());
+ 
++        // adjust volume, if necessary
++        if (!qFuzzyCompare(m_volume, qreal(1.0f))) {
++            QAudioHelperInternal::qMultiplySamples(m_volume,
++                                                   m_qFormat,
++                                                   m_inputBufferList->data(), /* input */
++                                                   m_inputBufferList->data(), /* output */
++                                                   m_inputBufferList->bufferSize());
++        }
++
+         if (m_audioConverter != 0) {
+             QAudioPacketFeeder  feeder(m_inputBufferList);
+ 
+@@ -452,6 +475,8 @@ private:
+     AudioConverterRef   m_audioConverter;
+     AudioStreamBasicDescription m_inputFormat;
+     AudioStreamBasicDescription m_outputFormat;
++    QAudioFormat m_qFormat;
++    qreal     m_volume;
+ 
+     const static OSStatus as_empty = 'qtem';
+ 
+@@ -535,6 +560,8 @@ QAudioInputPrivate::QAudioInputPrivate(const QByteArray& device)
+         errorCode = QAudio::NoError;
+         stateCode = QAudio::StoppedState;
+ 
++        m_volume = qreal(1.0f);
++
+         intervalTimer = new QTimer(this);
+         intervalTimer->setInterval(1000);
+         connect(intervalTimer, SIGNAL(timeout()), SIGNAL(notify()));
+@@ -709,6 +736,7 @@ bool QAudioInputPrivate::open()
+                                         streamFormat,
+                                         this);
+ 
++    audioBuffer->setVolume(m_volume);
+     audioIO = new QtMultimediaInternal::MacInputDevice(audioBuffer, this);
+ 
+     // Init
+@@ -765,11 +793,11 @@ void QAudioInputPrivate::start(QIODevice* device)
+     startTime = AudioGetCurrentHostTime();
+     totalFrames = 0;
+ 
+-    audioThreadStart();
+-
+-    stateCode = QAudio::ActiveState;
++    stateCode = QAudio::IdleState;
+     errorCode = QAudio::NoError;
+     emit stateChanged(stateCode);
++
++    audioThreadStart();
+ }
+ 
+ QIODevice* QAudioInputPrivate::start()
+@@ -793,12 +821,12 @@ QIODevice* QAudioInputPrivate::start()
+     startTime = AudioGetCurrentHostTime();
+     totalFrames = 0;
+ 
+-    audioThreadStart();
+-
+-    stateCode = QAudio::ActiveState;
++    stateCode = QAudio::IdleState;
+     errorCode = QAudio::NoError;
+     emit stateChanged(stateCode);
+ 
++    audioThreadStart();
++
+     return op;
+ }
+ 
+@@ -823,6 +851,7 @@ void QAudioInputPrivate::reset()
+ 
+         errorCode = QAudio::NoError;
+         stateCode = QAudio::StoppedState;
++        audioBuffer->reset();
+         QMetaObject::invokeMethod(this, "stateChanged", Qt::QueuedConnection, Q_ARG(QAudio::State, stateCode));
+     }
+ }
+@@ -853,6 +882,8 @@ void QAudioInputPrivate::resume()
+ 
+ int QAudioInputPrivate::bytesReady() const
+ {
++    if (!audioBuffer)
++        return 0;
+     return audioBuffer->used();
+ }
+ 
+@@ -910,6 +941,19 @@ QAudio::State QAudioInputPrivate::state() const
+     return stateCode;
+ }
+ 
++qreal QAudioInputPrivate::volume() const
++{
++    return m_volume;
++}
++
++void QAudioInputPrivate::setVolume(qreal volume)
++{
++    m_volume = volume;
++    if (audioBuffer)
++        audioBuffer->setVolume(m_volume);
++}
++
++
+ void QAudioInputPrivate::audioThreadStop()
+ {
+     stopTimers();
+@@ -931,15 +975,22 @@ void QAudioInputPrivate::audioDeviceStop()
+     threadFinished.wakeOne();
+ }
+ 
++void QAudioInputPrivate::audioDeviceActive()
++{
++    QMutexLocker    lock(&mutex);
++    if (stateCode == QAudio::IdleState) {
++        stateCode = QAudio::ActiveState;
++        QMetaObject::invokeMethod(this, "stateChanged",  Qt::QueuedConnection, Q_ARG(QAudio::State, stateCode));
++    }
++}
++
+ void QAudioInputPrivate::audioDeviceFull()
+ {
+     QMutexLocker    lock(&mutex);
+     if (stateCode == QAudio::ActiveState) {
+-        audioDeviceStop();
+-
+         errorCode = QAudio::UnderrunError;
+         stateCode = QAudio::IdleState;
+-        QMetaObject::invokeMethod(this, "deviceStopped", Qt::QueuedConnection);
++        QMetaObject::invokeMethod(this, "stateChanged",  Qt::QueuedConnection, Q_ARG(QAudio::State, stateCode));
+     }
+ }
+ 
+@@ -998,9 +1049,10 @@ OSStatus QAudioInputPrivate::inputCallback(void* inRefCon,
+                                                          inBusNumber,
+                                                          inNumberFrames);
+ 
+-        if (framesWritten > 0)
++        if (framesWritten > 0) {
+             d->totalFrames += framesWritten;
+-        else if (framesWritten == 0)
++            d->audioDeviceActive();
++        } else if (framesWritten == 0)
+             d->audioDeviceFull();
+         else if (framesWritten < 0)
+             d->audioDeviceError();
+diff --git a/src/multimedia/audio/qaudioinput_mac_p.h b/src/multimedia/audio/qaudioinput_mac_p.h
+index 2f9eb58..f41b5cb 100644
+--- a/src/multimedia/audio/qaudioinput_mac_p.h
++++ b/src/multimedia/audio/qaudioinput_mac_p.h
+@@ -109,6 +109,7 @@ public:
+     AudioStreamBasicDescription streamFormat;
+     AudioStreamBasicDescription deviceFormat;
+     QAbstractAudioDeviceInfo *audioDeviceInfo;
++    qreal           m_volume;
+ 
+     QAudioInputPrivate(const QByteArray& device);
+     ~QAudioInputPrivate();
+@@ -142,10 +143,14 @@ public:
+     QAudio::Error error() const;
+     QAudio::State state() const;
+ 
++    qreal volume() const;
++    void setVolume(qreal volume);
++
+     void audioThreadStart();
+     void audioThreadStop();
+ 
+     void audioDeviceStop();
++    void audioDeviceActive();
+     void audioDeviceFull();
+     void audioDeviceError();
+ 
+diff --git a/src/multimedia/audio/qaudiosystem.h b/src/multimedia/audio/qaudiosystem.h
+index e5ef8e4..0fd2bc2 100644
+--- a/src/multimedia/audio/qaudiosystem.h
++++ b/src/multimedia/audio/qaudiosystem.h
+@@ -131,8 +131,8 @@ public:
+     virtual QAudio::State state() const = 0;
+     virtual void setFormat(const QAudioFormat& fmt) = 0;
+     virtual QAudioFormat format() const = 0;
+-    virtual void setVolume(qreal) {}
+-    virtual qreal volume() const { return 1.0; }
++    virtual void setVolume(qreal) = 0;
++    virtual qreal volume() const = 0;
+ 
+ Q_SIGNALS:
+     void errorChanged(QAudio::Error);
+diff --git a/tests/auto/integration/qaudioinput/tst_qaudioinput.cpp b/tests/auto/integration/qaudioinput/tst_qaudioinput.cpp
+index 7d767f3..f4b30ad 100755
+--- a/tests/auto/integration/qaudioinput/tst_qaudioinput.cpp
++++ b/tests/auto/integration/qaudioinput/tst_qaudioinput.cpp
+@@ -630,6 +630,9 @@ void tst_QAudioInput::push()
+     WavHeader wavHeader(audioFormat);
+     QVERIFY(wavHeader.write(*audioFile));
+ 
++    // Set a large buffer to avoid underruns during QTest::qWaits
++    audioInput.setBufferSize(128*1024);
++
+     QIODevice* feed = audioInput.start();
+ 
+     // Check that QAudioInput immediately transitions to IdleState
+@@ -649,20 +652,18 @@ void tst_QAudioInput::push()
+     QByteArray buffer(AUDIO_BUFFER, 0);
+     qint64 len = (audioFormat.sampleRate()*audioFormat.channelCount()*(audioFormat.sampleSize()/8)*2); // 2 seconds
+     while (totalBytesRead < len) {
+-        if (audioInput.bytesReady() >= audioInput.periodSize()) {
+-            qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
+-            audioFile->write(buffer.constData(),bytesRead);
+-            totalBytesRead+=bytesRead;
+-            if (firstBuffer && bytesRead) {
+-                // Check for transition to ActiveState when data is provided
+-                QVERIFY2((stateSignal.count() == 1),"didn't emit ActiveState signal on data");
+-                QVERIFY2((audioInput.state() == QAudio::ActiveState),
+-                         "didn't transition to ActiveState after data");
+-                QVERIFY2((audioInput.error() == QAudio::NoError), "error state is not equal to QAudio::NoError after start()");
+-                firstBuffer = false;
+-            }
+-        } else
+-            QTest::qWait(20);
++        QTRY_VERIFY(audioInput.bytesReady() >= audioInput.periodSize());
++        qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
++        audioFile->write(buffer.constData(),bytesRead);
++        totalBytesRead+=bytesRead;
++        if (firstBuffer && bytesRead) {
++            // Check for transition to ActiveState when data is provided
++            QTRY_VERIFY2((stateSignal.count() == 1),"didn't emit ActiveState signal on data");
++            QVERIFY2((audioInput.state() == QAudio::ActiveState),
++                     "didn't transition to ActiveState after data");
++            QVERIFY2((audioInput.error() == QAudio::NoError), "error state is not equal to QAudio::NoError after start()");
++            firstBuffer = false;
++        }
+     }
+ 
+     QTest::qWait(1000);
+@@ -698,6 +699,7 @@ void tst_QAudioInput::pushSuspendResume()
+     QAudioInput audioInput(audioFormat, this);
+ 
+     audioInput.setNotifyInterval(100);
++    audioInput.setBufferSize(128*1024);
+ 
+     QSignalSpy notifySignal(&audioInput, SIGNAL(notify()));
+     QSignalSpy stateSignal(&audioInput, SIGNAL(stateChanged(QAudio::State)));
+@@ -731,20 +733,18 @@ void tst_QAudioInput::pushSuspendResume()
+     QByteArray buffer(AUDIO_BUFFER, 0);
+     qint64 len = (audioFormat.sampleRate()*audioFormat.channelCount()*(audioFormat.sampleSize()/8)); // 1 seconds
+     while (totalBytesRead < len) {
+-        if (audioInput.bytesReady() >= audioInput.periodSize()) {
+-            qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
+-            audioFile->write(buffer.constData(),bytesRead);
+-            totalBytesRead+=bytesRead;
+-            if (firstBuffer && bytesRead) {
+-                // Check for transition to ActiveState when data is provided
+-                QVERIFY2((stateSignal.count() == 1),"didn't emit ActiveState signal on data");
+-                QVERIFY2((audioInput.state() == QAudio::ActiveState),
+-                         "didn't transition to ActiveState after data");
+-                QVERIFY2((audioInput.error() == QAudio::NoError), "error state is not equal to QAudio::NoError after start()");
+-                firstBuffer = false;
+-            }
+-        } else
+-            QTest::qWait(20);
++        QTRY_VERIFY(audioInput.bytesReady() >= audioInput.periodSize());
++        qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
++        audioFile->write(buffer.constData(),bytesRead);
++        totalBytesRead+=bytesRead;
++        if (firstBuffer && bytesRead) {
++            // Check for transition to ActiveState when data is provided
++            QTRY_VERIFY2((stateSignal.count() == 1),"didn't emit ActiveState signal on data");
++            QVERIFY2((audioInput.state() == QAudio::ActiveState),
++                     "didn't transition to ActiveState after data");
++            QVERIFY2((audioInput.error() == QAudio::NoError), "error state is not equal to QAudio::NoError after start()");
++            firstBuffer = false;
++        }
+     }
+     stateSignal.clear();
+ 
+@@ -766,13 +766,15 @@ void tst_QAudioInput::pushSuspendResume()
+     QVERIFY(audioInput.elapsedUSecs() > elapsedUs);
+     QVERIFY(audioInput.processedUSecs() == processedUs);
+ 
+-    audioInput.resume();
++    // Drain any data, in case we run out of space when resuming
++    while (audioInput.bytesReady() >= audioInput.periodSize()) {
++        feed->read(buffer.data(), audioInput.periodSize());
++    }
+ 
+-    // Give backends running in separate threads a chance to resume.
+-    QTest::qWait(100);
++    audioInput.resume();
+ 
+     // Check that QAudioInput immediately transitions to Active or IdleState
+-    QVERIFY2((stateSignal.count() > 0),"didn't emit signals on resume()");
++    QTRY_VERIFY2((stateSignal.count() > 0),"didn't emit signals on resume()");
+     QVERIFY2((audioInput.state() == QAudio::ActiveState || audioInput.state() == QAudio::IdleState),
+              "didn't transition to ActiveState or IdleState after resume()");
+     QVERIFY2((audioInput.error() == QAudio::NoError), "error state is not equal to QAudio::NoError after resume()");
+@@ -785,13 +787,11 @@ void tst_QAudioInput::pushSuspendResume()
+     // Read another seconds worth
+     totalBytesRead = 0;
+     firstBuffer = true;
+-    while (totalBytesRead < len) {
+-        if (audioInput.bytesReady() >= audioInput.periodSize()) {
+-            qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
+-            audioFile->write(buffer.constData(),bytesRead);
+-            totalBytesRead+=bytesRead;
+-        } else
+-            QTest::qWait(20);
++    while (totalBytesRead < len && audioInput.state() != QAudio::StoppedState) {
++        QTRY_VERIFY(audioInput.bytesReady() >= audioInput.periodSize());
++        qint64 bytesRead = feed->read(buffer.data(), audioInput.periodSize());
++        audioFile->write(buffer.constData(),bytesRead);
++        totalBytesRead+=bytesRead;
+     }
+     stateSignal.clear();
+ 
+@@ -872,7 +872,7 @@ void tst_QAudioInput::reset()
+         stateSignal.clear();
+ 
+         audioInput.reset();
+-        QTRY_VERIFY2((stateSignal.count() == 1),"didn't emit StoppedState signal after reset()");
++        QTRY_VERIFY2((stateSignal.count() >= 1),"didn't emit StoppedState signal after reset()");
+         QVERIFY2((audioInput.state() == QAudio::StoppedState), "didn't transitions to StoppedState after reset()");
+         QVERIFY2((audioInput.bytesReady() == 0), "buffer not cleared after reset()");
+     }

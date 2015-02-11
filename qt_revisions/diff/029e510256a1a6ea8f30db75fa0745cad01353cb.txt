@@ -1,0 +1,316 @@
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index 2c2c597..12344e3 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -193,7 +193,7 @@ public:
+     static inline bool wasDeleted(QObject *);
+ 
+     static void markAsDeleted(QObject *);
+-    static inline void setQueuedForDeletion(QObject *);
++    static void setQueuedForDeletion(QObject *);
+ 
+ private:
+     // For attachedProperties
+@@ -213,17 +213,6 @@ bool QQmlData::wasDeleted(QObject *object)
+            static_cast<QQmlData *>(priv->declarativeData)->isQueuedForDeletion;
+ }
+ 
+-void QQmlData::setQueuedForDeletion(QObject *object)
+-{
+-    if (object) {
+-        if (QObjectPrivate *priv = QObjectPrivate::get(object)) {
+-            if (!priv->wasDeleted && priv->declarativeData) {
+-                static_cast<QQmlData *>(priv->declarativeData)->isQueuedForDeletion = true;
+-            }
+-        }
+-    }
+-}
+-
+ QQmlNotifierEndpoint *QQmlData::notify(int index)
+ {
+     Q_ASSERT(index <= 0xFFFF);
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 22d2845..7eed2f9 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -477,6 +477,20 @@ void QQmlData::markAsDeleted(QObject *o)
+     }
+ }
+ 
++void QQmlData::setQueuedForDeletion(QObject *object)
++{
++    if (object) {
++        if (QObjectPrivate *priv = QObjectPrivate::get(object)) {
++            if (!priv->wasDeleted && priv->declarativeData) {
++                QQmlData *ddata = QQmlData::get(object, false);
++                if (ddata->ownContext && ddata->context)
++                    ddata->context->emitDestruction();
++                ddata->isQueuedForDeletion = true;
++            }
++        }
++    }
++}
++
+ void QQmlEnginePrivate::init()
+ {
+     Q_Q(QQmlEngine);
+diff --git a/tests/auto/qml/qqmlecmascript/data/SignalEmittedComponent.qml b/tests/auto/qml/qqmlecmascript/data/SignalEmittedComponent.qml
+new file mode 100644
+index 0000000..a7866a3
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/SignalEmittedComponent.qml
+@@ -0,0 +1,14 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: sec
++    property int a: 10
++    Component.onDestruction: {
++        ModApi.setSpecificProperty(sec, "a", 20);
++    }
++
++    function setSuccessPropertyOf(obj, val) {
++        obj.success = val;
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.2.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.2.qml
+new file mode 100644
+index 0000000..8b2daa2
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.2.qml
+@@ -0,0 +1,29 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: root
++
++    property bool success: false
++    property bool c1HasBeenDestroyed: false
++
++    SignalEmittedComponent {
++        id: c1
++    }
++
++    SignalEmittedComponent {
++        id: c2
++        property int c1a: if (c1) c1.a; else 0; // will change during onDestruction handler of c1.
++        onC1aChanged: {
++            // this should still be called, after c1 has been destroyed.
++            if (root.c1HasBeenDestroyed && c1a == 20) c1.setSuccessPropertyOf(root, true);
++        }
++    }
++
++    Component.onCompleted: {
++        // destroy c1 directly
++        c1HasBeenDestroyed = true;
++        c1.destroy();
++        // return to event loop.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml
+new file mode 100644
+index 0000000..0cae5c0
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.3.qml
+@@ -0,0 +1,34 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: root
++
++    property bool success: false
++    property bool c1HasBeenDestroyed: false
++
++    property Item c1 // not a js reference, so won't keep it alive
++
++    SignalEmittedComponent {
++        id: c2
++        property int c1a: if (root.c1) root.c1.a; else 0; // will change during onDestruction handler of c1.
++        function c1aChangedHandler() {
++            // this should still be called, after c1 has been destroyed by gc,
++            // because the onDestruction handler of c1 will be triggered prior
++            // to when c1 will be invalidated.
++            if (root.c1HasBeenDestroyed && c1a == 20) root.c1.setSuccessPropertyOf(root, true);
++        }
++    }
++
++    Component.onCompleted: {
++        // dynamically construct sibling.  When it goes out of scope, it should be gc'd.
++        // note that the gc() will call weakqobjectcallback which will set queued for
++        // deletion flag -- thus QQmlData::wasDeleted() will return true for that object..
++        var c = Qt.createComponent("SignalEmittedComponent.qml", root);
++        var o = c.createObject(null); // JS ownership
++        o.onAChanged.connect(c2.c1aChangedHandler);
++        c1 = o;
++        c1HasBeenDestroyed = true;
++        // return to event loop.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml
+new file mode 100644
+index 0000000..e7dc024
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.4.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: root
++
++    property bool success: false
++    property bool c1HasBeenDestroyed: false
++
++    property Item c1 // not a js reference, so won't keep it alive
++
++    SignalEmittedComponent {
++        id: c2
++        property int c1a: if (root.c1) root.c1.a; else 0; // will change during onDestruction handler of c1.
++        function c1aChangedHandler() {
++            // this should still be called, after c1 has been destroyed by gc,
++            // because the onDestruction handler of c1 will be triggered prior
++            // to when c1 will be invalidated.
++            if (root.c1HasBeenDestroyed && c1a == 20) root.c1.setSuccessPropertyOf(root, true);
++        }
++    }
++
++    Component.onCompleted: {
++        // dynamically construct sibling.  When it goes out of scope, it should be gc'd.
++        // note that the gc() will call weakqobjectcallback which will set queued for
++        // deletion flag -- thus QQmlData::wasDeleted() will return true for that object..
++        var c = Qt.createComponent("SignalEmittedComponent.qml", root);
++        var o = c.createObject(null); // JS ownership
++        o.onAChanged.connect(c2.c1aChangedHandler);
++        c1 = o;
++        c1HasBeenDestroyed = true;
++        // return to event loop.
++    }
++
++    function destroyC2() {
++        // we must gc() c1 first, then destroy c2, then handle events.
++        c2.destroy();
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml
+new file mode 100644
+index 0000000..6de606e
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml
+@@ -0,0 +1,36 @@
++import QtQuick 2.0
++import Qt.test 1.0 as ModApi
++
++Item {
++    id: root
++
++    property bool success: false
++    property bool c1HasBeenDestroyed: false
++
++    Item {
++        id: container
++
++        SignalEmittedComponent {
++            id: c1
++        }
++
++        SignalEmittedComponent {
++            id: c2
++            property int c1a: if (c1) c1.a; else 0; // will change during onDestruction handler of c1.
++            onC1aChanged: {
++                // this should still be called, after c1 has been destroyed.
++                if (root.c1HasBeenDestroyed && c1a == 20) c1.setSuccessPropertyOf(root, true);
++            }
++        }
++    }
++
++    Component.onCompleted: {
++        // firstly, reparent c2 so that it doesn't get destroyed.
++        ModApi.changeQObjectParent(c2);
++
++        // then, destroy container (and thus also c1)
++        c1HasBeenDestroyed = true;
++        container.destroy();
++        // return to event loop.
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/testtypes.h b/tests/auto/qml/qqmlecmascript/testtypes.h
+index a289d97..90eda77 100644
+--- a/tests/auto/qml/qqmlecmascript/testtypes.h
++++ b/tests/auto/qml/qqmlecmascript/testtypes.h
+@@ -1022,6 +1022,7 @@ public:
+     Q_INVOKABLE QVariant trackedObjectProperty(const QString &propName) const { return m_trackedObject->property(qPrintable(propName)); }
+ 
+     Q_INVOKABLE void setSpecificProperty(QObject *obj, const QString & propName, const QVariant & v) const { obj->setProperty(qPrintable(propName), v); }
++    Q_INVOKABLE void changeQObjectParent(QObject *obj) { obj->setParent(this); }
+ 
+     int qobjectTestProperty() const { return m_testProperty; }
+     void setQObjectTestProperty(int tp) { m_testProperty = tp; emit qobjectTestPropertyChanged(tp); }
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 3740d73..a523bea 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -262,6 +262,8 @@ private slots:
+     void onDestruction();
+     void bindingSuppression();
+ 
++    void signalEmitted();
++
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
+     QQmlEngine engine;
+@@ -6712,6 +6714,52 @@ void tst_qqmlecmascript::bindingSuppression()
+     QCOMPARE(transientErrorsMsgCount, 0);
+ }
+ 
++void tst_qqmlecmascript::signalEmitted()
++{
++    {
++        // calling destroy on the parent.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("signalEmitted.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++        QTRY_VERIFY(obj->property("success").toBool());
++        delete obj;
++    }
++
++    {
++        // calling destroy on the sibling.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("signalEmitted.2.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++        QTRY_VERIFY(obj->property("success").toBool());
++        delete obj;
++    }
++
++    {
++        // allowing gc to clean up the sibling.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("signalEmitted.3.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++        gc(engine); // should collect c1.
++        QTRY_VERIFY(obj->property("success").toBool());
++        delete obj;
++    }
++
++    {
++        // allowing gc to clean up the sibling after manually destroying target.
++        QQmlEngine engine;
++        QQmlComponent c(&engine, testFileUrl("signalEmitted.4.qml"));
++        QObject *obj = c.create();
++        QVERIFY(obj != 0);
++        gc(engine); // should collect c1.
++        QMetaObject::invokeMethod(obj, "destroyC2");
++        QTRY_VERIFY(obj->property("success").toBool());
++        delete obj;
++    }
++}
++
+ QTEST_MAIN(tst_qqmlecmascript)
+ 
+ #include "tst_qqmlecmascript.moc"

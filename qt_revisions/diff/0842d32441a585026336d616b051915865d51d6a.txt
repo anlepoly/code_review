@@ -1,0 +1,241 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index e02eb19..16ba1c3 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -531,6 +531,10 @@ QtWidgets
+   by QAbstractProxyModel and related classes. A copy of QProxyModel is available
+   in the UiHelpers library.
+ 
++* [QTBUG-20503] QFileSystemModel no longer masks out write permissions from the permissions
++  returned from permissions() or data(FilePermissions), even if in read-only mode
++  (QFileSystemModel::isReadOnly()).
++
+ QtNetwork
+ ---------
+ * QHostAddress::isLoopback() API added. Returns true if the address is
+diff --git a/src/widgets/dialogs/qfiledialog.cpp b/src/widgets/dialogs/qfiledialog.cpp
+index 883c13e..d9d3187 100644
+--- a/src/widgets/dialogs/qfiledialog.cpp
++++ b/src/widgets/dialogs/qfiledialog.cpp
+@@ -2701,10 +2701,11 @@ void QFileDialogPrivate::_q_showContextMenu(const QPoint &position)
+     QMenu menu(view);
+     if (index.isValid()) {
+         // file context menu
++        const bool ro = model && model->isReadOnly();
+         QFile::Permissions p(index.parent().data(QFileSystemModel::FilePermissions).toInt());
+-        renameAction->setEnabled(p & QFile::WriteUser);
++        renameAction->setEnabled(!ro && p & QFile::WriteUser);
+         menu.addAction(renameAction);
+-        deleteAction->setEnabled(p & QFile::WriteUser);
++        deleteAction->setEnabled(!ro && p & QFile::WriteUser);
+         menu.addAction(deleteAction);
+         menu.addSeparator();
+     }
+diff --git a/src/widgets/dialogs/qfilesystemmodel.cpp b/src/widgets/dialogs/qfilesystemmodel.cpp
+index fd09187..49b59b6 100644
+--- a/src/widgets/dialogs/qfilesystemmodel.cpp
++++ b/src/widgets/dialogs/qfilesystemmodel.cpp
+@@ -1364,12 +1364,7 @@ QModelIndex QFileSystemModel::mkdir(const QModelIndex &parent, const QString &na
+ QFile::Permissions QFileSystemModel::permissions(const QModelIndex &index) const
+ {
+     Q_D(const QFileSystemModel);
+-    QFile::Permissions p = d->node(index)->permissions();
+-    if (d->readOnly) {
+-        p ^= (QFile::WriteOwner | QFile::WriteUser
+-            | QFile::WriteGroup | QFile::WriteOther);
+-    }
+-    return p;
++    return d->node(index)->permissions();
+ }
+ 
+ /*!
+diff --git a/tests/auto/widgets/dialogs/qfiledialog2/tst_qfiledialog2.cpp b/tests/auto/widgets/dialogs/qfiledialog2/tst_qfiledialog2.cpp
+index 69d9903..b4985df 100644
+--- a/tests/auto/widgets/dialogs/qfiledialog2/tst_qfiledialog2.cpp
++++ b/tests/auto/widgets/dialogs/qfiledialog2/tst_qfiledialog2.cpp
+@@ -60,6 +60,7 @@
+ #include <qsortfilterproxymodel.h>
+ #include <qlineedit.h>
+ #include <qlayout.h>
++#include <qmenu.h>
+ #include "../../../../../src/widgets/dialogs/qsidebar_p.h"
+ #include "../../../../../src/widgets/dialogs/qfilesystemmodel_p.h"
+ #include "../../../../../src/widgets/dialogs/qfiledialog_p.h"
+@@ -114,6 +115,9 @@ private slots:
+     void unc();
+     void emptyUncPath();
+ 
++#if !defined(QT_NO_CONTEXTMENU) && !defined(QT_NO_MENU)
++    void task143519_deleteAndRenameActionBehavior();
++#endif
+     void task178897_minimumSize();
+     void task180459_lastDirectory_data();
+     void task180459_lastDirectory();
+@@ -314,6 +318,101 @@ void tst_QFileDialog2::emptyUncPath()
+     QVERIFY(model);
+ }
+ 
++#if !defined(QT_NO_CONTEXTMENU) && !defined(QT_NO_MENU)
++struct MenuCloser {
++    QWidget *w;
++    explicit MenuCloser(QWidget *w) : w(w) {}
++    void operator()() const
++    {
++        QMenu *menu = qFindChild<QMenu*>(w);
++        if (!menu) {
++            qDebug("%s: cannot find file dialog child of type QMenu", Q_FUNC_INFO);
++            w->close();
++        }
++        QTest::keyClick(menu, Qt::Key_Escape);
++    }
++};
++static bool openContextMenu(QFileDialog &fd)
++{
++    QListView *list = qFindChild<QListView*>(&fd, "listView");
++    if (!list) {
++        qDebug("%s: didn't find file dialog child \"listView\"", Q_FUNC_INFO);
++        return false;
++    }
++    QTimer timer;
++    timer.setInterval(300);
++    timer.setSingleShot(true);
++    QObject::connect(&timer, &QTimer::timeout, MenuCloser(&fd));
++    timer.start();
++    QContextMenuEvent cme(QContextMenuEvent::Mouse, QPoint(10, 10));
++    qApp->sendEvent(list->viewport(), &cme); // blocks until menu is closed again.
++    return true;
++}
++
++void tst_QFileDialog2::task143519_deleteAndRenameActionBehavior()
++{
++    // test based on task233037_selectingDirectory
++
++    struct TestContext {
++        TestContext()
++            : current(QDir::current()) {}
++        ~TestContext() {
++            file.remove();
++            current.rmdir(test.dirName());
++        }
++        QDir current;
++        QDir test;
++        QFile file;
++    } ctx;
++
++    // setup testbed
++    QVERIFY(ctx.current.mkdir("task143519_deleteAndRenameActionBehavior_test")); // ensure at least one item
++    ctx.test = ctx.current;
++    QVERIFY(ctx.test.cd("task143519_deleteAndRenameActionBehavior_test"));
++    ctx.file.setFileName(ctx.test.absoluteFilePath("hello"));
++    QVERIFY(ctx.file.open(QIODevice::WriteOnly));
++    QVERIFY(ctx.file.permissions() & QFile::WriteUser);
++    ctx.file.close();
++
++    QNonNativeFileDialog fd;
++    fd.setViewMode(QFileDialog::List);
++    fd.setDirectory(ctx.test.absolutePath());
++    fd.show();
++
++    QTest::qWaitForWindowActive(&fd);
++
++    // grab some internals:
++    QAction *rm = qFindChild<QAction*>(&fd, "qt_delete_action");
++    QVERIFY(rm);
++    QAction *mv = qFindChild<QAction*>(&fd, "qt_rename_action");
++    QVERIFY(mv);
++
++    // these are the real test cases:
++
++    // defaults
++    QVERIFY(openContextMenu(fd));
++    QCOMPARE(fd.selectedFiles().size(), 1);
++    QCOMPARE(rm->isEnabled(), !fd.isReadOnly());
++    QCOMPARE(mv->isEnabled(), !fd.isReadOnly());
++
++    // change to non-defaults:
++    fd.setReadOnly(!fd.isReadOnly());
++
++    QVERIFY(openContextMenu(fd));
++    QCOMPARE(fd.selectedFiles().size(), 1);
++    QCOMPARE(rm->isEnabled(), !fd.isReadOnly());
++    QCOMPARE(mv->isEnabled(), !fd.isReadOnly());
++
++    // and changed back to defaults:
++    fd.setReadOnly(!fd.isReadOnly());
++
++    QVERIFY(openContextMenu(fd));
++    QCOMPARE(fd.selectedFiles().size(), 1);
++    QCOMPARE(rm->isEnabled(), !fd.isReadOnly());
++    QCOMPARE(mv->isEnabled(), !fd.isReadOnly());
++}
++#endif // !QT_NO_CONTEXTMENU && !QT_NO_MENU
++
+ void tst_QFileDialog2::task178897_minimumSize()
+ {
+     QNonNativeFileDialog fd;
+diff --git a/tests/auto/widgets/dialogs/qfilesystemmodel/tst_qfilesystemmodel.cpp b/tests/auto/widgets/dialogs/qfilesystemmodel/tst_qfilesystemmodel.cpp
+index b426024..e0256d2 100644
+--- a/tests/auto/widgets/dialogs/qfilesystemmodel/tst_qfilesystemmodel.cpp
++++ b/tests/auto/widgets/dialogs/qfilesystemmodel/tst_qfilesystemmodel.cpp
+@@ -127,6 +127,9 @@ private slots:
+     void roleNames_data();
+     void roleNames();
+ 
++    void permissions_data();
++    void permissions();
++
+ protected:
+     bool createFiles(const QString &test_path, const QStringList &initial_files, int existingFileCount = 0, const QStringList &intial_dirs = QStringList());
+ 
+@@ -1022,6 +1025,52 @@ void tst_QFileSystemModel::roleNames()
+     QVERIFY(values.contains(roleName));
+ }
+ 
++void tst_QFileSystemModel::permissions_data()
++{
++    QTest::addColumn<int>("permissions");
++    QTest::addColumn<bool>("readOnly");
++
++    static const int permissions[] = {
++        QFile::WriteOwner,
++        QFile::ReadOwner,
++        QFile::WriteOwner|QFile::ReadOwner,
++    };
++#define ROW_NAME(i) qPrintable(QString().sprintf("%s-0%04x", readOnly ? "ro" : "rw", permissions[i]))
++    for (int readOnly = false ; readOnly <= true; ++readOnly)
++        for (size_t i = 0; i < sizeof permissions / sizeof *permissions; ++i)
++            QTest::newRow(ROW_NAME(i)) << permissions[i] << bool(readOnly);
++#undef ROW_NAME
++}
++
++void tst_QFileSystemModel::permissions() // checks QTBUG-20503
++{
++    QFETCH(int, permissions);
++    QFETCH(bool, readOnly);
++
++    const QString tmp = flatDirTestPath;
++    const QString file  = tmp + '/' + "f";
++    QVERIFY(createFiles(tmp, QStringList() << "f"));
++
++    QVERIFY(QFile::setPermissions(file,  QFile::Permissions(permissions)));
++
++    const QModelIndex root = model->setRootPath(tmp);
++
++    model->setReadOnly(readOnly);
++
++    QCOMPARE(model->isReadOnly(), readOnly);
++
++    QTRY_COMPARE(model->rowCount(root), 1);
++
++    const QFile::Permissions modelPermissions = model->permissions(model->index(0, 0, root));
++    const QFile::Permissions modelFileInfoPermissions = model->fileInfo(model->index(0, 0, root)).permissions();
++    const QFile::Permissions fileInfoPermissions = QFileInfo(file).permissions();
++
++    QCOMPARE(modelPermissions, modelFileInfoPermissions);
++    QCOMPARE(modelFileInfoPermissions, fileInfoPermissions);
++    QCOMPARE(fileInfoPermissions, modelPermissions);
++}
++
++
+ QTEST_MAIN(tst_QFileSystemModel)
+ #include "tst_qfilesystemmodel.moc"

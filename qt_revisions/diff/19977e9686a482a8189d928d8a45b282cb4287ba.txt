@@ -1,0 +1,185 @@
+diff --git a/src/quick/items/qquickitemview.cpp b/src/quick/items/qquickitemview.cpp
+index 0d95500..209d30a 100644
+--- a/src/quick/items/qquickitemview.cpp
++++ b/src/quick/items/qquickitemview.cpp
+@@ -186,6 +186,18 @@ void QQuickItemViewChangeSet::applyChanges(const QQuickChangeSet &changeSet)
+     }
+ }
+ 
++void QQuickItemViewChangeSet::applyBufferedChanges(const QQuickItemViewChangeSet &other)
++{
++    if (!other.hasPendingChanges())
++        return;
++
++    pendingChanges.apply(other.pendingChanges);
++    itemCount = other.itemCount;
++    newCurrentIndex = other.newCurrentIndex;
++    currentChanged = other.currentChanged;
++    currentRemoved = other.currentRemoved;
++}
++
+ void QQuickItemViewChangeSet::prepare(int currentIndex, int count)
+ {
+     if (active)
+@@ -1044,8 +1056,17 @@ void QQuickItemView::modelUpdated(const QQuickChangeSet &changeSet, bool reset)
+             polish();
+         }
+     } else {
+-        d->currentChanges.prepare(d->currentIndex, d->itemCount);
+-        d->currentChanges.applyChanges(changeSet);
++        if (d->disableLayout) {
++            d->bufferedChanges.prepare(d->currentIndex, d->itemCount);
++            d->bufferedChanges.applyChanges(changeSet);
++        } else {
++            if (d->bufferedChanges.hasPendingChanges()) {
++                d->currentChanges.applyBufferedChanges(d->bufferedChanges);
++                d->bufferedChanges.reset();
++            }
++            d->currentChanges.prepare(d->currentIndex, d->itemCount);
++            d->currentChanges.applyChanges(changeSet);
++        }
+         polish();
+     }
+ }
+@@ -1756,11 +1777,16 @@ void QQuickItemViewPrivate::layout()
+ bool QQuickItemViewPrivate::applyModelChanges(ChangeResult *totalInsertionResult, ChangeResult *totalRemovalResult)
+ {
+     Q_Q(QQuickItemView);
+-    if (!q->isComponentComplete() || (!currentChanges.hasPendingChanges() && !runDelayedRemoveTransition) || disableLayout)
++    if (!q->isComponentComplete() || (!currentChanges.hasPendingChanges() && !bufferedChanges.hasPendingChanges() && !runDelayedRemoveTransition) || disableLayout)
+         return false;
+ 
+     disableLayout = true;
+ 
++    if (bufferedChanges.hasPendingChanges()) {
++        currentChanges.applyBufferedChanges(bufferedChanges);
++        bufferedChanges.reset();
++    }
++
+     updateUnrequestedIndexes();
+     moveReason = QQuickItemViewPrivate::Other;
+ 
+diff --git a/src/quick/items/qquickitemview_p_p.h b/src/quick/items/qquickitemview_p_p.h
+index 7516761..e352c46 100644
+--- a/src/quick/items/qquickitemview_p_p.h
++++ b/src/quick/items/qquickitemview_p_p.h
+@@ -107,6 +107,8 @@ public:
+ 
+     void applyChanges(const QQuickChangeSet &changeSet);
+ 
++    void applyBufferedChanges(const QQuickItemViewChangeSet &other);
++
+     int itemCount;
+     int newCurrentIndex;
+     QQuickChangeSet pendingChanges;
+@@ -245,6 +247,7 @@ public:
+     int requestedIndex;
+     FxViewItem *requestedItem;
+     QQuickItemViewChangeSet currentChanges;
++    QQuickItemViewChangeSet bufferedChanges;
+ 
+     QQmlComponent *highlightComponent;
+     FxViewItem *highlight;
+diff --git a/tests/auto/quick/qquicklistview/data/destroyItemOnCreation.qml b/tests/auto/quick/qquicklistview/data/destroyItemOnCreation.qml
+new file mode 100644
+index 0000000..12f43b0
+--- /dev/null
++++ b/tests/auto/quick/qquicklistview/data/destroyItemOnCreation.qml
+@@ -0,0 +1,37 @@
++import QtQuick 2.0
++
++Rectangle {
++    id: root
++
++    width: 240
++    height: 320
++
++    property int createdIndex: -1
++
++    Component {
++        id: myDelegate
++
++        Rectangle {
++            id: wrapper
++            width: 240; height: 20
++            objectName: "wrapper"
++
++            Text { text: index }
++
++            Component.onCompleted: {
++                root.createdIndex = index
++                ListView.view.model.removeItem(index)
++            }
++        }
++    }
++
++    ListView {
++        id: list
++        objectName: "list"
++        focus: true
++        width: 240
++        height: 320
++        delegate: myDelegate
++        model: testModel
++    }
++}
+diff --git a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+index 461a6b6..1218d3c 100644
+--- a/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
++++ b/tests/auto/quick/qquicklistview/tst_qquicklistview.cpp
+@@ -189,6 +189,7 @@ private slots:
+     void multipleDisplaced();
+ 
+     void flickBeyondBounds();
++    void destroyItemOnCreation();
+ 
+ private:
+     template <class T> void items(const QUrl &source, bool forceLayout);
+@@ -6245,6 +6246,32 @@ void tst_QQuickListView::flickBeyondBounds()
+     delete canvas;
+ }
+ 
++void tst_QQuickListView::destroyItemOnCreation()
++{
++    QmlListModel model;
++    QQuickView *canvas = createView();
++    canvas->rootContext()->setContextProperty("testModel", &model);
++
++    canvas->setSource(testFileUrl("destroyItemOnCreation.qml"));
++    canvas->show();
++    qApp->processEvents();
++
++    QQuickListView *listview = findItem<QQuickListView>(canvas->rootObject(), "list");
++    QVERIFY(listview != 0);
++
++    QQuickItem *contentItem = listview->contentItem();
++    QVERIFY(contentItem != 0);
++    QTRY_COMPARE(QQuickItemPrivate::get(listview)->polishScheduled, false);
++
++    QCOMPARE(canvas->rootObject()->property("createdIndex").toInt(), -1);
++    model.addItem("new item", "");
++    QTRY_COMPARE(canvas->rootObject()->property("createdIndex").toInt(), 0);
++
++    QTRY_COMPARE(findItems<QQuickItem>(contentItem, "wrapper").count(), 0);
++    QCOMPARE(model.count(), 0);
++
++    delete canvas;
++}
+ 
+ QTEST_MAIN(tst_QQuickListView)
+ 
+diff --git a/tests/auto/quick/shared/viewtestutil.h b/tests/auto/quick/shared/viewtestutil.h
+index 6ab754c..06efd9c 100644
+--- a/tests/auto/quick/shared/viewtestutil.h
++++ b/tests/auto/quick/shared/viewtestutil.h
+@@ -97,8 +97,8 @@ namespace QQuickViewTestUtil
+         void insertItem(int index, const QString &name, const QString &number);
+         void insertItems(int index, const QList<QPair<QString, QString> > &items);
+ 
+-        void removeItem(int index);
+-        void removeItems(int index, int count);
++        Q_INVOKABLE void removeItem(int index);
++        Q_INVOKABLE void removeItems(int index, int count);
+ 
+         void moveItem(int from, int to);
+         void moveItems(int from, int to, int count);

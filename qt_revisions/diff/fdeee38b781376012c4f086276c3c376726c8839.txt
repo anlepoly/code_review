@@ -1,0 +1,294 @@
+diff --git a/src/qml/qml/qqmlxmlhttprequest.cpp b/src/qml/qml/qqmlxmlhttprequest.cpp
+index 9d4c64b..11ba552 100644
+--- a/src/qml/qml/qqmlxmlhttprequest.cpp
++++ b/src/qml/qml/qqmlxmlhttprequest.cpp
+@@ -98,6 +98,14 @@ static inline QQmlXMLHttpRequestData *xhrdata(QV8Engine *engine)
+     return (QQmlXMLHttpRequestData *)engine->xmlHttpRequestData();
+ }
+ 
++static v8::Local<v8::Object> constructMeObject(v8::Handle<v8::Object> thisObj, QV8Engine *e)
++{
++    v8::Local<v8::Object> meObj = v8::Object::New();
++    meObj->Set(v8::String::New("ThisObject"), thisObj);
++    meObj->Set(v8::String::New("ActivationObject"), e->qmlScope(e->callingContext(), 0));
++    return meObj;
++}
++
+ QQmlXMLHttpRequestData::QQmlXMLHttpRequestData()
+ {
+ }
+@@ -1075,7 +1083,9 @@ v8::Handle<v8::Value> QQmlXMLHttpRequest::open(v8::Handle<v8::Object> me, const
+     m_method = method;
+     m_url = url;
+     m_state = Opened;
++    v8::TryCatch tc;
+     dispatchCallback(me);
++    if (tc.HasCaught()) printError(tc.Message());
+     return v8::Undefined();
+ }
+ 
+@@ -1216,7 +1226,9 @@ v8::Handle<v8::Value> QQmlXMLHttpRequest::abort(v8::Handle<v8::Object> me)
+ 
+         m_state = Done;
+         m_sendFlag = false;
++        v8::TryCatch tc;
+         dispatchCallback(me);
++        if (tc.HasCaught()) printError(tc.Message());
+     }
+ 
+     m_state = Unsent;
+@@ -1355,7 +1367,6 @@ void QQmlXMLHttpRequest::finished()
+         }
+     }
+ 
+-
+     m_data.clear();
+     destroyNetwork();
+     if (m_state < Loading) {
+@@ -1451,12 +1462,42 @@ const QByteArray &QQmlXMLHttpRequest::rawResponseBody() const
+ // Requires a TryCatch scope
+ void QQmlXMLHttpRequest::dispatchCallback(v8::Handle<v8::Object> me)
+ {
+-    v8::Local<v8::Value> callback = me->Get(v8::String::New("onreadystatechange"));
+-    if (callback->IsFunction()) {
+-        v8::Local<v8::Function> f = v8::Local<v8::Function>::Cast(callback);
++    v8::HandleScope hs;
++    v8::Context::Scope scope(engine->context());
+ 
+-        f->Call(me, 0, 0);
++    if (me.IsEmpty() || me->IsNull()) {
++        v8::ThrowException(v8::Exception::Error(v8::String::New("Unable to dispatch QQmlXmlHttpRequest callback: invalid object")));
++        return;
+     }
++
++    if (me->Get(v8::String::New("ThisObject")).IsEmpty()) {
++        v8::ThrowException(v8::Exception::Error(v8::String::New("QQmlXMLHttpRequest: internal error: empty ThisObject")));
++        return;
++    }
++
++    v8::Local<v8::Object> thisObj = me->Get(v8::String::New("ThisObject"))->ToObject();
++    v8::Local<v8::Value> callback = thisObj->Get(v8::String::New("onreadystatechange"));
++    if (!callback->IsFunction()) {
++        // not an error, but no onreadystatechange function to call.
++        return;
++    }
++
++    if (me->Get(v8::String::New("ActivationObject")).IsEmpty()) {
++        v8::ThrowException(v8::Exception::Error(v8::String::New("QQmlXMLHttpRequest: internal error: empty ActivationObject")));
++        return;
++    }
++
++    v8::Local<v8::Object> activationObject = me->Get(v8::String::New("ActivationObject"))->ToObject();
++    QQmlContextData *callingContext = engine->contextWrapper()->context(activationObject);
++    if (callingContext) {
++        v8::Local<v8::Function> f = v8::Local<v8::Function>::Cast(callback);
++        f->Call(activationObject, 0, 0); // valid activation object.
++    }
++
++    // if the callingContext object is no longer valid, then it has been
++    // deleted explicitly (e.g., by a Loader deleting the itemContext when
++    // the source is changed).  We do nothing in this case, as the evaluation
++    // cannot succeed.
+ }
+ 
+ // Must have a handle scope
+@@ -1523,7 +1564,7 @@ static v8::Handle<v8::Value> qmlxmlhttprequest_open(const v8::Arguments &args)
+     if (!username.isNull()) url.setUserName(username);
+     if (!password.isNull()) url.setPassword(password);
+ 
+-    return r->open(args.This(), method, url);
++    return r->open(constructMeObject(args.This(), engine), method, url);
+ }
+ 
+ static v8::Handle<v8::Value> qmlxmlhttprequest_setRequestHeader(const v8::Arguments &args)
+@@ -1589,7 +1630,7 @@ static v8::Handle<v8::Value> qmlxmlhttprequest_send(const v8::Arguments &args)
+     if (args.Length() > 0)
+         data = engine->toString(args[0]).toUtf8();
+ 
+-    return r->send(args.This(), data);
++    return r->send(constructMeObject(args.This(), engine), data);
+ }
+ 
+ static v8::Handle<v8::Value> qmlxmlhttprequest_abort(const v8::Arguments &args)
+@@ -1598,7 +1639,7 @@ static v8::Handle<v8::Value> qmlxmlhttprequest_abort(const v8::Arguments &args)
+     if (!r)
+         V8THROW_REFERENCE("Not an XMLHttpRequest object");
+ 
+-    return r->abort(args.This());
++    return r->abort(constructMeObject(args.This(), r->engine));
+ }
+ 
+ static v8::Handle<v8::Value> qmlxmlhttprequest_getResponseHeader(const v8::Arguments &args)
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent.qml b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent.qml
+new file mode 100644
+index 0000000..c4ecbd8
+--- /dev/null
++++ b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent.qml
+@@ -0,0 +1,23 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    property int a: 4
++
++    Component.onCompleted: {
++        root.parent.finished();
++        triggerXmlHttpRequest();
++    }
++
++    function triggerXmlHttpRequest() {
++        var doc = new XMLHttpRequest();
++        doc.onreadystatechange = function() {
++            if (doc.readyState == XMLHttpRequest.DONE) {
++                var seqComponent = doc.responseText;
++                var o = Qt.createQmlObject(seqComponent,root);
++            }
++        }
++        doc.open("GET", "http://127.0.0.1:14445/TestComponent3.qml");
++        doc.send();
++    }
++}
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent2.qml b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent2.qml
+new file mode 100644
+index 0000000..f27a980
+--- /dev/null
++++ b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent2.qml
+@@ -0,0 +1,7 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    property int a: 5
++    Component.onCompleted: root.parent.finished()
++}
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent3.qml b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent3.qml
+new file mode 100644
+index 0000000..763ec6d
+--- /dev/null
++++ b/tests/auto/qml/qqmlxmlhttprequest/data/TestComponent3.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++    property int a: 3
++}
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/data/stateChangeCallingContext.qml b/tests/auto/qml/qqmlxmlhttprequest/data/stateChangeCallingContext.qml
+new file mode 100644
+index 0000000..1f679d8
+--- /dev/null
++++ b/tests/auto/qml/qqmlxmlhttprequest/data/stateChangeCallingContext.qml
+@@ -0,0 +1,59 @@
++import QtQuick 2.0
++
++Item {
++    id: root
++
++    property int whichCount: 0
++    property bool success: false
++
++    SequentialAnimation {
++        id: anim
++        PauseAnimation { duration: 525 } // delay mode is 500 msec.
++        ScriptAction { script: loadcomponent(0) }
++        PauseAnimation { duration: 525 } // delay mode is 500 msec.
++        ScriptAction { script: loadcomponent(1) }
++        PauseAnimation { duration: 525 } // delay mode is 500 msec.
++        ScriptAction { script: if (whichCount == 2) root.success = true; else console.log("failed to load testlist"); }
++    }
++
++    Component.onCompleted: {
++        updateList();
++        anim.start();
++    }
++
++    function updateList() {
++        var xhr = new XMLHttpRequest();
++        xhr.open("GET","http://127.0.0.1:14445/testlist"); // list of components
++        xhr.onreadystatechange = function () {
++            if (xhr.readyState == XMLHttpRequest.DONE) {
++                var components = xhr.responseText.split('\n');
++                var i;
++                for (i=0; i<components.length; i++) {
++                    if (components[i].split(";").length == 2) {
++                        componentlist.append({"Name" : components[i].split(";")[0], "url" : components[i].split(";")[1]})
++                    }
++                }
++            }
++        }
++        xhr.send()
++    }
++
++    function loadcomponent(which) {
++        if (componentlist.count > which) {
++            loader.source = componentlist.get(which).url;
++            whichCount += 1;
++        }
++    }
++
++    Loader {
++        id: loader
++        signal finished
++
++        anchors.fill: parent
++        onStatusChanged: {
++            if (status == Loader.Error) { finished(); next(); }
++        }
++    }
++
++    ListModel { id: componentlist }
++}
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/data/testlist b/tests/auto/qml/qqmlxmlhttprequest/data/testlist
+new file mode 100644
+index 0000000..cd9dd14
+--- /dev/null
++++ b/tests/auto/qml/qqmlxmlhttprequest/data/testlist
+@@ -0,0 +1,3 @@
++One;TestComponent.qml
++Two;TestComponent2.qml
++Three;TestComponent3.qml
+diff --git a/tests/auto/qml/qqmlxmlhttprequest/tst_qqmlxmlhttprequest.cpp b/tests/auto/qml/qqmlxmlhttprequest/tst_qqmlxmlhttprequest.cpp
+index 7a65308..8f57594 100644
+--- a/tests/auto/qml/qqmlxmlhttprequest/tst_qqmlxmlhttprequest.cpp
++++ b/tests/auto/qml/qqmlxmlhttprequest/tst_qqmlxmlhttprequest.cpp
+@@ -117,6 +117,8 @@ private slots:
+     // void network_errors()
+     // void readyState()
+ 
++    void stateChangeCallingContext();
++
+ private:
+     QQmlEngine engine;
+ };
+@@ -165,7 +167,7 @@ void tst_qqmlxmlhttprequest::callbackException()
+ 
+     QFETCH(QString, which);
+     QFETCH(int, line);
+-    
++
+     QString expect = testFileUrl("callbackException.qml").toString() + ":"+QString::number(line)+": Error: Exception from Callback";
+     QTest::ignoreMessage(QtWarningMsg, expect.toLatin1());
+ 
+@@ -1155,6 +1157,22 @@ void tst_qqmlxmlhttprequest::cdata()
+     delete object;
+ }
+ 
++void tst_qqmlxmlhttprequest::stateChangeCallingContext()
++{
++    // ensure that we don't crash by attempting to evaluate
++    // without a valid calling context.
++
++    TestHTTPServer server(SERVER_PORT);
++    QVERIFY(server.isValid());
++    server.serveDirectory(dataDirectory(), TestHTTPServer::Delay);
++
++    QQmlComponent component(&engine, testFileUrl("stateChangeCallingContext.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QTRY_VERIFY(object->property("success").toBool() == true);
++    delete object;
++}
++
+ QTEST_MAIN(tst_qqmlxmlhttprequest)
+ 
+ #include "tst_qqmlxmlhttprequest.moc"

@@ -1,0 +1,269 @@
+diff --git a/src/quick/items/context2d/qquickcanvascontext.cpp b/src/quick/items/context2d/qquickcanvascontext.cpp
+index bb1065b..39f178b 100644
+--- a/src/quick/items/context2d/qquickcanvascontext.cpp
++++ b/src/quick/items/context2d/qquickcanvascontext.cpp
+@@ -66,10 +66,6 @@ void QQuickCanvasContext::flush()
+ {
+ }
+ 
+-void QQuickCanvasContext::sync()
+-{
+-}
+-
+ QT_END_NAMESPACE
+ 
+ 
+diff --git a/src/quick/items/context2d/qquickcanvascontext_p.h b/src/quick/items/context2d/qquickcanvascontext_p.h
+index 37b5fa3..37ce698 100644
+--- a/src/quick/items/context2d/qquickcanvascontext_p.h
++++ b/src/quick/items/context2d/qquickcanvascontext_p.h
+@@ -68,13 +68,8 @@ public:
+     virtual void init(QQuickCanvasItem *canvasItem, const QVariantMap &args) = 0;
+ 
+     virtual void prepare(const QSize& canvasSize, const QSize& tileSize, const QRect& canvasWindow, const QRect& dirtyRect, bool smooth);
+-
+-    // Indicate this is a good time to begin composition
+     virtual void flush();
+ 
+-    // Cause render (if necessary) to surface via execution unit
+-    virtual void sync();
+-
+     virtual void setV8Engine(QV8Engine *engine) = 0;
+     virtual v8::Handle<v8::Object> v8value() const = 0;
+ 
+diff --git a/src/quick/items/context2d/qquickcanvasitem.cpp b/src/quick/items/context2d/qquickcanvasitem.cpp
+index 3d520d2..3b4adc1 100644
+--- a/src/quick/items/context2d/qquickcanvasitem.cpp
++++ b/src/quick/items/context2d/qquickcanvasitem.cpp
+@@ -549,8 +549,12 @@ void QQuickCanvasItem::updatePolish()
+         }
+     }
+ 
+-    if (d->contextInitialized)
+-        d->context->flush();
++    if (d->contextInitialized) {
++        if (d->renderStrategy == QQuickCanvasItem::Cooperative)
++            update();
++        else
++            d->context->flush();
++    }
+ }
+ 
+ QSGNode *QQuickCanvasItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
+@@ -566,7 +570,7 @@ QSGNode *QQuickCanvasItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData
+     }
+ 
+     if (d->renderStrategy == QQuickCanvasItem::Cooperative)
+-        d->context->sync();
++        d->context->flush();
+ 
+     node->setTexture(d->context->texture());
+     node->setRect(QRectF(QPoint(0, 0), d->canvasWindow.size()));
+diff --git a/src/quick/items/context2d/qquickcontext2d.cpp b/src/quick/items/context2d/qquickcontext2d.cpp
+index fc2ada2..05577e8 100644
+--- a/src/quick/items/context2d/qquickcontext2d.cpp
++++ b/src/quick/items/context2d/qquickcontext2d.cpp
+@@ -100,21 +100,6 @@ QT_BEGIN_NAMESPACE
+     \image qml-item-canvas-context.gif
+ */
+ 
+-QLockedCommandBuffer::QLockedCommandBuffer(QQuickContext2DCommandBuffer *b)
+-    : m_buffer(b)
+-{
+-    m_buffer->lockQueue();
+-}
+-
+-QLockedCommandBuffer::~QLockedCommandBuffer()
+-{
+-    m_buffer->unlockQueue();
+-}
+-
+-QQuickContext2DCommandBuffer* QLockedCommandBuffer::operator->() const
+-{
+-    return m_buffer;
+-}
+ 
+ 
+ Q_CORE_EXPORT double qstrtod(const char *s00, char const **se, bool *ok);
+@@ -3196,7 +3181,7 @@ void QQuickContext2D::init(QQuickCanvasItem *canvasItem, const QVariantMap &args
+ 
+     switch (m_renderTarget) {
+     case QQuickCanvasItem::Image:
+-        m_texture = new QQuickContext2DImageTexture(m_renderStrategy == QQuickCanvasItem::Threaded); // ?? || Coop
++        m_texture = new QQuickContext2DImageTexture(m_renderStrategy == QQuickCanvasItem::Threaded);
+         break;
+     case QQuickCanvasItem::FramebufferObject:
+         m_texture = new QQuickContext2DFBOTexture;
+@@ -3221,6 +3206,13 @@ void QQuickContext2D::prepare(const QSize& canvasSize, const QSize& tileSize, co
+ 
+ void QQuickContext2D::flush()
+ {
++    if (!m_buffer->isEmpty()) {
++        QMutexLocker lock(&m_bufferMutex);
++        m_bufferQueue.enqueue(m_buffer);
++        m_buffer = new QQuickContext2DCommandBuffer;
++    } else
++        return;
++
+     switch (m_renderStrategy) {
+     case QQuickCanvasItem::Immediate:
+         // Cause the texture to consume paint commands immediately
+@@ -3231,19 +3223,12 @@ void QQuickContext2D::flush()
+         m_texture->paint();
+         break;
+     case QQuickCanvasItem::Cooperative:
+-        // Add to the update list in SG
+-        m_canvas->update(); // FIXME
++        // NOTE: On SG Thread
++        m_texture->paint();
+         break;
+     }
+ }
+ 
+-// On SG render thread
+-void QQuickContext2D::sync()
+-{
+-    if (m_renderStrategy == QQuickCanvasItem::Cooperative)
+-        m_texture->paint();
+-}
+-
+ QSGDynamicTexture *QQuickContext2D::texture() const
+ {
+     return m_texture;
+@@ -3251,6 +3236,15 @@ QSGDynamicTexture *QQuickContext2D::texture() const
+ 
+ QImage QQuickContext2D::toImage(const QRectF& bounds)
+ {
++    switch (m_renderStrategy) {
++    case QQuickCanvasItem::Immediate:
++    case QQuickCanvasItem::Threaded:
++        flush();
++        break;
++    case QQuickCanvasItem::Cooperative:
++        break;
++    }
++
+     return m_texture->toImage(bounds);
+ }
+ 
+@@ -3475,4 +3469,10 @@ void QQuickContext2D::setV8Engine(QV8Engine *engine)
+     }
+ }
+ 
++QQuickContext2DCommandBuffer* QQuickContext2D::nextBuffer()
++{
++    QMutexLocker lock(&m_bufferMutex);
++    return m_bufferQueue.isEmpty() ? 0 : m_bufferQueue.dequeue();
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/quick/items/context2d/qquickcontext2d_p.h b/src/quick/items/context2d/qquickcontext2d_p.h
+index 239a244..3230881 100644
+--- a/src/quick/items/context2d/qquickcontext2d_p.h
++++ b/src/quick/items/context2d/qquickcontext2d_p.h
+@@ -51,6 +51,7 @@
+ #include <QtGui/qpainterpath.h>
+ #include <QtCore/qstring.h>
+ #include <QtCore/qstack.h>
++#include <QtCore/qqueue.h>
+ #include <private/qv8engine_p.h>
+ 
+ 
+@@ -70,14 +71,6 @@ class QQuickContext2DTexture;
+ class QQuickPixmap;
+ class QSGTexture;
+ 
+-class QLockedCommandBuffer {
+-public:
+-    QLockedCommandBuffer(QQuickContext2DCommandBuffer *b);
+-    ~QLockedCommandBuffer();
+-    QQuickContext2DCommandBuffer* operator->() const;
+-private:
+-    QQuickContext2DCommandBuffer *m_buffer;
+-};
+ 
+ class Q_QUICK_EXPORT QQuickContext2D : public QQuickCanvasContext
+ {
+@@ -179,7 +172,9 @@ public:
+     void setV8Engine(QV8Engine *eng);
+ 
+     QQuickCanvasItem* canvas() const { return m_canvas; }
+-    QLockedCommandBuffer buffer() const { return m_buffer; }
++    QQuickContext2DCommandBuffer* buffer() const { return m_buffer; }
++    QQuickContext2DCommandBuffer* nextBuffer();
++
+     bool bufferValid() const { return m_buffer != 0; }
+     void popState();
+     void pushState();
+@@ -221,6 +216,8 @@ public:
+     QQuickContext2DTexture *m_texture;
+     QQuickCanvasItem::RenderTarget m_renderTarget;
+     QQuickCanvasItem::RenderStrategy m_renderStrategy;
++    QQueue<QQuickContext2DCommandBuffer*> m_bufferQueue;
++    QMutex m_bufferMutex;
+ };
+ 
+ 
+diff --git a/src/quick/items/context2d/qquickcontext2dtexture.cpp b/src/quick/items/context2d/qquickcontext2dtexture.cpp
+index 7d9f65a..60f5854 100644
+--- a/src/quick/items/context2d/qquickcontext2dtexture.cpp
++++ b/src/quick/items/context2d/qquickcontext2dtexture.cpp
+@@ -195,13 +195,14 @@ void QQuickContext2DTexture::canvasChanged(const QSize& canvasSize, const QSize&
+ 
+ void QQuickContext2DTexture::paintWithoutTiles()
+ {
+-    QLockedCommandBuffer ccb = m_context->buffer();
++    QQuickContext2DCommandBuffer* ccb = m_context->nextBuffer();
+ 
+-    if (ccb->isEmpty())
++    if (!ccb || ccb->isEmpty())
+         return;
+ 
+     QPaintDevice* device = beginPainting();
+     if (!device) {
++        delete ccb;
+         endPainting();
+         return;
+     }
+@@ -218,6 +219,7 @@ void QQuickContext2DTexture::paintWithoutTiles()
+ 
+     ccb->replay(&p, m_state);
+     ccb->clear();
++    delete ccb;
+ 
+     endPainting();
+ 
+@@ -269,7 +271,12 @@ void QQuickContext2DTexture::paint()
+ 
+             if (beginPainting()) {
+                 QQuickContext2D::State oldState = m_state;
+-                QLockedCommandBuffer ccb = m_context->buffer();
++                QQuickContext2DCommandBuffer* ccb = m_context->nextBuffer();
++                if (!ccb || ccb->isEmpty()) {
++                    endPainting();
++                    delete ccb;
++                    return;
++                }
+                 foreach (QQuickContext2DTile* tile, m_tiles) {
+                     bool dirtyTile = false, dirtyCanvas = false, smooth = false;
+ 
+@@ -296,6 +303,7 @@ void QQuickContext2DTexture::paint()
+                     compositeTile(tile);
+                 }
+                 ccb->clear();
++                delete ccb;
+                 endPainting();
+                 m_state = oldState;
+                 markDirtyTexture();
+diff --git a/tests/auto/quick/qquickcanvasitem/data/tst_canvas.qml b/tests/auto/quick/qquickcanvasitem/data/tst_canvas.qml
+index a00ccc3..348a7b3 100644
+--- a/tests/auto/quick/qquickcanvasitem/data/tst_canvas.qml
++++ b/tests/auto/quick/qquickcanvasitem/data/tst_canvas.qml
+@@ -228,7 +228,7 @@ Rectangle {
+            c.toDataURL();
+            wait(100);
+ 
+-           compare(c.paintedCount, 1);
++           compare(c.paintedCount, 2);
+            compare(c.paintCount, 1);
+            c.destroy();

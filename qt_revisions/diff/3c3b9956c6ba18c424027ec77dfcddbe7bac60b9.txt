@@ -1,0 +1,419 @@
+diff --git a/doc/src/qml/qmltypes.qdoc b/doc/src/qml/qmltypes.qdoc
+index 71985c2..964ff98 100644
+--- a/doc/src/qml/qmltypes.qdoc
++++ b/doc/src/qml/qmltypes.qdoc
+@@ -406,7 +406,9 @@ Q_PROPERTY(int size READ size CONSTANT)
+     value. Similarly, setting the length property of the Array to a value larger
+     than its current value will result in the Array being padded out to the
+     specified length with default-constructed elements rather than Undefined
+-    elements.
++    elements.  Finally, the Qt container classes support signed (rather than
++    unsigned) integer indexes; thus, attempting to access any index greater
++    than INT_MAX will fail.
+ 
+     The default-constructed values for each sequence type are as follows:
+     \table
+diff --git a/src/declarative/qml/v8/qv8sequencewrapper_p_p.h b/src/declarative/qml/v8/qv8sequencewrapper_p_p.h
+index b8faafd..41cdcaa 100644
+--- a/src/declarative/qml/v8/qv8sequencewrapper_p_p.h
++++ b/src/declarative/qml/v8/qv8sequencewrapper_p_p.h
+@@ -101,6 +101,26 @@ protected:
+     }
+ };
+ 
++// helper function to generate valid warnings if errors occur during sequence operations.
++static void generateWarning(QV8Engine *engine, const QString& description)
++{
++    if (!engine)
++        return;
++    v8::Local<v8::StackTrace> currStack = v8::StackTrace::CurrentStackTrace(1);
++    if (currStack.IsEmpty())
++        return;
++    v8::Local<v8::StackFrame> currFrame = currStack->GetFrame(0);
++    if (currFrame.IsEmpty())
++        return;
++
++    QDeclarativeError retn;
++    retn.setDescription(description);
++    retn.setLine(currFrame->GetLineNumber());
++    retn.setUrl(QUrl(engine->toString(currFrame->GetScriptName())));
++    QDeclarativeEnginePrivate::warning(engine->engine(), retn);
++}
++
++
+ static int convertV8ValueToInt(QV8Engine *, v8::Handle<v8::Value> v)
+ {
+     return v->Int32Value();
+@@ -187,7 +207,7 @@ static QUrl convertV8ValueToUrl(QV8Engine *e, v8::Handle<v8::Value> v)
+ 
+ static v8::Handle<v8::Value> convertUrlToV8Value(QV8Engine *e, const QUrl &v)
+ {
+-    return e->toString(v.toEncoded());
++    return e->toString(QLatin1String(v.toEncoded().data()));
+ }
+ 
+ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+@@ -286,7 +306,7 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                         return 0; \
+                     loadReference(); \
+                 } \
+-                return c.count(); \
++                return static_cast<quint32>(c.count()); \
+             } \
+             void lengthSetter(v8::Handle<v8::Value> value) \
+             { \
+@@ -294,28 +314,39 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                 if (value.IsEmpty() || !value->IsUint32()) \
+                     return; \
+                 quint32 newLength = value->Uint32Value(); \
++                /* Qt containers have int (rather than uint) allowable indexes. */ \
++                if (newLength > INT_MAX) { \
++                    generateWarning(engine, QLatin1String("Index out of range during length set")); \
++                    return; \
++                } \
+                 /* Read the sequence from the QObject property if we're a reference */ \
+                 if (objectType == QV8SequenceResource::Reference) { \
+                     if (!object) \
+                         return; \
+-                    void *a[] = { &c, 0 }; \
+-                    QMetaObject::metacall(object, QMetaObject::ReadProperty, propertyIndex, a); \
++                    loadReference(); \
+                 } \
+                 /* Determine whether we need to modify the sequence */ \
+-                quint32 count = c.count(); \
+-                if (newLength == count) { \
++                qint32 newCount = static_cast<qint32>(newLength); \
++                qint32 count = c.count(); \
++                if (newCount == count) { \
+                     return; \
+-                } else if (newLength > count) { \
++                } else if (newCount > count) { \
+                     /* according to ECMA262r3 we need to insert */ \
+                     /* undefined values increasing length to newLength. */ \
+                     /* We cannot, so we insert default-values instead. */ \
+-                    while (newLength > count++) { \
+-                        c.append(DefaultValue); \
++                    while (newCount > count++) { \
++                        QT_TRY { \
++                            c.append(DefaultValue); \
++                        } QT_CATCH (std::bad_alloc &exception) { \
++                            generateWarning(engine, QString(QLatin1String(exception.what()) \
++                                                    + QLatin1String(" during length set"))); \
++                            return; /* failed; don't write back any result. */ \
++                        } \
+                     } \
+                 } else { \
+                     /* according to ECMA262r3 we need to remove */ \
+                     /* elements until the sequence is the required length. */ \
+-                    while (newLength < count) { \
++                    while (newCount < count) { \
+                         count--; \
+                         c.removeAt(count); \
+                     } \
+@@ -323,15 +354,17 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                 /* write back if required. */ \
+                 if (objectType == QV8SequenceResource::Reference) { \
+                     /* write back.  already checked that object is non-null, so skip that check here. */ \
+-                    int status = -1; \
+-                    QDeclarativePropertyPrivate::WriteFlags flags = QDeclarativePropertyPrivate::DontRemoveBinding; \
+-                    void *a[] = { &c, 0, &status, &flags }; \
+-                    QMetaObject::metacall(object, QMetaObject::WriteProperty, propertyIndex, a); \
++                    storeReference(); \
+                 } \
+                 return; \
+             } \
+             v8::Handle<v8::Value> indexedSetter(quint32 index, v8::Handle<v8::Value> value) \
+             { \
++                /* Qt containers have int (rather than uint) allowable indexes. */ \
++                if (index > INT_MAX) { \
++                    generateWarning(engine, QLatin1String("Index out of range during indexed set")); \
++                    return v8::Undefined(); \
++                } \
+                 if (objectType == QV8SequenceResource::Reference) { \
+                     if (!object) \
+                         return v8::Undefined(); \
+@@ -339,18 +372,25 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                 } \
+                 /* modify the sequence */ \
+                 SequenceElementType elementValue = ConversionFromV8fn(engine, value); \
+-                quint32 count = c.count(); \
+-                if (index == count) { \
++                qint32 count = c.count(); \
++                qint32 signedIdx = static_cast<qint32>(index); \
++                if (signedIdx == count) { \
+                     c.append(elementValue); \
+-                } else if (index < count) { \
++                } else if (signedIdx < count) { \
+                     c[index] = elementValue; \
+                 } else { \
+                     /* according to ECMA262r3 we need to insert */ \
+                     /* the value at the given index, increasing length to index+1. */ \
+-                    while (index > count++) { \
+-                        c.append(DefaultValue); \
++                    QT_TRY { \
++                        while (signedIdx > count++) { \
++                            c.append(DefaultValue); \
++                        } \
++                        c.append(elementValue); \
++                    } QT_CATCH (std::bad_alloc &exception) { \
++                        generateWarning(engine, QString(QLatin1String(exception.what()) \
++                                                + QLatin1String(" during indexed set"))); \
++                        return v8::Undefined(); /* failed; don't write back any result. */ \
+                     } \
+-                    c.append(elementValue); \
+                 } \
+                 /* write back.  already checked that object is non-null, so skip that check here. */ \
+                 if (objectType == QV8SequenceResource::Reference) \
+@@ -359,34 +399,41 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+             } \
+             v8::Handle<v8::Value> indexedGetter(quint32 index) \
+             { \
++                /* Qt containers have int (rather than uint) allowable indexes. */ \
++                if (index > INT_MAX) { \
++                    generateWarning(engine, QLatin1String("Index out of range during indexed get")); \
++                    return v8::Undefined(); \
++                } \
+                 if (objectType == QV8SequenceResource::Reference) { \
+                     if (!object) \
+                         return v8::Undefined(); \
+                     loadReference(); \
+                 } \
+-                quint32 count = c.count(); \
+-                if (index < count) \
+-                    return ConversionToV8fn(engine, c.at(index)); \
++                qint32 count = c.count(); \
++                qint32 signedIdx = static_cast<qint32>(index); \
++                if (signedIdx < count) \
++                    return ConversionToV8fn(engine, c.at(signedIdx)); \
+                 return v8::Undefined(); \
+             } \
+             v8::Handle<v8::Boolean> indexedDeleter(quint32 index) \
+             { \
++                /* Qt containers have int (rather than uint) allowable indexes. */ \
++                if (index > INT_MAX) \
++                    return v8::Boolean::New(false); \
++                /* Read in the sequence from the QObject */ \
+                 if (objectType == QV8SequenceResource::Reference) { \
+                     if (!object) \
+                         return v8::Boolean::New(false); \
+-                    void *a[] = { &c, 0 }; \
+-                    QMetaObject::metacall(object, QMetaObject::ReadProperty, propertyIndex, a); \
++                    loadReference(); \
+                 } \
+-                if (index < c.count()) { \
++                qint32 signedIdx = static_cast<qint32>(index); \
++                if (signedIdx < c.count()) { \
+                     /* according to ECMA262r3 it should be Undefined, */ \
+                     /* but we cannot, so we insert a default-value instead. */ \
+-                    c.replace(index, DefaultValue); \
++                    c.replace(signedIdx, DefaultValue); \
+                     if (objectType == QV8SequenceResource::Reference) { \
+                         /* write back.  already checked that object is non-null, so skip that check here. */ \
+-                        int status = -1; \
+-                        QDeclarativePropertyPrivate::WriteFlags flags = QDeclarativePropertyPrivate::DontRemoveBinding; \
+-                        void *a[] = { &c, 0, &status, &flags }; \
+-                        QMetaObject::metacall(object, QMetaObject::WriteProperty, propertyIndex, a); \
++                        storeReference(); \
+                     } \
+                     return v8::Boolean::New(true); \
+                 } \
+@@ -399,10 +446,10 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                         return v8::Handle<v8::Array>(); \
+                     loadReference(); \
+                 } \
+-                quint32 count = c.count(); \
++                qint32 count = c.count(); \
+                 v8::Local<v8::Array> retn = v8::Array::New(count); \
+-                for (quint32 i = 0; i < count; ++i) { \
+-                    retn->Set(i, v8::Integer::NewFromUnsigned(i)); \
++                for (qint32 i = 0; i < count; ++i) { \
++                    retn->Set(static_cast<quint32>(i), v8::Integer::NewFromUnsigned(static_cast<quint32>(i))); \
+                 } \
+                 return retn; \
+             } \
+@@ -414,8 +461,8 @@ static QString convertUrlToString(QV8Engine *, const QUrl &v)
+                     loadReference(); \
+                 } \
+                 QString str; \
+-                quint32 count = c.count(); \
+-                for (quint32 i = 0; i < count; ++i) { \
++                qint32 count = c.count(); \
++                for (qint32 i = 0; i < count; ++i) { \
+                     str += QString(QLatin1String("%1,")).arg(ToStringfn(engine, c[i])); \
+                 } \
+                 str.chop(1); \
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/data/sequenceConversion.indexes.qml b/tests/auto/declarative/qdeclarativeecmascript/data/sequenceConversion.indexes.qml
+new file mode 100644
+index 0000000..23f1e90
+--- /dev/null
++++ b/tests/auto/declarative/qdeclarativeecmascript/data/sequenceConversion.indexes.qml
+@@ -0,0 +1,89 @@
++import QtQuick 2.0
++import Qt.test 1.0
++
++Item {
++    id: root
++    objectName: "root"
++
++    MySequenceConversionObject {
++        id: msco
++        objectName: "msco"
++    }
++
++    property bool success: false
++
++    function verifyExpected(array, idx) {
++        for (var i = 0; i < idx; ++i) {
++            if (array[i] != i) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    function indexedAccess() {
++        success = true;
++
++        msco.intListProperty = [ 0, 1, 2, 3, 4 ];
++        var expectedLength = msco.intListProperty.length;
++        var maxIndex = msco.maxIndex;
++        var tooBigIndex = msco.tooBigIndex;
++        var negativeIndex = msco.negativeIndex;
++
++        // shouldn't be able to set the length > maxIndex.
++        msco.intListProperty.length = tooBigIndex;
++        if (msco.intListProperty.length != expectedLength)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // shouldn't be able to set any index > maxIndex.
++        msco.intListProperty[tooBigIndex] = 12;
++        if (msco.intListProperty.length != expectedLength)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // shouldn't be able to access any index > maxIndex.
++        var valueAtTBI = msco.intListProperty[tooBigIndex];
++        if (valueAtTBI != undefined)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // shouldn't be able to set the length to < 0
++        msco.intListProperty.length = negativeIndex;
++        if (msco.intListProperty.length != expectedLength)
++            success = false; // shouldn't have changed.
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // shouldn't be able to set any index < 0.
++        msco.intListProperty[negativeIndex] = 12;
++        if (msco.intListProperty.length != expectedLength)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // shouldn't be able to access any index < 0.
++        var valueAtNI = msco.intListProperty[negativeIndex];
++        if (valueAtNI != undefined)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++
++        // NOTE: while these two operations are technically
++        // fine, we expect std::bad_alloc exceptions here
++        // which we handle in the sequence wrapper.
++        msco.intListProperty.length = maxIndex;
++        if (msco.intListProperty.length != expectedLength)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++        msco.intListProperty[maxIndex] = 15;
++        if (msco.intListProperty.length != expectedLength)
++            success = false;
++        if (!verifyExpected(msco.intListProperty, 4))
++            success = false;
++    }
++}
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/testtypes.h b/tests/auto/declarative/qdeclarativeecmascript/testtypes.h
+index d413209..a463d3f 100644
+--- a/tests/auto/declarative/qdeclarativeecmascript/testtypes.h
++++ b/tests/auto/declarative/qdeclarativeecmascript/testtypes.h
+@@ -1194,6 +1194,10 @@ class MySequenceConversionObject : public QObject
+     Q_PROPERTY (QList<QPoint> pointListProperty READ pointListProperty WRITE setPointListProperty NOTIFY pointListPropertyChanged)
+     Q_PROPERTY (QList<QVariant> variantListProperty READ variantListProperty WRITE setVariantListProperty NOTIFY variantListPropertyChanged)
+ 
++    Q_PROPERTY (qint32 maxIndex READ maxIndex CONSTANT)
++    Q_PROPERTY (quint32 tooBigIndex READ tooBigIndex CONSTANT)
++    Q_PROPERTY (qint32 negativeIndex READ negativeIndex CONSTANT)
++
+ public:
+     MySequenceConversionObject()
+     {
+@@ -1211,6 +1215,21 @@ public:
+ 
+     ~MySequenceConversionObject() {}
+ 
++    qint32 maxIndex() const
++    {
++        return INT_MAX;
++    }
++    quint32 tooBigIndex() const
++    {
++        quint32 retn = 7;
++        retn += INT_MAX;
++        return retn;
++    }
++    qint32 negativeIndex() const
++    {
++        return -5;
++    }
++
+     QList<int> intListProperty() const { return m_intList; }
+     void setIntListProperty(const QList<int> &list) { m_intList = list; emit intListPropertyChanged(); }
+     QList<int> intListProperty2() const { return m_intList2; }
+diff --git a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+index 02f79d2..354087d 100644
+--- a/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
++++ b/tests/auto/declarative/qdeclarativeecmascript/tst_qdeclarativeecmascript.cpp
+@@ -170,6 +170,7 @@ private slots:
+     void sequenceConversionRead();
+     void sequenceConversionWrite();
+     void sequenceConversionArray();
++    void sequenceConversionIndexes();
+     void sequenceConversionThreads();
+     void sequenceConversionBindings();
+     void sequenceConversionCopy();
+@@ -4608,6 +4609,30 @@ void tst_qdeclarativeecmascript::sequenceConversionArray()
+     delete object;
+ }
+ 
++
++void tst_qdeclarativeecmascript::sequenceConversionIndexes()
++{
++    // ensure that we gracefully fail if unsupported index values are specified.
++    // Qt container classes only support non-negative, signed integer index values.
++    QUrl qmlFile = testFileUrl("sequenceConversion.indexes.qml");
++    QDeclarativeComponent component(&engine, qmlFile);
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QString w1 = qmlFile.toString() + QLatin1String(":34: Index out of range during length set");
++    QString w2 = qmlFile.toString() + QLatin1String(":41: Index out of range during indexed set");
++    QString w3 = qmlFile.toString() + QLatin1String(":48: Index out of range during indexed get");
++    QString w4 = qmlFile.toString() + QLatin1String(":78: std::bad_alloc during length set");
++    QString w5 = qmlFile.toString() + QLatin1String(":83: std::bad_alloc during indexed set");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w1));
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w2));
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w3));
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w4));
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w5));
++    QMetaObject::invokeMethod(object, "indexedAccess");
++    QVERIFY(object->property("success").toBool());
++    delete object;
++}
++
+ void tst_qdeclarativeecmascript::sequenceConversionThreads()
+ {
+     // ensure that sequence conversion operations work correctly in a worker thread

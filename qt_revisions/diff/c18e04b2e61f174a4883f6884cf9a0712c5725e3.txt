@@ -1,0 +1,172 @@
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index da918c3..9db3ee5 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -1244,6 +1244,7 @@ v8::Persistent<v8::Object> QQmlVME::run(QQmlContextData *parentCtxt, QQmlScriptD
+         script->initialize(parentCtxt->engine);
+ 
+     v8::Local<v8::Object> qmlglobal = v8engine->qmlScope(ctxt, 0);
++    v8engine->contextWrapper()->takeContextOwnership(qmlglobal);
+ 
+     if (!script->m_program.IsEmpty()) {
+         script->m_program->Run(qmlglobal);
+diff --git a/src/qml/qml/v8/qv8contextwrapper.cpp b/src/qml/qml/v8/qv8contextwrapper.cpp
+index 9f18afc..bc64189 100644
+--- a/src/qml/qml/v8/qv8contextwrapper.cpp
++++ b/src/qml/qml/v8/qv8contextwrapper.cpp
+@@ -55,7 +55,7 @@ class QV8ContextResource : public QV8ObjectResource
+     V8_RESOURCE_TYPE(ContextType);
+ 
+ public:
+-    QV8ContextResource(QV8Engine *engine, QQmlContextData *context, QObject *scopeObject);
++    QV8ContextResource(QV8Engine *engine, QQmlContextData *context, QObject *scopeObject, bool ownsContext = false);
+     ~QV8ContextResource();
+ 
+     inline QQmlContextData *getContext() const;
+@@ -64,7 +64,8 @@ public:
+     quint32 isSharedContext:1;
+     quint32 hasSubContexts:1;
+     quint32 readOnly:1;
+-    quint32 dummy:29;
++    quint32 ownsContext:1;
++    quint32 dummy:28;
+ 
+     // This is a pretty horrible hack, and an abuse of external strings.  When we create a 
+     // sub-context (a context created by a Qt.include() in an external javascript file),
+@@ -86,15 +87,15 @@ private:
+ 
+ };
+ 
+-QV8ContextResource::QV8ContextResource(QV8Engine *engine, QQmlContextData *context, QObject *scopeObject)
+-: QV8ObjectResource(engine), isSharedContext(false), hasSubContexts(false), readOnly(true), 
+-  context(context), scopeObject(scopeObject)
++QV8ContextResource::QV8ContextResource(QV8Engine *engine, QQmlContextData *context, QObject *scopeObject, bool ownsContext)
++: QV8ObjectResource(engine), isSharedContext(false), hasSubContexts(false), readOnly(true),
++  ownsContext(ownsContext), context(context), scopeObject(scopeObject)
+ {
+ }
+ 
+ QV8ContextResource::~QV8ContextResource()
+ {
+-    if (context && context->isJSContext)
++    if (context && ownsContext)
+         context->destroy();
+ }
+ 
+@@ -186,7 +187,7 @@ v8::Local<v8::Object> QV8ContextWrapper::urlScope(const QUrl &url)
+ 
+     // XXX NewInstance() should be optimized
+     v8::Local<v8::Object> rv = m_urlConstructor->NewInstance(); 
+-    QV8ContextResource *r = new QV8ContextResource(m_engine, context, 0);
++    QV8ContextResource *r = new QV8ContextResource(m_engine, context, 0, true);
+     rv->SetExternalResource(r);
+     return rv;
+ }
+@@ -226,6 +227,12 @@ QQmlContextData *QV8ContextWrapper::context(v8::Handle<v8::Value> value)
+     return r?r->getContext():0;
+ }
+ 
++void QV8ContextWrapper::takeContextOwnership(v8::Handle<v8::Object> qmlglobal)
++{
++    QV8ContextResource *r = v8_resource_cast<QV8ContextResource>(qmlglobal);
++    r->ownsContext = true;
++}
++
+ v8::Handle<v8::Value> QV8ContextWrapper::NullGetter(v8::Local<v8::String>,
+                                                     const v8::AccessorInfo &)
+ {
+diff --git a/src/qml/qml/v8/qv8contextwrapper_p.h b/src/qml/qml/v8/qv8contextwrapper_p.h
+index 1e62ea6..43eeee0 100644
+--- a/src/qml/qml/v8/qv8contextwrapper_p.h
++++ b/src/qml/qml/v8/qv8contextwrapper_p.h
+@@ -54,6 +54,7 @@
+ //
+ 
+ #include <QtCore/qglobal.h>
++#include <private/qtqmlglobal_p.h>
+ #include <private/qv8_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -62,7 +63,7 @@ class QUrl;
+ class QObject;
+ class QV8Engine;
+ class QQmlContextData;
+-class QV8ContextWrapper 
++class Q_QML_PRIVATE_EXPORT QV8ContextWrapper
+ {
+ public:
+     QV8ContextWrapper();
+@@ -84,6 +85,8 @@ public:
+ 
+     inline v8::Handle<v8::Object> sharedContext() const;
+ 
++    void takeContextOwnership(v8::Handle<v8::Object> qmlglobal);
++
+ private:
+     static v8::Handle<v8::Value> NullGetter(v8::Local<v8::String> property, 
+                                             const v8::AccessorInfo &info);
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index a99c5fa..048fdb1 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -288,6 +288,7 @@ private slots:
+ 
+ private:
+     static void propertyVarWeakRefCallback(v8::Persistent<v8::Value> object, void* parameter);
++    static void verifyContextLifetime(QQmlContextData *ctxt);
+     QQmlEngine engine;
+ };
+ 
+@@ -3783,6 +3784,41 @@ void tst_qqmlecmascript::singletonTypeResolution()
+     delete object;
+ }
+ 
++void tst_qqmlecmascript::verifyContextLifetime(QQmlContextData *ctxt) {
++    QQmlContextData *childCtxt = ctxt->childContexts;
++
++    if (!ctxt->importedScripts.isEmpty()) {
++        QV8Engine *engine = QV8Engine::get(ctxt->engine);
++        foreach (v8::Persistent<v8::Object> qmlglobal, ctxt->importedScripts) {
++            QQmlContextData *scriptContext, *newContext;
++
++            if (qmlglobal.IsEmpty())
++                continue;
++
++            scriptContext = engine->contextWrapper()->context(qmlglobal);
++
++            {
++                v8::HandleScope handle_scope;
++                v8::Persistent<v8::Context> context = v8::Context::New();
++                v8::Context::Scope context_scope(context);
++                v8::Local<v8::Object> temporaryScope = engine->qmlScope(scriptContext, NULL);
++
++                context.Dispose();
++            }
++
++            QV8Engine::gc();
++            newContext = engine->contextWrapper()->context(qmlglobal);
++            QVERIFY(scriptContext == newContext);
++        }
++    }
++
++    while (childCtxt) {
++        verifyContextLifetime(childCtxt);
++
++        childCtxt = childCtxt->nextChild;
++    }
++}
++
+ void tst_qqmlecmascript::importScripts_data()
+ {
+     QTest::addColumn<QUrl>("testfile");
+@@ -4014,6 +4050,10 @@ void tst_qqmlecmascript::importScripts()
+         QVERIFY(object == 0);
+     } else {
+         QVERIFY(object != 0);
++
++        QQmlContextData *ctxt = QQmlContextData::get(engine.rootContext());
++        tst_qqmlecmascript::verifyContextLifetime(ctxt);
++
+         for (int i = 0; i < propertyNames.size(); ++i)
+             QCOMPARE(object->property(propertyNames.at(i).toLatin1().constData()), propertyValues.at(i));
+         delete object;

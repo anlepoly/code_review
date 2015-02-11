@@ -1,0 +1,205 @@
+diff --git a/src/plugins/printsupport/cups/qcupsprintersupport.cpp b/src/plugins/printsupport/cups/qcupsprintersupport.cpp
+index 83d4068..493e01d 100644
+--- a/src/plugins/printsupport/cups/qcupsprintersupport.cpp
++++ b/src/plugins/printsupport/cups/qcupsprintersupport.cpp
+@@ -46,16 +46,26 @@
+ 
+ #include <QtPrintSupport/QPrinterInfo>
+ 
+-#include "qcups_p.h"
++#include <cups/ppd.h>
++#ifndef QT_LINUXBASE // LSB merges everything into cups.h
++# include <cups/language.h>
++#endif
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-QCupsPrinterSupport::QCupsPrinterSupport() : QPlatformPrinterSupport()
++QCupsPrinterSupport::QCupsPrinterSupport() : QPlatformPrinterSupport(),
++                                             m_cups(QLatin1String("cups"), 2),
++                                             m_cupsPrinters(0),
++                                             m_cupsPrintersCount(0)
+ {
++    loadCups();
++    loadCupsPrinters();
+ }
+ 
+ QCupsPrinterSupport::~QCupsPrinterSupport()
+ {
++    if (cupsFreeDests)
++        cupsFreeDests(m_cupsPrintersCount, m_cupsPrinters);
+ }
+ 
+ QPrintEngine *QCupsPrinterSupport::createNativePrintEngine(QPrinter::PrinterMode printerMode)
+@@ -74,14 +84,63 @@ QList<QPrinter::PaperSize> QCupsPrinterSupport::supportedPaperSizes(const QPrint
+     return QCUPSSupport::getCupsPrinterPaperSizes(printerIndex(printerInfo));
+ }
+ 
+-QList<QPrinterInfo> QCupsPrinterSupport::availablePrinters()
++void QCupsPrinterSupport::loadCups()
+ {
+-    QList<QPrinterInfo> printers;
+-    foreach (const QCUPSSupport::Printer &p,  QCUPSSupport::availableUnixPrinters()) {
+-        QPrinterInfo printer = createPrinterInfo(p.name, QString(), QString(), QString(), p.isDefault, p.cupsPrinterIndex);
+-        printers.append(printer);
++    cupsGetDests = (CupsGetDests) m_cups.resolve("cupsGetDests");
++    cupsFreeDests = (CupsFreeDests) m_cups.resolve("cupsFreeDests");
++    cupsGetOption = (CupsGetOption) m_cups.resolve("cupsGetOption");
++}
++
++void QCupsPrinterSupport::loadCupsPrinters()
++{
++    m_cupsPrintersCount = 0;
++    m_printers.clear();
++
++    if (cupsFreeDests)
++        cupsFreeDests(m_cupsPrintersCount, m_cupsPrinters);
++
++    if (cupsGetDests)
++        m_cupsPrintersCount = cupsGetDests(&m_cupsPrinters);
++
++    for (int i = 0; i < m_cupsPrintersCount; ++i) {
++        QString printerName = QString::fromLocal8Bit(m_cupsPrinters[i].name);
++        if (m_cupsPrinters[i].instance)
++            printerName += QLatin1Char('/') + QString::fromLocal8Bit(m_cupsPrinters[i].instance);
++        QString description = cupsOption(i, "printer-info");
++        QString location = cupsOption(i, "printer-location");
++        QString makeAndModel = cupsOption(i, "printer-make-and-model");
++        QPrinterInfo printer = createPrinterInfo(printerName, description, location, makeAndModel,
++                                                 m_cupsPrinters[i].is_default, i);
++        m_printers.append(printer);
++    }
++}
++
++QString QCupsPrinterSupport::printerOption(const QPrinterInfo &printer, const QString &key) const
++{
++    return cupsOption(printerIndex(printer), key);
++}
++
++QString QCupsPrinterSupport::cupsOption(int i, const QString &key) const
++{
++    QString value;
++    if (i > -1 && i < m_cupsPrintersCount && cupsGetOption)
++        value = cupsGetOption(key.toLocal8Bit(), m_cupsPrinters[i].num_options, m_cupsPrinters[i].options);
++    return value;
++}
++
++PrinterOptions QCupsPrinterSupport::printerOptions(const QPrinterInfo &printer) const
++{
++    PrinterOptions options;
++    int p = printerIndex(printer);
++    if (p <= -1 || p >= m_cupsPrintersCount)
++        return options;
++    int numOptions = m_cupsPrinters[p].num_options;
++    for (int i = 0; i < numOptions; ++i) {
++        QString name = m_cupsPrinters[p].options[i].name;
++        QString value = m_cupsPrinters[p].options[i].value;
++        options.insert(name, value);
+     }
+-    return printers;
++    return options;
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/printsupport/cups/qcupsprintersupport_p.h b/src/plugins/printsupport/cups/qcupsprintersupport_p.h
+index 13b65a5..8470472 100644
+--- a/src/plugins/printsupport/cups/qcupsprintersupport_p.h
++++ b/src/plugins/printsupport/cups/qcupsprintersupport_p.h
+@@ -44,9 +44,18 @@
+ 
+ #include <qpa/qplatformprintersupport.h>
+ 
++#include <QtCore/qlibrary.h>
++#include <QtCore/qlist.h>
++
++#include <cups/cups.h>
++
+ QT_BEGIN_HEADER
+ QT_BEGIN_NAMESPACE
+ 
++typedef int (*CupsGetDests)(cups_dest_t **dests);
++typedef void (*CupsFreeDests)(int num_dests, cups_dest_t *dests);
++typedef const char* (*CupsGetOption)(const char *name, int num_options, cups_option_t *options);
++
+ class QCupsPrinterSupport : public QPlatformPrinterSupport
+ {
+ public:
+@@ -56,10 +65,21 @@ public:
+     virtual QPrintEngine *createNativePrintEngine(QPrinter::PrinterMode printerMode);
+     virtual QPaintEngine *createPaintEngine(QPrintEngine *printEngine, QPrinter::PrinterMode);
+     virtual QList<QPrinter::PaperSize> supportedPaperSizes(const QPrinterInfo &) const;
+-
+-    virtual QList<QPrinterInfo> availablePrinters();
++    virtual QString printerOption(const QPrinterInfo &printer, const QString &key) const;
++    virtual PrinterOptions printerOptions(const QPrinterInfo &printer) const;
+ 
+ private:
++    void loadCups();
++    void loadCupsPrinters();
++    QString cupsOption(int i, const QString &key) const;
++
++    QLibrary m_cups;
++    cups_dest_t *m_cupsPrinters;
++    int m_cupsPrintersCount;
++
++    CupsGetDests  cupsGetDests;
++    CupsFreeDests cupsFreeDests;
++    CupsGetOption cupsGetOption;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/printsupport/kernel/qplatformprintersupport.h b/src/printsupport/kernel/qplatformprintersupport.h
+index e922b5f..018ec05 100644
+--- a/src/printsupport/kernel/qplatformprintersupport.h
++++ b/src/printsupport/kernel/qplatformprintersupport.h
+@@ -53,6 +53,7 @@
+ #include <QtPrintSupport/qprinter.h>
+ 
+ #include <QtCore/qlist.h>
++#include <QtCore/qhash.h>
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -60,6 +61,8 @@ QT_BEGIN_NAMESPACE
+ 
+ #ifndef QT_NO_PRINTER
+ 
++typedef QHash<QString, QString> PrinterOptions;
++
+ class QPrintEngine;
+ 
+ class Q_PRINTSUPPORT_EXPORT QPlatformPrinterSupport
+@@ -76,6 +79,9 @@ public:
+     virtual QPrinterInfo defaultPrinter();
+     virtual QPrinterInfo printerInfo(const QString &printerName);
+ 
++    virtual QString printerOption(const QPrinterInfo &printer, const QString &key) const;
++    virtual PrinterOptions printerOptions(const QPrinterInfo &printer) const;
++
+     static QPrinter::PaperSize convertQSizeFToPaperSize(const QSizeF &sizef);
+     static QSizeF convertPaperSizeToQSizeF(QPrinter::PaperSize paperSize);
+ 
+diff --git a/src/printsupport/kernel/qplatformprintersupport_qpa.cpp b/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
+index 0a386ea..b74a84f 100644
+--- a/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
++++ b/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
+@@ -107,6 +107,19 @@ QPrinterInfo QPlatformPrinterSupport::printerInfo(const QString &printerName)
+     return QPrinterInfo();
+ }
+ 
++QString QPlatformPrinterSupport::printerOption(const QPrinterInfo &printer, const QString &key) const
++{
++    Q_UNUSED(printer)
++    Q_UNUSED(key)
++    return QString();
++}
++
++PrinterOptions QPlatformPrinterSupport::printerOptions(const QPrinterInfo &printer) const
++{
++    Q_UNUSED(printer)
++    return PrinterOptions();
++}
++
+ int QPlatformPrinterSupport::printerIndex(const QPrinterInfo &printer)
+ {
+     return printer.d_func()->index;

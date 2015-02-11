@@ -1,0 +1,2068 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index b8a4e21..bb4ceef 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -50,6 +50,11 @@ information about a particular change.
+   * QMetaType::unregisterType() has been removed.
+ 
+ - QTestLib:
++  * The plain-text, xml and lightxml test output formats have been changed to
++    show a test result for every row of test data in data-driven tests.  In
++    Qt4, only fails and skips were shown for individual data rows and passes
++    were not shown for individual data rows, preventing accurate calculation
++    of test run rates and pass rates.
+   * The QTRY_VERIFY and QTRY_COMPARE macros have been moved into QTestLib.
+     These macros formerly lived in tests/shared/util.h but are now provided
+     by including the <QtTest/QtTest> header. In addition,
+diff --git a/src/testlib/qtestcase.cpp b/src/testlib/qtestcase.cpp
+index d94abff..161af0f 100644
+--- a/src/testlib/qtestcase.cpp
++++ b/src/testlib/qtestcase.cpp
+@@ -1518,6 +1518,7 @@ static void qInvokeTestMethodDataEntry(char *slot)
+ 
+             QTestResult::setCurrentTestLocation(QTestResult::CleanupFunc);
+             invokeMethod(QTest::currentTestObject, "cleanup()");
++            QTestResult::finishedCurrentTestDataCleanup();
+             QTestResult::setCurrentTestLocation(QTestResult::NoWhere);
+ 
+             // If this test method has a benchmark, repeat until all measurements are
+@@ -1749,8 +1750,10 @@ static void qInvokeTestMethods(QObject *testObject)
+         QTestResult::setCurrentTestLocation(QTestResult::InitFunc);
+         invokeMethod(testObject, "initTestCase()");
+ 
+-        // finishedCurrentTestFunction() resets QTestResult::testFailed(), so use a local copy.
+-        const bool previousFailed = QTestResult::testFailed();
++        // finishedCurrentTestDataCleanup() resets QTestResult::currentTestFailed(), so use a local copy.
++        const bool previousFailed = QTestResult::currentTestFailed();
++        QTestResult::finishedCurrentTestData();
++        QTestResult::finishedCurrentTestDataCleanup();
+         QTestResult::finishedCurrentTestFunction();
+ 
+         if (!QTestResult::skipCurrentTest() && !previousFailed) {
+@@ -1782,6 +1785,8 @@ static void qInvokeTestMethods(QObject *testObject)
+         QTestResult::setSkipCurrentTest(false);
+         QTestResult::setCurrentTestFunction("cleanupTestCase");
+         invokeMethod(testObject, "cleanupTestCase()");
++        QTestResult::finishedCurrentTestData();
++        QTestResult::finishedCurrentTestDataCleanup();
+     }
+     QTestResult::finishedCurrentTestFunction();
+     QTestResult::setCurrentTestFunction(0);
+diff --git a/src/testlib/qtestresult.cpp b/src/testlib/qtestresult.cpp
+index c49c7ae..cfa85eb 100644
+--- a/src/testlib/qtestresult.cpp
++++ b/src/testlib/qtestresult.cpp
+@@ -58,7 +58,6 @@ namespace QTest
+     static const char *currentTestFunc = 0;
+     static const char *currentTestObjectName = 0;
+     static bool failed = false;
+-    static bool dataFailed = false;
+     static bool skipCurrentTest = false;
+     static QTestResult::TestLocation location = QTestResult::NoWhere;
+ 
+@@ -75,7 +74,6 @@ void QTestResult::reset()
+     QTest::currentTestFunc = 0;
+     QTest::currentTestObjectName = 0;
+     QTest::failed = false;
+-    QTest::dataFailed = false;
+     QTest::location = QTestResult::NoWhere;
+ 
+     QTest::expectFailComment = 0;
+@@ -86,7 +84,7 @@ void QTestResult::reset()
+ 
+ bool QTestResult::currentTestFailed()
+ {
+-    return QTest::dataFailed;
++    return QTest::failed;
+ }
+ 
+ QTestData *QTestResult::currentGlobalTestData()
+@@ -107,7 +105,7 @@ void QTestResult::setCurrentGlobalTestData(QTestData *data)
+ void QTestResult::setCurrentTestData(QTestData *data)
+ {
+     QTest::currentTestData = data;
+-    QTest::dataFailed = false;
++    QTest::failed = false;
+ }
+ 
+ void QTestResult::setCurrentTestFunction(const char *func)
+@@ -133,21 +131,27 @@ void QTestResult::finishedCurrentTestData()
+         addFailure("QEXPECT_FAIL was called without any subsequent verification statements", 0, 0);
+     clearExpectFail();
+ 
+-    if (!QTest::dataFailed && QTestLog::unhandledIgnoreMessages()) {
++    if (!QTest::failed && QTestLog::unhandledIgnoreMessages()) {
+         QTestLog::printUnhandledIgnoreMessages();
+         addFailure("Not all expected messages were received", 0, 0);
+     }
+     QTestLog::clearIgnoreMessages();
+ }
+ 
+-void QTestResult::finishedCurrentTestFunction()
++void QTestResult::finishedCurrentTestDataCleanup()
+ {
++    // If the current test hasn't failed or been skipped, then it passes.
+     if (!QTest::failed && !QTest::skipCurrentTest) {
+         QTestLog::addPass("");
+     }
++
++    QTest::failed = false;
++}
++
++void QTestResult::finishedCurrentTestFunction()
++{
+     QTest::currentTestFunc = 0;
+     QTest::failed = false;
+-    QTest::dataFailed = false;
+     QTest::location = NoWhere;
+ 
+     QTestLog::leaveTestFunction();
+@@ -276,7 +280,6 @@ void QTestResult::addFailure(const char *message, const char *file, int line)
+ 
+     QTestLog::addFail(message, file, line);
+     QTest::failed = true;
+-    QTest::dataFailed = true;
+ }
+ 
+ void QTestResult::addSkip(const char *message, const char *file, int line)
+@@ -306,11 +309,6 @@ const char *QTestResult::currentTestObjectName()
+     return QTest::currentTestObjectName ? QTest::currentTestObjectName : "";
+ }
+ 
+-bool QTestResult::testFailed()
+-{
+-    return QTest::failed;
+-}
+-
+ void QTestResult::setSkipCurrentTest(bool value)
+ {
+     QTest::skipCurrentTest = value;
+diff --git a/src/testlib/qtestresult_p.h b/src/testlib/qtestresult_p.h
+index 81e1118..5c6c4fb 100644
+--- a/src/testlib/qtestresult_p.h
++++ b/src/testlib/qtestresult_p.h
+@@ -74,6 +74,7 @@ public:
+     static const char *currentDataTag();
+     static const char *currentGlobalDataTag();
+     static void finishedCurrentTestData();
++    static void finishedCurrentTestDataCleanup();
+     static void finishedCurrentTestFunction();
+     static void reset();
+ 
+@@ -92,7 +93,6 @@ public:
+                            QTest::TestFailMode mode, const char *file, int line);
+     static bool verify(bool statement, const char *statementStr, const char *extraInfo,
+                        const char *file, int line);
+-    static bool testFailed();
+     static void setSkipCurrentTest(bool value);
+     static bool skipCurrentTest();
+ 
+diff --git a/tests/auto/testlib/selftests/expected_badxml.lightxml b/tests/auto/testlib/selftests/expected_badxml.lightxml
+index 43446c3..a8cdf56 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.lightxml
++++ b/tests/auto/testlib/selftests/expected_badxml.lightxml
+@@ -48,19 +48,30 @@
+     <DataTag><![CDATA[string 0]]></DataTag>
+     <Description><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 1]]></DataTag>
+     <Description><![CDATA[quotes " text" more text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 2]]></DataTag>
+     <Description><![CDATA[xml close > open < tags < text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 3]]></DataTag>
+     <Description><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 3]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="failWithNoFile">
+ <Incident type="fail" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_badxml.txt b/tests/auto/testlib/selftests/expected_badxml.txt
+index 0db292e..d4f4432 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.txt
++++ b/tests/auto/testlib/selftests/expected_badxml.txt
+@@ -22,11 +22,14 @@ FAIL!  : tst_BadXml::badDataTag(all > " mixed ]]> up > " in < the ]]> hopes < of
+ RESULT : tst_BadXml::badDataTag():"all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs":
+      0 events per iteration (total: 0, iterations: 1)
+ QDEBUG : tst_BadXml::badMessage(string 0) end cdata ]]> text ]]> more text
++PASS   : tst_BadXml::badMessage(string 0)
+ QDEBUG : tst_BadXml::badMessage(string 1) quotes " text" more text
++PASS   : tst_BadXml::badMessage(string 1)
+ QDEBUG : tst_BadXml::badMessage(string 2) xml close > open < tags < text
++PASS   : tst_BadXml::badMessage(string 2)
+ QDEBUG : tst_BadXml::badMessage(string 3) all > " mixed ]]> up > " in < the ]]> hopes < of triggering "< ]]> bugs
+-PASS   : tst_BadXml::badMessage()
++PASS   : tst_BadXml::badMessage(string 3)
+ FAIL!  : tst_BadXml::failWithNoFile() failure message
+ PASS   : tst_BadXml::cleanupTestCase()
+-Totals: 3 passed, 5 failed, 0 skipped
++Totals: 6 passed, 5 failed, 0 skipped
+ ********* Finished testing of tst_BadXml *********
+diff --git a/tests/auto/testlib/selftests/expected_badxml.xml b/tests/auto/testlib/selftests/expected_badxml.xml
+index fbb584d..9f083d3 100644
+--- a/tests/auto/testlib/selftests/expected_badxml.xml
++++ b/tests/auto/testlib/selftests/expected_badxml.xml
+@@ -50,19 +50,30 @@
+     <DataTag><![CDATA[string 0]]></DataTag>
+     <Description><![CDATA[end cdata ]]]><![CDATA[]> text ]]]><![CDATA[]> more text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 1]]></DataTag>
+     <Description><![CDATA[quotes " text" more text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 2]]></DataTag>
+     <Description><![CDATA[xml close > open < tags < text]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[string 3]]></DataTag>
+     <Description><![CDATA[all > " mixed ]]]><![CDATA[]> up > " in < the ]]]><![CDATA[]> hopes < of triggering "< ]]]><![CDATA[]> bugs]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[string 3]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="failWithNoFile">
+ <Incident type="fail" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt b/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
+index 2498c81..714b67f 100644
+--- a/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
++++ b/tests/auto/testlib/selftests/expected_benchlibcallgrind.txt
+@@ -1,9 +1,10 @@
+ ********* Start testing of tst_BenchlibCallgrind *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibCallgrind::initTestCase()
+-RESULT : tst_BenchlibCallgrind::twoHundredMillionInstructions():
+-     200,000,000 instruction reads per iteration (total: 200000000, iterations: 1)
+ PASS   : tst_BenchlibCallgrind::twoHundredMillionInstructions()
++PASS   : tst_BenchlibCallgrind::twoHundredMillionInstructions()
++RESULT : tst_BenchlibCallgrind::twoHundredMillionInstructions():
++     200,000,158 instruction reads per iteration (total: 200,000,158, iterations: 1)
+ PASS   : tst_BenchlibCallgrind::cleanupTestCase()
+-Totals: 3 passed, 0 failed, 0 skipped
++Totals: 4 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibCallgrind *********
+diff --git a/tests/auto/testlib/selftests/expected_benchlibeventcounter.lightxml b/tests/auto/testlib/selftests/expected_benchlibeventcounter.lightxml
+index 3bede6d..3cb59d2 100644
+--- a/tests/auto/testlib/selftests/expected_benchlibeventcounter.lightxml
++++ b/tests/auto/testlib/selftests/expected_benchlibeventcounter.lightxml
+@@ -6,14 +6,34 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="events">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[0]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="0" value="0" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="1" value="1" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[10]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="10" value="10" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[100]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="100" value="100" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[500]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="500" value="500" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[5000]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="5000" value="5000" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[100000]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="100000" value="100000" iterations="1" />
+-<Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_benchlibeventcounter.txt b/tests/auto/testlib/selftests/expected_benchlibeventcounter.txt
+index e3dc6c0..7be4bcc 100644
+--- a/tests/auto/testlib/selftests/expected_benchlibeventcounter.txt
++++ b/tests/auto/testlib/selftests/expected_benchlibeventcounter.txt
+@@ -1,21 +1,27 @@
+ ********* Start testing of tst_BenchlibEventCounter *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibEventCounter::initTestCase()
++PASS   : tst_BenchlibEventCounter::events(0)
+ RESULT : tst_BenchlibEventCounter::events():"0":
+      0 events per iteration (total: 0, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(1)
+ RESULT : tst_BenchlibEventCounter::events():"1":
+      1 events per iteration (total: 1, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(10)
+ RESULT : tst_BenchlibEventCounter::events():"10":
+      10 events per iteration (total: 10, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(100)
+ RESULT : tst_BenchlibEventCounter::events():"100":
+      100 events per iteration (total: 100, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(500)
+ RESULT : tst_BenchlibEventCounter::events():"500":
+      500 events per iteration (total: 500, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(5000)
+ RESULT : tst_BenchlibEventCounter::events():"5000":
+-     5,000 events per iteration (total: 5000, iterations: 1)
++     5,000 events per iteration (total: 5,000, iterations: 1)
++PASS   : tst_BenchlibEventCounter::events(100000)
+ RESULT : tst_BenchlibEventCounter::events():"100000":
+-     100,000 events per iteration (total: 100000, iterations: 1)
+-PASS   : tst_BenchlibEventCounter::events()
++     100,000 events per iteration (total: 100,000, iterations: 1)
+ PASS   : tst_BenchlibEventCounter::cleanupTestCase()
+-Totals: 3 passed, 0 failed, 0 skipped
++Totals: 9 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibEventCounter *********
+diff --git a/tests/auto/testlib/selftests/expected_benchlibeventcounter.xml b/tests/auto/testlib/selftests/expected_benchlibeventcounter.xml
+index 646cf22..47b4978 100644
+--- a/tests/auto/testlib/selftests/expected_benchlibeventcounter.xml
++++ b/tests/auto/testlib/selftests/expected_benchlibeventcounter.xml
+@@ -8,14 +8,34 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="events">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[0]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="0" value="0" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="1" value="1" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[10]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="10" value="10" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[100]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="100" value="100" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[500]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="500" value="500" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[5000]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="5000" value="5000" iterations="1" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[100000]]></DataTag>
++</Incident>
+ <BenchmarkResult metric="Events" tag="100000" value="100000" iterations="1" />
+-<Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_benchliboptions.txt b/tests/auto/testlib/selftests/expected_benchliboptions.txt
+index 3e75d20..6d6d91c 100644
+--- a/tests/auto/testlib/selftests/expected_benchliboptions.txt
++++ b/tests/auto/testlib/selftests/expected_benchliboptions.txt
+@@ -1,27 +1,33 @@
+ ********* Start testing of tst_BenchlibOptions *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibOptions::initTestCase()
++PASS   : tst_BenchlibOptions::threeEvents()
+ RESULT : tst_BenchlibOptions::threeEvents():
+      3 events per iteration (total: 3, iterations: 1)
+-PASS   : tst_BenchlibOptions::threeEvents()
+ PASS   : tst_BenchlibOptions::cleanupTestCase()
+ Totals: 3 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibOptions *********
+ ********* Start testing of tst_BenchlibFifteenIterations *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibFifteenIterations::initTestCase()
++PASS   : tst_BenchlibFifteenIterations::threeEvents()
+ RESULT : tst_BenchlibFifteenIterations::threeEvents():
+      3.0 events per iteration (total: 45, iterations: 15)
+-PASS   : tst_BenchlibFifteenIterations::threeEvents()
+ PASS   : tst_BenchlibFifteenIterations::cleanupTestCase()
+ Totals: 3 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibFifteenIterations *********
+ ********* Start testing of tst_BenchlibOneHundredMinimum *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_BenchlibOneHundredMinimum::initTestCase()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
++PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+ RESULT : tst_BenchlibOneHundredMinimum::threeEvents():
+      3.00 events per iteration (total: 192, iterations: 64)
+-PASS   : tst_BenchlibOneHundredMinimum::threeEvents()
+ PASS   : tst_BenchlibOneHundredMinimum::cleanupTestCase()
+-Totals: 3 passed, 0 failed, 0 skipped
++Totals: 9 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_BenchlibOneHundredMinimum *********
+diff --git a/tests/auto/testlib/selftests/expected_cmptest.lightxml b/tests/auto/testlib/selftests/expected_cmptest.lightxml
+index 17f3e6e..d1cccd4 100644
+--- a/tests/auto/testlib/selftests/expected_cmptest.lightxml
++++ b/tests/auto/testlib/selftests/expected_cmptest.lightxml
+@@ -12,25 +12,28 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="compare_tostring">
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[int, string]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(int,123)
+    Expected (expected): QVariant(QString,hi)]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both invalid]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[null hash, invalid]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(QVariantHash)
+    Expected (expected): QVariant()]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[string, null user type]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(QString,A simple string)
+    Expected (expected): QVariant(PhonyClass)]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[both non-null user type]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(PhonyClass,<value not representable as string>)
+@@ -38,31 +41,37 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQStringLists">
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[empty lists]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal lists]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[last item different]]></DataTag>
+     <Description><![CDATA[Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[second-last item different]]></DataTag>
+     <Description><![CDATA[Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[prefix]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '2'
+    Expected (opB) size: '1']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[short list second]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '12'
+    Expected (opB) size: '1']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[short list first]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '1'
+@@ -70,55 +79,67 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQPixmaps">
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both null]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[one null]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[other null]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[different size]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[different pixels]]></DataTag>
+     <Description><![CDATA[Compared values are not the same]]></Description>
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQImages">
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both null]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[one null]]></DataTag>
+     <Description><![CDATA[Compared QImages differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[other null]]></DataTag>
+     <Description><![CDATA[Compared QImages differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different size]]></DataTag>
+     <Description><![CDATA[Compared QImages differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different format]]></DataTag>
+     <Description><![CDATA[Compared QImages differ in format.
+    Actual (opA)  : 6
+    Expected (opB): 3]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different pixels]]></DataTag>
+     <Description><![CDATA[Compared values are not the same]]></Description>
+ </Incident>
+diff --git a/tests/auto/testlib/selftests/expected_cmptest.txt b/tests/auto/testlib/selftests/expected_cmptest.txt
+index 36a4995..fce635a 100644
+--- a/tests/auto/testlib/selftests/expected_cmptest.txt
++++ b/tests/auto/testlib/selftests/expected_cmptest.txt
+@@ -6,71 +6,78 @@ PASS   : tst_Cmptest::compare_pointerfuncs()
+ FAIL!  : tst_Cmptest::compare_tostring(int, string) Compared values are not the same
+    Actual (actual): QVariant(int,123)
+    Expected (expected): QVariant(QString,hi)
+-   Loc: [tst_cmptest.cpp(214)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(214)]
++PASS   : tst_Cmptest::compare_tostring(both invalid)
+ FAIL!  : tst_Cmptest::compare_tostring(null hash, invalid) Compared values are not the same
+    Actual (actual): QVariant(QVariantHash)
+    Expected (expected): QVariant()
+-   Loc: [tst_cmptest.cpp(214)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(214)]
+ FAIL!  : tst_Cmptest::compare_tostring(string, null user type) Compared values are not the same
+    Actual (actual): QVariant(QString,A simple string)
+    Expected (expected): QVariant(PhonyClass)
+-   Loc: [tst_cmptest.cpp(214)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(214)]
+ FAIL!  : tst_Cmptest::compare_tostring(both non-null user type) Compared values are not the same
+    Actual (actual): QVariant(PhonyClass,<value not representable as string>)
+    Expected (expected): QVariant(PhonyClass,<value not representable as string>)
+-   Loc: [tst_cmptest.cpp(214)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(214)]
++PASS   : tst_Cmptest::compareQStringLists(empty lists)
++PASS   : tst_Cmptest::compareQStringLists(equal lists)
+ FAIL!  : tst_Cmptest::compareQStringLists(last item different) Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS'
+-   Loc: [tst_cmptest.cpp(308)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(308)]
+ FAIL!  : tst_Cmptest::compareQStringLists(second-last item different) Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS'
+-   Loc: [tst_cmptest.cpp(308)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(308)]
+ FAIL!  : tst_Cmptest::compareQStringLists(prefix) Compared QStringLists have different sizes.
+    Actual (opA) size  : '2'
+    Expected (opB) size: '1'
+-   Loc: [tst_cmptest.cpp(308)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(308)]
+ FAIL!  : tst_Cmptest::compareQStringLists(short list second) Compared QStringLists have different sizes.
+    Actual (opA) size  : '12'
+    Expected (opB) size: '1'
+-   Loc: [tst_cmptest.cpp(308)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(308)]
+ FAIL!  : tst_Cmptest::compareQStringLists(short list first) Compared QStringLists have different sizes.
+    Actual (opA) size  : '1'
+    Expected (opB) size: '12'
+-   Loc: [tst_cmptest.cpp(308)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(308)]
++PASS   : tst_Cmptest::compareQPixmaps(both null)
+ FAIL!  : tst_Cmptest::compareQPixmaps(one null) Compared QPixmaps differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0
+-   Loc: [tst_cmptest.cpp(333)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(333)]
+ FAIL!  : tst_Cmptest::compareQPixmaps(other null) Compared QPixmaps differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1
+-   Loc: [tst_cmptest.cpp(333)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(333)]
++PASS   : tst_Cmptest::compareQPixmaps(equal)
+ FAIL!  : tst_Cmptest::compareQPixmaps(different size) Compared QPixmaps differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20
+-   Loc: [tst_cmptest.cpp(333)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(333)]
+ FAIL!  : tst_Cmptest::compareQPixmaps(different pixels) Compared values are not the same
+-   Loc: [tst_cmptest.cpp(333)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(333)]
++PASS   : tst_Cmptest::compareQImages(both null)
+ FAIL!  : tst_Cmptest::compareQImages(one null) Compared QImages differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0
+-   Loc: [tst_cmptest.cpp(360)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(360)]
+ FAIL!  : tst_Cmptest::compareQImages(other null) Compared QImages differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1
+-   Loc: [tst_cmptest.cpp(360)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(360)]
++PASS   : tst_Cmptest::compareQImages(equal)
+ FAIL!  : tst_Cmptest::compareQImages(different size) Compared QImages differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20
+-   Loc: [tst_cmptest.cpp(360)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(360)]
+ FAIL!  : tst_Cmptest::compareQImages(different format) Compared QImages differ in format.
+    Actual (opA)  : 6
+    Expected (opB): 3
+-   Loc: [tst_cmptest.cpp(360)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(360)]
+ FAIL!  : tst_Cmptest::compareQImages(different pixels) Compared values are not the same
+-   Loc: [tst_cmptest.cpp(360)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp(360)]
+ PASS   : tst_Cmptest::cleanupTestCase()
+-Totals: 4 passed, 18 failed, 0 skipped
++Totals: 11 passed, 18 failed, 0 skipped
+ ********* Finished testing of tst_Cmptest *********
+diff --git a/tests/auto/testlib/selftests/expected_cmptest.xml b/tests/auto/testlib/selftests/expected_cmptest.xml
+index aba1ce5..90bb313 100644
+--- a/tests/auto/testlib/selftests/expected_cmptest.xml
++++ b/tests/auto/testlib/selftests/expected_cmptest.xml
+@@ -14,25 +14,28 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="compare_tostring">
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[int, string]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(int,123)
+    Expected (expected): QVariant(QString,hi)]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both invalid]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[null hash, invalid]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(QVariantHash)
+    Expected (expected): QVariant()]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[string, null user type]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(QString,A simple string)
+    Expected (expected): QVariant(PhonyClass)]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="214">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="214">
+     <DataTag><![CDATA[both non-null user type]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+    Actual (actual): QVariant(PhonyClass,<value not representable as string>)
+@@ -40,31 +43,37 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQStringLists">
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[empty lists]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal lists]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[last item different]]></DataTag>
+     <Description><![CDATA[Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[second-last item different]]></DataTag>
+     <Description><![CDATA[Compared QStringLists differ at index 2.
+    Actual (opA) : 'string3'
+    Expected (opB) : 'DIFFERS']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[prefix]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '2'
+    Expected (opB) size: '1']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[short list second]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '12'
+    Expected (opB) size: '1']]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="308">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="308">
+     <DataTag><![CDATA[short list first]]></DataTag>
+     <Description><![CDATA[Compared QStringLists have different sizes.
+    Actual (opA) size  : '1'
+@@ -72,55 +81,67 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQPixmaps">
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both null]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[one null]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[other null]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[different size]]></DataTag>
+     <Description><![CDATA[Compared QPixmaps differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="333">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="333">
+     <DataTag><![CDATA[different pixels]]></DataTag>
+     <Description><![CDATA[Compared values are not the same]]></Description>
+ </Incident>
+ </TestFunction>
+ <TestFunction name="compareQImages">
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[both null]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[one null]]></DataTag>
+     <Description><![CDATA[Compared QImages differ.
+    Actual (opA).isNull()  : 1
+    Expected (opB).isNull(): 0]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[other null]]></DataTag>
+     <Description><![CDATA[Compared QImages differ.
+    Actual (opA).isNull()  : 0
+    Expected (opB).isNull(): 1]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[equal]]></DataTag>
++</Incident>
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different size]]></DataTag>
+     <Description><![CDATA[Compared QImages differ in size.
+    Actual (opA)  : 11x20
+    Expected (opB): 20x20]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different format]]></DataTag>
+     <Description><![CDATA[Compared QImages differ in format.
+    Actual (opA)  : 6
+    Expected (opB): 3]]></Description>
+ </Incident>
+-<Incident type="fail" file="tst_cmptest.cpp" line="360">
++<Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/cmptest/tst_cmptest.cpp" line="360">
+     <DataTag><![CDATA[different pixels]]></DataTag>
+     <Description><![CDATA[Compared values are not the same]]></Description>
+ </Incident>
+diff --git a/tests/auto/testlib/selftests/expected_commandlinedata.lightxml b/tests/auto/testlib/selftests/expected_commandlinedata.lightxml
+index 8de90f0..37eb5f5 100644
+--- a/tests/auto/testlib/selftests/expected_commandlinedata.lightxml
++++ b/tests/auto/testlib/selftests/expected_commandlinedata.lightxml
+@@ -10,30 +10,46 @@
+     <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data2]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data2]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data3]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data3]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data4]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data4]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data5]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveTablePasses">
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_commandlinedata.txt b/tests/auto/testlib/selftests/expected_commandlinedata.txt
+index c1b97e2..10e4916 100644
+--- a/tests/auto/testlib/selftests/expected_commandlinedata.txt
++++ b/tests/auto/testlib/selftests/expected_commandlinedata.txt
+@@ -4,21 +4,25 @@ INFO   : tst_DataTable::initTestCase() entering
+ PASS   : tst_DataTable::initTestCase()
+ INFO   : tst_DataTable::fiveTablePasses() entering
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data1) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data1)
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data2) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data2)
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data3) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data3)
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data4) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data4)
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data5) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
+-PASS   : tst_DataTable::fiveTablePasses()
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data5)
+ INFO   : tst_DataTable::fiveTablePasses() entering
+ INFO   : tst_DataTable::fiveTablePasses(fiveTablePasses_data1) QVERIFY(test)
+-   Loc: [tst_commandlinedata.cpp(30)]
+-PASS   : tst_DataTable::fiveTablePasses()
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp(65)]
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data1)
+ INFO   : tst_DataTable::cleanupTestCase() entering
+ PASS   : tst_DataTable::cleanupTestCase()
+-Totals: 4 passed, 0 failed, 0 skipped
++Totals: 8 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_DataTable *********
+diff --git a/tests/auto/testlib/selftests/expected_commandlinedata.xml b/tests/auto/testlib/selftests/expected_commandlinedata.xml
+index bfaf623..2296ae8 100644
+--- a/tests/auto/testlib/selftests/expected_commandlinedata.xml
++++ b/tests/auto/testlib/selftests/expected_commandlinedata.xml
+@@ -12,30 +12,46 @@
+     <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data2]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data2]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data3]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data3]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data4]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data4]]></DataTag>
++</Incident>
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data5]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveTablePasses">
+ <Message type="info" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/commandlinedata/tst_commandlinedata.cpp" line="65">
+     <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
+     <Description><![CDATA[QVERIFY(test)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data1]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_counting.lightxml b/tests/auto/testlib/selftests/expected_counting.lightxml
+index f16abef..fd80292 100644
+--- a/tests/auto/testlib/selftests/expected_counting.lightxml
++++ b/tests/auto/testlib/selftests/expected_counting.lightxml
+@@ -6,15 +6,26 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="testPassPass">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testPassSkip">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="102">
+     <DataTag><![CDATA[row 2]]></DataTag>
+     <Description><![CDATA[Skipping]]></Description>
+ </Message>
+ </TestFunction>
+ <TestFunction name="testPassFail">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="99">
+     <DataTag><![CDATA[row 2]]></DataTag>
+     <Description><![CDATA['false' returned FALSE. ()]]></Description>
+@@ -25,7 +36,9 @@
+     <DataTag><![CDATA[row 1]]></DataTag>
+     <Description><![CDATA[Skipping]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testSkipSkip">
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="102">
+@@ -52,6 +65,9 @@
+     <DataTag><![CDATA[row 1]]></DataTag>
+     <Description><![CDATA['false' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testFailSkip">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="99">
+diff --git a/tests/auto/testlib/selftests/expected_counting.txt b/tests/auto/testlib/selftests/expected_counting.txt
+index adf8001..bd70a44 100644
+--- a/tests/auto/testlib/selftests/expected_counting.txt
++++ b/tests/auto/testlib/selftests/expected_counting.txt
+@@ -1,14 +1,17 @@
+ ********* Start testing of tst_Counting *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_Counting::initTestCase()
+-PASS   : tst_Counting::testPassPass()
++PASS   : tst_Counting::testPassPass(row 1)
++PASS   : tst_Counting::testPassPass(row 2)
++PASS   : tst_Counting::testPassSkip(row 1)
+ SKIP   : tst_Counting::testPassSkip(row 2) Skipping
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(102)]
++PASS   : tst_Counting::testPassFail(row 1)
+ FAIL!  : tst_Counting::testPassFail(row 2) 'false' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(99)]
+ SKIP   : tst_Counting::testSkipPass(row 1) Skipping
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(102)]
+-PASS   : tst_Counting::testSkipPass()
++PASS   : tst_Counting::testSkipPass(row 2)
+ SKIP   : tst_Counting::testSkipSkip(row 1) Skipping
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(102)]
+ SKIP   : tst_Counting::testSkipSkip(row 2) Skipping
+@@ -19,6 +22,7 @@ FAIL!  : tst_Counting::testSkipFail(row 2) 'false' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(99)]
+ FAIL!  : tst_Counting::testFailPass(row 1) 'false' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(99)]
++PASS   : tst_Counting::testFailPass(row 2)
+ FAIL!  : tst_Counting::testFailSkip(row 1) 'false' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(99)]
+ SKIP   : tst_Counting::testFailSkip(row 2) Skipping
+@@ -28,5 +32,5 @@ FAIL!  : tst_Counting::testFailFail(row 1) 'false' returned FALSE. ()
+ FAIL!  : tst_Counting::testFailFail(row 2) 'false' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp(99)]
+ PASS   : tst_Counting::cleanupTestCase()
+-Totals: 4 passed, 6 failed, 6 skipped
++Totals: 8 passed, 6 failed, 6 skipped
+ ********* Finished testing of tst_Counting *********
+diff --git a/tests/auto/testlib/selftests/expected_counting.xml b/tests/auto/testlib/selftests/expected_counting.xml
+index f5982d7..c5460a7 100644
+--- a/tests/auto/testlib/selftests/expected_counting.xml
++++ b/tests/auto/testlib/selftests/expected_counting.xml
+@@ -8,15 +8,26 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="testPassPass">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testPassSkip">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="102">
+     <DataTag><![CDATA[row 2]]></DataTag>
+     <Description><![CDATA[Skipping]]></Description>
+ </Message>
+ </TestFunction>
+ <TestFunction name="testPassFail">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 1]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="99">
+     <DataTag><![CDATA[row 2]]></DataTag>
+     <Description><![CDATA['false' returned FALSE. ()]]></Description>
+@@ -27,7 +38,9 @@
+     <DataTag><![CDATA[row 1]]></DataTag>
+     <Description><![CDATA[Skipping]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testSkipSkip">
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="102">
+@@ -54,6 +67,9 @@
+     <DataTag><![CDATA[row 1]]></DataTag>
+     <Description><![CDATA['false' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[row 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="testFailSkip">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/counting/tst_counting.cpp" line="99">
+diff --git a/tests/auto/testlib/selftests/expected_counting.xunitxml b/tests/auto/testlib/selftests/expected_counting.xunitxml
+index c19a161..4965467 100644
+--- a/tests/auto/testlib/selftests/expected_counting.xunitxml
++++ b/tests/auto/testlib/selftests/expected_counting.xunitxml
+@@ -6,7 +6,7 @@
+   </properties>
+   <testcase result="pass" name="initTestCase"/>
+   <testcase result="pass" name="testPassPass"/>
+-  <testcase name="testPassSkip">
++  <testcase result="pass" name="testPassSkip">
+     <!-- tag="row 2" message="Skipping" type="skip" -->
+   </testcase>
+   <testcase result="fail" name="testPassFail">
+diff --git a/tests/auto/testlib/selftests/expected_datatable.lightxml b/tests/auto/testlib/selftests/expected_datatable.lightxml
+index 1741b6f..83ac0c0 100644
+--- a/tests/auto/testlib/selftests/expected_datatable.lightxml
++++ b/tests/auto/testlib/selftests/expected_datatable.lightxml
+@@ -12,7 +12,21 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="fiveTablePasses">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveTableFailures">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+@@ -41,18 +55,54 @@
+     <DataTag><![CDATA[startsWithFailure_data 1]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="endsWithFailure">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 4]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+     <DataTag><![CDATA[endsWithFailure 5]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
+ </TestFunction>
+ <TestFunction name="failureInMiddle">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 2]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+     <DataTag><![CDATA[failureInMiddle_data 3]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveIsolatedFailures">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="173">
+diff --git a/tests/auto/testlib/selftests/expected_datatable.txt b/tests/auto/testlib/selftests/expected_datatable.txt
+index 4031ca2..68c33e6 100644
+--- a/tests/auto/testlib/selftests/expected_datatable.txt
++++ b/tests/auto/testlib/selftests/expected_datatable.txt
+@@ -3,33 +3,49 @@ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE
+ PASS   : tst_DataTable::initTestCase()
+ PASS   : tst_DataTable::singleTestFunction1()
+ PASS   : tst_DataTable::singleTestFunction2()
+-PASS   : tst_DataTable::fiveTablePasses()
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data 1)
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data 2)
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data 3)
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data 4)
++PASS   : tst_DataTable::fiveTablePasses(fiveTablePasses_data 5)
+ FAIL!  : tst_DataTable::fiveTableFailures(fiveTableFailures_data 1) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
+ FAIL!  : tst_DataTable::fiveTableFailures(fiveTableFailures_data 2) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
+ FAIL!  : tst_DataTable::fiveTableFailures(fiveTableFailures_data 3) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
+ FAIL!  : tst_DataTable::fiveTableFailures(fiveTableFailures_data 4) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
+ FAIL!  : tst_DataTable::fiveTableFailures(fiveTableFailures_data 5) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
+ FAIL!  : tst_DataTable::startsWithFailure(startsWithFailure_data 1) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
++PASS   : tst_DataTable::startsWithFailure(startsWithFailure_data 2)
++PASS   : tst_DataTable::startsWithFailure(startsWithFailure_data 3)
++PASS   : tst_DataTable::startsWithFailure(startsWithFailure_data 4)
++PASS   : tst_DataTable::startsWithFailure(startsWithFailure_data 5)
++PASS   : tst_DataTable::endsWithFailure(endsWithFailure 1)
++PASS   : tst_DataTable::endsWithFailure(endsWithFailure 2)
++PASS   : tst_DataTable::endsWithFailure(endsWithFailure 3)
++PASS   : tst_DataTable::endsWithFailure(endsWithFailure 4)
+ FAIL!  : tst_DataTable::endsWithFailure(endsWithFailure 5) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
++PASS   : tst_DataTable::failureInMiddle(failureInMiddle_data 1)
++PASS   : tst_DataTable::failureInMiddle(failureInMiddle_data 2)
+ FAIL!  : tst_DataTable::failureInMiddle(failureInMiddle_data 3) 'test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(58)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(91)]
++PASS   : tst_DataTable::failureInMiddle(failureInMiddle_data 4)
++PASS   : tst_DataTable::failureInMiddle(failureInMiddle_data 5)
+ FAIL!  : tst_DataTable::fiveIsolatedFailures(fiveIsolatedFailures_data 1) '!test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(140)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(173)]
+ FAIL!  : tst_DataTable::fiveIsolatedFailures(fiveIsolatedFailures_data 2) '!test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(140)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(173)]
+ FAIL!  : tst_DataTable::fiveIsolatedFailures(fiveIsolatedFailures_data 3) '!test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(140)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(173)]
+ FAIL!  : tst_DataTable::fiveIsolatedFailures(fiveIsolatedFailures_data 4) '!test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(140)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(173)]
+ FAIL!  : tst_DataTable::fiveIsolatedFailures(fiveIsolatedFailures_data 5) '!test' returned FALSE. ()
+-   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(140)]
++   Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp(173)]
+ PASS   : tst_DataTable::cleanupTestCase()
+-Totals: 5 passed, 13 failed, 0 skipped
++Totals: 21 passed, 13 failed, 0 skipped
+ ********* Finished testing of tst_DataTable *********
+diff --git a/tests/auto/testlib/selftests/expected_datatable.xml b/tests/auto/testlib/selftests/expected_datatable.xml
+index ce123d8..132b34e 100644
+--- a/tests/auto/testlib/selftests/expected_datatable.xml
++++ b/tests/auto/testlib/selftests/expected_datatable.xml
+@@ -14,7 +14,21 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="fiveTablePasses">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[fiveTablePasses_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveTableFailures">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+@@ -43,18 +57,54 @@
+     <DataTag><![CDATA[startsWithFailure_data 1]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[startsWithFailure_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="endsWithFailure">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 2]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 3]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[endsWithFailure 4]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+     <DataTag><![CDATA[endsWithFailure 5]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
+ </TestFunction>
+ <TestFunction name="failureInMiddle">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 2]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="91">
+     <DataTag><![CDATA[failureInMiddle_data 3]]></DataTag>
+     <Description><![CDATA['test' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 4]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[failureInMiddle_data 5]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="fiveIsolatedFailures">
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datatable/tst_datatable.cpp" line="173">
+diff --git a/tests/auto/testlib/selftests/expected_datetime.lightxml b/tests/auto/testlib/selftests/expected_datetime.lightxml
+index 0024b10..17fd48a 100644
+--- a/tests/auto/testlib/selftests/expected_datetime.lightxml
++++ b/tests/auto/testlib/selftests/expected_datetime.lightxml
+@@ -13,6 +13,9 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="qurl">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[empty urls]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datetime/tst_datetime.cpp" line="74">
+     <DataTag><![CDATA[empty rhs]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+@@ -25,6 +28,9 @@
+    Actual (operandA): 
+    Expected (operandB): http://example.com]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[same urls]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_datetime.txt b/tests/auto/testlib/selftests/expected_datetime.txt
+index e2966b9..239886c 100644
+--- a/tests/auto/testlib/selftests/expected_datetime.txt
++++ b/tests/auto/testlib/selftests/expected_datetime.txt
+@@ -5,6 +5,7 @@ FAIL!  : tst_DateTime::dateTime() Compared values are not the same
+    Actual (local): 2000/05/03 04:03:04.000[local time]
+    Expected (utc): 2000/05/03 04:03:04.000[UTC]
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datetime/tst_datetime.cpp(33)]
++PASS   : tst_DateTime::qurl(empty urls)
+ FAIL!  : tst_DateTime::qurl(empty rhs) Compared values are not the same
+    Actual (operandA): http://example.com
+    Expected (operandB): 
+@@ -13,6 +14,7 @@ FAIL!  : tst_DateTime::qurl(empty lhs) Compared values are not the same
+    Actual (operandA): 
+    Expected (operandB): http://example.com
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datetime/tst_datetime.cpp(41)]
++PASS   : tst_DateTime::qurl(same urls)
+ PASS   : tst_DateTime::cleanupTestCase()
+-Totals: 2 passed, 3 failed, 0 skipped
++Totals: 4 passed, 3 failed, 0 skipped
+ ********* Finished testing of tst_DateTime *********
+diff --git a/tests/auto/testlib/selftests/expected_datetime.xml b/tests/auto/testlib/selftests/expected_datetime.xml
+index f1b5a6a..747ff13 100644
+--- a/tests/auto/testlib/selftests/expected_datetime.xml
++++ b/tests/auto/testlib/selftests/expected_datetime.xml
+@@ -15,6 +15,9 @@
+ </Incident>
+ </TestFunction>
+ <TestFunction name="qurl">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[empty urls]]></DataTag>
++</Incident>
+ <Incident type="fail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/datetime/tst_datetime.cpp" line="74">
+     <DataTag><![CDATA[empty rhs]]></DataTag>
+     <Description><![CDATA[Compared values are not the same
+@@ -27,6 +30,9 @@
+    Actual (operandA): 
+    Expected (operandB): http://example.com]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[same urls]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_expectfail.lightxml b/tests/auto/testlib/selftests/expected_expectfail.lightxml
+index eab0bbb..8fdac12 100644
+--- a/tests/auto/testlib/selftests/expected_expectfail.lightxml
++++ b/tests/auto/testlib/selftests/expected_expectfail.lightxml
+@@ -41,29 +41,47 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="xfailDataDriven">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass 2]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="135">
+     <DataTag><![CDATA[Abort]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Abort]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="135">
+     <DataTag><![CDATA[Continue]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Continue]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailOnWrongRow">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[right row]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailOnAnyRow">
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="170">
+     <DataTag><![CDATA[first row]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[first row]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="170">
+     <DataTag><![CDATA[second row]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[second row]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailWithoutVerify">
+ <Incident type="fail" file="" line="0">
+@@ -85,6 +103,9 @@
+     <DataTag><![CDATA[XPass]]></DataTag>
+     <Description><![CDATA['true' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_expectfail.txt b/tests/auto/testlib/selftests/expected_expectfail.txt
+index 0286490..f1ad406 100644
+--- a/tests/auto/testlib/selftests/expected_expectfail.txt
++++ b/tests/auto/testlib/selftests/expected_expectfail.txt
+@@ -17,23 +17,28 @@ XFAIL  : tst_ExpectFail::xfailWithQString() A string
+ XFAIL  : tst_ExpectFail::xfailWithQString() Bug 5 (The message)
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(106)]
+ PASS   : tst_ExpectFail::xfailWithQString()
++PASS   : tst_ExpectFail::xfailDataDriven(Pass 1)
++PASS   : tst_ExpectFail::xfailDataDriven(Pass 2)
+ XFAIL  : tst_ExpectFail::xfailDataDriven(Abort) This test should xfail
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(135)]
++PASS   : tst_ExpectFail::xfailDataDriven(Abort)
+ XFAIL  : tst_ExpectFail::xfailDataDriven(Continue) This test should xfail
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(135)]
+-PASS   : tst_ExpectFail::xfailDataDriven()
+-PASS   : tst_ExpectFail::xfailOnWrongRow()
++PASS   : tst_ExpectFail::xfailDataDriven(Continue)
++PASS   : tst_ExpectFail::xfailOnWrongRow(right row)
+ XFAIL  : tst_ExpectFail::xfailOnAnyRow(first row) This test should xfail
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(170)]
++PASS   : tst_ExpectFail::xfailOnAnyRow(first row)
+ XFAIL  : tst_ExpectFail::xfailOnAnyRow(second row) This test should xfail
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(170)]
+-PASS   : tst_ExpectFail::xfailOnAnyRow()
++PASS   : tst_ExpectFail::xfailOnAnyRow(second row)
+ FAIL!  : tst_ExpectFail::xfailWithoutVerify(first row) QEXPECT_FAIL was called without any subsequent verification statements
+ FAIL!  : tst_ExpectFail::xfailWithoutVerify(second row) QEXPECT_FAIL was called without any subsequent verification statements
+ XPASS  : tst_ExpectFail::xpass() 'true' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(190)]
+ XPASS  : tst_ExpectFail::xpassDataDriven(XPass) 'true' returned FALSE. ()
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp(212)]
++PASS   : tst_ExpectFail::xpassDataDriven(Pass)
+ PASS   : tst_ExpectFail::cleanupTestCase()
+-Totals: 8 passed, 5 failed, 0 skipped
++Totals: 13 passed, 5 failed, 0 skipped
+ ********* Finished testing of tst_ExpectFail *********
+diff --git a/tests/auto/testlib/selftests/expected_expectfail.xml b/tests/auto/testlib/selftests/expected_expectfail.xml
+index 3c8baf9..cb061f5 100644
+--- a/tests/auto/testlib/selftests/expected_expectfail.xml
++++ b/tests/auto/testlib/selftests/expected_expectfail.xml
+@@ -43,29 +43,47 @@
+ <Incident type="pass" file="" line="0" />
+ </TestFunction>
+ <TestFunction name="xfailDataDriven">
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass 1]]></DataTag>
++</Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass 2]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="135">
+     <DataTag><![CDATA[Abort]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Abort]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="135">
+     <DataTag><![CDATA[Continue]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Continue]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailOnWrongRow">
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[right row]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailOnAnyRow">
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="170">
+     <DataTag><![CDATA[first row]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[first row]]></DataTag>
++</Incident>
+ <Incident type="xfail" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/expectfail/tst_expectfail.cpp" line="170">
+     <DataTag><![CDATA[second row]]></DataTag>
+     <Description><![CDATA[This test should xfail]]></Description>
+ </Incident>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[second row]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="xfailWithoutVerify">
+ <Incident type="fail" file="" line="0">
+@@ -87,6 +105,9 @@
+     <DataTag><![CDATA[XPass]]></DataTag>
+     <Description><![CDATA['true' returned FALSE. ()]]></Description>
+ </Incident>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[Pass]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_float.txt b/tests/auto/testlib/selftests/expected_float.txt
+index 81e4d7b..6ebbeff 100644
+--- a/tests/auto/testlib/selftests/expected_float.txt
++++ b/tests/auto/testlib/selftests/expected_float.txt
+@@ -1,6 +1,7 @@
+ ********* Start testing of tst_float *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_float::initTestCase()
++PASS   : tst_float::floatComparisons(should SUCCEED 1)
+ FAIL!  : tst_float::floatComparisons(should FAIL 1) Compared floats are not the same (fuzzy compare)
+    Actual (operandLeft): 1
+    Expected (operandRight): 3
+@@ -13,6 +14,7 @@ FAIL!  : tst_float::floatComparisons(should FAIL 3) Compared floats are not the
+    Actual (operandLeft): 99998
+    Expected (operandRight): 99999
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/float/tst_float.cpp(61)]
++PASS   : tst_float::floatComparisons(should SUCCEED 2)
+ FAIL!  : tst_float::compareFloatTests(1e0) Compared floats are not the same (fuzzy compare)
+    Actual (t1): 1
+    Expected (t3): 3
+@@ -26,5 +28,5 @@ FAIL!  : tst_float::compareFloatTests(1e+7) Compared floats are not the same (fu
+    Expected (t3): 3e+07
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/float/tst_float.cpp(104)]
+ PASS   : tst_float::cleanupTestCase()
+-Totals: 2 passed, 6 failed, 0 skipped
++Totals: 4 passed, 6 failed, 0 skipped
+ ********* Finished testing of tst_float *********
+diff --git a/tests/auto/testlib/selftests/expected_globaldata.lightxml b/tests/auto/testlib/selftests/expected_globaldata.lightxml
+index 7a50f01..6d68bfb 100644
+--- a/tests/auto/testlib/selftests/expected_globaldata.lightxml
++++ b/tests/auto/testlib/selftests/expected_globaldata.lightxml
+@@ -25,6 +25,9 @@
+     <DataTag><![CDATA[1:local 1]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[init testGlobal local 2 ]]></Description>
+@@ -41,6 +44,9 @@
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 2 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[init testGlobal local 1 ]]></Description>
+@@ -57,6 +63,9 @@
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[init testGlobal local 2 ]]></Description>
+@@ -73,7 +82,9 @@
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="skip">
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/globaldata/tst_globaldata.cpp" line="129">
+@@ -120,6 +131,9 @@
+     <DataTag><![CDATA[1:local 1]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[init skipSingle local 2 ]]></Description>
+@@ -132,6 +146,9 @@
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 2 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[init skipSingle local 1 ]]></Description>
+@@ -156,7 +173,9 @@
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Message type="qdebug" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_globaldata.txt b/tests/auto/testlib/selftests/expected_globaldata.txt
+index e3905e2..59b95fa 100644
+--- a/tests/auto/testlib/selftests/expected_globaldata.txt
++++ b/tests/auto/testlib/selftests/expected_globaldata.txt
+@@ -6,19 +6,22 @@ QDEBUG : tst_globaldata::testGlobal(1:local 1) init testGlobal local 1
+ QDEBUG : tst_globaldata::testGlobal(1:local 1) global: false 
+ QDEBUG : tst_globaldata::testGlobal(1:local 1) local: false 
+ QDEBUG : tst_globaldata::testGlobal(1:local 1) cleanup testGlobal local 1 
++PASS   : tst_globaldata::testGlobal(1:local 1)
+ QDEBUG : tst_globaldata::testGlobal(1:local 2) init testGlobal local 2 
+ QDEBUG : tst_globaldata::testGlobal(1:local 2) global: false 
+ QDEBUG : tst_globaldata::testGlobal(1:local 2) local: true 
+ QDEBUG : tst_globaldata::testGlobal(1:local 2) cleanup testGlobal local 2 
++PASS   : tst_globaldata::testGlobal(1:local 2)
+ QDEBUG : tst_globaldata::testGlobal(2:local 1) init testGlobal local 1 
+ QDEBUG : tst_globaldata::testGlobal(2:local 1) global: true 
+ QDEBUG : tst_globaldata::testGlobal(2:local 1) local: false 
+ QDEBUG : tst_globaldata::testGlobal(2:local 1) cleanup testGlobal local 1 
++PASS   : tst_globaldata::testGlobal(2:local 1)
+ QDEBUG : tst_globaldata::testGlobal(2:local 2) init testGlobal local 2 
+ QDEBUG : tst_globaldata::testGlobal(2:local 2) global: true 
+ QDEBUG : tst_globaldata::testGlobal(2:local 2) local: true 
+ QDEBUG : tst_globaldata::testGlobal(2:local 2) cleanup testGlobal local 2 
+-PASS   : tst_globaldata::testGlobal()
++PASS   : tst_globaldata::testGlobal(2:local 2)
+ SKIP   : tst_globaldata::skip(1) skipping
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/globaldata/tst_globaldata.cpp(129)]
+ QDEBUG : tst_globaldata::skipLocal(1:local 1) init skipLocal local 1 
+@@ -32,9 +35,11 @@ QDEBUG : tst_globaldata::skipLocal(1:local 2) cleanup skipLocal local 2
+ QDEBUG : tst_globaldata::skipSingle(1:local 1) init skipSingle local 1 
+ QDEBUG : tst_globaldata::skipSingle(1:local 1) global: false local: false 
+ QDEBUG : tst_globaldata::skipSingle(1:local 1) cleanup skipSingle local 1 
++PASS   : tst_globaldata::skipSingle(1:local 1)
+ QDEBUG : tst_globaldata::skipSingle(1:local 2) init skipSingle local 2 
+ QDEBUG : tst_globaldata::skipSingle(1:local 2) global: false local: true 
+ QDEBUG : tst_globaldata::skipSingle(1:local 2) cleanup skipSingle local 2 
++PASS   : tst_globaldata::skipSingle(1:local 2)
+ QDEBUG : tst_globaldata::skipSingle(2:local 1) init skipSingle local 1 
+ SKIP   : tst_globaldata::skipSingle(2:local 1) skipping
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/globaldata/tst_globaldata.cpp(143)]
+@@ -42,8 +47,8 @@ QDEBUG : tst_globaldata::skipSingle(2:local 1) cleanup skipSingle local 1
+ QDEBUG : tst_globaldata::skipSingle(2:local 2) init skipSingle local 2 
+ QDEBUG : tst_globaldata::skipSingle(2:local 2) global: true local: true 
+ QDEBUG : tst_globaldata::skipSingle(2:local 2) cleanup skipSingle local 2 
+-PASS   : tst_globaldata::skipSingle()
++PASS   : tst_globaldata::skipSingle(2:local 2)
+ QDEBUG : tst_globaldata::cleanupTestCase() cleanupTestCase cleanupTestCase (null) 
+ PASS   : tst_globaldata::cleanupTestCase()
+-Totals: 4 passed, 0 failed, 4 skipped
++Totals: 9 passed, 0 failed, 4 skipped
+ ********* Finished testing of tst_globaldata *********
+diff --git a/tests/auto/testlib/selftests/expected_globaldata.xml b/tests/auto/testlib/selftests/expected_globaldata.xml
+index 9abbeee..09edaac 100644
+--- a/tests/auto/testlib/selftests/expected_globaldata.xml
++++ b/tests/auto/testlib/selftests/expected_globaldata.xml
+@@ -27,6 +27,9 @@
+     <DataTag><![CDATA[1:local 1]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[init testGlobal local 2 ]]></Description>
+@@ -43,6 +46,9 @@
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 2 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[init testGlobal local 1 ]]></Description>
+@@ -59,6 +65,9 @@
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[init testGlobal local 2 ]]></Description>
+@@ -75,7 +84,9 @@
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[cleanup testGlobal local 2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="skip">
+ <Message type="skip" file="/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/globaldata/tst_globaldata.cpp" line="129">
+@@ -122,6 +133,9 @@
+     <DataTag><![CDATA[1:local 1]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[init skipSingle local 2 ]]></Description>
+@@ -134,6 +148,9 @@
+     <DataTag><![CDATA[1:local 2]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 2 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[1:local 2]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[2:local 1]]></DataTag>
+     <Description><![CDATA[init skipSingle local 1 ]]></Description>
+@@ -158,7 +175,9 @@
+     <DataTag><![CDATA[2:local 2]]></DataTag>
+     <Description><![CDATA[cleanup skipSingle local 2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[2:local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Message type="qdebug" file="" line="0">
+diff --git a/tests/auto/testlib/selftests/expected_qexecstringlist.txt b/tests/auto/testlib/selftests/expected_qexecstringlist.txt
+index 87df97a..da283e1 100644
+--- a/tests/auto/testlib/selftests/expected_qexecstringlist.txt
++++ b/tests/auto/testlib/selftests/expected_qexecstringlist.txt
+@@ -2,19 +2,23 @@
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_QExecStringList::initTestCase()
+ PASS   : tst_QExecStringList::testA()
+-PASS   : tst_QExecStringList::testB()
++PASS   : tst_QExecStringList::testB(Data1)
++PASS   : tst_QExecStringList::testB(Data2)
++PASS   : tst_QExecStringList::testB(Data3)
+ PASS   : tst_QExecStringList::testC()
+ PASS   : tst_QExecStringList::cleanupTestCase()
+-Totals: 5 passed, 0 failed, 0 skipped
++Totals: 7 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_QExecStringList *********
+ ********* Start testing of tst_QExecStringList *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_QExecStringList::initTestCase()
+ PASS   : tst_QExecStringList::testA()
+-PASS   : tst_QExecStringList::testB()
++PASS   : tst_QExecStringList::testB(Data1)
++PASS   : tst_QExecStringList::testB(Data2)
++PASS   : tst_QExecStringList::testB(Data3)
+ PASS   : tst_QExecStringList::testC()
+ PASS   : tst_QExecStringList::cleanupTestCase()
+-Totals: 5 passed, 0 failed, 0 skipped
++Totals: 7 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_QExecStringList *********
+ ********* Start testing of tst_QExecStringList *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+@@ -26,14 +30,16 @@ Totals: 3 passed, 0 failed, 0 skipped
+ ********* Start testing of tst_QExecStringList *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_QExecStringList::initTestCase()
+-PASS   : tst_QExecStringList::testB()
++PASS   : tst_QExecStringList::testB(Data1)
++PASS   : tst_QExecStringList::testB(Data2)
++PASS   : tst_QExecStringList::testB(Data3)
+ PASS   : tst_QExecStringList::cleanupTestCase()
+-Totals: 3 passed, 0 failed, 0 skipped
++Totals: 5 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_QExecStringList *********
+ ********* Start testing of tst_QExecStringList *********
+ Config: Using QTest library @INSERT_QT_VERSION_HERE@, Qt @INSERT_QT_VERSION_HERE@
+ PASS   : tst_QExecStringList::initTestCase()
+-PASS   : tst_QExecStringList::testB()
++PASS   : tst_QExecStringList::testB(Data2)
+ PASS   : tst_QExecStringList::cleanupTestCase()
+ Totals: 3 passed, 0 failed, 0 skipped
+ ********* Finished testing of tst_QExecStringList *********
+diff --git a/tests/auto/testlib/selftests/expected_skip.lightxml b/tests/auto/testlib/selftests/expected_skip.lightxml
+index 8399a76..b01570e 100644
+--- a/tests/auto/testlib/selftests/expected_skip.lightxml
++++ b/tests/auto/testlib/selftests/expected_skip.lightxml
+@@ -24,7 +24,9 @@
+     <DataTag><![CDATA[local 2]]></DataTag>
+     <Description><![CDATA[this line should only be reached once (true)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_skip.txt b/tests/auto/testlib/selftests/expected_skip.txt
+index e18386e..fadbc96 100644
+--- a/tests/auto/testlib/selftests/expected_skip.txt
++++ b/tests/auto/testlib/selftests/expected_skip.txt
+@@ -8,7 +8,7 @@ SKIP   : tst_Skip::emptytest() skipping all
+ SKIP   : tst_Skip::singleSkip(local 1) skipping one
+    Loc: [/home/user/dev/qt5/qtbase/tests/auto/testlib/selftests/skip/tst_skip.cpp(97)]
+ QDEBUG : tst_Skip::singleSkip(local 2) this line should only be reached once (true)
+-PASS   : tst_Skip::singleSkip()
++PASS   : tst_Skip::singleSkip(local 2)
+ PASS   : tst_Skip::cleanupTestCase()
+ Totals: 3 passed, 0 failed, 3 skipped
+ ********* Finished testing of tst_Skip *********
+diff --git a/tests/auto/testlib/selftests/expected_skip.xml b/tests/auto/testlib/selftests/expected_skip.xml
+index d0e45d0..6609c04 100644
+--- a/tests/auto/testlib/selftests/expected_skip.xml
++++ b/tests/auto/testlib/selftests/expected_skip.xml
+@@ -26,7 +26,9 @@
+     <DataTag><![CDATA[local 2]]></DataTag>
+     <Description><![CDATA[this line should only be reached once (true)]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[local 2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="cleanupTestCase">
+ <Incident type="pass" file="" line="0" />
+diff --git a/tests/auto/testlib/selftests/expected_subtest.lightxml b/tests/auto/testlib/selftests/expected_subtest.lightxml
+index d76ec13..e7d8d53 100644
+--- a/tests/auto/testlib/selftests/expected_subtest.lightxml
++++ b/tests/auto/testlib/selftests/expected_subtest.lightxml
+@@ -43,6 +43,9 @@
+     <DataTag><![CDATA[data0]]></DataTag>
+     <Description><![CDATA[cleanup test2 data0 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[init test2 data1 ]]></Description>
+@@ -59,6 +62,9 @@
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[cleanup test2 data1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data2]]></DataTag>
+     <Description><![CDATA[init test2 data2 ]]></Description>
+@@ -75,7 +81,9 @@
+     <DataTag><![CDATA[data2]]></DataTag>
+     <Description><![CDATA[cleanup test2 data2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="test3">
+ <Message type="qdebug" file="" line="0">
+@@ -100,6 +108,9 @@
+     <DataTag><![CDATA[data0]]></DataTag>
+     <Description><![CDATA[cleanup test3 data0 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[init test3 data1 ]]></Description>
+diff --git a/tests/auto/testlib/selftests/expected_subtest.txt b/tests/auto/testlib/selftests/expected_subtest.txt
+index e35fb80..7b29bfc 100644
+--- a/tests/auto/testlib/selftests/expected_subtest.txt
++++ b/tests/auto/testlib/selftests/expected_subtest.txt
+@@ -12,21 +12,24 @@ QDEBUG : tst_Subtest::test2(data0) init test2 data0
+ QDEBUG : tst_Subtest::test2(data0) test2 test2 data0 
+ QDEBUG : tst_Subtest::test2(data0) test2 end 
+ QDEBUG : tst_Subtest::test2(data0) cleanup test2 data0 
++PASS   : tst_Subtest::test2(data0)
+ QDEBUG : tst_Subtest::test2(data1) init test2 data1 
+ QDEBUG : tst_Subtest::test2(data1) test2 test2 data1 
+ QDEBUG : tst_Subtest::test2(data1) test2 end 
+ QDEBUG : tst_Subtest::test2(data1) cleanup test2 data1 
++PASS   : tst_Subtest::test2(data1)
+ QDEBUG : tst_Subtest::test2(data2) init test2 data2 
+ QDEBUG : tst_Subtest::test2(data2) test2 test2 data2 
+ QDEBUG : tst_Subtest::test2(data2) test2 end 
+ QDEBUG : tst_Subtest::test2(data2) cleanup test2 data2 
+-PASS   : tst_Subtest::test2()
++PASS   : tst_Subtest::test2(data2)
+ QDEBUG : tst_Subtest::test3() test3_data test3 (null) 
+ QDEBUG : tst_Subtest::test3() test3_data end 
+ QDEBUG : tst_Subtest::test3(data0) init test3 data0 
+ QDEBUG : tst_Subtest::test3(data0) test2 test3 data0 
+ QDEBUG : tst_Subtest::test3(data0) test2 end 
+ QDEBUG : tst_Subtest::test3(data0) cleanup test3 data0 
++PASS   : tst_Subtest::test3(data0)
+ QDEBUG : tst_Subtest::test3(data1) init test3 data1 
+ QDEBUG : tst_Subtest::test3(data1) test2 test3 data1 
+ FAIL!  : tst_Subtest::test3(data1) Compared values are not the same
+@@ -43,5 +46,5 @@ FAIL!  : tst_Subtest::test3(data2) Compared values are not the same
+ QDEBUG : tst_Subtest::test3(data2) cleanup test3 data2 
+ QDEBUG : tst_Subtest::cleanupTestCase() cleanupTestCase cleanupTestCase (null) 
+ PASS   : tst_Subtest::cleanupTestCase()
+-Totals: 4 passed, 2 failed, 0 skipped
++Totals: 7 passed, 2 failed, 0 skipped
+ ********* Finished testing of tst_Subtest *********
+diff --git a/tests/auto/testlib/selftests/expected_subtest.xml b/tests/auto/testlib/selftests/expected_subtest.xml
+index d79242f..8a38465 100644
+--- a/tests/auto/testlib/selftests/expected_subtest.xml
++++ b/tests/auto/testlib/selftests/expected_subtest.xml
+@@ -45,6 +45,9 @@
+     <DataTag><![CDATA[data0]]></DataTag>
+     <Description><![CDATA[cleanup test2 data0 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[init test2 data1 ]]></Description>
+@@ -61,6 +64,9 @@
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[cleanup test2 data1 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data1]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data2]]></DataTag>
+     <Description><![CDATA[init test2 data2 ]]></Description>
+@@ -77,7 +83,9 @@
+     <DataTag><![CDATA[data2]]></DataTag>
+     <Description><![CDATA[cleanup test2 data2 ]]></Description>
+ </Message>
+-<Incident type="pass" file="" line="0" />
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data2]]></DataTag>
++</Incident>
+ </TestFunction>
+ <TestFunction name="test3">
+ <Message type="qdebug" file="" line="0">
+@@ -102,6 +110,9 @@
+     <DataTag><![CDATA[data0]]></DataTag>
+     <Description><![CDATA[cleanup test3 data0 ]]></Description>
+ </Message>
++<Incident type="pass" file="" line="0">
++    <DataTag><![CDATA[data0]]></DataTag>
++</Incident>
+ <Message type="qdebug" file="" line="0">
+     <DataTag><![CDATA[data1]]></DataTag>
+     <Description><![CDATA[init test3 data1 ]]></Description>

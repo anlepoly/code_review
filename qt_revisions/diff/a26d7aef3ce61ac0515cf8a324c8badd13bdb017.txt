@@ -1,0 +1,304 @@
+diff --git a/src/qml/qml/qqmlcompiler.cpp b/src/qml/qml/qqmlcompiler.cpp
+index f862586..218d719 100644
+--- a/src/qml/qml/qqmlcompiler.cpp
++++ b/src/qml/qml/qqmlcompiler.cpp
+@@ -1155,7 +1155,7 @@ bool QQmlCompiler::buildObject(QQmlScript::Object *obj, const BindingContext &ct
+     return true;
+ }
+ 
+-void QQmlCompiler::genObject(QQmlScript::Object *obj)
++void QQmlCompiler::genObject(QQmlScript::Object *obj, bool parentToSuper)
+ {
+     QQmlCompiledData::TypeReference &tr = output->types[obj->type];
+     if (tr.type && obj->metatype->metaObject() == &QQmlComponent::staticMetaObject) {
+@@ -1173,6 +1173,7 @@ void QQmlCompiler::genObject(QQmlScript::Object *obj)
+         create.type = obj->type;
+         create.line = obj->location.start.line;
+         create.column = obj->location.start.column;
++        create.parentToSuper = parentToSuper;
+         output->addInstruction(create);
+ 
+     } else {
+@@ -1186,6 +1187,7 @@ void QQmlCompiler::genObject(QQmlScript::Object *obj)
+                 create.data = output->indexForByteArray(obj->custom);
+             create.type = obj->type;
+             create.isRoot = (compileState->root == obj);
++            create.parentToSuper = parentToSuper;
+             output->addInstruction(create);
+         } else {
+             Instruction::CreateQMLObject create;
+@@ -1975,31 +1977,25 @@ void QQmlCompiler::genPropertyAssignment(QQmlScript::Property *prop,
+                  v->type == Value::ValueInterceptor);
+ 
+         if (v->type == Value::ValueSource) {
+-            genObject(v->object);
++            genObject(v->object, valueTypeProperty?true:false);
+ 
+             Instruction::StoreValueSource store;
+-            if (valueTypeProperty) {
++            if (valueTypeProperty)
+                 store.property = genValueTypeData(prop, valueTypeProperty);
+-                store.owner = 1;
+-            } else {
++            else
+                 store.property = prop->core;
+-                store.owner = 0;
+-            }
+             QQmlType *valueType = toQmlType(v->object);
+             store.castValue = valueType->propertyValueSourceCast();
+             output->addInstruction(store);
+ 
+         } else if (v->type == Value::ValueInterceptor) {
+-            genObject(v->object);
++            genObject(v->object, valueTypeProperty?true:false);
+ 
+             Instruction::StoreValueInterceptor store;
+-            if (valueTypeProperty) {
++            if (valueTypeProperty)
+                 store.property = genValueTypeData(prop, valueTypeProperty);
+-                store.owner = 1;
+-            } else {
++            else
+                 store.property = prop->core;
+-                store.owner = 0;
+-            }
+             QQmlType *valueType = toQmlType(v->object);
+             store.castValue = valueType->propertyValueInterceptorCast();
+             output->addInstruction(store);
+diff --git a/src/qml/qml/qqmlcompiler_p.h b/src/qml/qml/qqmlcompiler_p.h
+index 2339b6c..4b730c2 100644
+--- a/src/qml/qml/qqmlcompiler_p.h
++++ b/src/qml/qml/qqmlcompiler_p.h
+@@ -373,7 +373,7 @@ private:
+     bool checkValidId(QQmlScript::Value *, const QString &);
+ 
+ 
+-    void genObject(QQmlScript::Object *obj);
++    void genObject(QQmlScript::Object *obj, bool parentToSuper = false);
+     void genObjectBody(QQmlScript::Object *obj);
+     void genValueTypeProperty(QQmlScript::Object *obj,QQmlScript::Property *);
+     void genComponent(QQmlScript::Object *obj);
+diff --git a/src/qml/qml/qqmldata_p.h b/src/qml/qml/qqmldata_p.h
+index eba2f4d..879d597 100644
+--- a/src/qml/qml/qqmldata_p.h
++++ b/src/qml/qml/qqmldata_p.h
+@@ -80,7 +80,7 @@ public:
+     QQmlData()
+         : ownMemory(true), ownContext(false), indestructible(true), explicitIndestructibleSet(false), 
+           hasTaintedV8Object(false), isQueuedForDeletion(false), rootObjectInCreation(false),
+-          hasVMEMetaObject(false), notifyList(0), context(0), outerContext(0),
++          hasVMEMetaObject(false), parentFrozen(false), notifyList(0), context(0), outerContext(0),
+           bindings(0), signalHandlers(0), nextContextObject(0), prevContextObject(0), bindingBitsSize(0), bindingBits(0),
+           lineNumber(0), columnNumber(0), compiledData(0), deferredIdx(0), v8objectid(0),
+           propertyCache(0), guards(0), extendedData(0) {
+@@ -122,7 +122,8 @@ public:
+      */
+     quint32 rootObjectInCreation:1;
+     quint32 hasVMEMetaObject:1;
+-    quint32 dummy:24;
++    quint32 parentFrozen:1;
++    quint32 dummy:23;
+ 
+     struct NotifyList {
+         quint64 connectionMask;
+diff --git a/src/qml/qml/qqmlengine.cpp b/src/qml/qml/qqmlengine.cpp
+index 7b4b827..832f58b 100644
+--- a/src/qml/qml/qqmlengine.cpp
++++ b/src/qml/qml/qqmlengine.cpp
+@@ -1383,10 +1383,23 @@ void QQmlData::destroyed(QObject *object)
+         delete this;
+ }
+ 
++DEFINE_BOOL_CONFIG_OPTION(parentTest, QML_PARENT_TEST);
++
+ void QQmlData::parentChanged(QObject *object, QObject *parent)
+ {
+-    Q_UNUSED(object);
+-    Q_UNUSED(parent);
++    if (parentTest()) {
++        if (parentFrozen && !QObjectPrivate::get(object)->wasDeleted) {
++            QString on;
++            QString pn;
++
++            { QDebug dbg(&on); dbg << object; on = on.left(on.length() - 1); }
++            { QDebug dbg(&pn); dbg << parent; pn = pn.left(pn.length() - 1); }
++
++            qFatal("Object %s has had its parent frozen by QML and cannot be changed.\n"
++                   "User code is attempting to change it to %s.\n"
++                   "This behavior is NOT supported!", qPrintable(on), qPrintable(pn));
++        }
++    }
+ }
+ 
+ bool QQmlData::hasBindingBit(int bit) const
+diff --git a/src/qml/qml/qqmlinstruction_p.h b/src/qml/qml/qqmlinstruction_p.h
+index bd279d6..8b7dc38 100644
+--- a/src/qml/qml/qqmlinstruction_p.h
++++ b/src/qml/qml/qqmlinstruction_p.h
+@@ -200,6 +200,7 @@ union QQmlInstruction
+         ushort column;
+         ushort line; 
+         bool isRoot;
++        bool parentToSuper;
+     };
+     struct instr_createSimple {
+         QML_INSTR_HEADER
+@@ -208,6 +209,7 @@ union QQmlInstruction
+         int type;
+         ushort column;
+         ushort line; 
++        bool parentToSuper;
+     };
+     struct instr_storeMeta {
+         QML_INSTR_HEADER
+@@ -222,13 +224,11 @@ union QQmlInstruction
+     struct instr_assignValueSource {
+         QML_INSTR_HEADER
+         QQmlPropertyRawData property;
+-        int owner;
+         int castValue;
+     };
+     struct instr_assignValueInterceptor {
+         QML_INSTR_HEADER
+         QQmlPropertyRawData property;
+-        int owner;
+         int castValue;
+     };
+     struct instr_initV8Bindings {
+diff --git a/src/qml/qml/qqmlvme.cpp b/src/qml/qml/qqmlvme.cpp
+index bb24519..b9924e3 100644
+--- a/src/qml/qml/qqmlvme.cpp
++++ b/src/qml/qml/qqmlvme.cpp
+@@ -609,13 +609,14 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+                 customParser->setCustomData(o, DATAS.at(instr.data));
+             }
+             if (!objects.isEmpty()) {
+-                QObject *parent = objects.top();
++                QObject *parent = objects.at(objects.count() - 1 - (instr.parentToSuper?1:0));
+ #if 0 // ### refactor
+                 if (o->isWidgetType() && parent->isWidgetType()) 
+                     static_cast<QWidget*>(o)->setParent(static_cast<QWidget*>(parent));
+                 else 
+ #endif
+                     QQml_setParent_noEvent(o, parent);
++                ddata->parentFrozen = true;
+             }
+             objects.push(o);
+         QML_END_INSTR(CreateCppObject)
+@@ -642,9 +643,10 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+             ddata->prevContextObject = &CTXT->contextObjects; 
+             CTXT->contextObjects = ddata; 
+ 
+-            QObject *parent = objects.top();                                                                    
++            QObject *parent = objects.at(objects.count() - 1 - (instr.parentToSuper?1:0));
+             QQml_setParent_noEvent(o, parent);                                                        
+ 
++            ddata->parentFrozen = true;
+             objects.push(o);
+         QML_END_INSTR(CreateSimpleObject)
+ 
+@@ -905,19 +907,16 @@ QObject *QQmlVME::run(QList<QQmlError> *errors,
+         QML_BEGIN_INSTR(StoreValueSource)
+             QObject *obj = objects.pop();
+             QQmlPropertyValueSource *vs = reinterpret_cast<QQmlPropertyValueSource *>(reinterpret_cast<char *>(obj) + instr.castValue);
+-            QObject *target = objects.at(objects.count() - 1 - instr.owner);
+-
+-            obj->setParent(target);
++            QObject *target = obj->parent();
+             vs->setTarget(QQmlPropertyPrivate::restore(target, instr.property, CTXT));
+         QML_END_INSTR(StoreValueSource)
+ 
+         QML_BEGIN_INSTR(StoreValueInterceptor)
+             QObject *obj = objects.pop();
+             QQmlPropertyValueInterceptor *vi = reinterpret_cast<QQmlPropertyValueInterceptor *>(reinterpret_cast<char *>(obj) + instr.castValue);
+-            QObject *target = objects.at(objects.count() - 1 - instr.owner);
++            QObject *target = obj->parent();
+             QQmlProperty prop = 
+                 QQmlPropertyPrivate::restore(target, instr.property, CTXT);
+-            obj->setParent(target);
+             vi->setTarget(prop);
+             QQmlVMEMetaObject *mo = QQmlVMEMetaObject::get(target);
+             Q_ASSERT(mo);
+diff --git a/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml b/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml
+deleted file mode 100644
+index 6de606e..0000000
+--- a/tests/auto/qml/qqmlecmascript/data/signalEmitted.qml
++++ /dev/null
+@@ -1,36 +0,0 @@
+-import QtQuick 2.0
+-import Qt.test 1.0 as ModApi
+-
+-Item {
+-    id: root
+-
+-    property bool success: false
+-    property bool c1HasBeenDestroyed: false
+-
+-    Item {
+-        id: container
+-
+-        SignalEmittedComponent {
+-            id: c1
+-        }
+-
+-        SignalEmittedComponent {
+-            id: c2
+-            property int c1a: if (c1) c1.a; else 0; // will change during onDestruction handler of c1.
+-            onC1aChanged: {
+-                // this should still be called, after c1 has been destroyed.
+-                if (root.c1HasBeenDestroyed && c1a == 20) c1.setSuccessPropertyOf(root, true);
+-            }
+-        }
+-    }
+-
+-    Component.onCompleted: {
+-        // firstly, reparent c2 so that it doesn't get destroyed.
+-        ModApi.changeQObjectParent(c2);
+-
+-        // then, destroy container (and thus also c1)
+-        c1HasBeenDestroyed = true;
+-        container.destroy();
+-        // return to event loop.
+-    }
+-}
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index 18743ac..d34a840 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -6860,16 +6860,6 @@ void tst_qqmlecmascript::bindingSuppression()
+ void tst_qqmlecmascript::signalEmitted()
+ {
+     {
+-        // calling destroy on the parent.
+-        QQmlEngine engine;
+-        QQmlComponent c(&engine, testFileUrl("signalEmitted.qml"));
+-        QObject *obj = c.create();
+-        QVERIFY(obj != 0);
+-        QTRY_VERIFY(obj->property("success").toBool());
+-        delete obj;
+-    }
+-
+-    {
+         // calling destroy on the sibling.
+         QQmlEngine engine;
+         QQmlComponent c(&engine, testFileUrl("signalEmitted.2.qml"));
+diff --git a/tests/auto/qml/qqmlinstruction/tst_qqmlinstruction.cpp b/tests/auto/qml/qqmlinstruction/tst_qqmlinstruction.cpp
+index b4c83b3..77de47d 100644
+--- a/tests/auto/qml/qqmlinstruction/tst_qqmlinstruction.cpp
++++ b/tests/auto/qml/qqmlinstruction/tst_qqmlinstruction.cpp
+@@ -339,7 +339,6 @@ void tst_qqmlinstruction::dump()
+     {
+         QQmlCompiledData::Instruction::StoreValueSource i;
+         i.property.coreIndex = 29;
+-        i.owner = 1;
+         i.castValue = 4;
+         data->addInstruction(i);
+     }
+@@ -347,7 +346,6 @@ void tst_qqmlinstruction::dump()
+     {
+         QQmlCompiledData::Instruction::StoreValueInterceptor i;
+         i.property.coreIndex = 30;
+-        i.owner = 2;
+         i.castValue = -4;
+         data->addInstruction(i);
+     }

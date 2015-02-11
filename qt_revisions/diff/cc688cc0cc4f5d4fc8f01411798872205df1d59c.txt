@@ -1,0 +1,352 @@
+diff --git a/src/qml/qml/qqmlvaluetype_p.h b/src/qml/qml/qqmlvaluetype_p.h
+index 02be333..153037b 100644
+--- a/src/qml/qml/qqmlvaluetype_p.h
++++ b/src/qml/qml/qqmlvaluetype_p.h
+@@ -71,7 +71,9 @@ class Q_QML_PRIVATE_EXPORT QQmlValueType : public QObject
+ public:
+     QQmlValueType(int userType, QObject *parent = 0);
+     virtual void read(QObject *, int) = 0;
++    virtual void readVariantValue(QObject *, int, QVariant *) = 0;
+     virtual void write(QObject *, int, QQmlPropertyPrivate::WriteFlags flags) = 0;
++    virtual void writeVariantValue(QObject *, int, QQmlPropertyPrivate::WriteFlags, QVariant *) = 0;
+     virtual QVariant value() = 0;
+     virtual void setValue(const QVariant &) = 0;
+ 
+@@ -120,14 +122,25 @@ public:
+         readProperty(obj, idx, &v);
+     }
+ 
++    virtual void readVariantValue(QObject *obj, int idx, QVariant *into)
++    {
++        // important: must not change the userType of the variant
++        readProperty(obj, idx, into);
++    }
++
+     virtual void write(QObject *obj, int idx, QQmlPropertyPrivate::WriteFlags flags)
+     {
+         writeProperty(obj, idx, flags, &v);
+     }
+ 
++    virtual void writeVariantValue(QObject *obj, int idx, QQmlPropertyPrivate::WriteFlags flags, QVariant *from)
++    {
++        writeProperty(obj, idx, flags, from);
++    }
++
+     virtual QVariant value()
+     {
+-        return QVariant(v);
++        return QVariant::fromValue(v);
+     }
+ 
+     virtual void setValue(const QVariant &value)
+@@ -138,7 +151,7 @@ public:
+ 
+     virtual bool isEqual(const QVariant &other) const
+     {
+-        return QVariant(v) == other;
++        return QVariant::fromValue(v) == other;
+     }
+ 
+ protected:
+diff --git a/src/qml/qml/v8/qv8qobjectwrapper.cpp b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+index 4128358..5fce03a 100644
+--- a/src/qml/qml/v8/qv8qobjectwrapper.cpp
++++ b/src/qml/qml/v8/qv8qobjectwrapper.cpp
+@@ -440,6 +440,12 @@ static v8::Handle<v8::Value> LoadProperty(QV8Engine *engine, QObject *object,
+     } else if (property.isQVariant()) {
+         QVariant v;
+         ReadFunction(object, property, &v, notifier);
++        if (QQmlValueTypeFactory::isValueType(v.userType()) && engine->engine()) {
++            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine->engine());
++            QQmlValueType *valueType = ep->valueTypes[v.userType()];
++            if (valueType)
++                return engine->newValueType(object, property.coreIndex, valueType); // VariantReference value-type.
++        }
+         return engine->fromVariant(v);
+     } else if (QQmlValueTypeFactory::isValueType((uint)property.propType)
+                && engine->engine()) {
+diff --git a/src/qml/qml/v8/qv8valuetypewrapper.cpp b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+index cdee5a4..cf6c530 100644
+--- a/src/qml/qml/v8/qv8valuetypewrapper.cpp
++++ b/src/qml/qml/v8/qv8valuetypewrapper.cpp
+@@ -149,6 +149,39 @@ v8::Local<v8::Object> QV8ValueTypeWrapper::newValueType(const QVariant &value, Q
+     return rv;
+ }
+ 
++static bool readReferenceValue(QV8ValueTypeReferenceResource *reference)
++{
++    // A reference resource may be either a "true" reference (eg, to a QVector3D property)
++    // or a "variant" reference (eg, to a QVariant property which happens to contain a value-type).
++    QMetaProperty writebackProperty = reference->object->metaObject()->property(reference->property);
++    if (writebackProperty.userType() == QMetaType::QVariant) {
++        // variant-containing-value-type reference
++        QVariant variantReferenceValue;
++        reference->type->readVariantValue(reference->object, reference->property, &variantReferenceValue);
++        int variantReferenceType = variantReferenceValue.userType();
++        if (variantReferenceType != reference->type->userType()) {
++            // This is a stale VariantReference.  That is, the variant has been
++            // overwritten with a different type in the meantime.
++            // We need to modify this reference to the updated value type, if
++            // possible, or return false if it is not a value type.
++            QQmlEngine *e = reference->engine->engine();
++            if (QQmlValueTypeFactory::isValueType(variantReferenceType) && e) {
++                reference->type = QQmlEnginePrivate::get(e)->valueTypes[variantReferenceType];
++                if (!reference->type) {
++                    return false;
++                }
++            } else {
++                return false;
++            }
++        }
++        reference->type->setValue(variantReferenceValue);
++    } else {
++        // value-type reference
++        reference->type->read(reference->object, reference->property);
++    }
++    return true;
++}
++
+ QVariant QV8ValueTypeWrapper::toVariant(v8::Handle<v8::Object> obj, int typeHint, bool *succeeded)
+ {
+     // NOTE: obj must not be an external resource object (ie, wrapper object)
+@@ -172,8 +205,7 @@ QVariant QV8ValueTypeWrapper::toVariant(QV8ObjectResource *r)
+     if (resource->objectType == QV8ValueTypeResource::Reference) {
+         QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(resource);
+ 
+-        if (reference->object) {
+-            reference->type->read(reference->object, reference->property);
++        if (reference->object && readReferenceValue(reference)) {
+             return reference->type->value();
+         } else {
+             return QVariant();
+@@ -195,8 +227,7 @@ bool QV8ValueTypeWrapper::isEqual(QV8ObjectResource *r, const QVariant& value)
+ 
+     if (resource->objectType == QV8ValueTypeResource::Reference) {
+         QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(resource);
+-        if (reference->object) {
+-            reference->type->read(reference->object, reference->property);
++        if (reference->object && readReferenceValue(reference)) {
+             return reference->type->isEqual(value);
+         } else {
+             return false;
+@@ -221,8 +252,7 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::ToString(const v8::Arguments &args)
+     if (resource) {
+         if (resource->objectType == QV8ValueTypeResource::Reference) {
+             QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(resource);
+-            if (reference->object) {
+-                reference->type->read(reference->object, reference->property);
++            if (reference->object && readReferenceValue(reference)) {
+                 return resource->engine->toString(resource->type->toString());
+             } else {
+                 return v8::Undefined();
+@@ -258,6 +288,21 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Getter(v8::Local<v8::String> property
+         }
+     }
+ 
++    // Note: readReferenceValue() can change the reference->type.
++    if (r->objectType == QV8ValueTypeResource::Reference) {
++        QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(r);
++
++        if (!reference->object || !readReferenceValue(reference))
++            return v8::Handle<v8::Value>();
++
++    } else {
++        Q_ASSERT(r->objectType == QV8ValueTypeResource::Copy);
++
++        QV8ValueTypeCopyResource *copy = static_cast<QV8ValueTypeCopyResource *>(r);
++
++        r->type->setValue(copy->value);
++    }
++
+     QQmlPropertyData local;
+     QQmlPropertyData *result = 0;
+     {
+@@ -272,21 +317,6 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Getter(v8::Local<v8::String> property
+     if (!result)
+         return v8::Handle<v8::Value>();
+ 
+-    if (r->objectType == QV8ValueTypeResource::Reference) {
+-        QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(r);
+-
+-        if (!reference->object)
+-            return v8::Handle<v8::Value>();
+-
+-        r->type->read(reference->object, reference->property);
+-    } else {
+-        Q_ASSERT(r->objectType == QV8ValueTypeResource::Copy);
+-
+-        QV8ValueTypeCopyResource *copy = static_cast<QV8ValueTypeCopyResource *>(r);
+-
+-        r->type->setValue(copy->value);
+-    }
+-
+ #define VALUE_TYPE_LOAD(metatype, cpptype, constructor) \
+     if (result->propType == metatype) { \
+         cpptype v; \
+@@ -316,18 +346,17 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Setter(v8::Local<v8::String> property
+     if (!r) return value;
+ 
+     QByteArray propName = r->engine->toString(property).toUtf8();
+-    int index = r->type->metaObject()->indexOfProperty(propName.constData());
+-    if (index == -1)
+-        return value;
+-
+     if (r->objectType == QV8ValueTypeResource::Reference) {
+         QV8ValueTypeReferenceResource *reference = static_cast<QV8ValueTypeReferenceResource *>(r);
++        QMetaProperty writebackProperty = reference->object->metaObject()->property(reference->property);
+ 
+-        if (!reference->object || 
+-            !reference->object->metaObject()->property(reference->property).isWritable())
++        if (!reference->object || !writebackProperty.isWritable() || !readReferenceValue(reference))
+             return value;
+ 
+-        r->type->read(reference->object, reference->property);
++        // we lookup the index after readReferenceValue() since it can change the reference->type.
++        int index = r->type->metaObject()->indexOfProperty(propName.constData());
++        if (index == -1)
++            return value;
+         QMetaProperty p = r->type->metaObject()->property(index);
+ 
+         QQmlBinding *newBinding = 0;
+@@ -381,7 +410,12 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Setter(v8::Local<v8::String> property
+ 
+             p.write(reference->type, v);
+ 
+-            reference->type->write(reference->object, reference->property, 0);
++            if (writebackProperty.userType() == QMetaType::QVariant) {
++                QVariant variantReferenceValue = r->type->value();
++                reference->type->writeVariantValue(reference->object, reference->property, 0, &variantReferenceValue);
++            } else {
++                reference->type->write(reference->object, reference->property, 0);
++            }
+         }
+ 
+     } else {
+@@ -389,6 +423,10 @@ v8::Handle<v8::Value> QV8ValueTypeWrapper::Setter(v8::Local<v8::String> property
+ 
+         QV8ValueTypeCopyResource *copy = static_cast<QV8ValueTypeCopyResource *>(r);
+ 
++        int index = r->type->metaObject()->indexOfProperty(propName.constData());
++        if (index == -1)
++            return value;
++
+         QVariant v = r->engine->toVariant(value, -1);
+ 
+         r->type->setValue(copy->value);
+diff --git a/tests/auto/qml/qqmlvaluetypes/data/variant_write.1.qml b/tests/auto/qml/qqmlvaluetypes/data/variant_write.1.qml
+new file mode 100644
+index 0000000..6063917
+--- /dev/null
++++ b/tests/auto/qml/qqmlvaluetypes/data/variant_write.1.qml
+@@ -0,0 +1,25 @@
++import QtQuick 2.0
++
++Item {
++    property bool complete: false
++    property bool success: false
++
++    property variant v1: Qt.vector3d(1,2,3)
++    property variant v2: Qt.vector3d(4,5,6)
++    property variant v3: v1.plus(v2) // set up doomed binding
++
++    Component.onCompleted: {
++        complete = false;
++        success = true;
++
++        v1 = Qt.vector2d(1,2) // changing the type of the property shouldn't cause crash
++
++        v1.x = 8;
++        v2.x = 9;
++
++        if (v1 != Qt.vector2d(8,2)) success = false;
++        if (v2 != Qt.vector3d(9,5,6)) success = false;
++
++        complete = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlvaluetypes/data/variant_write.2.qml b/tests/auto/qml/qqmlvaluetypes/data/variant_write.2.qml
+new file mode 100644
+index 0000000..0dbfd2a
+--- /dev/null
++++ b/tests/auto/qml/qqmlvaluetypes/data/variant_write.2.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++
++Item {
++    property bool complete: false
++    property bool success: false
++
++    property variant v1
++
++    Component.onCompleted: {
++        complete = false;
++        success = true;
++
++        // store a js reference to the VariantReference vt in a temp var.
++        v1 = Qt.vector3d(1,2,3)
++        var ref = v1;
++        ref.z = 5
++        if (v1 != Qt.vector3d(1,2,5)) success = false;
++
++        // now change the type of a reference, and attempt a valid write.
++        v1 = Qt.vector2d(1,2);
++        ref.x = 5;
++        if (v1 != Qt.vector2d(5,2)) success = false;
++
++        // now change the type of a reference, and attempt an invalid write.
++        v1 = Qt.rgba(1,0,0,1);
++        ref.x = 5;
++        if (v1.toString() != Qt.rgba(1,0,0,1).toString()) success = false;
++        v1 = 6;
++        ref.x = 5;
++        if (v1 != 6) success = false;
++
++        // now change the type of a reference, and attempt an invalid read.
++        v1 = Qt.vector3d(1,2,3);
++        ref = v1;
++        v1 = Qt.vector2d(1,2);
++        if (ref.z == 3) success = false;
++
++        complete = true;
++    }
++}
+diff --git a/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp b/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
+index af5e914..a323db5 100644
+--- a/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
++++ b/tests/auto/qml/qqmlvaluetypes/tst_qqmlvaluetypes.cpp
+@@ -290,6 +290,7 @@ void tst_qqmlvaluetypes::sizef()
+ 
+ void tst_qqmlvaluetypes::variant()
+ {
++    {
+     QQmlComponent component(&engine, testFileUrl("variant_read.qml"));
+     MyTypeObject *object = qobject_cast<MyTypeObject *>(component.create());
+     QVERIFY(object != 0);
+@@ -299,6 +300,27 @@ void tst_qqmlvaluetypes::variant()
+     QCOMPARE(object->property("copy"), QVariant(QSizeF(0.1, 100923.2)));
+ 
+     delete object;
++    }
++
++    {
++    QString w1 = testFileUrl("variant_write.1.qml").toString() + QLatin1String(":9: TypeError: Object QVector2D(8, 2) has no method 'plus'");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(w1));
++    QQmlComponent component(&engine, testFileUrl("variant_write.1.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QVERIFY(object->property("complete").toBool());
++    QVERIFY(object->property("success").toBool());
++    delete object;
++    }
++
++    {
++    QQmlComponent component(&engine, testFileUrl("variant_write.2.qml"));
++    QObject *object = component.create();
++    QVERIFY(object != 0);
++    QVERIFY(object->property("complete").toBool());
++    QVERIFY(object->property("success").toBool());
++    delete object;
++    }
+ }
+ 
+ void tst_qqmlvaluetypes::sizereadonly()

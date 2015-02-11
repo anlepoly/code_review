@@ -1,0 +1,283 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.h b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.h
+index c28cfc5..4be30c4 100644
+--- a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.h
++++ b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.h
+@@ -177,9 +177,10 @@ public:
+     void temporarilyStopAllModalSessions();
+     void beginModalSession(QWindow *widget);
+     void endModalSession(QWindow *widget);
++    void cleanupModalSessions();
++
+     void cancelWaitForMoreEvents();
+     void maybeCancelWaitForMoreEvents();
+-    void cleanupModalSessions();
+     void ensureNSAppInitialized();
+ 
+     MacSocketHash macSockets;
+diff --git a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+index 7a1e485..a3bd4a9 100644
+--- a/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
++++ b/src/plugins/platforms/cocoa/qcocoaeventdispatcher.mm
+@@ -82,6 +82,7 @@
+ #include "qmutex.h"
+ #include "qsocketnotifier.h"
+ #include <qplatformwindow_qpa.h>
++#include <qplatformnativeinterface_qpa.h>
+ #include "private/qthread_p.h"
+ #include "private/qguiapplication_p.h"
+ #include <qdebug.h>
+@@ -781,26 +782,18 @@ NSModalSession QCocoaEventDispatcherPrivate::currentModalSession()
+         QCocoaModalSessionInfo &info = cocoaModalSessionStack[i];
+         if (!info.window)
+             continue;
+-//     ### port
+-//        if (info.window->testAttribute(Qt::WA_DontShowOnScreen))
+-//            continue;
+ 
+         if (!info.session) {
+             QCocoaAutoReleasePool pool;
+-            NSWindow *window = reinterpret_cast<NSWindow *>(info.window->handle()->winId());
+-            if (!window)
++            NSWindow *nswindow = static_cast<NSWindow *>(QGuiApplication::platformNativeInterface()->nativeResourceForWindow("nswindow", info.window));
++            if (!nswindow)
+                 continue;
+ 
+             ensureNSAppInitialized();
+             QBoolBlocker block1(blockSendPostedEvents, true);
+-            info.nswindow = window;
++            info.nswindow = nswindow;
+             [(NSWindow*) info.nswindow retain];
+-            int levelBeforeEnterModal = [window level];
+-            info.session = [NSApp beginModalSessionForWindow:window];
+-            // Make sure we don't stack the window lower that it was before
+-            // entering modal, in case it e.g. had the stays-on-top flag set:
+-            if (levelBeforeEnterModal > [window level])
+-                [window setLevel:levelBeforeEnterModal];
++            info.session = [NSApp beginModalSessionForWindow:nswindow];
+         }
+         currentModalSessionCached = info.session;
+         cleanupModalSessionsNeeded = false;
+@@ -869,12 +862,14 @@ void QCocoaEventDispatcherPrivate::cleanupModalSessions()
+             currentModalSessionCached = info.session;
+             break;
+         }
+-        cocoaModalSessionStack.remove(i);
+         currentModalSessionCached = 0;
+         if (info.session) {
++            Q_ASSERT(info.nswindow != 0);
+             [NSApp endModalSession:info.session];
+             [(NSWindow *)info.nswindow release];
+         }
++        // remove the info now that we are finished with it
++        cocoaModalSessionStack.remove(i);
+     }
+ 
+     updateChildrenWorksWhenModal();
+@@ -883,6 +878,14 @@ void QCocoaEventDispatcherPrivate::cleanupModalSessions()
+ 
+ void QCocoaEventDispatcherPrivate::beginModalSession(QWindow *window)
+ {
++    // We need to start spinning the modal session. Usually this is done with
++    // QDialog::exec() for QtWidgets based applications, but for others that
++    // just call show(), we need to interrupt(). We call this here, before
++    // setting currentModalSessionCached to zero, so that interrupt() calls
++    // [NSApp abortModal] if another modal session is currently running
++    Q_Q(QCocoaEventDispatcher);
++    q->interrupt();
++
+     // Add a new, empty (null), NSModalSession to the stack.
+     // It will become active the next time QEventDispatcher::processEvents is called.
+     // A QCocoaModalSessionInfo is considered pending to become active if the window pointer
+@@ -898,6 +901,8 @@ void QCocoaEventDispatcherPrivate::beginModalSession(QWindow *window)
+ 
+ void QCocoaEventDispatcherPrivate::endModalSession(QWindow *window)
+ {
++    Q_Q(QCocoaEventDispatcher);
++
+     // Mark all sessions attached to window as pending to be stopped. We do this
+     // by setting the window pointer to zero, but leave the session pointer.
+     // We don't tell cocoa to stop any sessions just yet, because cocoa only understands
+@@ -909,11 +914,14 @@ void QCocoaEventDispatcherPrivate::endModalSession(QWindow *window)
+         if (info.window == window) {
+             info.window = 0;
+             if (i == stackSize-1) {
+-                // The top sessions ended. Interrupt the event dispatcher
+-                // to start spinning the correct session immidiatly: 
++                // The top sessions ended. Interrupt the event dispatcher to
++                // start spinning the correct session immediately. Like in
++                // beginModalSession(), we call interrupt() before clearing
++                // currentModalSessionCached to make sure we stop any currently
++                // running modal session with [NSApp abortModal]
++                q->interrupt();
+                 currentModalSessionCached = 0;
+                 cleanupModalSessionsNeeded = true;
+-                QCocoaEventDispatcher::instance()->interrupt();
+             }
+         }
+     }
+@@ -1093,16 +1101,23 @@ void QCocoaEventDispatcher::interrupt()
+ {
+     Q_D(QCocoaEventDispatcher);
+     d->interrupt = true;
+-    wakeUp();
+-
+-    // We do nothing more here than setting d->interrupt = true, and
+-    // poke the event loop if it is sleeping. Actually stopping
+-    // NSApp, or the current modal session, is done inside the send
+-    // posted events callback. We do this to ensure that all current pending
+-    // cocoa events gets delivered before we stop. Otherwise, if we now stop
+-    // the last event loop recursion, cocoa will just drop pending posted
+-    // events on the floor before we get a chance to reestablish a new session.
+-    d->cancelWaitForMoreEvents();
++    if (d->currentModalSessionCached) {
++        // If a modal session is active, abort it so that we can clean it up
++        // later. We can't use [NSApp stopModal] here, because we do not know
++        // where the interrupt() came from.
++        [NSApp abortModal];
++    } else {
++        wakeUp();
++
++        // We do nothing more here than setting d->interrupt = true, and
++        // poke the event loop if it is sleeping. Actually stopping
++        // NSApp, or the current modal session, is done inside the send
++        // posted events callback. We do this to ensure that all current pending
++        // cocoa events gets delivered before we stop. Otherwise, if we now stop
++        // the last event loop recursion, cocoa will just drop pending posted
++        // events on the floor before we get a chance to reestablish a new session.
++        d->cancelWaitForMoreEvents();
++    }
+ }
+ 
+ void QCocoaEventDispatcher::flush()
+@@ -1117,6 +1132,21 @@ QCocoaEventDispatcher::~QCocoaEventDispatcher()
+     CFRunLoopRemoveSource(mainRunLoop(), d->activateTimersSourceRef, kCFRunLoopCommonModes);
+     CFRelease(d->activateTimersSourceRef);
+ 
++    // end all modal sessions
++    for (int i = 0; i < d->cocoaModalSessionStack.count(); ++i) {
++        QCocoaModalSessionInfo &info = d->cocoaModalSessionStack[i];
++        if (info.session) {
++            [NSApp endModalSession:info.session];
++            [(NSWindow *)info.nswindow release];
++        }
++    }
++
++    // release all queued user input events
++    for (int i = 0; i < d->queuedUserInputEvents.count(); ++i) {
++        NSEvent *nsevent = static_cast<NSEvent *>(d->queuedUserInputEvents.at(i));
++        [nsevent release];
++    }
++
+     // Remove CFSockets from the runloop.
+     for (MacSocketHash::ConstIterator it = d->macSockets.constBegin(); it != d->macSockets.constEnd(); ++it) {
+         MacSocketInfo *socketInfo = (*it);
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.h b/src/plugins/platforms/cocoa/qcocoawindow.h
+index b709f38..cbcdbcb 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.h
++++ b/src/plugins/platforms/cocoa/qcocoawindow.h
+@@ -144,6 +144,8 @@ public: // for QNSView
+ 
+     bool m_inConstructor;
+     QCocoaGLContext *m_glContext;
++
++    bool m_hasModalSession;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/cocoa/qcocoawindow.mm b/src/plugins/platforms/cocoa/qcocoawindow.mm
+index 5c8ea05..32c87e7 100644
+--- a/src/plugins/platforms/cocoa/qcocoawindow.mm
++++ b/src/plugins/platforms/cocoa/qcocoawindow.mm
+@@ -41,6 +41,7 @@
+ #include "qcocoawindow.h"
+ #include "qnswindowdelegate.h"
+ #include "qcocoaautoreleasepool.h"
++#include "qcocoaeventdispatcher.h"
+ #include "qcocoaglcontext.h"
+ #include "qcocoahelpers.h"
+ #include "qnsview.h"
+@@ -98,6 +99,7 @@ QCocoaWindow::QCocoaWindow(QWindow *tlw)
+     , m_nsWindow(0)
+     , m_inConstructor(true)
+     , m_glContext(0)
++    , m_hasModalSession(false)
+ {
+     QCocoaAutoReleasePool pool;
+ 
+@@ -145,7 +147,10 @@ void QCocoaWindow::setVisible(bool visible)
+     qDebug() << "QCocoaWindow::setVisible" << window() << visible;
+ #endif
+     if (visible) {
++        QCocoaWindow *parentCocoaWindow = 0;
+         if (window()->transientParent()) {
++            parentCocoaWindow = static_cast<QCocoaWindow *>(window()->transientParent()->handle());
++
+             // The parent window might have moved while this window was hidden,
+             // update the window geometry if there is a parent.
+             setGeometry(window()->geometry());
+@@ -154,8 +159,6 @@ void QCocoaWindow::setVisible(bool visible)
+             // close them when needed.
+             if (window()->windowType() == Qt::Popup) {
+                 // qDebug() << "transientParent and popup" << window()->windowType() << Qt::Popup << (window()->windowType() & Qt::Popup);
+-
+-                QCocoaWindow *parentCocoaWindow = static_cast<QCocoaWindow *>(window()->transientParent()->handle());
+                 parentCocoaWindow->m_activePopupWindow = window();
+             }
+ 
+@@ -170,16 +173,40 @@ void QCocoaWindow::setVisible(bool visible)
+             syncWindowState(window()->windowState());
+ 
+             if (window()->windowState() != Qt::WindowMinimized) {
+-                if ([m_nsWindow canBecomeKeyWindow])
++                if ((window()->windowModality() == Qt::WindowModal
++                     || window()->windowType() == Qt::Sheet)
++                        && parentCocoaWindow) {
++                    // show the window as a sheet
++                    [NSApp beginSheet:m_nsWindow modalForWindow:parentCocoaWindow->m_nsWindow modalDelegate:nil didEndSelector:nil contextInfo:nil];
++                } else if (window()->windowModality() != Qt::NonModal) {
++                    // show the window as application modal
++                    QCocoaEventDispatcher *cocoaEventDispatcher = qobject_cast<QCocoaEventDispatcher *>(QGuiApplication::instance()->eventDispatcher());
++                    Q_ASSERT(cocoaEventDispatcher != 0);
++                    QCocoaEventDispatcherPrivate *cocoaEventDispatcherPrivate = static_cast<QCocoaEventDispatcherPrivate *>(QObjectPrivate::get(cocoaEventDispatcher));
++                    cocoaEventDispatcherPrivate->beginModalSession(window());
++                    m_hasModalSession = true;
++                } else if ([m_nsWindow canBecomeKeyWindow]) {
+                     [m_nsWindow makeKeyAndOrderFront:nil];
+-                else
++                } else {
+                     [m_nsWindow orderFront: nil];
++                }
+             }
+         }
+     } else {
+         // qDebug() << "close" << this;
+-        if (m_nsWindow)
++        if (m_nsWindow) {
++            if (m_hasModalSession) {
++                QCocoaEventDispatcher *cocoaEventDispatcher = qobject_cast<QCocoaEventDispatcher *>(QGuiApplication::instance()->eventDispatcher());
++                Q_ASSERT(cocoaEventDispatcher != 0);
++                QCocoaEventDispatcherPrivate *cocoaEventDispatcherPrivate = static_cast<QCocoaEventDispatcherPrivate *>(QObjectPrivate::get(cocoaEventDispatcher));
++                cocoaEventDispatcherPrivate->endModalSession(window());
++                m_hasModalSession = false;
++            } else {
++                if ([m_nsWindow isSheet])
++                    [NSApp endSheet:m_nsWindow];
++            }
+             [m_nsWindow orderOut:m_nsWindow];
++        }
+         if (!QCoreApplication::closingDown())
+             QWindowSystemInterface::handleExposeEvent(window(), QRegion());
+     }
+@@ -363,6 +390,12 @@ void QCocoaWindow::recreateWindow(const QPlatformWindow *parentWindow)
+         // Create a new NSWindow if this is a top-level window.
+         m_nsWindow = createNSWindow();
+         setNSWindow(m_nsWindow);
++
++        if (window()->transientParent()) {
++            // keep this window on the same level as its transient parent (which may be a modal dialog, for example)
++            QCocoaWindow *parentCocoaWindow = static_cast<QCocoaWindow *>(window()->transientParent()->handle());
++            [m_nsWindow setLevel:[parentCocoaWindow->m_nsWindow level]];
++        }
+     } else {
+         // Child windows have no NSWindow, link the NSViews instead.
+         const QCocoaWindow *parentCococaWindow = static_cast<const QCocoaWindow *>(parentWindow);

@@ -1,0 +1,539 @@
+diff --git a/src/declarative/qml/qdeclarativecompiler.cpp b/src/declarative/qml/qdeclarativecompiler.cpp
+index 74dbd67..ddae368 100644
+--- a/src/declarative/qml/qdeclarativecompiler.cpp
++++ b/src/declarative/qml/qdeclarativecompiler.cpp
+@@ -913,8 +913,11 @@ void QDeclarativeCompiler::compileTree(QDeclarativeScript::Object *tree)
+ 
+     if (!compileState->v8BindingProgram.isEmpty()) {
+         Instruction::InitV8Bindings bindings;
+-        bindings.program = output->indexForString(compileState->v8BindingProgram);
+-        bindings.programIndex = compileState->v8BindingProgramIndex;
++        int index = output->programs.count();
++        output->programs.append(compileState->v8BindingProgram);
++        output->v8bindings.append(v8::Persistent<v8::Array>());
++
++        bindings.programIndex = index;
+         bindings.line = compileState->v8BindingProgramLine;
+         output->addInstruction(bindings);
+     }
+@@ -1346,9 +1349,8 @@ void QDeclarativeCompiler::genObjectBody(QDeclarativeScript::Object *obj)
+ 
+             Instruction::StoreSignal store;
+             store.signalIndex = prop->index;
+-            const QString &rewrite =
+-                    rewriteSignalHandler(v->value, prop->name().toString());
+-            store.value = output->indexForString(rewrite);
++            const QString &rewrite = rewriteSignalHandler(v->value, prop->name().toString());
++            store.value = output->indexForByteArray(rewrite.toUtf8());
+             store.context = v->signalExpressionContextStack;
+             store.line = v->location.start.line;
+             store.column = v->location.start.column;
+@@ -1469,8 +1471,11 @@ void QDeclarativeCompiler::genComponent(QDeclarativeScript::Object *obj)
+ 
+     if (!compileState->v8BindingProgram.isEmpty()) {
+         Instruction::InitV8Bindings bindings;
+-        bindings.program = output->indexForString(compileState->v8BindingProgram);
+-        bindings.programIndex = compileState->v8BindingProgramIndex;
++        int index = output->programs.count();
++        output->programs.append(compileState->v8BindingProgram);
++        output->v8bindings.append(v8::Persistent<v8::Array>());
++
++        bindings.programIndex = index;
+         bindings.line = compileState->v8BindingProgramLine;
+         output->addInstruction(bindings);
+     }
+@@ -3049,8 +3054,9 @@ bool QDeclarativeCompiler::buildDynamicMeta(QDeclarativeScript::Object *obj, Dyn
+                 }
+                 funcScript += QLatin1Char(')') + s->body + QLatin1Char(')');
+ 
++                QByteArray utf8 = funcScript.toUtf8();
+                 VMD::MethodData methodData = { s->parameterNames.count(), 0, 
+-                                               funcScript.length(), 
++                                               utf8.length(),
+                                                s->location.start.line };
+ 
+                 VMD *vmd = (QDeclarativeVMEMetaData *)dynamicData.data();
+@@ -3060,10 +3066,10 @@ bool QDeclarativeCompiler::buildDynamicMeta(QDeclarativeScript::Object *obj, Dyn
+                 md = methodData;
+                 md.bodyOffset = dynamicData.size();
+ 
+-                dynamicData.append((const char *)funcScript.constData(),
+-                                   (funcScript.length() * sizeof(QChar)));
++                dynamicData.append((const char *)utf8.constData(), utf8.length());
+             }
+ 
++
+             methodIndex++;
+         }
+     }
+@@ -3626,29 +3632,28 @@ bool QDeclarativeCompiler::completeComponentBuild()
+         int startLineNumber = sharedBindings.at(0)->value->location.start.line;
+         int lineNumber = startLineNumber;
+ 
+-        QString functionArray(QLatin1String("["));
++        QByteArray functionArray("[", 1);
+         for (int ii = 0; ii < sharedBindings.count(); ++ii) {
++
+             JSBindingReference *reference = sharedBindings.at(ii);
+             QDeclarativeScript::Value *value = reference->value;
+             const QString &expression = reference->rewrittenExpression;
+ 
+-            if (ii != 0) functionArray += QLatin1String(",");
++            if (ii != 0) functionArray.append(",", 1);
+ 
+             while (lineNumber < value->location.start.line) {
+                 lineNumber++;
+-                functionArray += QLatin1String("\n");
++                functionArray.append("\n", 1);
+             }
+ 
+-            functionArray += expression;
++            functionArray += expression.toUtf8();
+             lineNumber += expression.count(QLatin1Char('\n'));
+             reference->compiledIndex = ii;
+         }
+-        functionArray += QLatin1String("]");
++        functionArray.append("]", 1);
+ 
+         compileState->v8BindingProgram = functionArray;
+         compileState->v8BindingProgramLine = startLineNumber;
+-        compileState->v8BindingProgramIndex = output->v8bindings.count();
+-        output->v8bindings.append(v8::Persistent<v8::Array>());
+     }
+ 
+     if (bindingCompiler.isValid()) 
+diff --git a/src/declarative/qml/qdeclarativecompiler_p.h b/src/declarative/qml/qdeclarativecompiler_p.h
+index 67d925e..8ae6685 100644
+--- a/src/declarative/qml/qdeclarativecompiler_p.h
++++ b/src/declarative/qml/qdeclarativecompiler_p.h
+@@ -112,6 +112,7 @@ public:
+     QDeclarativePropertyCache *rootPropertyCache;
+     QList<QString> primitives;
+     QList<QByteArray> datas;
++    QList<QByteArray> programs;
+     QByteArray bytecode;
+     QList<QDeclarativePropertyCache *> propertyCaches;
+     QList<QDeclarativeIntegerCache *> contextCaches;
+@@ -256,9 +257,8 @@ namespace QDeclarativeCompilerTypes {
+         bool nested;
+ 
+         QByteArray compiledBindingData;
+-        QString v8BindingProgram;
++        QByteArray v8BindingProgram;
+         int v8BindingProgramLine;
+-        int v8BindingProgramIndex;
+ 
+         DepthStack objectDepth;
+         DepthStack listDepth;
+diff --git a/src/declarative/qml/qdeclarativeexpression.cpp b/src/declarative/qml/qdeclarativeexpression.cpp
+index 97afaa8..53ed8e7 100644
+--- a/src/declarative/qml/qdeclarativeexpression.cpp
++++ b/src/declarative/qml/qdeclarativeexpression.cpp
+@@ -135,6 +135,76 @@ void QDeclarativeExpressionPrivate::init(QDeclarativeContextData *ctxt, const QS
+     setScopeObject(me);
+ }
+ 
++void QDeclarativeExpressionPrivate::init(QDeclarativeContextData *ctxt, const QByteArray &expr,
++                                         bool isRewritten, QObject *me, const QString &srcUrl,
++                                         int lineNumber, int columnNumber)
++{
++    url = srcUrl;
++    line = lineNumber;
++    column = columnNumber;
++
++    if (isRewritten) {
++        expressionFunctionValid = true;
++        expressionFunctionRewritten = true;
++        v8function = evalFunction(ctxt, me, expr.constData(), expr.length(),
++                                  srcUrl, lineNumber, &v8qmlscope);
++        setUseSharedContext(false);
++
++        expressionUtf8 = expr;
++    } else {
++        expression = QString::fromUtf8(expr);
++
++        expressionFunctionValid = false;
++        expressionFunctionRewritten = isRewritten;
++    }
++
++    QDeclarativeAbstractExpression::setContext(ctxt);
++    setScopeObject(me);
++}
++
++// Callee owns the persistent handle
++v8::Persistent<v8::Function>
++QDeclarativeExpressionPrivate::evalFunction(QDeclarativeContextData *ctxt, QObject *scope,
++                                            const char *code, int codeLength,
++                                            const QString &filename, int line,
++                                            v8::Persistent<v8::Object> *qmlscope)
++{
++    QDeclarativeEngine *engine = ctxt->engine;
++    QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(engine);
++
++    v8::HandleScope handle_scope;
++    v8::Context::Scope ctxtscope(ep->v8engine()->context());
++
++    v8::TryCatch tc;
++    v8::Local<v8::Object> scopeobject = ep->v8engine()->qmlScope(ctxt, scope);
++    v8::Local<v8::Script> script = ep->v8engine()->qmlModeCompile(code, codeLength, filename, line);
++    if (tc.HasCaught()) {
++        QDeclarativeError error;
++        error.setDescription(QLatin1String("Exception occurred during function compilation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QDeclarativeExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    v8::Local<v8::Value> result = script->Run(scopeobject);
++    if (tc.HasCaught()) {
++        QDeclarativeError error;
++        error.setDescription(QLatin1String("Exception occurred during function evaluation"));
++        error.setLine(line);
++        error.setUrl(QUrl::fromLocalFile(filename));
++        v8::Local<v8::Message> message = tc.Message();
++        if (!message.IsEmpty())
++            QDeclarativeExpressionPrivate::exceptionToError(message, error);
++        ep->warning(error);
++        return v8::Persistent<v8::Function>();
++    }
++    if (qmlscope) *qmlscope = qPersistentNew<v8::Object>(scopeobject);
++    return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
++}
++
+ // Callee owns the persistent handle
+ v8::Persistent<v8::Function> 
+ QDeclarativeExpressionPrivate::evalFunction(QDeclarativeContextData *ctxt, QObject *scope, 
+@@ -144,8 +214,6 @@ QDeclarativeExpressionPrivate::evalFunction(QDeclarativeContextData *ctxt, QObje
+     QDeclarativeEngine *engine = ctxt->engine;
+     QDeclarativeEnginePrivate *ep = QDeclarativeEnginePrivate::get(engine);
+ 
+-    // XXX TODO: Implement script caching, like we used to do with QScriptProgram in the
+-    // QtScript days
+     v8::HandleScope handle_scope;
+     v8::Context::Scope ctxtscope(ep->v8engine()->context());
+ 
+@@ -179,7 +247,9 @@ QDeclarativeExpressionPrivate::evalFunction(QDeclarativeContextData *ctxt, QObje
+     return qPersistentNew<v8::Function>(v8::Local<v8::Function>::Cast(result));
+ }
+ 
+-QDeclarativeExpression *QDeclarativeExpressionPrivate::create(QDeclarativeContextData *ctxt, QObject *object, const QString &expr, bool isRewritten,
++QDeclarativeExpression *
++QDeclarativeExpressionPrivate::create(QDeclarativeContextData *ctxt, QObject *object,
++                                      const QString &expr, bool isRewritten,
+                                       const QString &url, int lineNumber, int columnNumber)
+ {
+     return new QDeclarativeExpression(ctxt, object, expr, isRewritten, url, lineNumber, columnNumber, *new QDeclarativeExpressionPrivate);
+@@ -235,6 +305,18 @@ QDeclarativeExpression::QDeclarativeExpression(QDeclarativeContextData *ctxt,
+     d->init(ctxt, expr, isRewritten, object, url, lineNumber, columnNumber);
+ }
+ 
++/*!  \internal */
++QDeclarativeExpression::QDeclarativeExpression(QDeclarativeContextData *ctxt,
++                                               QObject *object, const QByteArray &expr,
++                                               bool isRewritten,
++                                               const QString &url, int lineNumber, int columnNumber,
++                                               QDeclarativeExpressionPrivate &dd)
++: QObject(dd, 0)
++{
++    Q_D(QDeclarativeExpression);
++    d->init(ctxt, expr, isRewritten, object, url, lineNumber, columnNumber);
++}
++
+ /*!
+     Create a QDeclarativeExpression object that is a child of \a parent.
+ 
+@@ -380,8 +462,11 @@ QString QDeclarativeExpression::expression() const
+         v8::Context::Scope scope(v8engine->context());
+ 
+         return v8engine->toString(v8::Handle<v8::Value>(d->v8function));
++    } else if (!d->expressionUtf8.isEmpty()) {
++        return QString::fromUtf8(d->expressionUtf8);
++    } else {
++        return d->expression;
+     }
+-    return d->expression;
+ }
+ 
+ /*!
+@@ -393,6 +478,7 @@ void QDeclarativeExpression::setExpression(const QString &expression)
+ 
+     d->resetNotifyOnValueChanged();
+     d->expression = expression;
++    d->expressionUtf8.clear();
+     d->expressionFunctionValid = false;
+     d->expressionFunctionRewritten = false;
+     qPersistentDispose(d->v8function);
+diff --git a/src/declarative/qml/qdeclarativeexpression.h b/src/declarative/qml/qdeclarativeexpression.h
+index 1a47bb1..c9ab408 100644
+--- a/src/declarative/qml/qdeclarativeexpression.h
++++ b/src/declarative/qml/qdeclarativeexpression.h
+@@ -100,6 +100,8 @@ protected:
+                            QDeclarativeExpressionPrivate &dd);
+     QDeclarativeExpression(QDeclarativeContextData *, QObject *, const QString &, bool,
+                            const QString &, int, int, QDeclarativeExpressionPrivate &dd);
++    QDeclarativeExpression(QDeclarativeContextData *, QObject *, const QByteArray &, bool,
++                           const QString &, int, int, QDeclarativeExpressionPrivate &dd);
+ 
+ private:
+     QDeclarativeExpression(QDeclarativeContextData *, QObject *, const QString &);
+diff --git a/src/declarative/qml/qdeclarativeexpression_p.h b/src/declarative/qml/qdeclarativeexpression_p.h
+index 4060a94..bbe4b2d 100644
+--- a/src/declarative/qml/qdeclarativeexpression_p.h
++++ b/src/declarative/qml/qdeclarativeexpression_p.h
+@@ -178,6 +178,7 @@ public:
+     void init(QDeclarativeContextData *, const QString &, QObject *);
+     void init(QDeclarativeContextData *, v8::Handle<v8::Function>, QObject *);
+     void init(QDeclarativeContextData *, const QString &, bool, QObject *, const QString &, int, int);
++    void init(QDeclarativeContextData *, const QByteArray &, bool, QObject *, const QString &, int, int);
+ 
+     QVariant value(QObject *secondaryScope = 0, bool *isUndefined = 0);
+ 
+@@ -191,8 +192,14 @@ public:
+ 
+     static void exceptionToError(v8::Handle<v8::Message>, QDeclarativeError &);
+     static v8::Persistent<v8::Function> evalFunction(QDeclarativeContextData *ctxt, QObject *scope, 
+-                                                     const QString &code, const QString &filename, int line,
++                                                     const QString &code, const QString &filename,
++                                                     int line,
+                                                      v8::Persistent<v8::Object> *qmlscope = 0);
++    static v8::Persistent<v8::Function> evalFunction(QDeclarativeContextData *ctxt, QObject *scope,
++                                                     const char *code, int codeLength,
++                                                     const QString &filename, int line,
++                                                     v8::Persistent<v8::Object> *qmlscope = 0);
++
+     static QDeclarativeExpression *create(QDeclarativeContextData *, QObject *, const QString &, bool,
+                                           const QString &, int, int);
+ 
+@@ -203,6 +210,7 @@ public:
+     inline virtual QString expressionIdentifier();
+ 
+     QString expression;
++    QByteArray expressionUtf8;
+ 
+     v8::Persistent<v8::Object> v8qmlscope;
+     v8::Persistent<v8::Function> v8function;
+diff --git a/src/declarative/qml/qdeclarativeinstruction.cpp b/src/declarative/qml/qdeclarativeinstruction.cpp
+index 24e2821..799357c 100644
+--- a/src/declarative/qml/qdeclarativeinstruction.cpp
++++ b/src/declarative/qml/qdeclarativeinstruction.cpp
+@@ -205,7 +205,7 @@ void QDeclarativeCompiledData::dump(QDeclarativeInstruction *instr, int idx)
+         qWarning().nospace() << idx << "\t\t" << "ASSIGN_CUSTOMTYPE\t" << instr->assignCustomType.propertyIndex << "\t" << instr->assignCustomType.primitive << "\t" << instr->assignCustomType.type;
+         break;
+     case QDeclarativeInstruction::InitV8Bindings:
+-        qWarning().nospace() << idx << "\t\t" << "INIT_V8_BINDING\t" << instr->initV8Bindings.program << "\t" << instr->initV8Bindings.programIndex << "\t" << instr->initV8Bindings.line;
++        qWarning().nospace() << idx << "\t\t" << "INIT_V8_BINDING\t" << instr->initV8Bindings.programIndex << "\t" << instr->initV8Bindings.line;
+         break;
+     case QDeclarativeInstruction::StoreBinding:
+         qWarning().nospace() << idx << "\t\t" << "STORE_BINDING\t" << instr->assignBinding.property.coreIndex << "\t" << instr->assignBinding.value << "\t" << instr->assignBinding.context;
+diff --git a/src/declarative/qml/qdeclarativeinstruction_p.h b/src/declarative/qml/qdeclarativeinstruction_p.h
+index 49eadad..dee712d 100644
+--- a/src/declarative/qml/qdeclarativeinstruction_p.h
++++ b/src/declarative/qml/qdeclarativeinstruction_p.h
+@@ -231,7 +231,6 @@ union QDeclarativeInstruction
+     };
+     struct instr_initV8Bindings {
+         QML_INSTR_HEADER
+-        int program;
+         ushort programIndex;
+         ushort line;
+     };
+diff --git a/src/declarative/qml/qdeclarativetypeloader.cpp b/src/declarative/qml/qdeclarativetypeloader.cpp
+index 7251296..a65de06 100644
+--- a/src/declarative/qml/qdeclarativetypeloader.cpp
++++ b/src/declarative/qml/qdeclarativetypeloader.cpp
+@@ -1893,7 +1893,7 @@ void QDeclarativeScriptBlob::done()
+     m_imports.populateCache(m_scriptData->importCache, engine);
+ 
+     m_scriptData->pragmas = m_pragmas;
+-    m_scriptData->m_programSource = m_source;
++    m_scriptData->m_programSource = m_source.toUtf8();
+ }
+ 
+ QDeclarativeQmldirData::QDeclarativeQmldirData(const QUrl &url)
+diff --git a/src/declarative/qml/qdeclarativetypeloader_p.h b/src/declarative/qml/qdeclarativetypeloader_p.h
+index 67d8cd5..80016c9 100644
+--- a/src/declarative/qml/qdeclarativetypeloader_p.h
++++ b/src/declarative/qml/qdeclarativetypeloader_p.h
+@@ -370,7 +370,7 @@ private:
+     friend class QDeclarativeScriptBlob;
+ 
+     bool m_loaded;
+-    QString m_programSource;
++    QByteArray m_programSource;
+     v8::Persistent<v8::Script> m_program;
+     v8::Persistent<v8::Object> m_value;
+ };
+diff --git a/src/declarative/qml/qdeclarativevme.cpp b/src/declarative/qml/qdeclarativevme.cpp
+index a37964a..0aa74a4 100644
+--- a/src/declarative/qml/qdeclarativevme.cpp
++++ b/src/declarative/qml/qdeclarativevme.cpp
+@@ -341,6 +341,7 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+ #define TYPES COMP->types
+ #define PRIMITIVES COMP->primitives
+ #define DATAS COMP->datas
++#define PROGRAMS COMP->programs
+ #define PROPERTYCACHES COMP->propertyCaches
+ #define SCRIPTS COMP->scripts
+ #define URLS COMP->urls
+@@ -711,7 +712,7 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+ 
+             QDeclarativeBoundSignal *bs = new QDeclarativeBoundSignal(target, signal, target);
+             QDeclarativeExpression *expr = 
+-                new QDeclarativeExpression(CTXT, context, PRIMITIVES.at(instr.value), true, COMP->name, instr.line, instr.column, *new QDeclarativeExpressionPrivate);
++                new QDeclarativeExpression(CTXT, context, DATAS.at(instr.value), true, COMP->name, instr.line, instr.column, *new QDeclarativeExpressionPrivate);
+             bs->setExpression(expr);
+         QML_END_INSTR(StoreSignal)
+ 
+@@ -749,8 +750,7 @@ QObject *QDeclarativeVME::run(QList<QDeclarativeError> *errors,
+         QML_END_INSTR(BeginObject)
+ 
+         QML_BEGIN_INSTR(InitV8Bindings)
+-            CTXT->v8bindings = new QV8Bindings(PRIMITIVES.at(instr.program), instr.programIndex, 
+-                                                       instr.line, COMP, CTXT);
++            CTXT->v8bindings = new QV8Bindings(instr.programIndex, instr.line, COMP, CTXT);
+         QML_END_INSTR(InitV8Bindings)
+ 
+         QML_BEGIN_INSTR(StoreBinding)
+@@ -1073,11 +1073,14 @@ void QDeclarativeScriptData::initialize(QDeclarativeEngine *engine)
+     QV8Engine *v8engine = ep->v8engine();
+ 
+     // If compilation throws an error, a surrounding v8::TryCatch will record it.
+-    v8::Local<v8::Script> program = v8engine->qmlModeCompile(m_programSource, url.toString(), 1);
++    v8::Local<v8::Script> program = v8engine->qmlModeCompile(m_programSource.constData(),
++                                                             m_programSource.length(), url.toString(),
++                                                             1);
+     if (program.IsEmpty())
+         return;
+ 
+     m_program = qPersistentNew<v8::Script>(program);
++    m_programSource.clear(); // We don't need this anymore
+ 
+     addToEngine(engine);
+ 
+diff --git a/src/declarative/qml/qdeclarativevmemetaobject.cpp b/src/declarative/qml/qdeclarativevmemetaobject.cpp
+index d9ad56a..de8863a 100644
+--- a/src/declarative/qml/qdeclarativevmemetaobject.cpp
++++ b/src/declarative/qml/qdeclarativevmemetaobject.cpp
+@@ -790,15 +790,14 @@ v8::Handle<v8::Function> QDeclarativeVMEMetaObject::method(int index)
+     if (v8methods[index].IsEmpty()) {
+         QDeclarativeVMEMetaData::MethodData *data = metaData->methodData() + index;
+ 
+-        const QChar *body = 
+-            (const QChar *)(((const char*)metaData) + data->bodyOffset);
+-
+-        QString code = QString::fromRawData(body, data->bodyLength);
++        const char *body = ((const char*)metaData) + data->bodyOffset;
++        int bodyLength = data->bodyLength;
+ 
+         // XXX We should evaluate all methods in a single big script block to 
+         // improve the call time between dynamic methods defined on the same
+         // object
+-        v8methods[index] = QDeclarativeExpressionPrivate::evalFunction(ctxt, object, code, ctxt->url.toString(),
++        v8methods[index] = QDeclarativeExpressionPrivate::evalFunction(ctxt, object, body, bodyLength,
++                                                                       ctxt->url.toString(),
+                                                                        data->lineNumber);
+     }
+ 
+diff --git a/src/declarative/qml/v8/qv8bindings.cpp b/src/declarative/qml/v8/qv8bindings.cpp
+index daadce4..39203d3 100644
+--- a/src/declarative/qml/v8/qv8bindings.cpp
++++ b/src/declarative/qml/v8/qv8bindings.cpp
+@@ -156,7 +156,7 @@ void QV8Bindings::Binding::destroy()
+     parent->release();
+ }
+ 
+-QV8Bindings::QV8Bindings(const QString &program, int index, int line,
++QV8Bindings::QV8Bindings(int index, int line,
+                          QDeclarativeCompiledData *compiled, 
+                          QDeclarativeContextData *context)
+ : bindingsCount(0), bindings(0)
+@@ -171,7 +171,8 @@ QV8Bindings::QV8Bindings(const QString &program, int index, int line,
+         bool compileFailed = false;
+         {
+             v8::TryCatch try_catch;
+-            script = engine->qmlModeCompile(program, compiled->name, line);
++            const QByteArray &program = compiled->programs.at(index);
++            script = engine->qmlModeCompile(program.constData(), program.length(), compiled->name, line);
+             if (try_catch.HasCaught()) {
+                 // The binding was not compiled.  There are some exceptional cases which the
+                 // expression rewriter does not rewrite properly (e.g., \r-terminated lines
+@@ -192,6 +193,7 @@ QV8Bindings::QV8Bindings(const QString &program, int index, int line,
+             v8::Local<v8::Value> result = script->Run(engine->contextWrapper()->sharedContext());
+             if (result->IsArray()) {
+                 compiled->v8bindings[index] = qPersistentNew(v8::Local<v8::Array>::Cast(result));
++                compiled->programs[index].clear(); // We don't need the source anymore
+             }
+         }
+     }
+diff --git a/src/declarative/qml/v8/qv8bindings_p.h b/src/declarative/qml/v8/qv8bindings_p.h
+index a98f6cb..8eaf4ff 100644
+--- a/src/declarative/qml/v8/qv8bindings_p.h
++++ b/src/declarative/qml/v8/qv8bindings_p.h
+@@ -68,7 +68,7 @@ class QV8Bindings : public QDeclarativeAbstractExpression,
+                     public QDeclarativeRefCount
+ {
+ public:
+-    QV8Bindings(const QString &program, int index, int line,
++    QV8Bindings(int index, int line,
+                 QDeclarativeCompiledData *compiled,
+                 QDeclarativeContextData *context);
+     virtual ~QV8Bindings();
+diff --git a/src/declarative/qml/v8/qv8engine.cpp b/src/declarative/qml/v8/qv8engine.cpp
+index 9013733..92cd336 100644
+--- a/src/declarative/qml/v8/qv8engine.cpp
++++ b/src/declarative/qml/v8/qv8engine.cpp
+@@ -416,7 +416,9 @@ v8::Handle<v8::Value> QV8Engine::fromVariant(const QVariant &variant)
+ }
+ 
+ // A handle scope and context must be entered
+-v8::Local<v8::Script> QV8Engine::qmlModeCompile(const QString &source, const QString &fileName, int lineNumber)
++v8::Local<v8::Script> QV8Engine::qmlModeCompile(const QString &source,
++                                                const QString &fileName,
++                                                int lineNumber)
+ {
+     v8::Local<v8::String> v8source = m_stringWrapper.toString(source);
+     v8::Local<v8::String> v8fileName = m_stringWrapper.toString(fileName);
+@@ -429,6 +431,26 @@ v8::Local<v8::Script> QV8Engine::qmlModeCompile(const QString &source, const QSt
+     return script;
+ }
+ 
++// A handle scope and context must be entered.
++// source can be either ascii or utf8.
++v8::Local<v8::Script> QV8Engine::qmlModeCompile(const char *source, int sourceLength,
++                                                const QString &fileName,
++                                                int lineNumber)
++{
++    if (sourceLength == -1)
++        sourceLength = strlen(source);
++
++    v8::Local<v8::String> v8source = v8::String::New(source, sourceLength);
++    v8::Local<v8::String> v8fileName = m_stringWrapper.toString(fileName);
++
++    v8::ScriptOrigin origin(v8fileName, v8::Integer::New(lineNumber - 1));
++
++    v8::Local<v8::Script> script = v8::Script::Compile(v8source, &origin, 0, v8::Handle<v8::String>(),
++                                                       v8::Script::QmlMode);
++
++    return script;
++}
++
+ QNetworkAccessManager *QV8Engine::networkAccessManager() 
+ {
+     return QDeclarativeEnginePrivate::get(m_engine)->getNetworkAccessManager();
+diff --git a/src/declarative/qml/v8/qv8engine_p.h b/src/declarative/qml/v8/qv8engine_p.h
+index a39f673..4bfb991 100644
+--- a/src/declarative/qml/v8/qv8engine_p.h
++++ b/src/declarative/qml/v8/qv8engine_p.h
+@@ -330,6 +330,9 @@ public:
+     v8::Local<v8::Script> qmlModeCompile(const QString &source, 
+                                          const QString &fileName = QString(), 
+                                          int lineNumber = 1);
++    v8::Local<v8::Script> qmlModeCompile(const char *source, int sourceLength = -1,
++                                         const QString &fileName = QString(),
++                                         int lineNumber = 1);
+ 
+     // Return the QML global "scope" object for the \a ctxt context and \a scope object.
+     inline v8::Local<v8::Object> qmlScope(QDeclarativeContextData *ctxt, QObject *scope);

@@ -1,0 +1,157 @@
+diff --git a/src/platformsupport/fontdatabases/mac/qcoretextfontdatabase.mm b/src/platformsupport/fontdatabases/mac/qcoretextfontdatabase.mm
+index 1eb1cbe..c423208 100644
+--- a/src/platformsupport/fontdatabases/mac/qcoretextfontdatabase.mm
++++ b/src/platformsupport/fontdatabases/mac/qcoretextfontdatabase.mm
+@@ -39,10 +39,12 @@
+ **
+ ****************************************************************************/
+ 
++#import <Cocoa/Cocoa.h>
++#import <IOKit/graphics/IOGraphicsLib.h>
++
+ #include "qcoretextfontdatabase_p.h"
+ #include "qfontengine_coretext_p.h"
+ #include <QtCore/QSettings>
+-#import <Foundation/Foundation.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -86,9 +88,6 @@ static const char *languageForWritingSystem[] = {
+ };
+ enum { LanguageCount = sizeof(languageForWritingSystem) / sizeof(const char *) };
+ 
+-int qt_antialiasing_threshold = 0;
+-bool qt_enable_font_smoothing = true;
+-
+ QFont::StyleHint styleHintFromNSString(NSString *style)
+ {
+     if ([style isEqual: @"sans-serif"])
+@@ -122,13 +121,37 @@ QCoreTextFontDatabase::QCoreTextFontDatabase()
+     QSettings appleSettings(QLatin1String("apple.com"));
+     QVariant appleValue = appleSettings.value(QLatin1String("AppleAntiAliasingThreshold"));
+     if (appleValue.isValid())
+-        qt_antialiasing_threshold = appleValue.toInt();
+-
++        QCoreTextFontEngine::antialiasingThreshold = appleValue.toInt();
++
++    /*
++        font_smoothing = 0 means no smoothing, while 1-3 means subpixel
++        antialiasing with different hinting styles (but we don't care about the
++        exact value, only if subpixel rendering is available or not)
++    */
++    int font_smoothing = 0;
+     appleValue = appleSettings.value(QLatin1String("AppleFontSmoothing"));
+-    // Only disable font smoothing when AppleFontSmoothing is set to 0,
+-    // empty or non-zero means enabled
+-    if (appleValue.isValid() && appleValue.toInt() == 0)
+-        qt_enable_font_smoothing = false;
++    if (appleValue.isValid()) {
++        font_smoothing = appleValue.toInt();
++    } else {
++        NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
++
++        // find the primary display (which is always the first NSScreen
++        // according to the documentation)
++        NSScreen *defaultScreen = [[NSScreen screens] objectAtIndex:0];
++        CGDirectDisplayID displayId = [[[defaultScreen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
++        io_service_t iodisplay = CGDisplayIOServicePort(displayId);
++
++        // determine if font smoothing is available based on the subpixel
++        // layout of the primary display
++        NSDictionary *d = (NSDictionary *) IODisplayCreateInfoDictionary(iodisplay, kIODisplayOnlyPreferredName);
++        uint displaySubpixelLayout = [[d objectForKey:@kDisplaySubPixelLayout] unsignedIntValue];
++        font_smoothing = (displaySubpixelLayout == kDisplaySubPixelLayoutUndefined ? 0 : 1);
++
++        [pool release];
++    }
++    QCoreTextFontEngine::defaultGlyphFormat = (font_smoothing > 0
++                                               ? QFontEngineGlyphCache::Raster_RGBMask
++                                               : QFontEngineGlyphCache::Raster_A8);
+ }
+ 
+ QCoreTextFontDatabase::~QCoreTextFontDatabase()
+diff --git a/src/platformsupport/fontdatabases/mac/qfontengine_coretext.mm b/src/platformsupport/fontdatabases/mac/qfontengine_coretext.mm
+index a51ffb7..a02361b 100644
+--- a/src/platformsupport/fontdatabases/mac/qfontengine_coretext.mm
++++ b/src/platformsupport/fontdatabases/mac/qfontengine_coretext.mm
+@@ -77,7 +77,9 @@ static void loadAdvancesForGlyphs(CTFontRef ctfont,
+     }
+ }
+ 
+-extern int qt_antialiasing_threshold, qt_enable_font_smoothing;
++
++int QCoreTextFontEngine::antialiasingThreshold = 0;
++QFontEngineGlyphCache::Type QCoreTextFontEngine::defaultGlyphFormat = QFontEngineGlyphCache::Raster_RGBMask;
+ 
+ CGAffineTransform qt_transform_from_fontdef(const QFontDef &fontDef)
+ {
+@@ -147,8 +149,7 @@ void QCoreTextFontEngine::init()
+     Q_ASSERT(ctfont != NULL);
+     Q_ASSERT(cgFont != NULL);
+ 
+-    glyphFormat = qt_enable_font_smoothing ? QFontEngineGlyphCache::Raster_RGBMask
+-                                           : QFontEngineGlyphCache::Raster_A8;
++    glyphFormat = defaultGlyphFormat;
+ 
+     QCFString family = CTFontCopyFamilyName(ctfont);
+     fontDef.family = family;
+@@ -421,7 +422,7 @@ QImage QCoreTextFontEngine::imageForGlyph(glyph_t glyph, QFixed subPixelPosition
+                                              8, im.bytesPerLine(), colorspace,
+                                              cgflags);
+     CGContextSetFontSize(ctx, fontDef.pixelSize);
+-    CGContextSetShouldAntialias(ctx, (aa || fontDef.pointSize > qt_antialiasing_threshold)
++    CGContextSetShouldAntialias(ctx, (aa || fontDef.pointSize > antialiasingThreshold)
+                                  && !(fontDef.styleStrategy & QFont::NoAntialias));
+     CGContextSetShouldSmoothFonts(ctx, aa);
+     CGAffineTransform oldTextMatrix = CGContextGetTextMatrix(ctx);
+diff --git a/src/platformsupport/fontdatabases/mac/qfontengine_coretext_p.h b/src/platformsupport/fontdatabases/mac/qfontengine_coretext_p.h
+index d32f050..02c8d92 100644
+--- a/src/platformsupport/fontdatabases/mac/qfontengine_coretext_p.h
++++ b/src/platformsupport/fontdatabases/mac/qfontengine_coretext_p.h
+@@ -100,6 +100,9 @@ public:
+     virtual QFontEngine *cloneWithSize(qreal pixelSize) const;
+     virtual int glyphMargin(QFontEngineGlyphCache::Type type) { return 0; }
+ 
++    static int antialiasingThreshold;
++    static QFontEngineGlyphCache::Type defaultGlyphFormat;
++
+ private:
+     friend class QRawFontPrivate;
+ 
+diff --git a/src/plugins/platforms/cocoa/cocoa.pro b/src/plugins/platforms/cocoa/cocoa.pro
+index e861f48..2ae39dd 100644
+--- a/src/plugins/platforms/cocoa/cocoa.pro
++++ b/src/plugins/platforms/cocoa/cocoa.pro
+@@ -73,7 +73,7 @@ HEADERS += qcocoaintegration.h \
+ FORMS += $$PWD/../../../widgets/dialogs/qfiledialog.ui
+ RESOURCES += qcocoaresources.qrc
+ 
+-LIBS += -framework Cocoa
++LIBS += -framework Cocoa -framework IOKit
+ 
+ QT += core-private gui-private widgets-private platformsupport-private printsupport
+ 
+diff --git a/src/plugins/platforms/cocoa/qpaintengine_mac.mm b/src/plugins/platforms/cocoa/qpaintengine_mac.mm
+index 8b8445c..87f3713 100644
+--- a/src/plugins/platforms/cocoa/qpaintengine_mac.mm
++++ b/src/plugins/platforms/cocoa/qpaintengine_mac.mm
+@@ -73,8 +73,6 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-extern int qt_antialiasing_threshold; // from qcoretextfontdatabase.mm
+-
+ /*****************************************************************************
+   QCoreGraphicsPaintEngine utility functions
+  *****************************************************************************/
+@@ -1182,7 +1180,9 @@ void QCoreGraphicsPaintEngine::drawTextItem(const QPointF &pos, const QTextItem
+ 
+     QFontEngine *fe = ti.fontEngine;
+ 
+-    const bool textAA = state->renderHints() & QPainter::TextAntialiasing && fe->fontDef.pointSize > qt_antialiasing_threshold && !(fe->fontDef.styleStrategy & QFont::NoAntialias);
++    const bool textAA = ((state->renderHints() & QPainter::TextAntialiasing)
++                         && (fe->fontDef.pointSize > QCoreTextFontEngine::antialiasingThreshold)
++                         && !(fe->fontDef.styleStrategy & QFont::NoAntialias));
+     const bool lineAA = state->renderHints() & QPainter::Antialiasing;
+     if (textAA != lineAA)
+         CGContextSetShouldAntialias(d->hd, textAA);

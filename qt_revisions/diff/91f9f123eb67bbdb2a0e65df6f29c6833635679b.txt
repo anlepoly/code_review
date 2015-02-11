@@ -1,0 +1,202 @@
+diff --git a/src/qml/qml/qqmlcomponent.cpp b/src/qml/qml/qqmlcomponent.cpp
+index 6cd5cf6c..416178e 100644
+--- a/src/qml/qml/qqmlcomponent.cpp
++++ b/src/qml/qml/qqmlcomponent.cpp
+@@ -829,7 +829,10 @@ QQmlComponentPrivate::beginCreate(QQmlContextData *context)
+     if (rv) {
+         QQmlData *ddata = QQmlData::get(rv);
+         Q_ASSERT(ddata);
++        //top level objects should never get JS ownership.
++        //if JS ownership is needed this needs to be explicitly undone (like in component.createObject())
+         ddata->indestructible = true;
++        ddata->explicitIndestructibleSet = true;
+     }
+ 
+     if (enginePriv->isDebugging && rv) {
+@@ -1120,7 +1123,8 @@ void QQmlComponent::createObject(QQmlV8Function *args)
+     d->completeCreate();
+ 
+     Q_ASSERT(QQmlData::get(rv));
+-    QQmlData::get(rv)->setImplicitDestructible();
++    QQmlData::get(rv)->explicitIndestructibleSet = false;
++    QQmlData::get(rv)->indestructible = false;
+ 
+     if (!rv)
+         args->returnValue(v8::Null());
+@@ -1255,10 +1259,6 @@ void QQmlComponentPrivate::initializeObjectWithInitialProperties(v8::Handle<v8::
+         v8::Handle<v8::Value> args[] = { object, valuemap };
+         v8::Handle<v8::Function>::Cast(function)->Call(v8engine->global(), 2, args);
+     }
+-
+-    QQmlData *ddata = QQmlData::get(toCreate);
+-    Q_ASSERT(ddata);
+-    ddata->setImplicitDestructible();
+ }
+ 
+ 
+diff --git a/src/qml/qml/qqmlincubator.cpp b/src/qml/qml/qqmlincubator.cpp
+index aa9777d..fad2ae2 100644
+--- a/src/qml/qml/qqmlincubator.cpp
++++ b/src/qml/qml/qqmlincubator.cpp
+@@ -293,8 +293,9 @@ void QQmlIncubatorPrivate::incubate(QQmlVME::Interrupt &i)
+         if (result) {
+             QQmlData *ddata = QQmlData::get(result);
+             Q_ASSERT(ddata);
++            //see QQmlComponent::beginCreate for explanation of indestructible
+             ddata->indestructible = true;
+-
++            ddata->explicitIndestructibleSet = true;
+             q->setInitialState(result);
+         }
+ 
+diff --git a/src/qml/qml/v8/qqmlbuiltinfunctions.cpp b/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
+index 57a1cb0..c8f178d 100644
+--- a/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
++++ b/src/qml/qml/v8/qqmlbuiltinfunctions.cpp
+@@ -1097,7 +1097,9 @@ v8::Handle<v8::Value> createQmlObject(const v8::Arguments &args)
+ 
+     QObject *obj = component.beginCreate(effectiveContext);
+     if (obj) {
+-        QQmlData::get(obj, true)->setImplicitDestructible();
++        QQmlData::get(obj, true)->explicitIndestructibleSet = false;
++        QQmlData::get(obj)->indestructible = false;
++
+ 
+         obj->setParent(parentArg);
+ 
+@@ -1208,7 +1210,9 @@ v8::Handle<v8::Value> createComponent(const v8::Arguments &args)
+     QUrl url = context->resolvedUrl(QUrl(arg));
+     QQmlComponent *c = new QQmlComponent(engine, url, compileMode, parentArg);
+     QQmlComponentPrivate::get(c)->creationContext = effectiveContext;
+-    QQmlData::get(c, true)->setImplicitDestructible();
++    QQmlData::get(c, true)->explicitIndestructibleSet = false;
++    QQmlData::get(c)->indestructible = false;
++
+     return v8engine->newQObject(c);
+ }
+ 
+diff --git a/tests/auto/qml/qqmlecmascript/data/ownershipConsistency.qml b/tests/auto/qml/qqmlecmascript/data/ownershipConsistency.qml
+new file mode 100644
+index 0000000..7ae099e
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/ownershipConsistency.qml
+@@ -0,0 +1,21 @@
++import QtQuick 2.0
++
++Item {
++    Loader {
++        source: "PropertyVarBaseItem.qml"
++        onLoaded: item.destroy()
++    }
++    Loader {
++        Component.onCompleted: setSource("PropertyVarBaseItem.qml", { random: "" })
++        onLoaded: item.destroy()
++    }
++
++    Repeater {
++        model: 1
++        Item { Component.onCompleted: destroy() }
++    }
++    Repeater {
++        model: 1
++        Item { id: me; Component.onCompleted: { setObject(me); getObject().destroy() } }
++    }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/data/ownershipRootObject.qml b/tests/auto/qml/qqmlecmascript/data/ownershipRootObject.qml
+new file mode 100644
+index 0000000..b1b0b72
+--- /dev/null
++++ b/tests/auto/qml/qqmlecmascript/data/ownershipRootObject.qml
+@@ -0,0 +1,6 @@
++import QtQuick 2.0
++
++QtObject {
++    id: root
++    Component.onCompleted: { setObject(root); getObject() }
++}
+diff --git a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+index a94e837..403cc63 100644
+--- a/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
++++ b/tests/auto/qml/qqmlecmascript/tst_qqmlecmascript.cpp
+@@ -133,6 +133,8 @@ private slots:
+     void ownership();
+     void cppOwnershipReturnValue();
+     void ownershipCustomReturnValue();
++    void ownershipRootObject();
++    void ownershipConsistency();
+     void qlistqobjectMethods();
+     void strictlyEquals();
+     void compiled();
+@@ -2939,6 +2941,72 @@ void tst_qqmlecmascript::ownershipCustomReturnValue()
+     QVERIFY(source.value == 0);
+ }
+ 
++//the return value from getObject will be JS ownership,
++//unless strong Cpp ownership has been set
++class OwnershipChangingObject : public QObject
++{
++    Q_OBJECT
++public:
++    OwnershipChangingObject(): object(0) { }
++
++    QPointer<QObject> object;
++
++public slots:
++    QObject *getObject() { return object; }
++    void setObject(QObject *obj) { object = obj; }
++};
++
++void tst_qqmlecmascript::ownershipRootObject()
++{
++    OwnershipChangingObject own;
++    QQmlContext *context = new QQmlContext(engine.rootContext());
++    context->setContextObject(&own);
++
++    QQmlComponent component(&engine, testFileUrl("ownershipRootObject.qml"));
++    QQmlGuard<QObject> object = component.create(context);
++    QVERIFY(object);
++
++    engine.collectGarbage();
++
++    QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++    QCoreApplication::processEvents();
++
++    QVERIFY(own.object != 0);
++
++    delete context;
++    delete object;
++}
++
++void tst_qqmlecmascript::ownershipConsistency()
++{
++    OwnershipChangingObject own;
++    QQmlContext *context = new QQmlContext(engine.rootContext());
++    context->setContextObject(&own);
++
++    QString expectedWarning = testFileUrl("ownershipConsistency.qml").toString() + QLatin1String(":19: Error: Invalid attempt to destroy() an indestructible object");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(expectedWarning)); // we expect a meaningful warning to be printed.
++    expectedWarning = testFileUrl("ownershipConsistency.qml").toString() + QLatin1String(":15: Error: Invalid attempt to destroy() an indestructible object");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(expectedWarning)); // we expect a meaningful warning to be printed.
++    expectedWarning = testFileUrl("ownershipConsistency.qml").toString() + QLatin1String(":6: Error: Invalid attempt to destroy() an indestructible object");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(expectedWarning)); // we expect a meaningful warning to be printed.
++    expectedWarning = testFileUrl("ownershipConsistency.qml").toString() + QLatin1String(":10: Error: Invalid attempt to destroy() an indestructible object");
++    QTest::ignoreMessage(QtWarningMsg, qPrintable(expectedWarning)); // we expect a meaningful warning to be printed.
++
++    QQmlComponent component(&engine, testFileUrl("ownershipConsistency.qml"));
++    QQmlGuard<QObject> object = component.create(context);
++    QVERIFY(object);
++
++    engine.collectGarbage();
++
++    QCoreApplication::sendPostedEvents(0, QEvent::DeferredDelete);
++    QCoreApplication::processEvents();
++
++    QVERIFY(own.object != 0);
++
++    delete context;
++    delete object;
++}
++
+ class QListQObjectMethodsObject : public QObject
+ {
+     Q_OBJECT

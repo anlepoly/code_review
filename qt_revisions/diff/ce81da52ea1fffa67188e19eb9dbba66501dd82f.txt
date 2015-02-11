@@ -1,0 +1,98 @@
+diff --git a/src/plugins/platforms/xcb/qxcbclipboard.cpp b/src/plugins/platforms/xcb/qxcbclipboard.cpp
+index f021ab8..142a8df 100644
+--- a/src/plugins/platforms/xcb/qxcbclipboard.cpp
++++ b/src/plugins/platforms/xcb/qxcbclipboard.cpp
+@@ -300,6 +300,9 @@ void QXcbClipboard::setMimeData(QMimeData *data, QClipboard::Mode mode)
+         m_timestamp[mode] = XCB_CURRENT_TIME;
+     }
+ 
++    if (connection()->time() == XCB_CURRENT_TIME)
++        connection()->setTime(connection()->getTimestamp());
++
+     if (data) {
+         newOwner = owner();
+ 
+diff --git a/src/plugins/platforms/xcb/qxcbconnection.cpp b/src/plugins/platforms/xcb/qxcbconnection.cpp
+index 401739f..ad9fb1d 100644
+--- a/src/plugins/platforms/xcb/qxcbconnection.cpp
++++ b/src/plugins/platforms/xcb/qxcbconnection.cpp
+@@ -864,6 +864,59 @@ void QXcbConnection::sendConnectionEvent(QXcbAtom::Atom a, uint id)
+     xcb_flush(xcb_connection());
+ }
+ 
++namespace
++{
++    class PropertyNotifyEvent {
++    public:
++        PropertyNotifyEvent(xcb_window_t win, xcb_atom_t property)
++            : window(win), type(XCB_PROPERTY_NOTIFY), atom(property) {}
++        xcb_window_t window;
++        int type;
++        xcb_atom_t atom;
++        bool checkEvent(xcb_generic_event_t *event) const {
++            if (!event)
++                return false;
++            if ((event->response_type & ~0x80) != type) {
++                return false;
++            } else {
++                xcb_property_notify_event_t *pn = (xcb_property_notify_event_t *)event;
++                if ((pn->window == window) && (pn->atom == atom))
++                    return true;
++            }
++            return false;
++        }
++    };
++}
++
++xcb_timestamp_t QXcbConnection::getTimestamp()
++{
++    // send a dummy event to myself to get the timestamp from X server.
++    xcb_window_t rootWindow = screens().at(primaryScreen())->root();
++    xcb_change_property(xcb_connection(), XCB_PROP_MODE_APPEND, rootWindow, atom(QXcbAtom::CLIP_TEMPORARY),
++                        XCB_ATOM_INTEGER, 32, 0, NULL);
++
++    connection()->flush();
++    PropertyNotifyEvent checker(rootWindow, atom(QXcbAtom::CLIP_TEMPORARY));
++
++    xcb_generic_event_t *event = 0;
++    // lets keep this inside a loop to avoid a possible race condition, where
++    // reader thread has not yet had the time to acquire the mutex in order
++    // to add the new set of events to its event queue
++    while (true) {
++        connection()->sync();
++        if (event = checkEvent(checker))
++            break;
++    }
++
++    xcb_property_notify_event_t *pn = (xcb_property_notify_event_t *)event;
++    xcb_timestamp_t timestamp = pn->time;
++    free(event);
++
++    xcb_delete_property(xcb_connection(), rootWindow, atom(QXcbAtom::CLIP_TEMPORARY));
++
++    return timestamp;
++}
++
+ void QXcbConnection::processXcbEvents()
+ {
+     QXcbEventArray *eventqueue = m_reader->lock();
+diff --git a/src/plugins/platforms/xcb/qxcbconnection.h b/src/plugins/platforms/xcb/qxcbconnection.h
+index 08dd304..8a6c418 100644
+--- a/src/plugins/platforms/xcb/qxcbconnection.h
++++ b/src/plugins/platforms/xcb/qxcbconnection.h
+@@ -319,7 +319,6 @@ public:
+     QByteArray atomName(xcb_atom_t atom);
+ 
+     const char *displayName() const { return m_displayName.constData(); }
+-
+     xcb_connection_t *xcb_connection() const { return m_connection; }
+     const xcb_setup_t *setup() const { return m_setup; }
+     const xcb_format_t *formatForDepth(uint8_t depth) const;
+@@ -380,6 +379,8 @@ public:
+     bool hasXRandr() const { return has_randr_extension; }
+     bool hasInputShape() const { return has_input_shape; }
+ 
++    xcb_timestamp_t getTimestamp();
++
+ private slots:
+     void processXcbEvents();

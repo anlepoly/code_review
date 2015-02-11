@@ -1,0 +1,3576 @@
+diff --git a/src/quick/items/qquickvisualadaptormodel.cpp b/src/quick/items/qquickvisualadaptormodel.cpp
+index c1402ae..f5a5c8e 100644
+--- a/src/quick/items/qquickvisualadaptormodel.cpp
++++ b/src/quick/items/qquickvisualadaptormodel.cpp
+@@ -108,6 +108,7 @@ public:
+         , stringValue(&initializeStringValue)
+         , m_ref(0)
+         , m_count(0)
++        , m_roleCount(0)
+         , m_objectList(false)
+     {
+     }
+@@ -142,14 +143,13 @@ public:
+         return d->createItem(metaType, model, index);
+     }
+ 
+-    static QString initializeStringValue(QQuickVisualAdaptorModel *model, int index, const QString &name) {
+-        QQuickVisualAdaptorModelPrivate *d = get(model);
+-        d->createMetaObject();
+-        return d->stringValue(model, index, name);
++    static QString initializeStringValue(QQuickVisualAdaptorModelPrivate *model, int index, const QString &name) {
++        model->createMetaObject();
++        return model->stringValue(model, index, name);
+     }
+ 
+     typedef QQuickVisualDataModelItem *(*CreateModelData)(QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index);
+-    typedef QString (*StringValue)(QQuickVisualAdaptorModel *model, int index, const QString &name);
++    typedef QString (*StringValue)(QQuickVisualAdaptorModelPrivate *model, int index, const QString &name);
+ 
+     struct PropertyData {
+         int role;
+@@ -177,6 +177,7 @@ public:
+ 
+     int m_ref;
+     int m_count;
++    int m_roleCount;
+     QQuickVisualAdaptorModel::Flags m_flags;
+     bool m_objectList : 1;
+ 
+@@ -191,6 +192,109 @@ public:
+     QQuickVisualDataModelItemCache m_cache;
+ };
+ 
++class QQuickVDMCachedModelData : public QQuickVisualDataModelItem
++{
++public:
++    virtual QVariant value(QQuickVisualAdaptorModelPrivate *model, int role) const = 0;
++    virtual void setValue(QQuickVisualAdaptorModelPrivate *model, int role, const QVariant &value) = 0;
++
++    void setValue(const QString &role, const QVariant &value)
++    {
++        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
++        QHash<QByteArray, int>::iterator it = d->m_roleNames.find(role.toUtf8());
++        if (it != d->m_roleNames.end()) {
++            for (int i = 0; i < d->m_propertyData.count(); ++i) {
++                if (d->m_propertyData.at(i).role == *it) {
++                    cachedData[i] = value;
++                    return;
++                }
++            }
++        }
++    }
++
++    bool resolveIndex(int idx)
++    {
++        if (index[0] == -1) {
++            Q_ASSERT(idx >= 0);
++            QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
++            index[0] = idx;
++            cachedData.clear();
++            emit modelIndexChanged();
++            const QMetaObject *meta = metaObject();
++            const int propertyCount = d->m_propertyData.count();
++            for (int i = 0; i < propertyCount; ++i)
++                QMetaObject::activate(this, meta, i, 0);
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++    static v8::Handle<v8::Value> get_property(v8::Local<v8::String>, const v8::AccessorInfo &info)
++    {
++        QQuickVisualDataModelItem *data = v8_resource_cast<QQuickVisualDataModelItem>(info.This());
++        if (!data)
++            V8THROW_ERROR("Not a valid VisualData object");
++
++        QQuickVisualAdaptorModelPrivate *model = QQuickVisualAdaptorModelPrivate::get(data->model);
++        QQuickVDMCachedModelData *modelData = static_cast<QQuickVDMCachedModelData *>(data);
++        const int propertyId = info.Data()->Int32Value();
++        if (data->index[0] == -1) {
++            if (!modelData->cachedData.isEmpty()) {
++                return data->engine->fromVariant(
++                        modelData->cachedData.at(modelData->cachedData.count() > 1 ? propertyId : 0));
++            }
++        } else {
++            return data->engine->fromVariant(
++                    modelData->value(model, model->m_propertyData.at(propertyId).role));
++        }
++        return v8::Undefined();
++    }
++
++    static void set_property(
++            v8::Local<v8::String>, v8::Local<v8::Value> value, const v8::AccessorInfo &info)
++    {
++        QQuickVisualDataModelItem *data = v8_resource_cast<QQuickVisualDataModelItem>(info.This());
++        if (!data)
++            V8THROW_ERROR_SETTER("Not a valid VisualData object");
++
++        const int propertyId = info.Data()->Int32Value();
++        if (data->index[0] == -1) {
++            QQuickVDMCachedModelData *modelData = static_cast<QQuickVDMCachedModelData *>(data);
++            if (!modelData->cachedData.isEmpty()) {
++                if (modelData->cachedData.count() > 1) {
++                    modelData->cachedData[propertyId] = data->engine->toVariant(value, QVariant::Invalid);
++                    QMetaObject::activate(data, data->metaObject(), propertyId, 0);
++                } else if (modelData->cachedData.count() == 1) {
++                    modelData->cachedData[0] = data->engine->toVariant(value, QVariant::Invalid);
++                    QMetaObject::activate(data, data->metaObject(), 0, 0);
++                    QMetaObject::activate(data, data->metaObject(), 1, 0);
++                }
++            }
++        }
++    }
++
++    v8::Handle<v8::Value> get()
++    {
++        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
++
++        v8::Local<v8::Object> data = d->m_constructor->NewInstance();
++        data->SetExternalResource(this);
++        return data;
++    }
++
++
++    QQuickVDMCachedModelData(
++            QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index)
++        : QQuickVisualDataModelItem(metaType, model, index)
++    {
++        if (index == -1)
++            cachedData.resize(QQuickVisualAdaptorModelPrivate::get(model)->m_roleCount);
++    }
++
++    QVector<QVariant> cachedData;
++};
++
+ class QQuickVisualDataModelItemMetaObject : public QAbstractDynamicMetaObject
+ {
+ public:
+@@ -219,20 +323,48 @@ public:
+     VDMDelegateDataType *m_type;
+ };
+ 
+-class QQuickVDMAbstractItemModelDataMetaObject : public QQuickVisualDataModelItemMetaObject
++class QQuickVDMCachedModelDataMetaObject : public QQuickVisualDataModelItemMetaObject
+ {
+ public:
+-    QQuickVDMAbstractItemModelDataMetaObject(QQuickVisualDataModelItem *object, VDMDelegateDataType *type)
++    QQuickVDMCachedModelDataMetaObject(QQuickVisualDataModelItem *object, VDMDelegateDataType *type)
+         : QQuickVisualDataModelItemMetaObject(object, type) {}
+ 
+     int metaCall(QMetaObject::Call call, int id, void **arguments)
+     {
+         if (call == QMetaObject::ReadProperty && id >= m_type->propertyOffset) {
+             QQuickVisualAdaptorModelPrivate *model = QQuickVisualAdaptorModelPrivate::get(m_data->model);
+-            if (m_data->index[0] == -1 || !model->m_abstractItemModel)
+-                return -1;
+-            *static_cast<QVariant *>(arguments[0]) = model->m_abstractItemModel->index(
+-                    m_data->index[0], 0, model->m_root).data(model->m_propertyData.at(id - m_type->propertyOffset).role);
++            const int propertyIndex = id - m_type->propertyOffset;
++            if (m_data->index[0] == -1) {
++                QQuickVDMCachedModelData *data = static_cast<QQuickVDMCachedModelData *>(m_data);
++                if (!data->cachedData.isEmpty()) {
++                    *static_cast<QVariant *>(arguments[0]) = data->cachedData.count() > 1
++                            ? data->cachedData.at(propertyIndex)
++                            : data->cachedData.at(0);
++                }
++            } else {
++                *static_cast<QVariant *>(arguments[0]) = static_cast<QQuickVDMCachedModelData *>(
++                        m_data)->value(model, model->m_propertyData.at(propertyIndex).role);
++            }
++            return -1;
++        } else if (call == QMetaObject::WriteProperty && id >= m_type->propertyOffset) {
++            QQuickVisualAdaptorModelPrivate *model = QQuickVisualAdaptorModelPrivate::get(m_data->model);
++            const int propertyIndex = id - m_type->propertyOffset;
++            if (m_data->index[0] == -1) {
++                QQuickVDMCachedModelData *data = static_cast<QQuickVDMCachedModelData *>(m_data);
++                if (data->cachedData.count() > 1) {
++                    data->cachedData[propertyIndex] = *static_cast<QVariant *>(arguments[0]);
++                    activate(data, this, propertyIndex, 0);
++                } else if (data->cachedData.count() == 1) {
++                    data->cachedData[0] = *static_cast<QVariant *>(arguments[0]);
++                    activate(data, this, 0, 0);
++                    activate(data, this, 1, 0);
++                }
++            } else {
++                static_cast<QQuickVDMCachedModelData *>(m_data)->setValue(
++                        model,
++                        model->m_propertyData.at(propertyIndex).role,
++                        *static_cast<QVariant *>(arguments[0]));
++            }
+             return -1;
+         } else {
+             return m_data->qt_metacall(call, id, arguments);
+@@ -240,7 +372,7 @@ public:
+     }
+ };
+ 
+-class QQuickVDMAbstractItemModelData : public QQuickVisualDataModelItem
++class QQuickVDMAbstractItemModelData : public QQuickVDMCachedModelData
+ {
+     Q_OBJECT
+     Q_PROPERTY(bool hasModelChildren READ hasModelChildren CONSTANT)
+@@ -255,32 +387,30 @@ public:
+             QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index) {
+         return new QQuickVDMAbstractItemModelData(metaType, model, index); }
+ 
+-    static QString stringValue(QQuickVisualAdaptorModel *model, int index, const QString &name)
++    static QString stringValue(QQuickVisualAdaptorModelPrivate *model, int index, const QString &role)
+     {
+-        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
+-        const int role = d->m_roleNames.value(name.toUtf8(), -1);
+-
+-        if (role != -1)
+-            return d->m_abstractItemModel->index(index, 0, d->m_root).data(role).toString();
+-        else if (name == QLatin1String("hasModelChildren"))
+-            return QVariant(d->m_abstractItemModel->hasChildren(d->m_abstractItemModel->index(index, 0, d->m_root))).toString();
+-        else
++        QHash<QByteArray, int>::const_iterator it = model->m_roleNames.find(role.toUtf8());
++        if (it != model->m_roleNames.end()) {
++            return model->m_abstractItemModel->index(index, 0, model->m_root).data(*it).toString();
++        } else if (role == QLatin1String("hasModelChildren")) {
++            return QVariant(model->m_abstractItemModel->hasChildren(
++                    model->m_abstractItemModel->index(index, 0, model->m_root))).toString();
++        } else {
+             return QString();
++        }
+     }
+ 
+-    static v8::Handle<v8::Value> get_property(v8::Local<v8::String>, const v8::AccessorInfo &info)
++    QVariant value(QQuickVisualAdaptorModelPrivate *model, int role) const
+     {
+-        QQuickVisualDataModelItem *data = v8_resource_cast<QQuickVisualDataModelItem>(info.This());
+-        if (!data)
+-            V8THROW_ERROR("Not a valid VisualData object");
+-
+-        QQuickVisualAdaptorModelPrivate *model = QQuickVisualAdaptorModelPrivate::get(data->model);
+-        if (data->index[0] == -1 || !model->m_abstractItemModel)
+-            return v8::Undefined();
++        return model->m_abstractItemModel
++                ? model->m_abstractItemModel->index(index[0], 0, model->m_root).data(role)
++                : 0;
++    }
+ 
+-        const int role = info.Data()->Int32Value();
+-        const QVariant value = model->m_abstractItemModel->index(data->index[0], 0, model->m_root).data(role);
+-        return data->engine->fromVariant(value);
++    void setValue(QQuickVisualAdaptorModelPrivate *model, int role, const QVariant &value)
++    {
++        model->m_abstractItemModel->setData(
++                model->m_abstractItemModel->index(index[0], 0, model->m_root), value, role);
+     }
+ 
+     static v8::Handle<v8::Value> get_hasModelChildren(v8::Local<v8::String>, const v8::AccessorInfo &info)
+@@ -295,21 +425,12 @@ public:
+                 model->m_abstractItemModel->index(data->index[0], 0, model->m_root)));
+     }
+ 
+-    v8::Handle<v8::Value> get()
+-    {
+-        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
+-
+-        v8::Local<v8::Object> data = d->m_constructor->NewInstance();
+-        data->SetExternalResource(this);
+-        return data;
+-    }
+-
+ private:
+     QQuickVDMAbstractItemModelData(
+             QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index)
+-        : QQuickVisualDataModelItem(metaType, model, index)
++        : QQuickVDMCachedModelData(metaType, model, index)
+     {
+-        new QQuickVDMAbstractItemModelDataMetaObject(
++        new QQuickVDMCachedModelDataMetaObject(
+                 this, QQuickVisualAdaptorModelPrivate::get(model)->m_delegateDataType);
+     }
+ };
+@@ -336,51 +457,35 @@ public:
+ 
+ };
+ 
+-class QQuickVDMListModelInterfaceData : public QQuickVisualDataModelItem
++class QQuickVDMListModelInterfaceData : public QQuickVDMCachedModelData
+ {
+ public:
+     static QQuickVisualDataModelItem *create(
+             QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index) {
+         return new QQuickVDMListModelInterfaceData(metaType, model, index); }
+ 
+-    static QString stringValue(QQuickVisualAdaptorModel *model, int index, const QString &name)
++    static QString stringValue(QQuickVisualAdaptorModelPrivate *model, int index, const QString &role)
+     {
+-        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
+-        const int role = d->m_roleNames.value(name.toUtf8(), -1);
+-        return role != -1
+-                ? d->m_listModelInterface->data(index, role).toString()
++        QHash<QByteArray, int>::const_iterator it = model->m_roleNames.find(role.toUtf8());
++        return it != model->m_roleNames.end()
++                ? model->m_listModelInterface->data(index, *it).toString()
+                 : QString();
+     }
+ 
+-    static v8::Handle<v8::Value> get_property(v8::Local<v8::String>, const v8::AccessorInfo &info)
++    QVariant value(QQuickVisualAdaptorModelPrivate *model, int role) const
+     {
+-        QQuickVisualDataModelItem *data = v8_resource_cast<QQuickVisualDataModelItem>(info.This());
+-        if (!data)
+-            V8THROW_ERROR("Not a valid VisualData object");
+-
+-        QQuickVisualAdaptorModelPrivate *model = QQuickVisualAdaptorModelPrivate::get(data->model);
+-        if (data->index[0] == -1 || !model->m_listModelInterface)
+-            return v8::Undefined();
+-
+-        const int role = info.Data()->Int32Value();
+-        const QVariant value = model->m_listModelInterface->data(data->index[0], role);
+-        return data->engine->fromVariant(value);
++        return model->m_listModelInterface
++                ? model->m_listModelInterface->data(index[0], role)
++                : 0;
+     }
+ 
+-    v8::Handle<v8::Value> get()
+-    {
+-        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
+-
+-        v8::Local<v8::Object> data = d->m_constructor->NewInstance();
+-        data->SetExternalResource(this);
+-        return data;
+-    }
++    void setValue(QQuickVisualAdaptorModelPrivate *, int, const QVariant &) {}
+ 
+ private:
+     QQuickVDMListModelInterfaceData(QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index)
+-        : QQuickVisualDataModelItem(metaType, model, index)
++        : QQuickVDMCachedModelData(metaType, model, index)
+     {
+-        new QQuickVDMListModelInterfaceDataMetaObject(
++        new QQuickVDMCachedModelDataMetaObject(
+                 this, QQuickVisualAdaptorModelPrivate::get(model)->m_delegateDataType);
+     }
+ };
+@@ -388,19 +493,32 @@ private:
+ class QQuickVDMListAccessorData : public QQuickVisualDataModelItem
+ {
+     Q_OBJECT
+-    Q_PROPERTY(QVariant modelData READ modelData CONSTANT)
++    Q_PROPERTY(QVariant modelData READ modelData WRITE setModelData NOTIFY modelDataChanged)
+ public:
+-    QVariant modelData() const {
+-        return QQuickVisualAdaptorModelPrivate::get(model)->m_listAccessor->at(index[0]); }
++    QVariant modelData() const
++    {
++        QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(model);
++        return index[0] != -1 && d->m_listAccessor
++                ? d->m_listAccessor->at(index[0])
++                : cachedData;
++    }
++
++    void setModelData(const QVariant &data)
++    {
++        if (index[0] == -1 && data != cachedData) {
++            cachedData = data;
++            emit modelDataChanged();
++        }
++    }
+ 
+     static QQuickVisualDataModelItem *create(
+             QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index) {
+         return new QQuickVDMListAccessorData(metaType, model, index); }
+ 
+-    static QString stringValue(QQuickVisualAdaptorModel *model, int index, const QString &name)
++    static QString stringValue(QQuickVisualAdaptorModelPrivate *model, int index, const QString &role)
+     {
+-        return name == QLatin1String("modelData")
+-                ? QQuickVisualAdaptorModelPrivate::get(model)->m_listAccessor->at(index).toString()
++        return role == QLatin1String("modelData")
++                ? model->m_listAccessor->at(index).toString()
+                 : QString();
+     }
+ 
+@@ -412,15 +530,52 @@ public:
+ 
+         QQuickVisualAdaptorModelPrivate *d = QQuickVisualAdaptorModelPrivate::get(data->model);
+         if (data->index[0] == -1 || !d->m_listAccessor)
+-            return v8::Undefined();
++            return data->engine->fromVariant(static_cast<QQuickVDMListAccessorData *>(data)->cachedData);
+ 
+         return data->engine->fromVariant(d->m_listAccessor->at(data->index[0]));
+     }
++
++    static void set_modelData(v8::Local<v8::String>, const v8::Handle<v8::Value> &value, const v8::AccessorInfo &info)
++    {
++        QQuickVisualDataModelItem *data = v8_resource_cast<QQuickVisualDataModelItem>(info.This());
++        if (!data)
++            V8THROW_ERROR_SETTER("Not a valid VisualData object");
++
++        if (data->index[0] == -1) {
++            static_cast<QQuickVDMListAccessorData *>(data)->setModelData(
++                    data->engine->toVariant(value, QVariant::Invalid));
++        }
++    }
++
++    void setValue(const QString &role, const QVariant &value)
++    {
++        if (role == QLatin1String("modelData"))
++            cachedData = value;
++    }
++
++    bool resolveIndex(int idx)
++    {
++        if (index[0] == -1) {
++            index[0] = idx;
++            cachedData.clear();
++            emit modelIndexChanged();
++            emit modelDataChanged();
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++Q_SIGNALS:
++    void modelDataChanged();
++
+ private:
+     QQuickVDMListAccessorData(QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index)
+         : QQuickVisualDataModelItem(metaType, model, index)
+     {
+     }
++
++    QVariant cachedData;
+ };
+ 
+ class QQuickVDMObjectDataMetaObject : public QQuickVisualDataModelItemMetaObject
+@@ -517,11 +672,11 @@ public:
+ 
+     static QQuickVisualDataModelItem *create(
+             QQuickVisualDataModelItemMetaType *metaType, QQuickVisualAdaptorModel *model, int index) {
+-        return new QQuickVDMObjectData(metaType, model, index); }
++        return index >= 0 ? new QQuickVDMObjectData(metaType, model, index) : 0; }
+ 
+-    static QString stringValue(QQuickVisualAdaptorModel *model, int index, const QString &name)
++    static QString stringValue(QQuickVisualAdaptorModelPrivate *model, int index, const QString &name)
+     {
+-        if (QObject *object = QQuickVisualAdaptorModelPrivate::get(model)->m_listAccessor->at(index).value<QObject *>())
++        if (QObject *object = model->m_listAccessor->at(index).value<QObject *>())
+             return object->property(name.toUtf8()).toString();
+         return QString();
+     }
+@@ -545,7 +700,7 @@ void QQuickVisualAdaptorModelPrivate::addProperty(
+     m_delegateDataType->builder.addSignal("__" + QByteArray::number(propertyId) + "()");
+     QMetaPropertyBuilder property = m_delegateDataType->builder.addProperty(
+             propertyName, propertyType, propertyId);
+-    property.setWritable(false);
++    property.setWritable(true); // No, yes, yes no?
+ 
+     m_propertyData.append(propertyData);
+ }
+@@ -589,37 +744,42 @@ void QQuickVisualAdaptorModelPrivate::createMetaObject()
+             ft->PrototypeTemplate()->SetAccessor(
+                     v8Engine->toString(roleName),
+                     QQuickVDMListModelInterfaceData::get_property,
+-                    0,
+-                    v8::Int32::New(role));
++                    QQuickVDMListModelInterfaceData::set_property,
++                    v8::Int32::New(propertyId));
+             m_roleNames.insert(propertyName, role);
+         }
++        m_roleCount = m_propertyData.count();
+         if (m_propertyData.count() == 1) {
+             addProperty(roles.first(), 1, "modelData", "QVariant", true);
+             ft->PrototypeTemplate()->SetAccessor(
+                     v8::String::New("modelData"),
+                     QQuickVDMListModelInterfaceData::get_property,
+-                    0,
+-                    v8::Int32::New(roles.first()));
++                    QQuickVDMListModelInterfaceData::set_property,
++                    v8::Int32::New(0));
++            m_roleNames.insert("modelData", roles.first());
+         }
+     } else if (m_abstractItemModel) {
+         setModelDataType<QQuickVDMAbstractItemModelData>();
+         QHash<int, QByteArray> roleNames = m_abstractItemModel->roleNames();
+         for (QHash<int, QByteArray>::const_iterator it = roleNames.begin(); it != roleNames.end(); ++it) {
+-            addProperty(it.key(), m_propertyData.count(), it.value(), "QVariant");
++            const int propertyId = m_propertyData.count();
++            addProperty(it.key(), propertyId, it.value(), "QVariant");
+             ft->PrototypeTemplate()->SetAccessor(
+                     v8::String::New(it.value().constData(), it.value().length()),
+                     QQuickVDMAbstractItemModelData::get_property,
+-                    0,
+-                    v8::Int32::New(it.key()));
++                    QQuickVDMAbstractItemModelData::set_property,
++                    v8::Int32::New(propertyId));
+             m_roleNames.insert(it.value(), it.key());
+         }
++        m_roleCount = m_propertyData.count();
+         if (m_propertyData.count() == 1) {
+             addProperty(roleNames.begin().key(), 1, "modelData", "QVariant", true);
+             ft->PrototypeTemplate()->SetAccessor(
+                     v8::String::New("modelData"),
+                     QQuickVDMAbstractItemModelData::get_property,
+-                    0,
+-                    v8::Int32::New(roleNames.begin().key()));
++                    QQuickVDMAbstractItemModelData::set_property,
++                    v8::Int32::New(0));
++            m_roleNames.insert("modelData", roleNames.begin().key());
+         }
+         ft->PrototypeTemplate()->SetAccessor(
+                 v8::String::New("hasModelChildren"),
+@@ -702,6 +862,7 @@ void QQuickVisualAdaptorModel::setModel(const QVariant &model, QDeclarativeEngin
+ 
+     d->m_roles.clear();
+     d->m_roleNames.clear();
++    d->m_roleCount = 0;
+     d->m_flags = QQuickVisualAdaptorModel::Flags();
+     if (d->m_delegateDataType)
+         d->m_delegateDataType->release();
+@@ -798,22 +959,24 @@ int QQuickVisualAdaptorModel::count() const
+ QQuickVisualDataModelItem *QQuickVisualAdaptorModel::createItem(QQuickVisualDataModelItemMetaType *metaType, int index)
+ {
+     Q_D(QQuickVisualAdaptorModel);
+-    QQuickVisualDataModelItem *data = d->createItem(metaType, this, index);
+-    d->m_cache.insert(data);
+ 
+-    if (d->m_delegateDataType && d->m_delegateDataType->propertyCache) {
+-        QDeclarativeData *qmldata = QDeclarativeData::get(data, true);
+-        qmldata->propertyCache = d->m_delegateDataType->propertyCache;
+-        qmldata->propertyCache->addref();
+-    }
++    if (QQuickVisualDataModelItem *item = d->createItem(metaType, this, index)) {
++        d->m_cache.insert(item);
+ 
+-    return data;
++        if (d->m_delegateDataType && d->m_delegateDataType->propertyCache) {
++            QDeclarativeData *qmldata = QDeclarativeData::get(item, true);
++            qmldata->propertyCache = d->m_delegateDataType->propertyCache;
++            qmldata->propertyCache->addref();
++        }
++        return item;
++    }
++    return 0;
+ }
+ 
+ QString QQuickVisualAdaptorModel::stringValue(int index, const QString &name)
+ {
+     Q_D(QQuickVisualAdaptorModel);
+-    return d->stringValue(this, index, name);
++    return d->stringValue(d, index, name);
+ }
+ 
+ bool QQuickVisualAdaptorModel::canFetchMore() const
+diff --git a/src/quick/items/qquickvisualdatamodel.cpp b/src/quick/items/qquickvisualdatamodel.cpp
+index caad582..b029443 100644
+--- a/src/quick/items/qquickvisualdatamodel.cpp
++++ b/src/quick/items/qquickvisualdatamodel.cpp
+@@ -111,7 +111,8 @@ QQuickVisualDataModelPrivate::QQuickVisualDataModelPrivate(QDeclarativeContext *
+     , m_filterGroup(QStringLiteral("items"))
+     , m_cacheItems(0)
+     , m_items(0)
+-    , m_groupCount(3)
++    , m_persistedItems(0)
++    , m_groupCount(Compositor::MinimumGroupCount)
+ {
+ }
+ 
+@@ -169,8 +170,8 @@ QQuickVisualDataModel::~QQuickVisualDataModel()
+         cacheItem->scriptRef += 1;
+         delete cacheItem->object;
+         cacheItem->scriptRef -= 1;
+-        cacheItem->object = 0;
+         cacheItem->objectRef = 0;
++        cacheItem->object = 0;
+         if (!cacheItem->isReferenced())
+             delete cacheItem;
+     }
+@@ -198,7 +199,7 @@ void QQuickVisualDataModel::componentComplete()
+         defaultGroups |= Compositor::DefaultFlag;
+     if (QQuickVisualDataGroupPrivate::get(d->m_persistedItems)->defaultInclude)
+         defaultGroups |= Compositor::PersistedFlag;
+-    for (int i = 3; i < d->m_groupCount; ++i) {
++    for (int i = Compositor::MinimumGroupCount; i < d->m_groupCount; ++i) {
+         QString name = d->m_groups[i]->name();
+         if (name.isEmpty()) {
+             d->m_groups[i] = d->m_groups[d->m_groupCount - 1];
+@@ -753,7 +754,8 @@ QObject *QQuickVisualDataModelPrivate::object(Compositor::Group group, int index
+         cacheItem = m_adaptorModel->createItem(m_cacheMetaType, it.modelIndex());
+         for (int i = 1; i < m_groupCount; ++i)
+             cacheItem->index[i] = it.index[i];
+-        cacheItem->groups = it->flags & Compositor::GroupMask;
++
++        cacheItem->groups = it->flags;
+ 
+         m_cache.insert(it.cacheIndex, cacheItem);
+         m_compositor.setFlags(it, 1, Compositor::CacheFlag);
+@@ -893,13 +895,11 @@ void QQuickVisualDataModelPrivate::setGroups(
+ 
+     m_compositor.setFlags(from, count, group, groupFlags, &inserts);
+     itemsInserted(inserts);
+-
+     const int removeFlags = ~groupFlags & Compositor::GroupMask;
+ 
+     from = m_compositor.find(from.group, from.index[from.group]);
+     m_compositor.clearFlags(from, count, group, removeFlags, &removes);
+     itemsRemoved(removes);
+-
+     emitChanges();
+ }
+ 
+@@ -1070,7 +1070,14 @@ void QQuickVisualDataModelPrivate::itemsRemoved(
+                         emitDestroyingItem(item);
+                     cacheItem->object = 0;
+                 }
+-                if (remove.groups() == cacheItem->groups) {
++                if (!cacheItem->isReferenced()) {
++                    m_compositor.clearFlags(Compositor::Cache, cacheIndex, 1, Compositor::CacheFlag);
++                    m_cache.removeAt(cacheIndex);
++                    delete cacheItem;
++                    --cacheIndex;
++                    ++removedCache;
++                    Q_ASSERT(m_cache.count() == m_compositor.count(Compositor::Cache));
++                } else if (remove.groups() == cacheItem->groups) {
+                     cacheItem->groups = 0;
+                     for (int i = 1; i < m_groupCount; ++i)
+                         cacheItem->index[i] = -1;
+@@ -1079,7 +1086,7 @@ void QQuickVisualDataModelPrivate::itemsRemoved(
+                         if (remove.inGroup(i))
+                             cacheItem->index[i] = remove.index[i];
+                     }
+-                    cacheItem->groups &= ~remove.flags & Compositor::GroupMask;
++                    cacheItem->groups &= ~remove.flags;
+                 }
+             }
+         }
+@@ -1113,6 +1120,7 @@ void QQuickVisualDataModel::_q_itemsRemoved(int index, int count)
+     QVector<Compositor::Remove> removes;
+     d->m_compositor.listItemsRemoved(d->m_adaptorModel, index, count, &removes);
+     d->itemsRemoved(removes);
++
+     d->emitChanges();
+ }
+ 
+@@ -1221,6 +1229,35 @@ QQuickVisualDataModelAttached *QQuickVisualDataModel::qmlAttachedProperties(QObj
+     return QQuickVisualDataModelAttached::properties(obj);
+ }
+ 
++bool QQuickVisualDataModelPrivate::insert(
++        Compositor::insert_iterator &before, const v8::Local<v8::Object> &object, int groups)
++{
++    QQuickVisualDataModelItem *cacheItem = m_adaptorModel->createItem(m_cacheMetaType, -1);
++    if (!cacheItem)
++        return false;
++
++    for (int i = 1; i < m_groupCount; ++i)
++        cacheItem->index[i] = before.index[i];
++
++    v8::Local<v8::Array> propertyNames = object->GetPropertyNames();
++    for (uint i = 0; i < propertyNames->Length(); ++i) {
++        v8::Local<v8::String> propertyName = propertyNames->Get(i)->ToString();
++        cacheItem->setValue(
++                m_cacheMetaType->v8Engine->toString(propertyName),
++                m_cacheMetaType->v8Engine->toVariant(object->Get(propertyName), QVariant::Invalid));
++    }
++
++    cacheItem->groups = groups | Compositor::UnresolvedFlag | Compositor::CacheFlag;
++
++    // Must be before the new object is inserted into the cache or its indexes will be adjusted too.
++    itemsInserted(QVector<Compositor::Insert>() << Compositor::Insert(before, 1, cacheItem->groups & ~Compositor::CacheFlag));
++
++    before = m_compositor.insert(before, 0, 0, 1, cacheItem->groups);
++    m_cache.insert(before.cacheIndex, cacheItem);
++
++    return true;
++}
++
+ //============================================================================
+ 
+ QQuickVisualDataModelItemMetaType::QQuickVisualDataModelItemMetaType(
+@@ -1244,6 +1281,7 @@ QQuickVisualDataModelItemMetaType::QQuickVisualDataModelItemMetaType(
+     ft->InstanceTemplate()->SetHasExternalResource(true);
+     ft->PrototypeTemplate()->SetAccessor(v8::String::New("model"), get_model);
+     ft->PrototypeTemplate()->SetAccessor(v8::String::New("groups"), get_groups, set_groups);
++    ft->PrototypeTemplate()->SetAccessor(v8::String::New("isUnresolved"), get_member, 0, v8::Int32::New(30));
+ 
+     int notifierId = 0;
+     for (int i = 0; i < groupNames.count(); ++i, ++notifierId) {
+@@ -1593,6 +1631,14 @@ void QQuickVisualDataModelAttached::setGroups(const QStringList &groups)
+     }
+ }
+ 
++bool QQuickVisualDataModelAttached::isUnresolved() const
++{
++    if (!m_cacheItem)
++        return false;
++
++    return m_cacheItem->groups & Compositor::UnresolvedFlag;
++}
++
+ /*!
+     \qmlattachedproperty int QtQuick2::VisualDataModel::inItems
+ 
+@@ -1850,7 +1896,7 @@ QDeclarativeV8Handle QQuickVisualDataGroup::get(int index)
+         cacheItem = model->m_adaptorModel->createItem(model->m_cacheMetaType, it.modelIndex());
+         for (int i = 1; i < model->m_groupCount; ++i)
+             cacheItem->index[i] = it.index[i];
+-        cacheItem->groups = it->flags & Compositor::GroupMask;
++        cacheItem->groups = it->flags;
+ 
+         model->m_cache.insert(it.cacheIndex, cacheItem);
+         model->m_compositor.setFlags(it, 1, Compositor::CacheFlag);
+@@ -1863,6 +1909,7 @@ QDeclarativeV8Handle QQuickVisualDataGroup::get(int index)
+ 
+         ++cacheItem->scriptRef;
+     }
++
+     return QDeclarativeV8Handle::fromHandle(cacheItem->indexHandle);
+ }
+ 
+@@ -1886,8 +1933,49 @@ bool QQuickVisualDataGroupPrivate::parseIndex(
+     return false;
+ }
+ 
++void QQuickVisualDataGroup::insert(QDeclarativeV8Function *args)
++{
++    Q_D(QQuickVisualDataGroup);
++    QQuickVisualDataModelPrivate *model = QQuickVisualDataModelPrivate::get(d->model);
++
++    int index = model->m_compositor.count(d->group);
++    Compositor::Group group = d->group;
++
++    if (args->Length() == 0)
++        return;
++
++    int  i = 0;
++    v8::Local<v8::Value> v = (*args)[i];
++    if (d->parseIndex(v, &index, &group)) {
++        if (index < 0 || index > model->m_compositor.count(group)) {
++            qmlInfo(this) << tr("insert: index out of range");
++            return;
++        }
++        if (++i == args->Length())
++            return;
++        v = (*args)[i];
++    }
++
++    Compositor::insert_iterator before = index < model->m_compositor.count(group)
++            ? model->m_compositor.findInsertPosition(group, index)
++            : model->m_compositor.end();
++
++    int groups = 1 << d->group;
++    if (++i < args->Length())
++        groups |= model->m_cacheMetaType->parseGroups((*args)[i]);
++
++    if (v->IsArray()) {
++        return;
++    } else if (v->IsObject()) {
++        model->insert(before, v->ToObject(), groups);
++        model->emitChanges();
++    }
++}
++
+ /*!
+     \qmlmethod QtQuick2::VisualDataGroup::create(var index)
++    \qmlmethod QtQuick2::VisualDataGroup::create(var index, jsdict data)
++    \qmlmethod QtQuick2::VisualDataGroup::create(jsdict data)
+ 
+     Returns a reference to the instantiated item at \a index in the group.
+ 
+@@ -1904,14 +1992,35 @@ void QQuickVisualDataGroup::create(QDeclarativeV8Function *args)
+     if (args->Length() == 0)
+         return;
+ 
++    QQuickVisualDataModelPrivate *model = QQuickVisualDataModelPrivate::get(d->model);
++
++    int index = model->m_compositor.count(d->group);
+     Compositor::Group group = d->group;
+-    int index = -1;
+-    if (!d->parseIndex((*args)[0], &index, &group)) {
+-        qmlInfo(this) << tr("create: invalid index");
+-        return;
+-    }
+ 
+-    QQuickVisualDataModelPrivate *model = QQuickVisualDataModelPrivate::get(d->model);
++    int  i = 0;
++    v8::Local<v8::Value> v = (*args)[i];
++    if (d->parseIndex(v, &index, &group))
++        ++i;
++
++    if (i < args->Length() && index >= 0 && index <= model->m_compositor.count(group)) {
++        v = (*args)[i];
++        if (v->IsObject()) {
++            int groups = 1 << d->group;
++            if (++i < args->Length())
++                groups |= model->m_cacheMetaType->parseGroups((*args)[i]);
++
++            Compositor::insert_iterator before = index < model->m_compositor.count(group)
++                    ? model->m_compositor.findInsertPosition(group, index)
++                    : model->m_compositor.end();
++
++            index = before.index[d->group];
++            group = d->group;
++
++            if (!model->insert(before, v->ToObject(), groups)) {
++                return;
++            }
++        }
++    }
+     if (index < 0 || index >= model->m_compositor.count(group)) {
+         qmlInfo(this) << tr("create: index out of range");
+         return;
+@@ -1919,10 +2028,108 @@ void QQuickVisualDataGroup::create(QDeclarativeV8Function *args)
+ 
+     QObject *object = model->object(group, index, false, false);
+     if (object) {
++        QVector<Compositor::Insert> inserts;
+         Compositor::iterator it = model->m_compositor.find(group, index);
+-        model->addGroups(it, 1, group, Compositor::PersistedFlag);
++        model->m_compositor.setFlags(it, 1, d->group, Compositor::PersistedFlag, &inserts);
++        model->itemsInserted(inserts);
+     }
++
+     args->returnValue(args->engine()->newQObject(object));
++    model->emitChanges();
++}
++
++void QQuickVisualDataGroup::resolve(QDeclarativeV8Function *args)
++{
++    Q_D(QQuickVisualDataGroup);
++    if (!d->model)
++        return;
++
++    QQuickVisualDataModelPrivate *model = QQuickVisualDataModelPrivate::get(d->model);
++
++    if (args->Length() < 2)
++        return;
++
++    int from = -1;
++    int to = -1;
++    Compositor::Group fromGroup = d->group;
++    Compositor::Group toGroup = d->group;
++
++    v8::Local<v8::Value> v = (*args)[0];
++    if (d->parseIndex(v, &from, &fromGroup)) {
++        if (from < 0 || from >= model->m_compositor.count(fromGroup)) {
++            qmlInfo(this) << tr("resolve: from index out of range");
++            return;
++        }
++    } else {
++        qmlInfo(this) << tr("resolve: from index invalid");
++        return;
++    }
++
++    v = (*args)[1];
++    if (d->parseIndex(v, &to, &toGroup)) {
++        if (to < 0 || to >= model->m_compositor.count(toGroup)) {
++            qmlInfo(this) << tr("resolve: to index out of range");
++            return;
++        }
++    } else {
++        qmlInfo(this) << tr("resolve: to index invalid");
++        return;
++    }
++
++    Compositor::iterator fromIt = model->m_compositor.find(fromGroup, from);
++    Compositor::iterator toIt = model->m_compositor.find(toGroup, to);
++
++    if (!fromIt->isUnresolved()) {
++        qmlInfo(this) << tr("resolve: from is not an unresolved item");
++        return;
++    }
++    if (!toIt->list) {
++        qmlInfo(this) << tr("resolve: to is not a model item");
++        return;
++    }
++
++    const int unresolvedFlags = fromIt->flags;
++    const int resolvedFlags = toIt->flags;
++    const int resolvedIndex = toIt.modelIndex();
++    void * const resolvedList = toIt->list;
++
++    QQuickVisualDataModelItem *cacheItem = model->m_cache.at(fromIt.cacheIndex);
++    cacheItem->groups &= ~Compositor::UnresolvedFlag;
++
++    if (toIt.cacheIndex > fromIt.cacheIndex)
++        toIt.decrementIndexes(1, unresolvedFlags);
++    if (!toIt->inGroup(fromGroup) || toIt.index[fromGroup] > from)
++        from += 1;
++
++    model->itemsMoved(
++            QVector<Compositor::Remove>() << Compositor::Remove(fromIt, 1, unresolvedFlags, 0),
++            QVector<Compositor::Insert>() << Compositor::Insert(toIt, 1, unresolvedFlags, 0));
++    model->itemsInserted(
++            QVector<Compositor::Insert>() << Compositor::Insert(toIt, 1, (resolvedFlags & ~unresolvedFlags) | Compositor::CacheFlag));
++    toIt.incrementIndexes(1, resolvedFlags | unresolvedFlags);
++    model->itemsRemoved(QVector<Compositor::Remove>() << Compositor::Remove(toIt, 1, resolvedFlags));
++
++    model->m_compositor.setFlags(toGroup, to, 1, unresolvedFlags & ~Compositor::UnresolvedFlag);
++    model->m_compositor.clearFlags(fromGroup, from, 1, unresolvedFlags);
++
++    if (resolvedFlags & Compositor::CacheFlag)
++        model->m_compositor.insert(Compositor::Cache, toIt.cacheIndex, resolvedList, resolvedIndex, 1, Compositor::CacheFlag);
++
++    Q_ASSERT(model->m_cache.count() == model->m_compositor.count(Compositor::Cache));
++
++    if (!cacheItem->isReferenced()) {
++        Q_ASSERT(toIt.cacheIndex == model->m_cache.indexOf(cacheItem));
++        model->m_cache.removeAt(toIt.cacheIndex);
++        model->m_compositor.clearFlags(Compositor::Cache, toIt.cacheIndex, 1, Compositor::CacheFlag);
++        delete cacheItem;
++        Q_ASSERT(model->m_cache.count() == model->m_compositor.count(Compositor::Cache));
++    } else {
++        cacheItem->resolveIndex(resolvedIndex);
++        if (cacheItem->object)
++            cacheItem->attached->emitUnresolvedChanged();
++    }
++
++    model->emitChanges();
+ }
+ 
+ /*!
+@@ -1946,7 +2153,7 @@ void QQuickVisualDataGroup::remove(QDeclarativeV8Function *args)
+     int i = 0;
+     v8::Local<v8::Value> v = (*args)[i];
+     if (!d->parseIndex(v, &index, &group)) {
+-        qmlInfo(this) << tr("create: invalid index");
++        qmlInfo(this) << tr("remove: invalid index");
+         return;
+     }
+ 
+@@ -2118,7 +2325,7 @@ void QQuickVisualDataGroup::move(QDeclarativeV8Function *args)
+     }
+ 
+     if (!d->parseIndex((*args)[1], &to, &toGroup)) {
+-        qmlInfo(this) << tr("move: invalid from index");
++        qmlInfo(this) << tr("move: invalid to index");
+         return;
+     }
+ 
+diff --git a/src/quick/items/qquickvisualdatamodel_p.h b/src/quick/items/qquickvisualdatamodel_p.h
+index ba9130a..aecf5e3 100644
+--- a/src/quick/items/qquickvisualdatamodel_p.h
++++ b/src/quick/items/qquickvisualdatamodel_p.h
+@@ -162,7 +162,9 @@ public:
+     Q_INVOKABLE QDeclarativeV8Handle get(int index);
+ 
+ public Q_SLOTS:
++    void insert(QDeclarativeV8Function *);
+     void create(QDeclarativeV8Function *);
++    void resolve(QDeclarativeV8Function *);
+     void remove(QDeclarativeV8Function *);
+     void addGroups(QDeclarativeV8Function *);
+     void removeGroups(QDeclarativeV8Function *);
+@@ -185,6 +187,7 @@ class QQuickVisualDataModelAttached : public QObject
+     Q_OBJECT
+     Q_PROPERTY(QQuickVisualDataModel *model READ model NOTIFY modelChanged)
+     Q_PROPERTY(QStringList groups READ groups WRITE setGroups NOTIFY groupsChanged)
++    Q_PROPERTY(bool isUnresolved READ isUnresolved NOTIFY unresolvedChanged)
+ public:
+     QQuickVisualDataModelAttached(QObject *parent)
+         : QObject(parent)
+@@ -201,8 +204,12 @@ public:
+     QStringList groups() const;
+     void setGroups(const QStringList &groups);
+ 
++    bool isUnresolved() const;
++
+     void emitChanges();
+ 
++    void emitUnresolvedChanged() { emit unresolvedChanged(); }
++
+     static QQuickVisualDataModelAttached *properties(QObject *obj)
+     {
+         QQuickVisualDataModelAttached *rv = attachedProperties.value(obj);
+@@ -216,6 +223,7 @@ public:
+ Q_SIGNALS:
+     void modelChanged();
+     void groupsChanged();
++    void unresolvedChanged();
+ 
+ public:
+     QQuickVisualDataModelItem *m_cacheItem;
+diff --git a/src/quick/items/qquickvisualdatamodel_p_p.h b/src/quick/items/qquickvisualdatamodel_p_p.h
+index b843e6a..03d9767 100644
+--- a/src/quick/items/qquickvisualdatamodel_p_p.h
++++ b/src/quick/items/qquickvisualdatamodel_p_p.h
+@@ -62,6 +62,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++typedef QDeclarativeListCompositor Compositor;
++
+ class QQuickVisualDataModelItemMetaType : public QDeclarativeRefCount
+ {
+ public:
+@@ -107,10 +109,14 @@ public:
+     ~QQuickVisualDataModelItem();
+ 
+     void referenceObject() { ++objectRef; }
+-    bool releaseObject() { return --objectRef == 0 && !(groups & QDeclarativeListCompositor::PersistedFlag); }
+-    bool isObjectReferenced() const { return objectRef == 0 && !(groups & QDeclarativeListCompositor::PersistedFlag); }
++    bool releaseObject() { return --objectRef == 0 && !(groups & Compositor::PersistedFlag); }
++    bool isObjectReferenced() const { return objectRef != 0 || (groups & Compositor::PersistedFlag); }
+ 
+-    bool isReferenced() const { return scriptRef || incubationTask || (groups & QDeclarativeListCompositor::PersistedFlag); }
++    bool isReferenced() const {
++        return scriptRef
++                || incubationTask
++                || ((groups & Compositor::UnresolvedFlag) && (groups & Compositor::GroupMask));
++    }
+ 
+     void Dispose();
+ 
+@@ -119,6 +125,9 @@ public:
+ 
+     virtual v8::Handle<v8::Value> get() { return engine->newQObject(this); }
+ 
++    virtual void setValue(const QString &role, const QVariant &value) { Q_UNUSED(role); Q_UNUSED(value); }
++    virtual bool resolveIndex(int) { return false; }
++
+ Q_SIGNALS:
+     void modelIndexChanged();
+ 
+@@ -137,7 +146,6 @@ public:
+     QVDMIncubationTask *incubationTask;
+ };
+ 
+-typedef QDeclarativeListCompositor Compositor;
+ 
+ class QQuickVisualDataModelPrivate;
+ class QVDMIncubationTask : public QDeclarativeIncubator
+@@ -256,6 +264,7 @@ public:
+     void emitChanges();
+     void emitModelUpdated(const QDeclarativeChangeSet &changeSet, bool reset);
+ 
++    bool insert(Compositor::insert_iterator &before, const v8::Local<v8::Object> &object, int groups);
+ 
+     static void group_append(QDeclarativeListProperty<QQuickVisualDataGroup> *property, QQuickVisualDataGroup *group);
+     static int group_count(QDeclarativeListProperty<QQuickVisualDataGroup> *property);
+diff --git a/src/quick/util/qdeclarativelistcompositor.cpp b/src/quick/util/qdeclarativelistcompositor.cpp
+index 1d8c781..8dca915 100644
+--- a/src/quick/util/qdeclarativelistcompositor.cpp
++++ b/src/quick/util/qdeclarativelistcompositor.cpp
+@@ -209,6 +209,7 @@ QDeclarativeListCompositor::insert_iterator &QDeclarativeListCompositor::insert_
+     while (offset > range->count
+             || (offset == range->count && !range->append() && offset > 0)
+             || (!(range->flags & groupFlag) && offset > 0)) {
++        Q_ASSERT(range->flags);
+         if (range->flags & groupFlag)
+             offset -= range->count;
+         incrementIndexes(range->count);
+@@ -265,7 +266,7 @@ QDeclarativeListCompositor::~QDeclarativeListCompositor()
+ }
+ 
+ inline QDeclarativeListCompositor::Range *QDeclarativeListCompositor::insert(
+-        Range *before, void *list, int index, int count, int flags)
++        Range *before, void *list, int index, int count, uint flags)
+ {
+     return new Range(before, list, index, count, flags);
+ }
+@@ -356,21 +357,21 @@ QDeclarativeListCompositor::iterator QDeclarativeListCompositor::begin(Group gro
+ }
+ 
+ void QDeclarativeListCompositor::append(
+-        void *list, int index, int count, int flags, QVector<Insert> *inserts)
++        void *list, int index, int count, uint flags, QVector<Insert> *inserts)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< list << index << count << flags)
+     insert(m_end, list, index, count, flags, inserts);
+ }
+ 
+ void QDeclarativeListCompositor::insert(
+-        Group group, int before, void *list, int index, int count, int flags, QVector<Insert> *inserts)
++        Group group, int before, void *list, int index, int count, uint flags, QVector<Insert> *inserts)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< group << before << list << index << count << flags)
+     insert(findInsertPosition(group, before), list, index, count, flags, inserts);
+ }
+ 
+ QDeclarativeListCompositor::iterator QDeclarativeListCompositor::insert(
+-        iterator before, void *list, int index, int count, int flags, QVector<Insert> *inserts)
++        iterator before, void *list, int index, int count, uint flags, QVector<Insert> *inserts)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< before << list << index << count << flags)
+     if (inserts) {
+@@ -418,7 +419,7 @@ void QDeclarativeListCompositor::setFlags(
+ }
+ 
+ void QDeclarativeListCompositor::setFlags(
+-        iterator from, int count, Group group, int flags, QVector<Insert> *inserts)
++        iterator from, int count, Group group, uint flags, QVector<Insert> *inserts)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< from << count << flags)
+     if (!flags || !count)
+@@ -443,8 +444,8 @@ void QDeclarativeListCompositor::setFlags(
+         const int difference = qMin(count, from->count);
+         count -= difference;
+ 
+-        const int insertFlags = ~from->flags & flags;
+-        const int setFlags = (from->flags | flags) & ~AppendFlag;
++        const uint insertFlags = ~from->flags & flags;
++        const uint setFlags = (from->flags | flags) & ~AppendFlag;
+         if (insertFlags && inserts)
+             inserts->append(Insert(from, difference, insertFlags | (from->flags & CacheFlag)));
+         m_end.incrementIndexes(difference, insertFlags);
+@@ -493,14 +494,14 @@ void QDeclarativeListCompositor::setFlags(
+ }
+ 
+ void QDeclarativeListCompositor::clearFlags(
+-        Group fromGroup, int from, int count, Group group, int flags, QVector<Remove> *removes)
++        Group fromGroup, int from, int count, Group group, uint flags, QVector<Remove> *removes)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< group << index << count << flags)
+     clearFlags(find(fromGroup, from), count, group, flags, removes);
+ }
+ 
+ void QDeclarativeListCompositor::clearFlags(
+-        iterator from, int count, Group group, int flags, QVector<Remove> *removes)
++        iterator from, int count, Group group, uint flags, QVector<Remove> *removes)
+ {
+     QT_DECLARATIVE_TRACE_LISTCOMPOSITOR(<< from << count << flags)
+     if (!flags || !count)
+@@ -527,8 +528,8 @@ void QDeclarativeListCompositor::clearFlags(
+         const int difference = qMin(count, from->count);
+         count -= difference;
+ 
+-        const int removeFlags = from->flags & flags & ~(AppendFlag | PrependFlag);
+-        const int clearedFlags = from->flags & ~(flags | AppendFlag);
++        const uint removeFlags = from->flags & flags & ~(AppendFlag | PrependFlag);
++        const uint clearedFlags = from->flags & ~(flags | AppendFlag | UnresolvedFlag);
+         if (removeFlags && removes) {
+             const int maskedFlags = clearCache
+                     ? (removeFlags & ~CacheFlag)
+@@ -806,7 +807,7 @@ void QDeclarativeListCompositor::listItemsInserted(
+                     || (offset == 0 && it->prepend())
+                     || (offset == it->count && it->append())) {
+                 if (it->prepend()) {
+-                    int flags = m_defaultFlags;
++                    uint flags = m_defaultFlags;
+                     if (insertion.isMove()) {
+                         for (QVector<MovedFlags>::const_iterator move = movedFlags->begin();
+                                 move != movedFlags->end();
+@@ -1139,6 +1140,7 @@ QDebug operator <<(QDebug debug, const QDeclarativeListCompositor::Range &range)
+             << range.list) << " "
+             << range.index << " "
+             << range.count << " "
++            << (range.isUnresolved() ? "U" : "0")
+             << (range.append() ? "A" : "0")
+             << (range.prepend() ? "P" : "0");
+     for (int i = QDeclarativeListCompositor::MaximumGroupCount - 1; i >= 2; --i)
+diff --git a/src/quick/util/qdeclarativelistcompositor_p.h b/src/quick/util/qdeclarativelistcompositor_p.h
+index 8881d57..380de01 100644
+--- a/src/quick/util/qdeclarativelistcompositor_p.h
++++ b/src/quick/util/qdeclarativelistcompositor_p.h
+@@ -65,7 +65,7 @@ QT_BEGIN_NAMESPACE
+ class Q_AUTOTEST_EXPORT QDeclarativeListCompositor
+ {
+ public:
+-    enum { MaximumGroupCount = 11 };
++    enum { MinimumGroupCount = 3, MaximumGroupCount = 11 };
+ 
+     enum Group
+     {
+@@ -76,13 +76,14 @@ public:
+ 
+     enum Flag
+     {
+-        CacheFlag   = 0x000001,
+-        DefaultFlag = 0x000002,
+-        PersistedFlag = 0x000004,
+-        GroupMask   = 0x00FFFE,
+-        PrependFlag = 0x100000,
+-        AppendFlag  = 0x200000,
+-        MovedFlag   = 0x400000
++        CacheFlag       = 1 << Cache,
++        DefaultFlag     = 1 << Default,
++        PersistedFlag   = 1 << Persisted,
++        PrependFlag     = 0x10000000,
++        AppendFlag      = 0x20000000,
++        UnresolvedFlag  = 0x40000000,
++        MovedFlag       = 0x80000000,
++        GroupMask       = ~(PrependFlag | AppendFlag | UnresolvedFlag | MovedFlag | CacheFlag)
+     };
+ 
+     class Range
+@@ -98,7 +99,7 @@ public:
+         void *list;
+         int index;
+         int count;
+-        int flags;
++        uint flags;
+ 
+         inline int start() const { return index; }
+         inline int end() const { return index + count; }
+@@ -108,6 +109,7 @@ public:
+         inline bool inGroup() const { return flags & GroupMask; }
+         inline bool inCache() const { return flags & CacheFlag; }
+         inline bool inGroup(int group) const { return flags & (1 << group); }
++        inline bool isUnresolved() const { return flags & UnresolvedFlag; }
+ 
+         inline bool prepend() const { return flags & PrependFlag; }
+         inline bool append() const { return flags & AppendFlag; }
+@@ -141,8 +143,8 @@ public:
+         void incrementIndexes(int difference) { incrementIndexes(difference, range->flags); }
+         void decrementIndexes(int difference) { decrementIndexes(difference, range->flags); }
+ 
+-        inline void incrementIndexes(int difference, int flags);
+-        inline void decrementIndexes(int difference, int flags);
++        inline void incrementIndexes(int difference, uint flags);
++        inline void decrementIndexes(int difference, uint flags);
+ 
+         void setGroup(Group g) { group = g; groupFlag = 1 << g; }
+ 
+@@ -174,9 +176,9 @@ public:
+     struct Change
+     {
+         inline Change() {}
+-        inline Change(iterator it, int count, int flags, int moveId = -1);
++        inline Change(iterator it, int count, uint flags, int moveId = -1);
+         int count;
+-        int flags;
++        uint flags;
+         int moveId;
+         union {
+             struct {
+@@ -196,14 +198,14 @@ public:
+     struct Insert : public Change
+     {
+         Insert() {}
+-        Insert(iterator it, int count, int flags, int moveId = -1)
++        Insert(iterator it, int count, uint flags, int moveId = -1)
+             : Change(it, count, flags, moveId) {}
+     };
+ 
+     struct Remove : public Change
+     {
+         Remove() {}
+-        Remove(iterator it, int count, int flags, int moveId = -1)
++        Remove(iterator it, int count, uint flags, int moveId = -1)
+             : Change(it, count, flags, moveId) {}
+     };
+ 
+@@ -225,22 +227,22 @@ public:
+     iterator begin(Group group);
+     const iterator &end() { return m_end; }
+ 
+-    void append(void *list, int index, int count, int flags, QVector<Insert> *inserts = 0);
+-    void insert(Group group, int before, void *list, int index, int count, int flags, QVector<Insert> *inserts = 0);
+-    iterator insert(iterator before, void *list, int index, int count, int flags, QVector<Insert> *inserts = 0);
++    void append(void *list, int index, int count, uint flags, QVector<Insert> *inserts = 0);
++    void insert(Group group, int before, void *list, int index, int count, uint flags, QVector<Insert> *inserts = 0);
++    iterator insert(iterator before, void *list, int index, int count, uint flags, QVector<Insert> *inserts = 0);
+ 
+     void setFlags(Group fromGroup, int from, int count, Group group, int flags, QVector<Insert> *inserts = 0);
+-    void setFlags(iterator from, int count, Group group, int flags, QVector<Insert> *inserts = 0);
+-    void setFlags(Group fromGroup, int from, int count, int flags, QVector<Insert> *inserts = 0) {
++    void setFlags(iterator from, int count, Group group, uint flags, QVector<Insert> *inserts = 0);
++    void setFlags(Group fromGroup, int from, int count, uint flags, QVector<Insert> *inserts = 0) {
+         setFlags(fromGroup, from, count, fromGroup, flags, inserts); }
+-    void setFlags(iterator from, int count, int flags, QVector<Insert> *inserts = 0) {
++    void setFlags(iterator from, int count, uint flags, QVector<Insert> *inserts = 0) {
+         setFlags(from, count, from.group, flags, inserts); }
+ 
+-    void clearFlags(Group fromGroup, int from, int count, Group group, int flags, QVector<Remove> *removals = 0);
+-    void clearFlags(iterator from, int count, Group group, int flags, QVector<Remove> *removals = 0);
+-    void clearFlags(Group fromGroup, int from, int count, int flags, QVector<Remove> *removals = 0) {
++    void clearFlags(Group fromGroup, int from, int count, Group group, uint flags, QVector<Remove> *removals = 0);
++    void clearFlags(iterator from, int count, Group group, uint flags, QVector<Remove> *removals = 0);
++    void clearFlags(Group fromGroup, int from, int count, uint flags, QVector<Remove> *removals = 0) {
+         clearFlags(fromGroup, from, count, fromGroup, flags, removals); }
+-    void clearFlags(iterator from, int count, int flags, QVector<Remove> *removals = 0) {
++    void clearFlags(iterator from, int count, uint flags, QVector<Remove> *removals = 0) {
+         clearFlags(from, count, from.group, flags, removals); }
+ 
+     void removeList(void *list, QVector<Remove> *removals, bool destroyed);
+@@ -283,16 +285,16 @@ private:
+     int m_defaultFlags;
+     int m_removeFlags;
+ 
+-    inline Range *insert(Range *before, void *list, int index, int count, int flags);
++    inline Range *insert(Range *before, void *list, int index, int count, uint flags);
+     inline Range *erase(Range *range);
+ 
+     struct MovedFlags
+     {
+         MovedFlags() {}
+-        MovedFlags(int moveId, int flags) : moveId(moveId), flags(flags) {}
++        MovedFlags(int moveId, uint flags) : moveId(moveId), flags(flags) {}
+ 
+         int moveId;
+-        int flags;
++        uint flags;
+     };
+ 
+     void listItemsRemoved(
+@@ -340,7 +342,7 @@ inline QDeclarativeListCompositor::iterator::iterator(
+         index[i] = 0;
+ }
+ 
+-inline void QDeclarativeListCompositor::iterator::incrementIndexes(int difference, int flags)
++inline void QDeclarativeListCompositor::iterator::incrementIndexes(int difference, uint flags)
+ {
+     for (int i = 0; i < groupCount; ++i) {
+         if (flags & (1 << i))
+@@ -348,7 +350,7 @@ inline void QDeclarativeListCompositor::iterator::incrementIndexes(int differenc
+     }
+ }
+ 
+-inline void QDeclarativeListCompositor::iterator::decrementIndexes(int difference, int flags)
++inline void QDeclarativeListCompositor::iterator::decrementIndexes(int difference, uint flags)
+ {
+     for (int i = 0; i < groupCount; ++i) {
+         if (flags & (1 << i))
+@@ -360,7 +362,7 @@ inline QDeclarativeListCompositor::insert_iterator::insert_iterator(
+         Range *range, int offset, Group group, int groupCount)
+     : iterator(range, offset, group, groupCount) {}
+ 
+-inline QDeclarativeListCompositor::Change::Change(iterator it, int count, int flags, int moveId)
++inline QDeclarativeListCompositor::Change::Change(iterator it, int count, uint flags, int moveId)
+     : count(count), flags(flags), moveId(moveId)
+ {
+     for (int i = 0; i < MaximumGroupCount; ++i)
+diff --git a/tests/auto/declarative/qdeclarativelistcompositor/tst_qdeclarativelistcompositor.cpp b/tests/auto/declarative/qdeclarativelistcompositor/tst_qdeclarativelistcompositor.cpp
+index b3ea4d9..edceff2 100644
+--- a/tests/auto/declarative/qdeclarativelistcompositor/tst_qdeclarativelistcompositor.cpp
++++ b/tests/auto/declarative/qdeclarativelistcompositor/tst_qdeclarativelistcompositor.cpp
+@@ -182,7 +182,7 @@ void tst_qdeclarativelistcompositor::find_data()
+     QTest::addColumn<int>("visibleIndex");
+     QTest::addColumn<int>("defaultIndex");
+     QTest::addColumn<int>("cacheIndex");
+-    QTest::addColumn<int>("rangeFlags");
++    QTest::addColumn<uint>("rangeFlags");
+     QTest::addColumn<int>("rangeIndex");
+ 
+     int listA; void *a = &listA;
+@@ -195,7 +195,7 @@ void tst_qdeclarativelistcompositor::find_data()
+             << C::Cache << 2
+             << Selection << 0
+             << 0 << 0 << 0 << 0
+-            << int(C::PrependFlag |  SelectionFlag | C::DefaultFlag | C::CacheFlag) << 0;
++            << uint(C::PrependFlag |  SelectionFlag | C::DefaultFlag | C::CacheFlag) << 0;
+ }
+ 
+ void tst_qdeclarativelistcompositor::find()
+@@ -209,7 +209,7 @@ void tst_qdeclarativelistcompositor::find()
+     QFETCH(int, defaultIndex);
+     QFETCH(int, visibleIndex);
+     QFETCH(int, selectionIndex);
+-    QFETCH(int, rangeFlags);
++    QFETCH(uint, rangeFlags);
+     QFETCH(int, rangeIndex);
+ 
+     QDeclarativeListCompositor compositor;
+@@ -239,7 +239,7 @@ void tst_qdeclarativelistcompositor::findInsertPosition_data()
+     QTest::addColumn<int>("visibleIndex");
+     QTest::addColumn<int>("defaultIndex");
+     QTest::addColumn<int>("cacheIndex");
+-    QTest::addColumn<int>("rangeFlags");
++    QTest::addColumn<uint>("rangeFlags");
+     QTest::addColumn<int>("rangeIndex");
+ 
+     int listA; void *a = &listA;
+@@ -251,7 +251,7 @@ void tst_qdeclarativelistcompositor::findInsertPosition_data()
+                 << Range(0, 0, 1, int(VisibleFlag| C::CacheFlag)))
+             << Selection << 0
+             << 0 << 0 << 0 << 0
+-            << int(C::PrependFlag |  SelectionFlag | C::DefaultFlag | C::CacheFlag) << 0;
++            << uint(C::PrependFlag |  SelectionFlag | C::DefaultFlag | C::CacheFlag) << 0;
+     QTest::newRow("1")
+             << (RangeList()
+                 << Range(a, 0, 1, int(C::PrependFlag |  SelectionFlag | C::DefaultFlag | C::CacheFlag))
+@@ -259,7 +259,7 @@ void tst_qdeclarativelistcompositor::findInsertPosition_data()
+                 << Range(0, 0, 1, int(VisibleFlag| C::CacheFlag)))
+             << Selection << 1
+             << 1 << 0 << 1 << 1
+-            << int(C::AppendFlag | C::PrependFlag | C::CacheFlag) << 1;
++            << uint(C::AppendFlag | C::PrependFlag | C::CacheFlag) << 1;
+ }
+ 
+ void tst_qdeclarativelistcompositor::findInsertPosition()
+@@ -271,7 +271,7 @@ void tst_qdeclarativelistcompositor::findInsertPosition()
+     QFETCH(int, defaultIndex);
+     QFETCH(int, visibleIndex);
+     QFETCH(int, selectionIndex);
+-    QFETCH(int, rangeFlags);
++    QFETCH(uint, rangeFlags);
+     QFETCH(int, rangeIndex);
+ 
+     QDeclarativeListCompositor compositor;
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties-package.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties-package.qml
+new file mode 100644
+index 0000000..b6b5672
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties-package.qml
+@@ -0,0 +1,51 @@
++import QtQuick 2.0
++
++ListView {
++    width: 100
++    height: 100
++    model: visualModel.parts.package
++
++    VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: ListModel {
++            id: listModel
++
++            ListElement { number: "one" }
++            ListElement { number: "two" }
++            ListElement { number: "three" }
++            ListElement { number: "four" }
++        }
++
++        delegate: Package {
++            id: delegate
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: number
++            property variant test4: model.number
++            property variant test5: modelData
++            property variant test6: model.modelData
++
++            function setTest3(arg) { number = arg }
++            function setTest4(arg) { model.number = arg }
++            function setTest5(arg) { modelData = arg }
++            function setTest6(arg) { model.modelData = arg }
++
++            Item {
++                objectName: "delegate"
++
++                Package.name: "package"
++
++                width: 100
++                height: 2
++            }
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties.qml
+new file mode 100644
+index 0000000..d2dfc37
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/listmodelproperties.qml
+@@ -0,0 +1,45 @@
++import QtQuick 2.0
++
++ListView {
++    width: 100
++    height: 100
++    model: VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: ListModel {
++            id: listModel
++
++            ListElement { number: "one" }
++            ListElement { number: "two" }
++            ListElement { number: "three" }
++            ListElement { number: "four" }
++        }
++
++        delegate: Item {
++            id: delegate
++
++            objectName: "delegate"
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: number
++            property variant test4: model.number
++            property variant test5: modelData
++            property variant test6: model.modelData
++
++            function setTest3(arg) { number = arg }
++            function setTest4(arg) { model.number = arg }
++            function setTest5(arg) { modelData = arg }
++            function setTest6(arg) { model.modelData = arg }
++
++            width: 100
++            height: 2
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties-package.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties-package.qml
+new file mode 100644
+index 0000000..964ac42
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties-package.qml
+@@ -0,0 +1,46 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: visualModel.parts.package
++    VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: StandardItemModel {
++            StandardItem { text: "Row 1 Item" }
++            StandardItem { text: "Row 2 Item" }
++            StandardItem { text: "Row 3 Item" }
++            StandardItem { text: "Row 4 Item" }
++        }
++
++        delegate: Package {
++            id: delegate
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: display
++            property variant test4: model.display
++
++            function setTest3(arg) { display = arg }
++            function setTest4(arg) { model.display = arg }
++
++            Item {
++                objectName: "delegate"
++
++                width: 100
++                height: 2
++
++                Package.name: "package"
++            }
++        }
++    }
++}
++
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties.qml
+new file mode 100644
+index 0000000..77e30b6
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/multipleroleproperties.qml
+@@ -0,0 +1,41 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: StandardItemModel {
++            StandardItem { text: "Row 1 Item" }
++            StandardItem { text: "Row 2 Item" }
++            StandardItem { text: "Row 3 Item" }
++            StandardItem { text: "Row 4 Item" }
++        }
++
++        delegate: Item {
++            id: delegate
++
++            objectName: "delegate"
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: display
++            property variant test4: model.display
++
++            function setTest3(arg) { display = arg }
++            function setTest4(arg) { model.display = arg }
++
++            width: 100
++            height: 2
++        }
++    }
++}
++
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties-package.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties-package.qml
+new file mode 100644
+index 0000000..c69e54c
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties-package.qml
+@@ -0,0 +1,48 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: visualModel.parts.package
++
++    VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        property list<DataObject> objects: [
++            DataObject { name: "Item 1"; color: "red" },
++            DataObject { name: "Item 2"; color: "green" },
++            DataObject { name: "Item 3"; color: "blue"},
++            DataObject { name: "Item 4"; color: "yellow" }
++        ]
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: objects
++
++        delegate: Package {
++            id: delegate
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: name
++            property variant test4: model.name
++
++            function setTest3(arg) { name = arg }
++            function setTest4(arg) { model.name = arg }
++
++            Item {
++                objectName: "delegate"
++
++                width: 100
++                height: 2
++                Package.name: "package"
++            }
++        }
++    }
++}
++
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties.qml
+new file mode 100644
+index 0000000..0dbe2f5
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/objectlistproperties.qml
+@@ -0,0 +1,43 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        property list<DataObject> objects: [
++            DataObject { name: "Item 1"; color: "red" },
++            DataObject { name: "Item 2"; color: "green" },
++            DataObject { name: "Item 3"; color: "blue"},
++            DataObject { name: "Item 4"; color: "yellow" }
++        ]
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: objects
++
++        delegate: Item {
++            id: delegate
++
++            objectName: "delegate"
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: name
++            property variant test4: model.name
++
++            function setTest3(arg) { name = arg }
++            function setTest4(arg) { model.name = arg }
++
++            width: 100
++            height: 2
++        }
++    }
++}
++
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties-package.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties-package.qml
+new file mode 100644
+index 0000000..910df81
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties-package.qml
+@@ -0,0 +1,45 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: visualModel.parts.package
++
++    VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: SingleRoleModel {}
++
++        delegate: Package {
++            id: delegate
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: name
++            property variant test4: model.name
++            property variant test5: modelData
++            property variant test6: model.modelData
++
++
++            function setTest3(arg) { name = arg }
++            function setTest4(arg) { model.name = arg }
++            function setTest5(arg) { modelData = arg }
++            function setTest6(arg) { model.modelData = arg }
++
++            Item {
++                objectName: "delegate"
++                width: 100
++                height: 2
++                Package.name: "package"
++            }
++        }
++
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties.qml
+new file mode 100644
+index 0000000..6133c61
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/singleroleproperties.qml
+@@ -0,0 +1,39 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: SingleRoleModel {}
++
++        delegate: Item {
++            id: delegate
++
++            objectName: "delegate"
++            width: 100
++            height: 2
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: name
++            property variant test4: model.name
++            property variant test5: modelData
++            property variant test6: model.modelData
++
++
++            function setTest3(arg) { name = arg }
++            function setTest4(arg) { model.name = arg }
++            function setTest5(arg) { modelData = arg }
++            function setTest6(arg) { model.modelData = arg }
++        }
++
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties-package.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties-package.qml
+new file mode 100644
+index 0000000..d1a4604
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties-package.qml
+@@ -0,0 +1,45 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: visualModel.parts.package
++    VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: [
++            "one",
++            "two",
++            "three",
++            "four"
++        ]
++
++        delegate: Package {
++            id: delegate
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: modelData
++            property variant test4: model.modelData
++
++            function setTest3(arg) { modelData = arg }
++            function setTest4(arg) { model.modelData = arg }
++
++            Item {
++                objectName: "delegate"
++
++                width: 100
++                height: 2
++
++                Package.name: "package"
++            }
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties.qml b/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties.qml
+new file mode 100644
+index 0000000..a075ccb
+--- /dev/null
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/data/stringlistproperties.qml
+@@ -0,0 +1,40 @@
++import QtQuick 2.0
++import tst_qquickvisualdatamodel 1.0
++
++ListView {
++    width: 100
++    height: 100
++    model: VisualDataModel {
++        id: visualModel
++        objectName: "visualModel"
++
++        groups: [
++            VisualDataGroup { id: visibleItems; objectName: "visibleItems"; name: "visible"; includeByDefault: true },
++            VisualDataGroup { id: selectedItems; objectName: "selectedItems"; name: "selected" }
++        ]
++
++        model: [
++            "one",
++            "two",
++            "three",
++            "four"
++        ]
++
++        delegate: Item {
++            id: delegate
++
++            objectName: "delegate"
++
++            property variant test1: index
++            property variant test2: model.index
++            property variant test3: modelData
++            property variant test4: model.modelData
++
++            function setTest3(arg) { modelData = arg }
++            function setTest4(arg) { model.modelData = arg }
++
++            width: 100
++            height: 2
++        }
++    }
++}
+diff --git a/tests/auto/qtquick2/qquickvisualdatamodel/tst_qquickvisualdatamodel.cpp b/tests/auto/qtquick2/qquickvisualdatamodel/tst_qquickvisualdatamodel.cpp
+index cec8931..bf19c9a 100644
+--- a/tests/auto/qtquick2/qquickvisualdatamodel/tst_qquickvisualdatamodel.cpp
++++ b/tests/auto/qtquick2/qquickvisualdatamodel/tst_qquickvisualdatamodel.cpp
+@@ -78,7 +78,7 @@ static void initStandardTreeModel(QStandardItemModel *model)
+ class SingleRoleModel : public QAbstractListModel
+ {
+     Q_OBJECT
+-
++    Q_PROPERTY(QStringList values WRITE setList)
+ public:
+     SingleRoleModel(const QByteArray &role = "name", QObject *parent = 0)
+         : QAbstractListModel(parent)
+@@ -96,6 +96,8 @@ public:
+ 
+     QStringList list;
+ 
++    void setList(const QStringList &l) { list = l; }
++
+ public slots:
+     void set(int idx, QString string) {
+         list[idx] = string;
+@@ -113,6 +115,71 @@ protected:
+     }
+ };
+ 
++class StandardItem : public QObject, public QStandardItem
++{
++    Q_OBJECT
++    Q_PROPERTY(QString text WRITE setText)
++
++public:
++    void writeText(const QString &text) { setText(text); }
++};
++
++class StandardItemModel : public QStandardItemModel
++{
++    Q_OBJECT
++    Q_PROPERTY(QDeclarativeListProperty<StandardItem> items READ items CONSTANT)
++    Q_CLASSINFO("DefaultProperty", "items")
++public:
++    QDeclarativeListProperty<StandardItem> items() { return QDeclarativeListProperty<StandardItem>(this, 0, append); }
++
++    static void append(QDeclarativeListProperty<StandardItem> *property, StandardItem *item)
++    {
++        static_cast<QStandardItemModel *>(property->object)->appendRow(item);
++    }
++};
++
++class DataObject : public QObject
++{
++    Q_OBJECT
++
++    Q_PROPERTY(QString name READ name WRITE setName NOTIFY nameChanged)
++    Q_PROPERTY(QString color READ color WRITE setColor NOTIFY colorChanged)
++
++public:
++    DataObject(QObject *parent=0) : QObject(parent) {}
++    DataObject(const QString &name, const QString &color, QObject *parent=0)
++        : QObject(parent), m_name(name), m_color(color) { }
++
++
++    QString name() const { return m_name; }
++    void setName(const QString &name) {
++        if (name != m_name) {
++            m_name = name;
++            emit nameChanged();
++        }
++    }
++
++    QString color() const { return m_color; }
++    void setColor(const QString &color) {
++        if (color != m_color) {
++            m_color = color;
++            emit colorChanged();
++        }
++    }
++
++signals:
++    void nameChanged();
++    void colorChanged();
++
++private:
++    QString m_name;
++    QString m_color;
++};
++
++QML_DECLARE_TYPE(SingleRoleModel)
++QML_DECLARE_TYPE(StandardItem)
++QML_DECLARE_TYPE(StandardItemModel)
++QML_DECLARE_TYPE(DataObject)
+ 
+ class tst_qquickvisualdatamodel : public QDeclarativeDataTest
+ {
+@@ -150,6 +217,12 @@ private slots:
+     void onChanged();
+     void create();
+     void incompleteModel();
++    void insert_data();
++    void insert();
++    void resolve_data();
++    void resolve();
++    void warnings_data();
++    void warnings();
+ 
+ private:
+     template <int N> void groups_verify(
+@@ -182,54 +255,6 @@ private:
+ 
+ Q_DECLARE_METATYPE(QDeclarativeChangeSet)
+ 
+-void tst_qquickvisualdatamodel::initTestCase()
+-{
+-    QDeclarativeDataTest::initTestCase();
+-    qRegisterMetaType<QDeclarativeChangeSet>();
+-}
+-
+-void tst_qquickvisualdatamodel::cleanupTestCase()
+-{
+-
+-}
+-class DataObject : public QObject
+-{
+-    Q_OBJECT
+-
+-    Q_PROPERTY(QString name READ name WRITE setName NOTIFY nameChanged)
+-    Q_PROPERTY(QString color READ color WRITE setColor NOTIFY colorChanged)
+-
+-public:
+-    DataObject(QObject *parent=0) : QObject(parent) {}
+-    DataObject(const QString &name, const QString &color, QObject *parent=0)
+-        : QObject(parent), m_name(name), m_color(color) { }
+-
+-
+-    QString name() const { return m_name; }
+-    void setName(const QString &name) {
+-        if (name != m_name) {
+-            m_name = name;
+-            emit nameChanged();
+-        }
+-    }
+-
+-    QString color() const { return m_color; }
+-    void setColor(const QString &color) {
+-        if (color != m_color) {
+-            m_color = color;
+-            emit colorChanged();
+-        }
+-    }
+-
+-signals:
+-    void nameChanged();
+-    void colorChanged();
+-
+-private:
+-    QString m_name;
+-    QString m_color;
+-};
+-
+ template <typename T> static T evaluate(QObject *scope, const QString &expression)
+ {
+     QDeclarativeExpression expr(qmlContext(scope), scope, expression);
+@@ -247,6 +272,22 @@ template <> void evaluate<void>(QObject *scope, const QString &expression)
+         qWarning() << expr.error().toString();
+ }
+ 
++void tst_qquickvisualdatamodel::initTestCase()
++{
++    QDeclarativeDataTest::initTestCase();
++    qRegisterMetaType<QDeclarativeChangeSet>();
++
++    qmlRegisterType<SingleRoleModel>("tst_qquickvisualdatamodel", 1, 0, "SingleRoleModel");
++    qmlRegisterType<StandardItem>("tst_qquickvisualdatamodel", 1, 0, "StandardItem");
++    qmlRegisterType<StandardItemModel>("tst_qquickvisualdatamodel", 1, 0, "StandardItemModel");
++    qmlRegisterType<DataObject>("tst_qquickvisualdatamodel", 1, 0, "DataObject");
++}
++
++void tst_qquickvisualdatamodel::cleanupTestCase()
++{
++
++}
++
+ tst_qquickvisualdatamodel::tst_qquickvisualdatamodel()
+ {
+ }
+@@ -1915,6 +1956,1488 @@ void tst_qquickvisualdatamodel::incompleteModel()
+     component.completeCreate();
+ }
+ 
++void tst_qquickvisualdatamodel::insert_data()
++{
++    QTest::addColumn<QUrl>("source");
++    QTest::addColumn<QString>("expression");
++    QTest::addColumn<int>("modelCount");
++    QTest::addColumn<int>("visualCount");
++    QTest::addColumn<int>("index");
++    QTest::addColumn<bool>("inItems");
++    QTest::addColumn<bool>("persisted");
++    QTest::addColumn<bool>("visible");
++    QTest::addColumn<bool>("selected");
++    QTest::addColumn<bool>("modelData");
++    QTest::addColumn<QString>("property");
++    QTest::addColumn<QStringList>("propertyData");
++
++    const QUrl listModelSource[] = {
++        testFileUrl("listmodelproperties.qml"),
++        testFileUrl("listmodelproperties-package.qml") };
++    const QUrl singleRoleSource[] = {
++        testFileUrl("singleroleproperties.qml"),
++        testFileUrl("singleroleproperties-package.qml") };
++    const QUrl multipleRoleSource[] = {
++        testFileUrl("multipleroleproperties.qml"),
++        testFileUrl("multipleroleproperties-package.qml") };
++    const QUrl stringListSource[] = {
++        testFileUrl("stringlistproperties.qml"),
++        testFileUrl("stringlistproperties-package.qml") };
++    const QUrl objectListSource[] = {
++        testFileUrl("objectlistproperties.qml"),
++        testFileUrl("objectlistproperties-package.qml") };
++
++    for (int i = 0; i < 2; ++i) {
++        // List Model.
++        QTest::newRow("ListModel.items prepend")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items append")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << 4 << 5 << 4 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items insert at 2")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert at items.get(2)")
++                << listModelSource[i]
++                << QString("items.insert(items.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert at visibleItems.get(2)")
++                << listModelSource[i]
++                << QString("items.insert(visibleItems.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems insert at items.get(2)")
++                << listModelSource[i]
++                << QString("selectedItems.insert(items.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << false << false << false << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems insert at visibleItems.get(2)")
++                << listModelSource[i]
++                << QString("selectedItems.insert(visibleItems.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << false << false << false << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend modelData")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, edit number")
++                << listModelSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"number\": \"eight\"}); "
++                       "items.get(0).model.number = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, edit modelData")
++                << listModelSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"number\": \"eight\"}); "
++                       "items.get(0).model.modelData = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, edit resolved")
++                << listModelSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"number\": \"eight\"}); "
++                       "items.get(2).model.number = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend with groups")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"}, [\"visible\", \"truncheon\"])")
++                << 4 << 5 << 0 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items append with groups")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"}, [\"visible\", \"selected\"])")
++                << 4 << 5 << 4 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items insert at 2 with groups")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"}, \"visible\")")
++                << 4 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        // create ListModel
++        QTest::newRow("ListModel.items prepend")
++                << listModelSource[i]
++                << QString("items.create(0, {\"number\": \"eight\"})")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items append")
++                << listModelSource[i]
++                << QString("items.create({\"number\": \"eight\"})")
++                << 4 << 5 << 4 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items create at 2")
++                << listModelSource[i]
++                << QString("items.create(2, {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create at items.get(2)")
++                << listModelSource[i]
++                << QString("items.create(items.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create at visibleItems.get(2)")
++                << listModelSource[i]
++                << QString("items.create(visibleItems.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems create at items.get(2)")
++                << listModelSource[i]
++                << QString("selectedItems.create(items.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << false << true << false << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems create at visibleItems.get(2)")
++                << listModelSource[i]
++                << QString("selectedItems.create(visibleItems.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << false << true << false << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended")
++                << listModelSource[i]
++                << QString("items.create(0, {\"number\": \"eight\"})")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create appended")
++                << listModelSource[i]
++                << QString("items.create({\"number\": \"eight\"})")
++                << 4 << 5 << 4 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items create at 2")
++                << listModelSource[i]
++                << QString("items.create(2, {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create at items.get(2)")
++                << listModelSource[i]
++                << QString("items.create(items.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create at visibleItems.get(2)")
++                << listModelSource[i]
++                << QString("items.create(visibleItems.get(2), {\"number\": \"eight\"})")
++                << 4 << 5 << 2 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.create prepend modelData")
++                << listModelSource[i]
++                << QString("items.create(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended, edit number")
++                << listModelSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"number\": \"eight\"}); "
++                       "item.setTest3(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended, edit model.number")
++                << listModelSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"number\": \"eight\"}); "
++                       "item.setTest4(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended, edit modelData")
++                << listModelSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"number\": \"eight\"}); "
++                       "item.setTest5(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended, edit model.modelData")
++                << listModelSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"number\": \"eight\"}); "
++                       "item.setTest6(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended with groups")
++                << listModelSource[i]
++                << QString("items.create(0, {\"number\": \"eight\"}, [\"visible\", \"truncheon\"])")
++                << 4 << 5 << 0 << true << true << true << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create appended with groups")
++                << listModelSource[i]
++                << QString("items.create({\"number\": \"eight\"}, [\"visible\", \"selected\"])")
++                << 4 << 5 << 4 << true << true << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items create inserted  with groups")
++                << listModelSource[i]
++                << QString("items.create(2, {\"number\": \"eight\"}, \"visible\")")
++                << 4 << 5 << 2 << true << true << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("ListModel.items create prepended clear persistence")
++                << listModelSource[i]
++                << QString("{ items.create(0, {\"number\": \"eight\"}); "
++                           "items.get(0).inPersistedItems = false }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items create appended clear persistence")
++                << listModelSource[i]
++                << QString("{ items.create({\"number\": \"eight\"}); "
++                           "items.get(4).inPersistedItems = false }")
++                << 4 << 5 << 4 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("ListModel.items create inserted clear persistence")
++                << listModelSource[i]
++                << QString("{ items.create(2, {\"number\": \"eight\"}); "
++                           "items.get(2).inPersistedItems = false }")
++                << 4 << 5 << 2 << true << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        // AbstractItemModel (Single Role).
++        QTest::newRow("AbstractItemModel.items prepend")
++                << singleRoleSource[i]
++                << QString("items.insert(0, {\"name\": \"eight\"})")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items append")
++                << singleRoleSource[i]
++                << QString("items.insert({\"name\": \"eight\"})")
++                << 4 << 5 << 4 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("AbstractItemModel.items insert at 2")
++                << singleRoleSource[i]
++                << QString("items.insert(2, {\"name\": \"eight\"})")
++                << 4 << 5 << 2 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items prepend modelData")
++                << singleRoleSource[i]
++                << QString("items.insert(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items prepend, edit name")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"name\": \"eight\"}); "
++                       "items.get(0).model.name = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items prepend, edit modelData")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"name\": \"eight\"}); "
++                       "items.get(0).model.modelData = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items prepend, edit resolved")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"name\": \"eight\"}); "
++                       "items.get(2).model.name = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << true
++                << QString("name")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.create prepend modelData")
++                << singleRoleSource[i]
++                << QString("items.create(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("name")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items create prepended, edit name")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"name\": \"eight\"}); "
++                       "item.setTest3(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items create prepended, edit model.name")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"name\": \"eight\"}); "
++                       "item.setTest4(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items create prepended, edit modelData")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"name\": \"eight\"}); "
++                       "item.setTest5(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items create prepended, edit model.modelData")
++                << singleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"name\": \"eight\"}); "
++                       "item.setTest6(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << true
++                << QString("name")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        // AbstractItemModel (Multiple Roles).
++        QTest::newRow("StandardItemModel.items prepend")
++                << multipleRoleSource[i]
++                << QString("items.insert(0, {\"display\": \"Row 8 Item\"})")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 8 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items append")
++                << multipleRoleSource[i]
++                << QString("items.insert({\"display\": \"Row 8 Item\"})")
++                << 4 << 5 << 4 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item" << "Row 8 Item");
++
++        QTest::newRow("StandardItemModel.items insert at 2")
++                << multipleRoleSource[i]
++                << QString("items.insert(2, {\"display\": \"Row 8 Item\"})")
++                << 4 << 5 << 2 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 1 Item" << "Row 2 Item" << "Row 8 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items prepend modelData")
++                << multipleRoleSource[i]
++                << QString("items.insert(0, {\"modelData\": \"Row 8 Item\"})")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << QString() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items prepend, edit display")
++                << multipleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"display\": \"Row 8 Item\"}); "
++                       "items.get(0).model.display = \"Row 7 Item\"; }")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 7 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items prepend, edit modelData")
++                << multipleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"display\": \"Row 8 Item\"}); "
++                       "items.get(0).model.modelData = \"Row 7 Item\"; }")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 8 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items prepend, edit resolved")
++                << multipleRoleSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"display\": \"Row 8 Item\"}); "
++                       "items.get(2).model.display = \"Row 7 Item\"; }")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 8 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.create prepend modelData")
++                << multipleRoleSource[i]
++                << QString("items.create(0, {\"modelData\": \"Row 8 Item\"})")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("display")
++                << (QStringList() << QString() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items create prepended, edit display")
++                << multipleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"display\": \"Row 8 Item\"}); "
++                       "item.setTest3(\"Row 7 Item\"); }")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 7 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items create prepended, edit model.display")
++                << multipleRoleSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"display\": \"Row 8 Item\"}); "
++                       "item.setTest4(\"Row 7 Item\"); }")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("display")
++                << (QStringList() << "Row 7 Item" << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        // StringList.
++        QTest::newRow("StringList.items prepend")
++                << stringListSource[i]
++                << QString("items.insert(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("modelData")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items append")
++                << stringListSource[i]
++                << QString("items.insert({\"modelData\": \"eight\"})")
++                << 4 << 5 << 4 << true << false << false << false << false
++                << QString("modelData")
++                << (QStringList() << "one" << "two" << "three" << "four" << "eight");
++
++        QTest::newRow("StringList.items insert at 2")
++                << stringListSource[i]
++                << QString("items.insert(2, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 2 << true << false << false << false << false
++                << QString("modelData")
++                << (QStringList() << "one" << "two" << "eight" << "three" << "four");
++
++        QTest::newRow("StringList.items prepend, edit modelData")
++                << stringListSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"modelData\": \"eight\"}); "
++                       "items.get(0).model.modelData = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("modelData")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items prepend, edit resolved")
++                << stringListSource[i]
++                << QString("{ "
++                       "items.insert(0, {\"modelData\": \"eight\"}); "
++                       "items.get(2).model.modelData = \"seven\"; }")
++                << 4 << 5 << 0 << true << false << false << false << false
++                << QString("modelData")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.create prepend modelData")
++                << stringListSource[i]
++                << QString("items.create(0, {\"modelData\": \"eight\"})")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("modelData")
++                << (QStringList() << "eight" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items create prepended, edit modelData")
++                << stringListSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"modelData\": \"eight\"}); "
++                       "item.setTest3(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("modelData")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items create prepended, edit model.modelData")
++                << stringListSource[i]
++                << QString("{ "
++                       "var item = items.create(0, {\"modelData\": \"eight\"}); "
++                       "item.setTest4(\"seven\"); }")
++                << 4 << 5 << 0 << true << true << false << false << false
++                << QString("modelData")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        // ObjectList
++        QTest::newRow("ObjectList.items prepend")
++                << objectListSource[i]
++                << QString("items.insert(0, {\"name\": \"Item 8\"})")
++                << 4 << 4 << 4 << false << false << false << false << false
++                << QString("name")
++                << (QStringList() << "Item 1" << "Item 2" << "Item 3" << "Item 4");
++
++        QTest::newRow("ObjectList.items append")
++                << objectListSource[i]
++                << QString("items.insert({\"name\": \"Item 8\"})")
++                << 4 << 4 << 4 << false << false << false << false << false
++                << QString("name")
++                << (QStringList() << "Item 1" << "Item 2" << "Item 3" << "Item 4");
++
++        QTest::newRow("ObjectList.items insert at 2")
++                << objectListSource[i]
++                << QString("items.insert(2, {\"name\": \"Item 8\"})")
++                << 4 << 4 << 4 << false << false << false << false << false
++                << QString("name")
++                << (QStringList() << "Item 1" << "Item 2" << "Item 3" << "Item 4");
++    }
++}
++
++void tst_qquickvisualdatamodel::insert()
++{
++    QFETCH(QUrl, source);
++    QFETCH(QString, expression);
++    QFETCH(int, modelCount);
++    QFETCH(int, visualCount);
++    QFETCH(int, index);
++    QFETCH(bool, inItems);
++    QFETCH(bool, persisted);
++    QFETCH(bool, visible);
++    QFETCH(bool, selected);
++    QFETCH(bool, modelData);
++    QFETCH(QString, property);
++    QFETCH(QStringList, propertyData);
++
++    QQuickCanvas canvas;
++
++    QDeclarativeComponent component(&engine);
++    component.loadUrl(source);
++    QScopedPointer<QObject> object(component.create());
++    QQuickListView *listView = qobject_cast<QQuickListView *>(object.data());
++    QVERIFY(listView);
++    listView->setParentItem(canvas.rootItem());
++
++    QQuickItem *contentItem = listView->contentItem();
++    QVERIFY(contentItem);
++
++    QObject *visualModel = listView->findChild<QObject *>("visualModel");
++    QVERIFY(visualModel);
++
++    evaluate<void>(visualModel, expression);
++
++    QCOMPARE(evaluate<int>(listView, "count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "items.count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "persistedItems.count"), persisted ? 1 : 0);
++    QCOMPARE(evaluate<int>(visualModel, "visibleItems.count"), visible ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "selectedItems.count"), selected ? 1 : 0);
++
++    QCOMPARE(propertyData.count(), visualCount);
++    for (int i = 0; i < visualCount; ++i) {
++        int modelIndex = i;
++        if (modelIndex > index)
++            modelIndex -= 1;
++        else if (modelIndex == index)
++            modelIndex = -1;
++
++        const int itemsIndex = inItems || i <= index ? i : i - 1;
++        QString get;
++
++        if (i != index) {
++            get = QString("items.get(%1)").arg(itemsIndex);
++
++            QQuickItem *item = findItem<QQuickItem>(contentItem, "delegate", modelIndex);
++            QVERIFY(item);
++
++            QCOMPARE(evaluate<int>(item, "test1"), modelIndex);
++            QCOMPARE(evaluate<int>(item, "test2"), modelIndex);
++            QCOMPARE(evaluate<QString>(item, "test3"), propertyData.at(i));
++            QCOMPARE(evaluate<QString>(item, "test4"), propertyData.at(i));
++
++            if (modelData) {
++                QCOMPARE(evaluate<QString>(item, "test5"), propertyData.at(i));
++                QCOMPARE(evaluate<QString>(item, "test6"), propertyData.at(i));
++            }
++
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inItems"), true);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inPersistedItems"), false);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inVisible"), true);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inSelected"), false);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.isUnresolved"), false);
++
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.itemsIndex"), itemsIndex);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.persistedItemsIndex"), persisted && i > index ? 1 : 0);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.visibleIndex"), visible || i <= index ? i : i - 1);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.selectedIndex"), selected && i > index ? 1 : 0);
++        } else if (inItems) {
++            get = QString("items.get(%1)").arg(index);
++        } else if (persisted) {
++            get = "persistedItems.get(0)";
++        } else if (visible) {
++            get = QString("visibleItems.get(%1)").arg(index);
++        } else if (selected) {
++            get = "selectedItems.get(0)";
++        } else {
++            continue;
++        }
++
++        QCOMPARE(evaluate<int>(visualModel, get + ".model.index"), modelIndex);
++
++        QCOMPARE(evaluate<QString>(visualModel, get + ".model." + property), propertyData.at(i));
++
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inItems"), inItems || i != index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inPersistedItems"), persisted && i == index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inVisible"), visible || i != index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inSelected"), selected && i == index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".isUnresolved"), i == index);
++
++        QCOMPARE(evaluate<int>(visualModel, get + ".itemsIndex"), inItems || i <= index ? i : i - 1);
++        QCOMPARE(evaluate<int>(visualModel, get + ".persistedItemsIndex"), persisted && i > index ? 1 : 0);
++        QCOMPARE(evaluate<int>(visualModel, get + ".visibleIndex"), visible || i <= index ? i : i - 1);
++        QCOMPARE(evaluate<int>(visualModel, get + ".selectedIndex"), selected && i > index ? 1 : 0);
++    }
++
++    QObject *item = 0;
++
++    if (inItems)
++        item = evaluate<QObject *>(visualModel, QString("items.create(%1)").arg(index));
++    else if (persisted)
++        item = evaluate<QObject *>(visualModel, QString("persistedItems.create(%1)").arg(0));
++    else if (visible)
++        item = evaluate<QObject *>(visualModel, QString("visibleItems.create(%1)").arg(index));
++    else if (selected)
++        item = evaluate<QObject *>(visualModel, QString("selectedItems.create(%1)").arg(0));
++    else
++        return;
++
++    QVERIFY(item);
++
++    QCOMPARE(evaluate<int>(item, "test1"), -1);
++    QCOMPARE(evaluate<int>(item, "test2"), -1);
++    QCOMPARE(evaluate<QString>(item, "test3"), propertyData.at(index));
++    QCOMPARE(evaluate<QString>(item, "test4"), propertyData.at(index));
++
++    if (modelData) {
++        QCOMPARE(evaluate<QString>(item, "test5"), propertyData.at(index));
++        QCOMPARE(evaluate<QString>(item, "test6"), propertyData.at(index));
++    }
++
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inItems"), inItems);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inPersistedItems"), true);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inVisible"), visible);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inSelected"), selected);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.isUnresolved"), true);
++
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.itemsIndex"), index);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.persistedItemsIndex"), 0);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.visibleIndex"), index);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.selectedIndex"), 0);
++}
++
++void tst_qquickvisualdatamodel::resolve_data()
++{
++    QTest::addColumn<QUrl>("source");
++    QTest::addColumn<QString>("setupExpression");
++    QTest::addColumn<QString>("resolveExpression");
++    QTest::addColumn<int>("unresolvedCount");
++    QTest::addColumn<int>("modelCount");
++    QTest::addColumn<int>("visualCount");
++    QTest::addColumn<int>("index");
++    QTest::addColumn<bool>("inItems");
++    QTest::addColumn<bool>("persisted");
++    QTest::addColumn<bool>("visible");
++    QTest::addColumn<bool>("selected");
++    QTest::addColumn<bool>("modelData");
++    QTest::addColumn<QString>("property");
++    QTest::addColumn<QStringList>("propertyData");
++
++    const QUrl listModelSource[] = {
++        testFileUrl("listmodelproperties.qml"),
++        testFileUrl("listmodelproperties-package.qml") };
++    const QUrl singleRoleSource[] = {
++        testFileUrl("singleroleproperties.qml"),
++        testFileUrl("singleroleproperties-package.qml") };
++    const QUrl multipleRoleSource[] = {
++        testFileUrl("multipleroleproperties.qml"),
++        testFileUrl("multipleroleproperties-package.qml") };
++    const QUrl stringListSource[] = {
++        testFileUrl("stringlistproperties.qml"),
++        testFileUrl("stringlistproperties-package.qml") };
++    const QUrl objectListSource[] = {
++        testFileUrl("objectlistproperties.qml"),
++        testFileUrl("objectlistproperties-package.qml") };
++
++    for (int i = 0; i < 2; ++i) {
++        // List Model.
++        QTest::newRow("ListModel.items prepend, resolve prepended")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); items.resolve(0, 1) }")
++                << 5 << 5 << 5 << 0 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, resolve appended")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); items.resolve(0, 5) }")
++                << 5 << 5 << 5 << 4 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "seven");
++
++        QTest::newRow("ListModel.items prepend, resolve inserted")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); items.resolve(0, 3) }")
++                << 5 << 5 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.items append, resolve prepended")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); items.resolve(5, 0) }")
++                << 5 << 5 << 5 << 0 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items append, resolve appended")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); items.resolve(5, 4) }")
++                << 5 << 5 << 5 << 4 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "seven");
++
++        QTest::newRow("ListModel.items append, resolve inserted")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); items.resolve(5, 2) }")
++                << 5 << 5 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert, resolve prepended")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); items.resolve(3, 0) }")
++                << 5 << 5 << 5 << 0 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert, resolve appended")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); items.resolve(2, 5) }")
++                << 5 << 5 << 5 << 4 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "seven");
++
++        QTest::newRow("ListModel.items insert, resolve inserted")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); items.resolve(2, 3) }")
++                << 5 << 5 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, move resolved")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); "
++                           "items.resolve(0, 1); "
++                           "listModel.move(0, 2, 1) }")
++                << 5 << 5 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.items append, move resolved")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); "
++                           "items.resolve(5, 4); "
++                           "listModel.move(4, 2, 1) }")
++                << 5 << 5 << 5 << 2 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert, move resolved")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); "
++                           "items.resolve(2, 3);"
++                           "listModel.move(2, 0, 1) }")
++                << 5 << 5 << 5 << 0 << true << false << true << false << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items prepend, remove resolved")
++                << listModelSource[i]
++                << QString("items.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); "
++                           "items.resolve(0, 1); "
++                           "listModel.remove(0, 1) }")
++                << 5 << 4 << 4 << 4 << false << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items append, remove resolved")
++                << listModelSource[i]
++                << QString("items.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); "
++                           "items.resolve(5, 4); "
++                           "listModel.remove(4, 1) }")
++                << 5 << 4 << 4 << 4 << false << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert, remove resolved")
++                << listModelSource[i]
++                << QString("items.insert(2, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); "
++                           "items.resolve(2, 3);"
++                           "listModel.remove(2, 1) }")
++                << 5 << 4 << 4 << 4 << false << false << false << false << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems prepend, resolve prepended")
++                << listModelSource[i]
++                << QString("selectedItems.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(0)) }")
++                << 4 << 5 << 5 << 0 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems prepend, resolve appended")
++                << listModelSource[i]
++                << QString("selectedItems.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(4)) }")
++                << 4 << 5 << 5 << 4 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "seven");
++
++        QTest::newRow("ListModel.selectedItems prepend, resolve inserted")
++                << listModelSource[i]
++                << QString("selectedItems.insert(0, {\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(2)) }")
++                << 4 << 5 << 5 << 2 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems append, resolve prepended")
++                << listModelSource[i]
++                << QString("selectedItems.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.insert(0, {\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(0)) }")
++                << 4 << 5 << 5 << 0 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "seven" << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.selectedItems append, resolve appended")
++                << listModelSource[i]
++                << QString("selectedItems.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.append({\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(4)) }")
++                << 4 << 5 << 5 << 4 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "three" << "four" << "seven");
++
++        QTest::newRow("ListModel.selectedItems append, resolve inserted")
++                << listModelSource[i]
++                << QString("selectedItems.insert({\"number\": \"eight\"})")
++                << QString("{ listModel.insert(2, {\"number\": \"seven\"}); "
++                           "selectedItems.resolve(selectedItems.get(0), items.get(2)) }")
++                << 4 << 5 << 5 << 2 << true << false << true << true << true
++                << QString("number")
++                << (QStringList() << "one" << "two" << "seven" << "three" << "four");
++
++        // AbstractItemModel (Single Role)
++        QTest::newRow("ListModel.items prepend, resolve prepended")
++                << singleRoleSource[i]
++                << QString("items.insert(0, {\"name\": \"eight\"})")
++                << QString("{ items.resolve(0, 1) }")
++                << 5 << 4 << 4 << 0 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++
++        QTest::newRow("ListModel.items append, resolve appended")
++                << singleRoleSource[i]
++                << QString("items.insert({\"name\": \"eight\"})")
++                << QString("{ items.resolve(4, 3) }")
++                << 5 << 4 << 4 << 3 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("ListModel.items insert, resolve inserted")
++                << singleRoleSource[i]
++                << QString("items.insert(2, {\"name\": \"eight\"})")
++                << QString("{ items.resolve(2, 3) }")
++                << 5 << 4 << 4 << 2 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        // AbstractItemModel (Single Role)
++        QTest::newRow("AbstractItemModel.items prepend, resolve prepended")
++                << singleRoleSource[i]
++                << QString("items.insert(0, {\"name\": \"eight\"})")
++                << QString("{ items.resolve(0, 1) }")
++                << 5 << 4 << 4 << 0 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items append, resolve appended")
++                << singleRoleSource[i]
++                << QString("items.insert({\"name\": \"eight\"})")
++                << QString("{ items.resolve(4, 3) }")
++                << 5 << 4 << 4 << 3 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("AbstractItemModel.items insert, resolve inserted")
++                << singleRoleSource[i]
++                << QString("items.insert(2, {\"name\": \"eight\"})")
++                << QString("{ items.resolve(2, 3) }")
++                << 5 << 4 << 4 << 2 << true << false << true << false << true
++                << QString("name")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        // AbstractItemModel (Multiple Roles)
++        QTest::newRow("StandardItemModel.items prepend, resolve prepended")
++                << multipleRoleSource[i]
++                << QString("items.insert(0, {\"display\": \"Row 8 Item\"})")
++                << QString("{ items.resolve(0, 1) }")
++                << 5 << 4 << 4 << 0 << true << false << true << false << false
++                << QString("display")
++                << (QStringList() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items append, resolve appended")
++                << multipleRoleSource[i]
++                << QString("items.insert({\"display\": \"Row 8 Item\"})")
++                << QString("{ items.resolve(4, 3) }")
++                << 5 << 4 << 4 << 3 << true << false << true << false << false
++                << QString("display")
++                << (QStringList() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        QTest::newRow("StandardItemModel.items insert, resolve inserted")
++                << multipleRoleSource[i]
++                << QString("items.insert(2, {\"display\": \"Row 8 Item\"})")
++                << QString("{ items.resolve(2, 3) }")
++                << 5 << 4 << 4 << 2 << true << false << true << false << false
++                << QString("display")
++                << (QStringList() << "Row 1 Item" << "Row 2 Item" << "Row 3 Item" << "Row 4 Item");
++
++        // StringList
++        QTest::newRow("StringList.items prepend, resolve prepended")
++                << stringListSource[i]
++                << QString("items.insert(0, {\"modelData\": \"eight\"})")
++                << QString("{ items.resolve(0, 1) }")
++                << 5 << 4 << 4 << 0 << true << false << true << false << false
++                << QString("modelData")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items append, resolve appended")
++                << stringListSource[i]
++                << QString("items.insert({\"modelData\": \"eight\"})")
++                << QString("{ items.resolve(4, 3) }")
++                << 5 << 4 << 4 << 3 << true << false << true << false << false
++                << QString("modelData")
++                << (QStringList() << "one" << "two" << "three" << "four");
++
++        QTest::newRow("StringList.items insert, resolve inserted")
++                << stringListSource[i]
++                << QString("items.insert(2, {\"modelData\": \"eight\"})")
++                << QString("{ items.resolve(2, 3) }")
++                << 5 << 4 << 4 << 2 << true << false << true << false << false
++                << QString("modelData")
++                << (QStringList() << "one" << "two" << "three" << "four");
++    }
++}
++
++void tst_qquickvisualdatamodel::resolve()
++{
++    QFETCH(QUrl, source);
++    QFETCH(QString, setupExpression);
++    QFETCH(QString, resolveExpression);
++    QFETCH(int, unresolvedCount);
++    QFETCH(int, modelCount);
++    QFETCH(int, visualCount);
++    QFETCH(int, index);
++    QFETCH(bool, inItems);
++    QFETCH(bool, persisted);
++    QFETCH(bool, visible);
++    QFETCH(bool, selected);
++    QFETCH(bool, modelData);
++    QFETCH(QString, property);
++    QFETCH(QStringList, propertyData);
++
++    QQuickCanvas canvas;
++
++    QDeclarativeComponent component(&engine);
++    component.loadUrl(source);
++    QScopedPointer<QObject> object(component.create());
++    QQuickListView *listView = qobject_cast<QQuickListView *>(object.data());
++    QVERIFY(listView);
++    listView->setParentItem(canvas.rootItem());
++
++    QQuickItem *contentItem = listView->contentItem();
++    QVERIFY(contentItem);
++
++    QObject *visualModel = listView->findChild<QObject *>("visualModel");
++    QVERIFY(visualModel);
++
++    evaluate<void>(visualModel, setupExpression);
++    QCOMPARE(evaluate<int>(listView, "count"), unresolvedCount);
++
++    evaluate<void>(visualModel, resolveExpression);
++
++    QCOMPARE(evaluate<int>(listView, "count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "items.count"), inItems ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "persistedItems.count"), persisted ? 1 : 0);
++    QCOMPARE(evaluate<int>(visualModel, "visibleItems.count"), visible ? visualCount : modelCount);
++    QCOMPARE(evaluate<int>(visualModel, "selectedItems.count"), selected ? 1 : 0);
++
++    QCOMPARE(propertyData.count(), visualCount);
++    for (int i = 0; i < visualCount; ++i) {
++        int modelIndex = i;
++
++        const int itemsIndex = inItems || i <= index ? i : i - 1;
++        QString get;
++
++        if (i != index) {
++            get = QString("items.get(%1)").arg(itemsIndex);
++
++            QQuickItem *item = findItem<QQuickItem>(contentItem, "delegate", modelIndex);
++            QVERIFY(item);
++
++            QCOMPARE(evaluate<int>(item, "test1"), modelIndex);
++            QCOMPARE(evaluate<int>(item, "test2"), modelIndex);
++            QCOMPARE(evaluate<QString>(item, "test3"), propertyData.at(i));
++            QCOMPARE(evaluate<QString>(item, "test4"), propertyData.at(i));
++
++            if (modelData) {
++                QCOMPARE(evaluate<QString>(item, "test5"), propertyData.at(i));
++                QCOMPARE(evaluate<QString>(item, "test6"), propertyData.at(i));
++            }
++
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inItems"), true);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inPersistedItems"), false);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inVisible"), true);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inSelected"), false);
++            QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.isUnresolved"), false);
++
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.itemsIndex"), itemsIndex);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.persistedItemsIndex"), persisted && i > index ? 1 : 0);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.visibleIndex"), visible || i <= index ? i : i - 1);
++            QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.selectedIndex"), selected && i > index ? 1 : 0);
++        } else if (inItems) {
++            get = QString("items.get(%1)").arg(index);
++        } else if (persisted) {
++            get = "persistedItems.get(0)";
++        } else if (visible) {
++            get = QString("visibleItems.get(%1)").arg(index);
++        } else if (selected) {
++            get = "selectedItems.get(0)";
++        } else {
++            continue;
++        }
++
++        QCOMPARE(evaluate<int>(visualModel, get + ".model.index"), modelIndex);
++
++        QCOMPARE(evaluate<QString>(visualModel, get + ".model." + property), propertyData.at(i));
++
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inItems"), inItems || i != index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inPersistedItems"), persisted && i == index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inVisible"), visible || i != index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".inSelected"), selected && i == index);
++        QCOMPARE(evaluate<bool>(visualModel, get + ".isUnresolved"), false);
++
++        QCOMPARE(evaluate<int>(visualModel, get + ".itemsIndex"), inItems || i <= index ? i : i - 1);
++        QCOMPARE(evaluate<int>(visualModel, get + ".persistedItemsIndex"), persisted && i > index ? 1 : 0);
++        QCOMPARE(evaluate<int>(visualModel, get + ".visibleIndex"), visible || i <= index ? i : i - 1);
++        QCOMPARE(evaluate<int>(visualModel, get + ".selectedIndex"), selected && i > index ? 1 : 0);
++    }
++
++    QObject *item = 0;
++
++    if (inItems)
++        item = evaluate<QObject *>(visualModel, QString("items.create(%1)").arg(index));
++    else if (persisted)
++        item = evaluate<QObject *>(visualModel, QString("persistedItems.create(%1)").arg(0));
++    else if (visible)
++        item = evaluate<QObject *>(visualModel, QString("visibleItems.create(%1)").arg(index));
++    else if (selected)
++        item = evaluate<QObject *>(visualModel, QString("selectedItems.create(%1)").arg(0));
++    else
++        return;
++
++    QVERIFY(item);
++
++    QCOMPARE(evaluate<int>(item, "test1"), index);
++    QCOMPARE(evaluate<int>(item, "test2"), index);
++    QCOMPARE(evaluate<QString>(item, "test3"), propertyData.at(index));
++    QCOMPARE(evaluate<QString>(item, "test4"), propertyData.at(index));
++
++    if (modelData) {
++        QCOMPARE(evaluate<QString>(item, "test5"), propertyData.at(index));
++        QCOMPARE(evaluate<QString>(item, "test6"), propertyData.at(index));
++    }
++
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inItems"), inItems);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inPersistedItems"), true);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inVisible"), visible);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.inSelected"), selected);
++    QCOMPARE(evaluate<bool>(item, "delegate.VisualDataModel.isUnresolved"), false);
++
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.itemsIndex"), index);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.persistedItemsIndex"), 0);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.visibleIndex"), index);
++    QCOMPARE(evaluate<int>(item, "delegate.VisualDataModel.selectedIndex"), 0);
++}
++
++void tst_qquickvisualdatamodel::warnings_data()
++{
++    QTest::addColumn<QUrl>("source");
++    QTest::addColumn<QString>("expression");
++    QTest::addColumn<QString>("warning");
++    QTest::addColumn<int>("count");
++
++    QTest::newRow("insert < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.insert(-2, {\"number\": \"eight\"})")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("insert: index out of range"))
++            << 4;
++
++    QTest::newRow("insert > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.insert(8, {\"number\": \"eight\"})")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("insert: index out of range"))
++            << 4;
++
++    QTest::newRow("create < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.create(-2, {\"number\": \"eight\"})")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("create: index out of range"))
++            << 4;
++
++    QTest::newRow("create > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.create(8, {\"number\": \"eight\"})")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("create: index out of range"))
++            << 4;
++
++    QTest::newRow("resolve from < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(-2, 3)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: from index out of range"))
++            << 4;
++
++    QTest::newRow("resolve from > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(8, 3)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: from index out of range"))
++            << 4;
++
++    QTest::newRow("resolve to < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(3, -2)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: to index out of range"))
++            << 4;
++
++    QTest::newRow("resolve to > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(3, 8)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: to index out of range"))
++            << 4;
++
++    QTest::newRow("resolve from invalid index")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(\"two\", 3)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: from index invalid"))
++            << 4;
++
++    QTest::newRow("resolve to invalid index")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(3, \"two\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: to index invalid"))
++            << 4;
++
++    QTest::newRow("resolve already resolved item")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.resolve(3, 2)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: from is not an unresolved item"))
++            << 4;
++
++    QTest::newRow("resolve already resolved item")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("{ items.insert(0, {\"number\": \"eight\"});"
++                       "items.insert(1, {\"number\": \"seven\"});"
++                       "items.resolve(0, 1)}")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("resolve: to is not a model item"))
++            << 6;
++
++    QTest::newRow("remove index < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(-2, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: index out of range"))
++            << 4;
++
++    QTest::newRow("remove index == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(4, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: index out of range"))
++            << 4;
++
++    QTest::newRow("remove index > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(9, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: index out of range"))
++            << 4;
++
++    QTest::newRow("remove invalid index")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(\"nine\", 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: invalid index"))
++            << 4;
++
++    QTest::newRow("remove count < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(1, -2)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: invalid count"))
++            << 4;
++
++    QTest::newRow("remove index + count > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.remove(2, 4, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("remove: invalid count"))
++            << 4;
++
++    QTest::newRow("addGroups index < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.addGroups(-2, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("addGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("addGroups index == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.addGroups(4, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("addGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("addGroups index > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.addGroups(9, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("addGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("addGroups count < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.addGroups(1, -2, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("addGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("addGroups index + count > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.addGroups(2, 4, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("addGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("removeGroups index < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.removeGroups(-2, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("removeGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("removeGroups index == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.removeGroups(4, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("removeGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("removeGroups index > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.removeGroups(9, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("removeGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("removeGroups count < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.removeGroups(1, -2, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("removeGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("removeGroups index + count > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.removeGroups(2, 4, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("removeGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("setGroups index < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.setGroups(-2, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("setGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("setGroups index == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.setGroups(4, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("setGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("setGroups index > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.setGroups(9, 1, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("setGroups: index out of range"))
++            << 4;
++
++    QTest::newRow("setGroups count < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.setGroups(1, -2, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("setGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("setGroups index + count > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.setGroups(2, 4, \"selected\")")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("setGroups: invalid count"))
++            << 4;
++
++    QTest::newRow("move from < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(-2, 1, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: from index out of range"))
++            << 4;
++
++    QTest::newRow("move from == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(4, 1, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: from index out of range"))
++            << 4;
++
++    QTest::newRow("move from > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(9, 1, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: from index out of range"))
++            << 4;
++
++    QTest::newRow("move invalid from")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(\"nine\", 1, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: invalid from index"))
++            << 4;
++
++    QTest::newRow("move to < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(1, -2, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: to index out of range"))
++            << 4;
++
++    QTest::newRow("move to == length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(1, 4, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: to index out of range"))
++            << 4;
++
++    QTest::newRow("move to > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(1, 9, 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: to index out of range"))
++            << 4;
++
++    QTest::newRow("move invalid to")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(1, \"nine\", 1)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: invalid to index"))
++            << 4;
++
++    QTest::newRow("move count < 0")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(1, 1, -2)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: invalid count"))
++            << 4;
++
++    QTest::newRow("move from + count > length")
++            << testFileUrl("listmodelproperties.qml")
++            << QString("items.move(2, 1, 4)")
++            << ("<Unknown File>: QML VisualDataGroup: " + QQuickVisualDataGroup::tr("move: from index out of range"))
++            << 4;
++}
++
++void tst_qquickvisualdatamodel::warnings()
++{
++    QFETCH(QUrl, source);
++    QFETCH(QString, expression);
++    QFETCH(QString, warning);
++    QFETCH(int, count);
++
++    QQuickCanvas canvas;
++
++    QDeclarativeComponent component(&engine);
++    component.loadUrl(source);
++    QScopedPointer<QObject> object(component.create());
++    QQuickListView *listView = qobject_cast<QQuickListView *>(object.data());
++    QVERIFY(listView);
++    listView->setParentItem(canvas.rootItem());
++
++    QQuickItem *contentItem = listView->contentItem();
++    QVERIFY(contentItem);
++
++    QObject *visualModel = evaluate<QObject *>(listView, "model");
++    QVERIFY(visualModel);
++
++    QTest::ignoreMessage(QtWarningMsg, warning.toUtf8());
++
++    evaluate<void>(visualModel, expression);
++    QCOMPARE(evaluate<int>(listView, "count"), count);
++}
++
+ template<typename T>
+ T *tst_qquickvisualdatamodel::findItem(QQuickItem *parent, const QString &objectName, int index)
+ {

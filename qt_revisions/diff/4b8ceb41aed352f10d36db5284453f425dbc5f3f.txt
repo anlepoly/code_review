@@ -1,0 +1,353 @@
+diff --git a/dist/changes-5.0.0 b/dist/changes-5.0.0
+index 1c1255b..1b67f87 100644
+--- a/dist/changes-5.0.0
++++ b/dist/changes-5.0.0
+@@ -117,6 +117,11 @@ information about a particular change.
+   * QWidget *widget() has been removed and is replaced by QObject
+     *target() in order to avoid QWidget dependencies.
+ 
++- QMetaType
++
++  * It is no longer possible to use Q_DECLARE_METATYPE(Foo*) where Foo is only
++    forward declared - it must be fully defined.
++
+ - QWindowSystemInterface:
+ 
+   * The signature of all handleTouchEvent() variants have changed,
+diff --git a/src/corelib/io/qtextstream.h b/src/corelib/io/qtextstream.h
+index 329dc4b..ba25a2b 100644
+--- a/src/corelib/io/qtextstream.h
++++ b/src/corelib/io/qtextstream.h
+@@ -208,6 +208,13 @@ typedef QTextStream & (*QTextStreamFunction)(QTextStream &);// manipulator funct
+ typedef void (QTextStream::*QTSMFI)(int); // manipulator w/int argument
+ typedef void (QTextStream::*QTSMFC)(QChar); // manipulator w/QChar argument
+ 
++
++namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<QTextStreamFunction> {
++    enum { Value = false };
++};
++}
++
+ class Q_CORE_EXPORT QTextStreamManipulator
+ {
+ public:
+diff --git a/src/corelib/kernel/qmetatype.cpp b/src/corelib/kernel/qmetatype.cpp
+index 44fa450..1c106f4 100644
+--- a/src/corelib/kernel/qmetatype.cpp
++++ b/src/corelib/kernel/qmetatype.cpp
+@@ -1670,11 +1670,13 @@ class Flags
+     template<typename T, bool IsAcceptedType = DefinedTypesFilter::Acceptor<T>::IsAccepted>
+     struct FlagsImpl
+     {
+-        static quint32 Flags(const int)
++        static quint32 Flags(const int type)
+         {
+             return (!QTypeInfo<T>::isStatic * QMetaType::MovableType)
+                     | (QTypeInfo<T>::isComplex * QMetaType::NeedsConstruction)
+-                    | (QTypeInfo<T>::isComplex * QMetaType::NeedsDestruction);
++                    | (QTypeInfo<T>::isComplex * QMetaType::NeedsDestruction)
++                    | (type == QMetaType::QObjectStar ? QMetaType::PointerToQObject : 0)
++                    | (type == QMetaType::QWidgetStar ? QMetaType::PointerToQObject : 0);
+         }
+     };
+     template<typename T>
+diff --git a/src/corelib/kernel/qmetatype.h b/src/corelib/kernel/qmetatype.h
+index e81dbb6..7c38d1c 100644
+--- a/src/corelib/kernel/qmetatype.h
++++ b/src/corelib/kernel/qmetatype.h
+@@ -207,7 +207,8 @@ public:
+     enum TypeFlag {
+         NeedsConstruction = 0x1,
+         NeedsDestruction = 0x2,
+-        MovableType = 0x4
++        MovableType = 0x4,
++        PointerToQObject = 0x8
+     };
+     Q_DECLARE_FLAGS(TypeFlags, TypeFlag)
+ 
+@@ -315,6 +316,9 @@ struct QMetaTypeId2
+     static inline int qt_metatype_id() { return QMetaTypeId<T>::qt_metatype_id(); }
+ };
+ 
++class QObject;
++class QWidget;
++
+ namespace QtPrivate {
+     template <typename T, bool Defined = QMetaTypeId2<T>::Defined>
+     struct QMetaTypeIdHelper {
+@@ -325,6 +329,43 @@ namespace QtPrivate {
+         static inline int qt_metatype_id()
+         { return -1; }
+     };
++
++    template<typename T>
++    struct IsPointerToTypeDerivedFromQObject
++    {
++        enum { Value = false };
++    };
++
++    // Specialize to avoid sizeof(void) warning
++    template<>
++    struct IsPointerToTypeDerivedFromQObject<void*>
++    {
++        enum { Value = false };
++    };
++    template<>
++    struct IsPointerToTypeDerivedFromQObject<QObject*>
++    {
++        enum { Value = true };
++    };
++    template<>
++    struct IsPointerToTypeDerivedFromQObject<QWidget*>
++    {
++        enum { Value = true };
++    };
++
++    template<typename T>
++    struct IsPointerToTypeDerivedFromQObject<T*>
++    {
++        typedef qint8 yes_type;
++        typedef qint64 no_type;
++
++#ifndef QT_NO_QOBJECT
++        static yes_type checkType(QObject* );
++#endif
++        static no_type checkType(...);
++        Q_STATIC_ASSERT_X(sizeof(T), "Type argument of Q_DECLARE_METATYPE(T*) must be fully defined");
++        enum { Value = sizeof(checkType(static_cast<T*>(0))) == sizeof(yes_type) };
++    };
+ }
+ 
+ template <typename T>
+@@ -354,6 +395,8 @@ int qRegisterMetaType(const char *typeName
+         flags |= QMetaType::NeedsConstruction;
+         flags |= QMetaType::NeedsDestruction;
+     }
++    if (QtPrivate::IsPointerToTypeDerivedFromQObject<T>::Value)
++        flags |= QMetaType::PointerToQObject;
+ 
+     return QMetaType::registerType(typeName, reinterpret_cast<QMetaType::Deleter>(dptr),
+                                    reinterpret_cast<QMetaType::Creator>(cptr),
+@@ -459,8 +502,6 @@ QT_FOR_EACH_STATIC_WIDGETS_CLASS(QT_FORWARD_DECLARE_STATIC_TYPES_ITER)
+ 
+ #undef QT_FORWARD_DECLARE_STATIC_TYPES_ITER
+ 
+-class QWidget;
+-class QObject;
+ template <class T> class QList;
+ template <class T1, class T2> class QMap;
+ template <class T1, class T2> class QHash;
+diff --git a/src/sql/drivers/psql/qsql_psql.cpp b/src/sql/drivers/psql/qsql_psql.cpp
+index de18178..ba9db5f 100644
+--- a/src/sql/drivers/psql/qsql_psql.cpp
++++ b/src/sql/drivers/psql/qsql_psql.cpp
+@@ -107,7 +107,18 @@
+ template <typename T>
+ inline void PQfreemem(T *t, int = 0) { free(t); }
+ 
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<PGconn*> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(PGconn*)
++
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<PGresult*> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(PGresult*)
+ 
+ QT_BEGIN_NAMESPACE
+diff --git a/src/sql/drivers/sqlite/qsql_sqlite.cpp b/src/sql/drivers/sqlite/qsql_sqlite.cpp
+index eef9499..900e81f 100644
+--- a/src/sql/drivers/sqlite/qsql_sqlite.cpp
++++ b/src/sql/drivers/sqlite/qsql_sqlite.cpp
+@@ -59,7 +59,18 @@
+ 
+ #include <sqlite3.h>
+ 
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<sqlite3*> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(sqlite3*)
++
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<sqlite3_stmt*> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(sqlite3_stmt*)
+ 
+ QT_BEGIN_NAMESPACE
+diff --git a/src/sql/drivers/tds/qsql_tds.cpp b/src/sql/drivers/tds/qsql_tds.cpp
+index 6a31574..c7bb964 100644
+--- a/src/sql/drivers/tds/qsql_tds.cpp
++++ b/src/sql/drivers/tds/qsql_tds.cpp
+@@ -127,6 +127,18 @@ QT_BEGIN_NAMESPACE
+ #define CS_PUBLIC
+ #endif
+ 
++namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<LOGINREC*> {
++    enum { Value = false };
++};
++}
++
++namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<DBPROCESS*> {
++    enum { Value = false };
++};
++}
++
+ QSqlError qMakeError(const QString& err, QSqlError::ErrorType type, int errNo = -1)
+ {
+     return QSqlError(QLatin1String("QTDS: ") + err, QString(), type, errNo);
+diff --git a/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp b/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
+index 3107fe4..de93c21 100644
+--- a/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
++++ b/tests/auto/corelib/kernel/qmetatype/tst_qmetatype.cpp
+@@ -596,21 +596,50 @@ Q_DECLARE_TYPEINFO(CustomMovable, Q_MOVABLE_TYPE);
+ QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(CustomMovable);
+ 
++class CustomObject : public QObject
++{
++    Q_OBJECT
++public:
++    CustomObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++
++    }
++};
++Q_DECLARE_METATYPE(CustomObject*);
++
++struct SecondBase {};
++
++class CustomMultiInheritanceObject : public QObject, SecondBase
++{
++    Q_OBJECT
++public:
++    CustomMultiInheritanceObject(QObject *parent = 0)
++      : QObject(parent)
++    {
++
++    }
++};
++Q_DECLARE_METATYPE(CustomMultiInheritanceObject*);
++
+ void tst_QMetaType::flags_data()
+ {
+     QTest::addColumn<int>("type");
+     QTest::addColumn<bool>("isMovable");
+     QTest::addColumn<bool>("isComplex");
++    QTest::addColumn<bool>("isPointerToQObject");
+ 
+ #define ADD_METATYPE_TEST_ROW(MetaTypeName, MetaTypeId, RealType) \
+-    QTest::newRow(#RealType) << MetaTypeId << bool(!QTypeInfo<RealType>::isStatic) << bool(QTypeInfo<RealType>::isComplex);
++    QTest::newRow(#RealType) << MetaTypeId << bool(!QTypeInfo<RealType>::isStatic) << bool(QTypeInfo<RealType>::isComplex) << bool(QtPrivate::IsPointerToTypeDerivedFromQObject<RealType>::Value);
+ QT_FOR_EACH_STATIC_CORE_CLASS(ADD_METATYPE_TEST_ROW)
+ QT_FOR_EACH_STATIC_PRIMITIVE_POINTER(ADD_METATYPE_TEST_ROW)
+ QT_FOR_EACH_STATIC_CORE_POINTER(ADD_METATYPE_TEST_ROW)
+ #undef ADD_METATYPE_TEST_ROW
+-    QTest::newRow("TestSpace::Foo") << ::qMetaTypeId<TestSpace::Foo>() << false << true;
+-    QTest::newRow("Whity<double>") << ::qMetaTypeId<Whity<double> >() << false << true;
+-    QTest::newRow("CustomMovable") << ::qMetaTypeId<CustomMovable>() << true << true;
++    QTest::newRow("TestSpace::Foo") << ::qMetaTypeId<TestSpace::Foo>() << false << true << false;
++    QTest::newRow("Whity<double>") << ::qMetaTypeId<Whity<double> >() << false << true << false;
++    QTest::newRow("CustomMovable") << ::qMetaTypeId<CustomMovable>() << true << true << false;
++    QTest::newRow("CustomObject*") << ::qMetaTypeId<CustomObject*>() << true << false << true;
++    QTest::newRow("CustomMultiInheritanceObject*") << ::qMetaTypeId<CustomMultiInheritanceObject*>() << true << false << true;
+ }
+ 
+ void tst_QMetaType::flags()
+@@ -618,10 +647,12 @@ void tst_QMetaType::flags()
+     QFETCH(int, type);
+     QFETCH(bool, isMovable);
+     QFETCH(bool, isComplex);
++    QFETCH(bool, isPointerToQObject);
+ 
+     QCOMPARE(bool(QMetaType::typeFlags(type) & QMetaType::NeedsConstruction), isComplex);
+     QCOMPARE(bool(QMetaType::typeFlags(type) & QMetaType::NeedsDestruction), isComplex);
+     QCOMPARE(bool(QMetaType::typeFlags(type) & QMetaType::MovableType), isMovable);
++    QCOMPARE(bool(QMetaType::typeFlags(type) & QMetaType::PointerToQObject), isPointerToQObject);
+ }
+ 
+ void tst_QMetaType::construct_data()
+diff --git a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+index f8fa92e..f40b1ea 100644
+--- a/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
++++ b/tests/auto/corelib/kernel/qvariant/tst_qvariant.cpp
+@@ -3324,6 +3324,11 @@ void tst_QVariant::colorInteger()
+ }
+ 
+ class Forward;
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<Forward*> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(Forward*);
+ 
+ void tst_QVariant::forwardDeclare()
+diff --git a/tests/auto/other/exceptionsafety_objects/tst_exceptionsafety_objects.cpp b/tests/auto/other/exceptionsafety_objects/tst_exceptionsafety_objects.cpp
+index 49516b7..65ac276 100644
+--- a/tests/auto/other/exceptionsafety_objects/tst_exceptionsafety_objects.cpp
++++ b/tests/auto/other/exceptionsafety_objects/tst_exceptionsafety_objects.cpp
+@@ -99,6 +99,11 @@ struct AbstractTester
+ Q_DECLARE_METATYPE(AbstractTester *)
+ 
+ typedef void (*TestFunction)(QObject*);
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<TestFunction> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(TestFunction)
+ 
+ template <typename T>
+diff --git a/tests/benchmarks/corelib/tools/qstring/main.cpp b/tests/benchmarks/corelib/tools/qstring/main.cpp
+index be2abe5..5ab53e3 100644
+--- a/tests/benchmarks/corelib/tools/qstring/main.cpp
++++ b/tests/benchmarks/corelib/tools/qstring/main.cpp
+@@ -1298,6 +1298,11 @@ static int ucstrncmp_ssse3_aligning2(const ushort *a, const ushort *b, int len)
+ #endif
+ 
+ typedef int (* UcstrncmpFunction)(const ushort *, const ushort *, int);
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<UcstrncmpFunction> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(UcstrncmpFunction)
+ 
+ void tst_QString::ucstrncmp_data() const
+@@ -1457,6 +1462,11 @@ void tst_QString::fromLatin1() const
+ }
+ 
+ typedef void (* FromLatin1Function)(ushort *, const char *, int);
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<FromLatin1Function> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(FromLatin1Function)
+ 
+ void fromLatin1_regular(ushort *dst, const char *str, int size)
+@@ -1907,6 +1917,11 @@ void tst_QString::fromLatin1Alternatives() const
+ }
+ 
+ typedef int (* FromUtf8Function)(ushort *, const char *, int);
++QT_BEGIN_NAMESPACE namespace QtPrivate {
++template <> struct IsPointerToTypeDerivedFromQObject<FromUtf8Function> {
++    enum { Value = false };
++};
++} QT_END_NAMESPACE
+ Q_DECLARE_METATYPE(FromUtf8Function)
+ 
+ extern QTextCodec::ConverterState *state;

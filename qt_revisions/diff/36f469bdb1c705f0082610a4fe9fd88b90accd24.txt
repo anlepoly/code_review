@@ -1,0 +1,213 @@
+diff --git a/src/plugins/platforms/cocoa/qcocoaprintersupport.h b/src/plugins/platforms/cocoa/qcocoaprintersupport.h
+index 88a83a4..c6790c3 100644
+--- a/src/plugins/platforms/cocoa/qcocoaprintersupport.h
++++ b/src/plugins/platforms/cocoa/qcocoaprintersupport.h
+@@ -44,6 +44,8 @@
+ 
+ #include <qpa/qplatformprintersupport.h>
+ 
++#include "qt_mac_p.h"
++
+ class QCocoaPrinterSupport : public QPlatformPrinterSupport
+ {
+ public:
+@@ -55,6 +57,10 @@ public:
+     QList<QPrinter::PaperSize> supportedPaperSizes(const QPrinterInfo &) const Q_DECL_OVERRIDE;
+ 
+     QList<QPrinterInfo> availablePrinters() Q_DECL_OVERRIDE;
++    QPrinterInfo printerInfo(const QString &printerName) Q_DECL_OVERRIDE;
++
++private:
++    QPrinterInfo printerInfoFromPMPrinter(const PMPrinter &printer);
+ };
+ 
+ #endif // QCOCOAPRINTERSUPPORT_H
+diff --git a/src/plugins/platforms/cocoa/qcocoaprintersupport.mm b/src/plugins/platforms/cocoa/qcocoaprintersupport.mm
+index a6eb5dd..2ded23a 100644
+--- a/src/plugins/platforms/cocoa/qcocoaprintersupport.mm
++++ b/src/plugins/platforms/cocoa/qcocoaprintersupport.mm
+@@ -44,6 +44,7 @@
+ 
+ #include <QtPrintSupport/QPrinter>
+ #include <QtPrintSupport/QPrinterInfo>
++#include <private/qprinterinfo_p.h>
+ 
+ QCocoaPrinterSupport::QCocoaPrinterSupport()
+ { }
+@@ -108,9 +109,27 @@ QList<QPrinterInfo> QCocoaPrinterSupport::availablePrinters()
+         CFIndex count = CFArrayGetCount(printerList);
+         for (CFIndex i = 0; i < count; ++i) {
+             PMPrinter printer = static_cast<PMPrinter>(const_cast<void *>(CFArrayGetValueAtIndex(printerList, i)));
+-            QString printerName = QCFString::toQString(PMPrinterGetID(printer));
+-            returnValue += QPlatformPrinterSupport::printerInfo(printerName, PMPrinterIsDefault(printer));
++            returnValue += printerInfoFromPMPrinter(printer);
+         }
+     }
+     return returnValue;
+ }
++
++QPrinterInfo QCocoaPrinterSupport::printerInfo(const QString &printerName)
++{
++    PMPrinter printer = PMPrinterCreateFromPrinterID(QCFString::toCFStringRef(printerName));
++    QPrinterInfo pi = printerInfoFromPMPrinter(printer);
++    PMRelease(printer);
++    return pi;
++}
++
++QPrinterInfo QCocoaPrinterSupport::printerInfoFromPMPrinter(const PMPrinter &printer)
++{
++    if (!printer)
++        return QPrinterInfo();
++
++    QPrinterInfo pi = QPrinterInfo(QCFString::toQString(PMPrinterGetID(printer)));
++    pi.d_func()->isDefault = PMPrinterIsDefault(printer);
++
++    return pi;
++}
+diff --git a/src/printsupport/kernel/qplatformprintersupport.h b/src/printsupport/kernel/qplatformprintersupport.h
+index f0efa3d..37fb9e8 100644
+--- a/src/printsupport/kernel/qplatformprintersupport.h
++++ b/src/printsupport/kernel/qplatformprintersupport.h
+@@ -73,12 +73,12 @@ public:
+ 
+     virtual QList<QPrinterInfo> availablePrinters();
+     virtual QPrinterInfo defaultPrinter();
++    virtual QPrinterInfo printerInfo(const QString &printerName);
+ 
+     static QPrinter::PaperSize convertQSizeFToPaperSize(const QSizeF &sizef);
+     static QSizeF convertPaperSizeToQSizeF(QPrinter::PaperSize paperSize);
+ 
+ protected:
+-     static QPrinterInfo printerInfo(const QString &printerName, bool isDefault = false);
+      static void setPrinterInfoDefault(QPrinterInfo *p, bool isDefault);
+      static bool printerInfoIsDefault(const QPrinterInfo &p);
+      static int printerInfoCupsPrinterIndex(const QPrinterInfo &p);
+diff --git a/src/printsupport/kernel/qplatformprintersupport_qpa.cpp b/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
+index 9c0c3f1..35441df 100644
+--- a/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
++++ b/src/printsupport/kernel/qplatformprintersupport_qpa.cpp
+@@ -97,11 +97,14 @@ QPrinterInfo QPlatformPrinterSupport::defaultPrinter()
+     return printers.isEmpty() ? QPrinterInfo() : printers.front();
+ }
+ 
+-QPrinterInfo QPlatformPrinterSupport::printerInfo(const QString &printerName, bool isDefault)
++QPrinterInfo QPlatformPrinterSupport::printerInfo(const QString &printerName)
+ {
+-    QPrinterInfo pi = QPrinterInfo(printerName);
+-    pi.d_func()->isDefault = isDefault;
+-    return pi;
++    const QList<QPrinterInfo> printers = availablePrinters();
++    foreach (const QPrinterInfo &printerInfo, printers) {
++        if (printerInfo.printerName() == printerName)
++            return printerInfo;
++    }
++    return QPrinterInfo();
+ }
+ 
+ void QPlatformPrinterSupport::setPrinterInfoDefault(QPrinterInfo *p, bool isDefault)
+diff --git a/src/printsupport/kernel/qprinterinfo.cpp b/src/printsupport/kernel/qprinterinfo.cpp
+index 3d0ba7f..fbf2e4d 100644
+--- a/src/printsupport/kernel/qprinterinfo.cpp
++++ b/src/printsupport/kernel/qprinterinfo.cpp
+@@ -96,11 +96,10 @@ QPrinterInfo::QPrinterInfo(const QPrinterInfo &other)
+ QPrinterInfo::QPrinterInfo(const QPrinter &printer)
+     : d_ptr(&QPrinterInfoPrivate::shared_null)
+ {
+-    foreach (const QPrinterInfo &printerInfo, availablePrinters()) {
+-        if (printerInfo.printerName() == printer.printerName()) {
+-            d_ptr.reset(new QPrinterInfoPrivate(*printerInfo.d_ptr));
+-            break;
+-        }
++    QPlatformPrinterSupport *ps = QPlatformPrinterSupportPlugin::get();
++    if (ps) {
++        QPrinterInfo pi = ps->printerInfo(printer.printerName());
++        d_ptr.reset(new QPrinterInfoPrivate(*pi.d_ptr));
+     }
+ }
+ 
+@@ -195,7 +194,27 @@ QPrinterInfo QPrinterInfo::defaultPrinter()
+     QPlatformPrinterSupport *ps = QPlatformPrinterSupportPlugin::get();
+     if (!ps)
+         return QPrinterInfo();
+-    return QPlatformPrinterSupportPlugin::get()->defaultPrinter();
++    return ps->defaultPrinter();
++}
++
++/*!
++    \fn QPrinterInfo QPrinterInfo::printerInfo()
++    \since 5.0
++
++    Returns the named printer.
++
++    The return value should be checked using isNull() before being
++    used, in case the named printer does not exist.
++
++    \sa isNull()
++*/
++
++QPrinterInfo QPrinterInfo::printerInfo(const QString &printerName)
++{
++    QPlatformPrinterSupport *ps = QPlatformPrinterSupportPlugin::get();
++    if (!ps)
++        return QPrinterInfo();
++    return ps->printerInfo(printerName);
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/printsupport/kernel/qprinterinfo.h b/src/printsupport/kernel/qprinterinfo.h
+index d26b70d..8b3ab44 100644
+--- a/src/printsupport/kernel/qprinterinfo.h
++++ b/src/printsupport/kernel/qprinterinfo.h
+@@ -71,6 +71,7 @@ public:
+ 
+     static QList<QPrinterInfo> availablePrinters();
+     static QPrinterInfo defaultPrinter();
++    static QPrinterInfo printerInfo(const QString &printerName);
+ 
+ private:
+     explicit QPrinterInfo(const QString &name);
+@@ -78,6 +79,7 @@ private:
+ private:
+     friend class QPlatformPrinterSupport;
+     friend class QWindowsPrinterSupport;
++    friend class QCocoaPrinterSupport;
+     Q_DECLARE_PRIVATE(QPrinterInfo)
+     QScopedPointer<QPrinterInfoPrivate, QPrinterInfoPrivateDeleter> d_ptr;
+ };
+diff --git a/tests/auto/printsupport/kernel/qprinterinfo/tst_qprinterinfo.cpp b/tests/auto/printsupport/kernel/qprinterinfo/tst_qprinterinfo.cpp
+index 70a00ed..ad51b91 100644
+--- a/tests/auto/printsupport/kernel/qprinterinfo/tst_qprinterinfo.cpp
++++ b/tests/auto/printsupport/kernel/qprinterinfo/tst_qprinterinfo.cpp
+@@ -68,6 +68,7 @@ private slots:
+     void testForPaperSizes();
+     void testConstructors();
+     void testAssignment();
++    void namedPrinter();
+ 
+ private:
+     QString getDefaultPrinterFromSystem();
+@@ -373,6 +374,24 @@ void tst_QPrinterInfo::testAssignment()
+     }
+ }
+ 
++void tst_QPrinterInfo::namedPrinter()
++{
++    QList<QPrinterInfo> printers = QPrinterInfo::availablePrinters();
++
++    QStringList printerNames;
++
++    foreach (const QPrinterInfo &pi, printers) {
++        QPrinterInfo pi2 = QPrinterInfo::printerInfo(pi.printerName());
++        qDebug() << "Printer: " << pi2.printerName() << " : "
++                 << pi2.isNull() << " : " << pi2.isDefault();
++        QCOMPARE(pi2.printerName(),         pi.printerName());
++        QCOMPARE(pi2.supportedPaperSizes(), pi.supportedPaperSizes());
++        QCOMPARE(pi2.isNull(),              pi.isNull());
++        QCOMPARE(pi2.isDefault(),           pi.isDefault());
++    }
++}
++
++
+ #endif
+ 
+ QTEST_MAIN(tst_QPrinterInfo)

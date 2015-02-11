@@ -1,0 +1,192 @@
+diff --git a/examples/player/histogramwidget.cpp b/examples/player/histogramwidget.cpp
+index cf7ae6f..d932751 100644
+--- a/examples/player/histogramwidget.cpp
++++ b/examples/player/histogramwidget.cpp
+@@ -44,29 +44,78 @@
+ HistogramWidget::HistogramWidget(QWidget *parent)
+     : QWidget(parent)
+     , m_levels(128)
++    , m_isBusy(false)
+ {
++    m_processor.moveToThread(&m_processorThread);
++    qRegisterMetaType<QVector<qreal> >("QVector<qreal>");
++    connect(&m_processor, SIGNAL(histogramReady(QVector<qreal>)), SLOT(setHistogram(QVector<qreal>)));
++    m_processorThread.start(QThread::LowestPriority);
++}
++
++HistogramWidget::~HistogramWidget()
++{
++    m_processorThread.quit();
++    m_processorThread.wait(10000);
+ }
+ 
+ void HistogramWidget::processFrame(QVideoFrame frame)
+ {
+-    m_histogram.clear();
++    if (m_isBusy)
++        return; //drop frame
++
++    m_isBusy = true;
++    QMetaObject::invokeMethod(&m_processor, "processFrame",
++                              Qt::QueuedConnection, Q_ARG(QVideoFrame, frame), Q_ARG(int, m_levels));
++}
++
++void HistogramWidget::setHistogram(QVector<qreal> histogram)
++{
++    m_isBusy = false;
++    m_histogram = histogram;
++    update();
++}
++
++void HistogramWidget::paintEvent(QPaintEvent *event)
++{
++    Q_UNUSED(event);
++
++    QPainter painter(this);
++
++    if (m_histogram.isEmpty()) {
++        painter.fillRect(0, 0, width(), height(), QColor::fromRgb(0, 0, 0));
++        return;
++    }
++
++    qreal barWidth = width() / (qreal)m_histogram.size();
++
++    for (int i = 0; i < m_histogram.size(); i++) {
++        qreal h = m_histogram[i] * height();
++        // draw level
++        painter.fillRect(barWidth * i, height() - h, barWidth * (i + 1), height(), Qt::red);
++        // clear the rest of the control
++        painter.fillRect(barWidth * i, 0, barWidth * (i + 1), height() - h, Qt::black);
++    }
++}
++
++void FrameProcessor::processFrame(QVideoFrame frame, int levels)
++{
++    QVector<qreal> histogram(levels);
+ 
+     do {
+-        if (!m_levels)
++        if (!levels)
+             break;
+ 
+         if (!frame.map(QAbstractVideoBuffer::ReadOnly))
+             break;
+ 
+-        m_histogram.resize(m_levels);
+-
+-        if (frame.pixelFormat() == QVideoFrame::Format_YUV420P) {
+-            // Process YUV420P data
++        if (frame.pixelFormat() == QVideoFrame::Format_YUV420P ||
++            frame.pixelFormat() == QVideoFrame::Format_NV12) {
++            // Process YUV data
+             uchar *b = frame.bits();
+             for (int y = 0; y < frame.height(); y++) {
+                 uchar *lastPixel = b + frame.width();
+                 for (uchar *curPixel = b; curPixel < lastPixel; curPixel++)
+-                    m_histogram[(*curPixel * m_levels) / 256] += 1.0;
++                    histogram[(*curPixel * levels) >> 8] += 1.0;
+                 b += frame.bytesPerLine();
+             }
+         } else {
+@@ -80,7 +129,7 @@ void HistogramWidget::processFrame(QVideoFrame frame)
+                 for (int y = 0; y < image.height(); y++) {
+                     const QRgb *lastPixel = b + frame.width();
+                     for (const QRgb *curPixel = b; curPixel < lastPixel; curPixel++)
+-                        m_histogram[(qGray(*curPixel) * m_levels) / 256] += 1.0;
++                        histogram[(qGray(*curPixel) * levels) >> 8] += 1.0;
+                     b = (const QRgb*)((uchar*)b + image.bytesPerLine());
+                 }
+             }
+@@ -88,40 +137,18 @@ void HistogramWidget::processFrame(QVideoFrame frame)
+ 
+         // find maximum value
+         qreal maxValue = 0.0;
+-        for (int i = 0; i < m_histogram.size(); i++) {
+-            if (m_histogram[i] > maxValue)
+-                maxValue = m_histogram[i];
++        for (int i = 0; i < histogram.size(); i++) {
++            if (histogram[i] > maxValue)
++                maxValue = histogram[i];
+         }
+ 
+         if (maxValue > 0.0) {
+-            for (int i = 0; i < m_histogram.size(); i++)
+-                m_histogram[i] /= maxValue;
++            for (int i = 0; i < histogram.size(); i++)
++                histogram[i] /= maxValue;
+         }
+ 
+         frame.unmap();
+     } while (false);
+ 
+-    update();
+-}
+-
+-void HistogramWidget::paintEvent(QPaintEvent *event)
+-{
+-    Q_UNUSED(event);
+-
+-    QPainter painter(this);
+-
+-    if (m_histogram.isEmpty()) {
+-        painter.fillRect(0, 0, width(), height(), QColor::fromRgb(0, 0, 0));
+-        return;
+-    }
+-
+-    qreal barWidth = width() / (qreal)m_histogram.size();
+-
+-    for (int i = 0; i < m_histogram.size(); i++) {
+-        qreal h = m_histogram[i] * height();
+-        // draw level
+-        painter.fillRect(barWidth * i, height() - h, barWidth * (i + 1), height(), Qt::red);
+-        // clear the rest of the control
+-        painter.fillRect(barWidth * i, 0, barWidth * (i + 1), height() - h, Qt::black);
+-    }
++    emit histogramReady(histogram);
+ }
+diff --git a/examples/player/histogramwidget.h b/examples/player/histogramwidget.h
+index 2d1883f..d15b841 100644
+--- a/examples/player/histogramwidget.h
++++ b/examples/player/histogramwidget.h
+@@ -43,18 +43,31 @@
+ 
+ #include <QWidget>
+ #include <qvideoframe.h>
++#include <QThread>
+ 
+ QT_USE_NAMESPACE
+ 
++class FrameProcessor: public QObject {
++    Q_OBJECT
++
++public slots:
++    void processFrame(QVideoFrame frame, int levels);
++
++signals:
++    void histogramReady(QVector<qreal> histogram);
++};
++
+ class HistogramWidget : public QWidget
+ {
+     Q_OBJECT
+ public:
+     explicit HistogramWidget(QWidget *parent = 0);
++    ~HistogramWidget();
+     void setLevels(int levels) { m_levels = levels; }
+ 
+ public slots:
+     void processFrame(QVideoFrame frame);
++    void setHistogram(QVector<qreal> histogram);
+ 
+ protected:
+     void paintEvent(QPaintEvent *event);
+@@ -62,6 +75,9 @@ protected:
+ private:
+     QVector<qreal> m_histogram;
+     int m_levels;
++    FrameProcessor m_processor;
++    QThread m_processorThread;
++    bool m_isBusy;
+ };
+ 
+ #endif // HISTOGRAMWIDGET_H

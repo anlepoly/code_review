@@ -1,0 +1,148 @@
+diff --git a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
+index 5a3329d..e2891d0 100644
+--- a/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
++++ b/src/3rdparty/harfbuzz/src/harfbuzz-shaper.h
+@@ -135,7 +135,7 @@ typedef struct {
+     hb_bitfield whiteSpace       : 1;     /* A unicode whitespace character */
+     hb_bitfield wordStart        : 1;
+     hb_bitfield wordEnd          : 1;
+-    hb_bitfield unused           : 1;
++    hb_bitfield mandatoryBreak   : 1;
+ } HB_CharAttributes;
+ 
+ void HB_GetTailoredCharAttributes(const HB_UChar16 *string, hb_uint32 stringLength,
+diff --git a/src/corelib/tools/qtextboundaryfinder.cpp b/src/corelib/tools/qtextboundaryfinder.cpp
+index 7f12032..416a14a 100644
+--- a/src/corelib/tools/qtextboundaryfinder.cpp
++++ b/src/corelib/tools/qtextboundaryfinder.cpp
+@@ -162,6 +162,8 @@ static void init(QTextBoundaryFinder::BoundaryType type, const QChar *chars, int
+   \value NotAtBoundary  The boundary finder is not at a boundary position.
+   \value StartWord  The boundary finder is at the start of a word.
+   \value EndWord  The boundary finder is at the end of a word.
++  \value MandatoryBreak  Since 5.0. The boundary finder is at the end of line
++                         (can occur for a Line boundary type only).
+   \value SoftHyphen  The boundary finder is at the soft hyphen
+                      (can occur for a Line boundary type only).
+ */
+@@ -477,7 +479,10 @@ QTextBoundaryFinder::BoundaryReasons QTextBoundaryFinder::boundaryReasons() cons
+             reasons |= EndWord;
+         break;
+     case Line:
+-        if (pos > 0 && chars[pos - 1].unicode() == QChar::SoftHyphen)
++        // ### TR#14 LB2 prohibits break at sot
++        if (d->attributes[pos].mandatoryBreak || pos == 0)
++            reasons |= MandatoryBreak;
++        else if (pos > 0 && chars[pos - 1].unicode() == QChar::SoftHyphen)
+             reasons |= SoftHyphen;
+         // fall through
+     case Grapheme:
+diff --git a/src/corelib/tools/qtextboundaryfinder.h b/src/corelib/tools/qtextboundaryfinder.h
+index 57c2fda..c752623 100644
+--- a/src/corelib/tools/qtextboundaryfinder.h
++++ b/src/corelib/tools/qtextboundaryfinder.h
+@@ -69,9 +69,10 @@ public:
+ 
+     enum BoundaryReason {
+         NotAtBoundary = 0,
+-        StartWord = 1,
+-        EndWord = 2,
+-        SoftHyphen = 4
++        StartWord = 0x10,
++        EndWord = 0x20,
++        MandatoryBreak = 0x40,
++        SoftHyphen = 0x80
+     };
+     Q_DECLARE_FLAGS( BoundaryReasons, BoundaryReason )
+ 
+diff --git a/src/corelib/tools/qunicodetools.cpp b/src/corelib/tools/qunicodetools.cpp
+index 1f45575..3d58f16 100644
+--- a/src/corelib/tools/qunicodetools.cpp
++++ b/src/corelib/tools/qunicodetools.cpp
+@@ -497,7 +497,7 @@ static void getLineBreaks(const ushort *string, quint32 len, QCharAttributes *at
+         if (Q_UNLIKELY(lcls >= QUnicodeTables::LineBreak_CR)) {
+             // LB4: BK!, LB5: (CRxLF|CR|LF|NL)!
+             if (lcls > QUnicodeTables::LineBreak_CR || ncls != QUnicodeTables::LineBreak_LF)
+-                attributes[pos].lineBreak = true;
++                attributes[pos].lineBreak = attributes[pos].mandatoryBreak = true;
+             goto next;
+         }
+ 
+@@ -547,8 +547,8 @@ static void getLineBreaks(const ushort *string, quint32 len, QCharAttributes *at
+             attributes[j].lineBreak = false;
+     }
+ 
+-    attributes[0].lineBreak = false; // LB2
+-    attributes[len].lineBreak = true; // LB3
++    attributes[0].lineBreak = attributes[0].mandatoryBreak = false; // LB2
++    attributes[len].lineBreak = attributes[len].mandatoryBreak = true; // LB3
+ }
+ 
+ 
+diff --git a/src/corelib/tools/qunicodetools_p.h b/src/corelib/tools/qunicodetools_p.h
+index b1e9127..143a4fd 100644
+--- a/src/corelib/tools/qunicodetools_p.h
++++ b/src/corelib/tools/qunicodetools_p.h
+@@ -66,7 +66,7 @@ struct Q_PACKED QCharAttributes
+     uchar whiteSpace       : 1;
+     uchar wordStart        : 1;
+     uchar wordEnd          : 1;
+-    uchar unused           : 1;
++    uchar mandatoryBreak   : 1;
+ };
+ Q_DECLARE_TYPEINFO(QCharAttributes, Q_PRIMITIVE_TYPE);
+ 
+diff --git a/tests/auto/corelib/tools/qtextboundaryfinder/tst_qtextboundaryfinder.cpp b/tests/auto/corelib/tools/qtextboundaryfinder/tst_qtextboundaryfinder.cpp
+index 22d3465..a0aab34 100644
+--- a/tests/auto/corelib/tools/qtextboundaryfinder/tst_qtextboundaryfinder.cpp
++++ b/tests/auto/corelib/tools/qtextboundaryfinder/tst_qtextboundaryfinder.cpp
+@@ -76,6 +76,8 @@ private slots:
+     void wordBoundaries_qtbug6498();
+     void isAtSoftHyphen_data();
+     void isAtSoftHyphen();
++    void isAtMandatoryBreak_data();
++    void isAtMandatoryBreak();
+     void thaiLineBreak();
+ };
+ 
+@@ -659,6 +661,41 @@ void tst_QTextBoundaryFinder::isAtSoftHyphen()
+     }
+ }
+ 
++void tst_QTextBoundaryFinder::isAtMandatoryBreak_data()
++{
++    QTest::addColumn<QString>("testString");
++    QTest::addColumn<QList<int> >("expectedBreakPositions");
++
++    {
++        QChar s[] = { 0x000D, 0x0308, 0x000A, 0x000A };
++        QString testString(s, sizeof(s)/sizeof(s[0]));
++        QList<int> expectedBreakPositions;
++        expectedBreakPositions << 0 << 1 << 3 << 4;
++
++        QTest::newRow("+CR+FExLF+LF+") << testString << expectedBreakPositions;
++    }
++    {
++        QString testString(QString::fromUtf8("Aaa bbb ccc.\r\nDdd eee fff."));
++        QList<int> expectedBreakPositions;
++        expectedBreakPositions << 0 << 14 << 26;
++
++        QTest::newRow("data1") << testString << expectedBreakPositions;
++    }
++}
++
++void tst_QTextBoundaryFinder::isAtMandatoryBreak()
++{
++    QFETCH(QString, testString);
++    QFETCH(QList<int>, expectedBreakPositions);
++
++    QTextBoundaryFinder boundaryFinder(QTextBoundaryFinder::Line, testString);
++    for (int i = 0; i <= testString.size(); ++i) {
++        boundaryFinder.setPosition(i);
++        if (boundaryFinder.boundaryReasons() & QTextBoundaryFinder::MandatoryBreak)
++            QVERIFY(expectedBreakPositions.contains(i));
++    }
++}
++
+ #include <qlibrary.h>
+ 
+ #define LIBTHAI_MAJOR   0
